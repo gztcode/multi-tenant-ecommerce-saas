@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "//": "prisma/ 不参与编译：种子脚本由 ts-node 直接跑源码（package.json#prisma.seed）。把它纳入编译会把 TypeScript 的公共根目录抬到项目根，产物多出一层 src/（dist/src/main.js），与 start:prod 里的 node dist/main 对不上。",
+  "exclude": ["node_modules", "test", "dist", "prisma", "**/*spec.ts"]
+}

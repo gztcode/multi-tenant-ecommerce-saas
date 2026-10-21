@@ -1,0 +1,125 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ecommerce-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ecommerce}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ecommerce}
+      POSTGRES_DB: ${POSTGRES_DB:-ecommerce}
+    ports:
+      # 宿主机端口默认 15432：本机 5432 已被另一个项目的 postgres 容器占用
+      - '${POSTGRES_PORT:-15432}:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-ecommerce} -d ${POSTGRES_DB:-ecommerce}']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+    container_name: ecommerce-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # 容器之间用服务名 + 容器内端口通信，与宿主机映射的 15432 无关。
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ecommerce}:${POSTGRES_PASSWORD:-ecommerce}@postgres:5432/${POSTGRES_DB:-ecommerce}?schema=public
+      DATABASE_URL_TEST: postgresql://${POSTGRES_USER:-ecommerce}:${POSTGRES_PASSWORD:-ecommerce}@postgres:5432/ecommerce_test?schema=public
+      NODE_ENV: production
+      PORT: '3000'
+      API_PREFIX: api/v1
+      # 本地开发用的固定值。必须固定：每次 up 都换密钥的话，
+      # 之前签发的 token 会全部失效，调试时登录状态莫名其妙丢失。
+      # 同时受两项约束：长度 ≥ 32 字符；不能等于 .env.example 里的占位符
+      # （api/src/common/config/assert-secure-config.ts 会在启动时拒绝）。
+      # 这里的值只服务于本机开发，真实部署必须换成随机密钥。
+      JWT_SECRET: local-dev-only-jwt-secret-at-least-32-chars-long
+      JWT_EXPIRES_IN: 2h
+      REFRESH_TOKEN_TTL_DAYS: '30'
+    ports:
+      - '${API_PORT:-3000}:3000'
+    healthcheck:
+      # 用 node 自带的 fetch 探活：运行阶段没有 curl / wget，
+      # node 22 的 fetch 不需要额外依赖。
+      test:
+        - CMD-SHELL
+        - node -e "fetch('http://127.0.0.1:3000/api/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  storefront:
+    build:
+      context: ../storefront
+      dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_* 在构建期被内联进产物，必须通过 build arg 传入。
+        NEXT_PUBLIC_TENANT_SUBDOMAIN: ${NEXT_PUBLIC_TENANT_SUBDOMAIN:-demo}
+    container_name: ecommerce-storefront
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      # 容器内走服务名，不走宿机的 localhost:3000。
+      API_BASE_URL: http://api:3000/api/v1
+      AUTH_SECRET: local-dev-only-auth-secret-at-least-32-chars
+      AUTH_URL: http://localhost:3001
+      AUTH_TRUST_HOST: 'true'
+    ports:
+      - '${STOREFRONT_PORT:-3001}:3000'
+
+  merchant-admin:
+    build:
+      context: ../merchant-admin
+      dockerfile: Dockerfile
+    container_name: ecommerce-merchant-admin
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      API_BASE_URL: http://api:3000/api/v1
+      AUTH_SECRET: local-dev-only-auth-secret-at-least-32-chars
+      AUTH_URL: http://localhost:3002
+      AUTH_TRUST_HOST: 'true'
+    ports:
+      - '${MERCHANT_ADMIN_PORT:-3002}:3000'
+
+  platform-admin:
+    build:
+      context: ../platform-admin
+      dockerfile: Dockerfile
+    container_name: ecommerce-platform-admin
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      API_BASE_URL: http://api:3000/api/v1
+      AUTH_SECRET: local-dev-only-auth-secret-at-least-32-chars
+      AUTH_URL: http://localhost:3003
+      AUTH_TRUST_HOST: 'true'
+    ports:
+      - '${PLATFORM_ADMIN_PORT:-3003}:3000'
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ecommerce-nginx
+    restart: unless-stopped
+    depends_on:
+      - api
+      - storefront
+      - merchant-admin
+      - platform-admin
+    ports:
+      - '${NGINX_PORT:-80}:80'
+    volumes:
+      - ./nginx/platform.test.conf:/etc/nginx/conf.d/default.conf:ro
+
+volumes:
+  pgdata:

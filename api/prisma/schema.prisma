@@ -1,0 +1,118 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  PLATFORM_ADMIN
+  MERCHANT_OWNER
+  MERCHANT_STAFF
+  CUSTOMER
+}
+
+enum TenantStatus {
+  TRIAL
+  ACTIVE
+  SUSPENDED
+}
+
+enum StoreStatus {
+  DRAFT
+  LIVE
+  PAUSED
+}
+
+model Tenant {
+  id        String       @id @default(uuid())
+  name      String
+  subdomain String       @unique
+  status    TenantStatus @default(TRIAL)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  users  User[]
+  stores Store[]
+
+  @@map("tenants")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  tenantId     String?
+  email        String
+  phone        String?
+  passwordHash String
+  displayName  String
+  role         UserRole
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant        Tenant?         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
+
+  // 邮箱唯一性分三层，全部由原生 SQL 的**部分唯一索引**保证，Prisma schema
+  // 表达不了条件唯一约束，因此这里刻意不再声明任何 @@unique：
+  //   PLATFORM_ADMIN → users_platform_admin_email_key（全局，tenantId IS NULL）
+  //   MERCHANT_OWNER → users_merchant_owner_email_key（全局，见 add_merchant_owner_email_unique）
+  //   CUSTOMER / MERCHANT_STAFF → users_customer_email_ci_key（租户内，见 narrow_customer_email_ci_unique）
+  //
+  // ⚠️ 曾经的 @@unique([tenantId, email]) 已删除（见 drop_user_tenant_email_unique）。
+  // 它不含角色，会把「店主在自己开的店里当消费者下单」这种正常用法也一起挡掉，
+  // 抛出无法解释给用户的 P2002。留下它等于让部分索引形同虚设——
+  // 它更严格，冲突永远发生在部分索引之前。
+  //
+  // db push 等同步路径下会缺失这些部分索引，届时邮箱唯一性会暂时失效；
+  // 正式环境一律用 migrate deploy。
+  //
+  // 配合应用层统一小写化的 email 精确查询
+  @@index([email])
+  @@map("users")
+}
+
+enum RefreshTokenRevokedReason {
+  ROTATED
+  LOGOUT
+  REPLAY
+}
+
+model RefreshToken {
+  id     String    @id @default(uuid())
+  userId String
+  // ROTATED：刷新时轮换掉旧令牌
+  // LOGOUT：用户主动登出
+  // REPLAY：疑似泄露，令牌族整体作废
+  // 重放检测只对 ROTATED 触发——登出后的令牌被再次使用不牵连其它设备。
+  revokedReason RefreshTokenRevokedReason?
+  tokenHash     String                   @unique
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  createdAt     DateTime                 @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model Store {
+  id            String      @id @default(uuid())
+  tenantId      String
+  name          String
+  slug          String
+  status        StoreStatus @default(DRAFT)
+  themeTokens   Json        @default("{}")
+  paymentConfig Json        @default("{}")
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // 复合唯一索引的最左前缀已能服务「按 tenantId 查该租户的店铺」，
+  // 不需要再单独建 @@index([tenantId])
+  @@unique([tenantId, slug])
+  @@map("stores")
+}
