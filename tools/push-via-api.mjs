@@ -119,32 +119,32 @@ const existing = await fetch(`https://api.github.com/${refPath}`, {
   },
 });
 
-if (existing.ok) {
-  const res = await fetch(`https://api.github.com/${refPath}`, {
-    method: 'PATCH',
-    headers: {
-      accept: 'application/vnd.github+json',
-      'content-type': 'application/json',
-      authorization: `Bearer ${process.env.GH_TOKEN}`,
-    },
-    body: JSON.stringify({ sha: commit.sha, force: false }),
-  });
-  console.log(`ref ${remoteBranch} 已更新：HTTP ${res.status}`);
-} else {
-  const res = await fetch(`https://api.github.com/${refPath}`, {
-    method: 'POST',
-    headers: {
-      accept: 'application/vnd.github+json',
-      'content-type': 'application/json',
-      authorization: `Bearer ${process.env.GH_TOKEN}`,
-    },
-    body: JSON.stringify({ ref: `refs/heads/${remoteBranch}`, sha: commit.sha }),
-  });
-  console.log(`ref ${remoteBranch} 已创建：HTTP ${res.status}`);
-}
+const refResponse = existing.ok
+  ? await fetch(`https://api.github.com/${refPath}`, {
+      method: 'PATCH',
+      headers: {
+        accept: 'application/vnd.github+json',
+        'content-type': 'application/json',
+        authorization: `Bearer ${process.env.GH_TOKEN}`,
+      },
+      body: JSON.stringify({ sha: commit.sha, force: false }),
+    })
+  : await fetch(`https://api.github.com/${refPath}`, {
+      method: 'POST',
+      headers: {
+        accept: 'application/vnd.github+json',
+        'content-type': 'application/json',
+        authorization: `Bearer ${process.env.GH_TOKEN}`,
+      },
+      body: JSON.stringify({ ref: `refs/heads/${remoteBranch}`, sha: commit.sha }),
+    });
 
-if (!res.ok) {
-  console.log(await res.text());
+console.log(
+  `ref ${remoteBranch} ${existing.ok ? '已更新' : '已创建'}：HTTP ${refResponse.status}`,
+);
+
+if (!refResponse.ok) {
+  console.log(await refResponse.text());
   process.exit(1);
 }
 console.log(`\n推送完成：${commit.sha}`);
