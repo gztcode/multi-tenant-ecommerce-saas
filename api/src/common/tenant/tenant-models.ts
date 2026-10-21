@@ -1,0 +1,92 @@
+/**
+ * 店铺子域名的合法格式：长度 3-32，首尾必须是字母或数字，中间可含连字符。
+ *
+ * 单一事实来源：写入侧（Task 6 的注册 DTO）与读取侧（子域名解析）都必须引用这里，
+ * 严禁各自复制一份正则——两处漂移会让「注册时被拒的格式」仍然能通过 Host 头进入解析。
+ */
+export const SUBDOMAIN_PATTERN = /^[a-z0-9]([a-z0-9-]{1,30})[a-z0-9]$/;
+
+/**
+ * 平台保留子域名：这些名字留给基础设施自己用，不允许商家注册或解析。
+ *
+ * 命中时按「无法确定店铺」处理（不查库、错误措辞与「不存在」一致），
+ * 既防止子域名接管，也避免攻击者通过响应差异枚举出商家目录。
+ *
+ * 两个理由：
+ * 1. 子域名接管——商家可以注册 `admin` 这个子域名；将来基础设施一旦把
+ *    `admin.platform.test` 指向超管后台，攻击者拿到的就是一个可被劫持的入口。
+ * 2. 侧信道枚举——若保留字与「不存在」返回不同响应，攻击者用同一套字典
+ *    就能判断哪些子域名被占用，从而枚举出商家目录。
+ *
+ * ⚠️ 这份名单**不是穷尽的**，只覆盖常见的基础设施保留名。新增内部子域名时
+ * 必须同步登记到这里；真正彻底的防护在网关层的子域名白名单——网关只允许
+ * 已注册的店铺子域名解析到应用，保留字根本不进入应用。
+ */
+export const RESERVED_SUBDOMAINS = new Set<string>([
+  'admin',
+  'api',
+  'app',
+  'auth',
+  'cdn',
+  'dashboard',
+  'dev',
+  'docs',
+  'health',
+  'internal',
+  'login',
+  'mail',
+  'media',
+  'platform',
+  'register',
+  'static',
+  'status',
+  'test',
+  'www',
+]);
+
+/** 子域名是否合法（调用前需先 trim + 转小写） */
+export function isValidSubdomain(value: string): boolean {
+  return SUBDOMAIN_PATTERN.test(value);
+}
+
+/**
+ * 租户作用域模型白名单。
+ * 名单内的模型：所有读写自动追加 tenantId 条件。
+ * 新增业务表时必须同步登记到此处，否则等于没有隔离。
+ */
+export const TENANT_SCOPED_MODELS = new Set<string>(['User', 'Store']);
+
+/**
+ * Prisma 中只接受唯一字段作为 where 的方法。
+ *
+ * 这些方法无法附加 tenantId 条件，会造成跨租户越权，因此禁止在租户作用域模型上使用：
+ * - findUnique / findUniqueOrThrow：读层面越权（按唯一字段读会读到别人租户的数据）
+ * - update / delete：写层面越权（按唯一字段改/删会改到别人租户的数据）
+ * - upsert：where 必须是唯一字段，无论是 `where: { id }` 还是
+ *   `where: { tenantId_slug: { ... } }` 都会形成越权通道——
+ *   前者完全无 tenantId 条件，后者里嵌入的 tenantId 也可以被伪造成别的租户
+ *
+ * 注意：`updateOrThrow` / `deleteOrThrow` 已从 Prisma 6 的裸 client 上彻底移除，
+ * 扩展后的 client 上同样不存在，既无法调用也不可能成为越权通道。
+ */
+export const UNIQUE_ONLY_OPERATIONS = new Set<string>([
+  'findUnique',
+  'findUniqueOrThrow',
+  'update',
+  'delete',
+  'upsert',
+]);
+
+/**
+ * 被禁止的方法对应的「推荐替换」。
+ *
+ * 当扩展抛 `TenantScopeError` 提示调用方改用什么替代写法时，用这个映射生成文案，
+ * 避免在各处用三元表达式硬编码。
+ */
+export const RECOMMENDED_REPLACEMENT: Record<string, string> = {
+  findUnique: 'findFirst',
+  findUniqueOrThrow: 'findFirst',
+  update: 'updateMany',
+  delete: 'deleteMany',
+  upsert: 'findFirst 判断后分别 create 或 updateMany',
+};

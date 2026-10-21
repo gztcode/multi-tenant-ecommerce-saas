@@ -107,6 +107,26 @@ e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物
 
 ---
 
+## 推送到 GitHub
+
+本仓库远端是 `gztcode/multi-tenant-ecommerce-saas`。常规 `git push` 即可：
+
+```bash
+git push -u origin <分支名>
+```
+
+**若 `git push` 超时失败**（某些网络环境下 `github.com:443` 不可达，但 `api.github.com` 可达），
+改用仓库里��� API 推送脚本：
+
+```bash
+export GH_TOKEN=$(gh auth token)
+node tools/push-via-api.mjs <本地分支> <远端分支>
+```
+
+它通过 Git Data API 手工构造 tree / commit / ref，效果与 `git push` 等价。
+
+---
+
 ## 后续计划
 
 | 计划 | 内容 |

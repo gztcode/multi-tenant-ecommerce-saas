@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/nest-cli",
+  "collection": "@nestjs/schematics",
+  "sourceRoot": "src",
+  "compilerOptions": {
+    "deleteOutDir": true,
+    "plugins": [
+      {
+        "name": "@nestjs/swagger",
+        "options": {
+          "_comment": "刻意让插件不去扫描 DTO/实体文件，原因是 @nestjs/swagger 的 CLI 插件有个上游缺陷：只要被扫描的文件里出现一个**本地枚举**，它就会在 _OPENAPI_METADATA_FACTORY 里生成 require(\"<该文件的绝对路径>\").枚举名。运行时 Node 无法 require 一个 .ts 文件，服务直接以 MODULE_NOT_FOUND 起不来。把枚举挪到别的文件也无济于事（插件用的是 TypeScript 的 UseFullyQualifiedType，跨文件同样输出绝对路径），实测确认。",
+          "_rejectedOptions": "readonly: true 是上游推荐的做法，但它要求每个字段都写 type，遇到本地枚举会在插件内部抛 'Cannot read properties of undefined' 而构建失败；esmCompatible: true 会把 require 换成 await import(...)，而 _OPENAPI_METADATA_FACTORY 是同步静态方法，产物直接变成 SyntaxError。两个选项都实测不可用。",
+          "_consequence": "代价：DTO 的 required/类型推断不再由插件自动补全。但本项目所有 DTO 字段都**显式**写了 @ApiProperty（约束与 class-validator 装饰器一致），schema 不依赖插件推断。当前 src 下没有任何 .entity.ts 文件，因此实际损失为零。以后新增 DTO 字段时，请显式补 @ApiProperty。",
+          "dtoFileNameSuffix": [".swagger-disabled.ts"],
+          "controllerFileNameSuffix": [".swagger-disabled.controller.ts"]
+        }
+      }
+    ]
+  }
+}
