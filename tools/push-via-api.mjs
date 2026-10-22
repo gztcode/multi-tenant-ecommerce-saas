@@ -112,6 +112,13 @@ console.log(`commit: ${commit.sha}`);
 
 // 5. 更新远端 ref（不存在则创建）
 const refPath = `repos/${REPO}/git/refs/heads/${remoteBranch}`;
+// ⚠️ 创建与更新 ref 的**端点不同**，不能共用同一个 URL：
+//   创建：POST /git/refs              （body 里带完整的 ref 名）
+//   更新：PATCH /git/refs/heads/{ref} （body 里只带 sha）
+// 之前两者都打到 /git/refs/heads/{ref} 上，POST 落在一个不存在的端点，
+// 返回 422 "Reference does not exist"——而这条错误信息恰好是 PATCH 找不到
+// ref 时的措辞，极易让人误判成「分支已存在」。
+const createRefPath = `repos/${REPO}/git/refs`;
 const existing = await fetch(`https://api.github.com/${refPath}`, {
   headers: {
     accept: 'application/vnd.github+json',
@@ -129,7 +136,7 @@ const refResponse = existing.ok
       },
       body: JSON.stringify({ sha: commit.sha, force: false }),
     })
-  : await fetch(`https://api.github.com/${refPath}`, {
+  : await fetch(`https://api.github.com/${createRefPath}`, {
       method: 'POST',
       headers: {
         accept: 'application/vnd.github+json',
