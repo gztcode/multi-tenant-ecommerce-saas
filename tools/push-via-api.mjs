@@ -96,8 +96,26 @@ console.log(`内联 ${inlineCount} 个，blob ${blobCount} 个`);
 const createdTree = gh('git/trees', { tree });
 console.log(`tree: ${createdTree.sha}`);
 
-// 4. 创建 commit
+// 4. 先读远端 ref 当前指向哪里——它决定新 commit 该接在谁后面
+const refPath = `repos/${REPO}/git/refs/heads/${remoteBranch}`;
+const existing = await fetch(`https://api.github.com/${refPath}`, {
+  headers: {
+    accept: 'application/vnd.github+json',
+    authorization: `Bearer ${process.env.GH_TOKEN}`,
+  },
+});
+const existingSha = existing.ok ? (await existing.json()).object.sha : null;
+
+// 5. 创建 commit
+//
+// 父提交的选择顺序很重要：
+//   1. ref 已存在 → 接在 ref 当前的位置（这才是 git push 的语义）。否则每次
+//      都是「从 main 重新分叉」，PATCH 会被 "Update is not a fast forward"
+//      拒绝——而报错完全看不出是父提交选错了。
+//   2. ref 不存在 → BASE_COMMIT（一般传远端 main 的 sha），
+//      这样 PR 的 diff 只包含本次新增的文件。
 const baseCommit =
+  existingSha ??
   process.env.BASE_COMMIT ??
   execFileSync('gh', ['api', `repos/${REPO}/commits/main`, '--jq', '.sha'])
     .toString()
@@ -109,9 +127,10 @@ const commit = gh('git/commits', {
   parents: [baseCommit],
 });
 console.log(`commit: ${commit.sha}`);
+console.log(`父提交: ${baseCommit}${existingSha ? '（接续远端分支）' : '（新建分支）'}`);
 
-// 5. 更新远端 ref（不存在则创建）
-const refPath = `repos/${REPO}/git/refs/heads/${remoteBranch}`;
+// 6. 更新远端 ref（不存在则创建）
+//
 // ⚠️ 创建与更新 ref 的**端点不同**，不能共用同一个 URL：
 //   创建：POST /git/refs              （body 里带完整的 ref 名）
 //   更新：PATCH /git/refs/heads/{ref} （body 里只带 sha）
@@ -119,12 +138,6 @@ const refPath = `repos/${REPO}/git/refs/heads/${remoteBranch}`;
 // 返回 422 "Reference does not exist"——而这条错误信息恰好是 PATCH 找不到
 // ref 时的措辞，极易让人误判成「分支已存在」。
 const createRefPath = `repos/${REPO}/git/refs`;
-const existing = await fetch(`https://api.github.com/${refPath}`, {
-  headers: {
-    accept: 'application/vnd.github+json',
-    authorization: `Bearer ${process.env.GH_TOKEN}`,
-  },
-});
 
 const refResponse = existing.ok
   ? await fetch(`https://api.github.com/${refPath}`, {
