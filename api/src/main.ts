@@ -30,7 +30,7 @@ async function bootstrap() {
   // 放在 /api/docs 让它既好记又不会和业务路由混淆。
   const swaggerConfig = new DocumentBuilder()
     .setTitle('多租户电商 SaaS API')
-    .setDescription('阶段 1：平台地基与身份体系')
+    .setDescription('多租户电商 SaaS API · 阶段 2：商品中心')
     .setVersion('1.0')
     .addBearerAuth()
     .build();

@@ -37,6 +37,18 @@ model Tenant {
   users  User[]
   stores Store[]
 
+  // ---------- 商品中心（Task 2）反向关系 ----------
+  // Prisma 要求双向关系都声明，否则 schema 校验直接失败。
+  categories         Category[]
+  products           Product[]
+  productSpecs       ProductSpec[]
+  productSpecValues  ProductSpecValue[]
+  skus               Sku[]
+  skuSpecValues      SkuSpecValue[]
+  medias             Media[]
+  productMedias      ProductMedia[]
+  inventoryMovements InventoryMovement[]
+
   @@map("tenants")
 }
 
@@ -51,7 +63,7 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  tenant        Tenant?         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant        Tenant?        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   refreshTokens RefreshToken[]
 
   // 邮箱唯一性分三层，全部由原生 SQL 的**部分唯一索引**保证，Prisma schema
@@ -80,17 +92,17 @@ enum RefreshTokenRevokedReason {
 }
 
 model RefreshToken {
-  id     String    @id @default(uuid())
-  userId String
+  id            String                     @id @default(uuid())
+  userId        String
   // ROTATED：刷新时轮换掉旧令牌
   // LOGOUT：用户主动登出
   // REPLAY：疑似泄露，令牌族整体作废
   // 重放检测只对 ROTATED 触发——登出后的令牌被再次使用不牵连其它设备。
   revokedReason RefreshTokenRevokedReason?
-  tokenHash     String                   @unique
+  tokenHash     String                     @unique
   expiresAt     DateTime
   revokedAt     DateTime?
-  createdAt     DateTime                 @default(now())
+  createdAt     DateTime                   @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -115,4 +127,232 @@ model Store {
   // 不需要再单独建 @@index([tenantId])
   @@unique([tenantId, slug])
   @@map("stores")
+}
+
+// ---------- 商品中心 ----------
+
+model Category {
+  id        String    @id @default(uuid())
+  tenantId  String
+  parentId  String?
+  name      String
+  slug      String
+  sort      Int       @default(0)
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  tenant   Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  // ⚠️ 唯一索引刻意**不在 schema 里声明**：软删除后 slug 仍占用唯一性，
+  // 而普通的 @@unique 做不到「仅对未删除记录生效」——带 deletedAt 的复合唯一
+  // 也无效，因为 PostgreSQL 的 NULL 不参与唯一性判定。
+  // 改由迁移手写部分唯一索引（见 migration.sql）。
+  @@index([tenantId, parentId])
+  @@map("categories")
+}
+
+model Product {
+  id          String        @id @default(uuid())
+  tenantId    String
+  categoryId  String?
+  name        String
+  slug        String
+  subtitle    String?
+  description String?
+  status      ProductStatus @default(DRAFT)
+  attributes  Json          @default("{}")
+  minPrice    Int           @default(0)
+  version     Int           @default(1)
+  publishedAt DateTime?
+  deletedAt   DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  tenant   Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  category Category?      @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  specs    ProductSpec[]
+  skus     Sku[]
+  media    ProductMedia[]
+
+  // ⚠️ 唯一索引由迁移手写部分唯一索引，不在 schema 里声明。
+  @@index([tenantId, status])
+  @@index([tenantId, categoryId])
+  @@map("products")
+}
+
+enum ProductStatus {
+  DRAFT
+  PUBLISHED
+  UNPUBLISHED
+}
+
+model ProductSpec {
+  id        String    @id @default(uuid())
+  tenantId  String
+  productId String
+  name      String
+  sort      Int       @default(0)
+  deletedAt DateTime?
+
+  product Product            @relation(fields: [productId], references: [id], onDelete: Cascade)
+  values  ProductSpecValue[]
+  // Cascade：删租户（销户 / 违规清退）必须连带清掉全部业务数据，
+  // 若这里默认成 Restrict，删租户会被自己的关联表挡住而失败。
+  tenant  Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // ⚠️ 唯一索引刻意**不在 schema 里声明**，由迁移手写部分唯一索引（见迁移文件）。
+  // 软删除后同名规格会占用普通 @@unique：商家把「颜色」规格删掉再加一个同名
+  // 的，数据库会直接拒绝。
+  @@index([tenantId, productId])
+  @@map("product_specs")
+}
+
+model ProductSpecValue {
+  id        String    @id @default(uuid())
+  tenantId  String
+  specId    String
+  value     String
+  mediaId   String?
+  sort      Int       @default(0)
+  deletedAt DateTime?
+
+  spec          ProductSpec    @relation(fields: [specId], references: [id], onDelete: Cascade)
+  media         Media?         @relation(fields: [mediaId], references: [id], onDelete: SetNull)
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  skuSpecValues SkuSpecValue[]
+
+  // ⚠️ 唯一索引由迁移手写部分唯一索引（软删除后同名值不占用唯一性）。
+  @@index([tenantId, specId])
+  @@map("product_spec_values")
+}
+
+enum SkuStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model Sku {
+  id           String    @id @default(uuid())
+  tenantId     String
+  productId    String
+  code         String?
+  price        Int
+  comparePrice Int?
+  stock        Int       @default(0)
+  // 库存的乐观锁版本号。库存调整是「读库存 → 算 delta → 写」，
+  // 并发时两个请求会各自读到同一个旧值、后写的覆盖先写的（丢失更新）——
+  // 症状是入库两笔却只进了一笔。把版本号放进 updateMany 的 where，
+  // 由数据库在写入那一刻判定，受影响行数为 0 即说明期间有人改过。
+  // 与 Product.version 是同一个模式。
+  stockVersion Int       @default(0)
+  status       SkuStatus @default(ACTIVE)
+  deletedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  product    Product             @relation(fields: [productId], references: [id], onDelete: Cascade)
+  specValues SkuSpecValue[]
+  movements  InventoryMovement[]
+  tenant     Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // ⚠️ 唯一索引由迁移手写部分唯一索引，不在 schema 里声明。
+  @@index([tenantId, productId])
+  @@map("skus")
+}
+
+model SkuSpecValue {
+  id       String @id @default(uuid())
+  tenantId String
+  skuId    String
+  valueId  String
+
+  sku    Sku              @relation(fields: [skuId], references: [id], onDelete: Cascade)
+  value  ProductSpecValue @relation(fields: [valueId], references: [id], onDelete: Cascade)
+  tenant Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([skuId, valueId])
+  @@index([tenantId, skuId])
+  @@map("sku_spec_values")
+}
+
+enum MediaStatus {
+  PENDING
+  READY
+  ORPHANED
+}
+
+model Media {
+  id         String      @id @default(uuid())
+  tenantId   String
+  key        String
+  url        String
+  mime       String
+  size       Int
+  width      Int?
+  height     Int?
+  status     MediaStatus @default(PENDING)
+  uploadedBy String
+  deletedAt  DateTime?
+  createdAt  DateTime    @default(now())
+
+  tenant     Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  products   ProductMedia[]
+  specValues ProductSpecValue[]
+
+  // ⚠️ 唯一索引由迁移手写部分唯一索引，不在 schema 里声明。
+  @@index([tenantId, status])
+  @@map("media")
+}
+
+model ProductMedia {
+  id        String @id @default(uuid())
+  tenantId  String
+  productId String
+  mediaId   String
+  sort      Int    @default(0)
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  media   Media   @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, mediaId])
+  @@index([tenantId, productId])
+  @@map("product_medias")
+}
+
+enum InventoryMovementType {
+  INITIAL
+  ADJUST_IN
+  ADJUST_OUT
+  CHECK
+  RESERVE
+  RELEASE
+  DEDUCT
+}
+
+model InventoryMovement {
+  id          String                @id @default(uuid())
+  tenantId    String
+  skuId       String
+  type        InventoryMovementType
+  quantity    Int
+  stockBefore Int
+  stockAfter  Int
+  reason      String?
+  operatorId  String
+  createdAt   DateTime              @default(now())
+
+  // Restrict 而非 Cascade：流水是审计凭证，物理删除有流水的 SKU 必须被数据库拒绝
+  sku    Sku    @relation(fields: [skuId], references: [id], onDelete: Restrict)
+  // 对租户同样保持 Restrict（默认值）：流水是合规凭证，销户时不允许被级联抹掉。
+  // 代价是「有流水的租户」无法直接物理删除——这是刻意的，
+  // 销户流程应走软删（Tenant 自身状态）而非 DELETE。
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, skuId, createdAt])
+  @@map("inventory_movements")
 }

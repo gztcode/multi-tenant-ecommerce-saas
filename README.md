@@ -2,7 +2,9 @@
 
 前后端完全分离的多租户电商底座。一个实例服务多个商家：每个商家有自己的店铺、商品、订单与客户。
 
-**当前进度：阶段 1「平台地基与身份体系」已完成并验收通过。** 验收记录见
+**当前进度：阶段 2a「商品中心后端」已完成并验收通过。** 验收记录见
+[`docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md)；
+阶段 1 的验收记录见
 [`docs/superpowers/plans/2026-10-21-plan-01-acceptance.md`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md)。
 
 ---
@@ -74,14 +76,31 @@ cd platform-admin && npm install && cp .env.example .env && npm run dev   # :300
 
 ```bash
 cd api
-npm test              # 单元测试（隔离机制）
-npm run test:e2e      # 端到端（81 条）
-npm run test:cov:e2e  # 项目真实覆盖率（63.9%）
+npm test              # 单元测试（隔离机制，88 条）
+npm run test:e2e      # 端到端（173 条，11 个套件）
+npm run test:cov:e2e  # 项目真实覆盖率（74.55%）
 ```
 
 三个前端各自 `npx tsc --noEmit && npm run lint && npm run build`。
 
 e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物理隔离。
+
+### 数据库迁移
+
+```bash
+cd api && npm run prisma:deploy
+```
+
+⚠️ **托管数据库上需要 DBA 先装 `pg_trgm` 扩展。** 商品搜索依赖它，
+而 `CREATE EXTENSION` 需要超级用户或数据库所有者权限——RDS / Cloud SQL
+这类平台上应用用户通常不是 owner，迁移会 `permission denied` 而失败。
+
+本项目的 `docker compose` 不受影响：扩展在 `infra/postgres/init-extensions.sql`
+里于建库阶段（超级用户身份）装好。真实部署请让 DBA 先执行：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
 
 ---
 
@@ -103,7 +122,7 @@ e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物
 
 - 设计文档：[`docs/superpowers/specs/2026-10-21-multi-tenant-ecommerce-saas-design.md`](docs/superpowers/specs/2026-10-21-multi-tenant-ecommerce-saas-design.md)
 - 实施计划：[`docs/superpowers/plans/`](docs/superpowers/plans/)
-- 验收记录：[`docs/superpowers/plans/2026-10-21-plan-01-acceptance.md`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md)
+- 验收记录：[`阶段 1`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md) / [`阶段 2a`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md)
 
 ---
 
@@ -131,6 +150,7 @@ node tools/push-via-api.mjs <本地分支> <远端分支>
 
 | 计划 | 内容 |
 |------|------|
-| 计划 2 | 商品中心与店铺前台浏览 |
+| 计划 2a | 商品中心后端 —— **已完成并验收通过** |
+| 计划 2b | 商品中心前端：主题 token、storefront 浏览页、商家后台 |
 | 计划 3 | 交易链路：购物车 → 库存 → 订单 → 支付（微信 + 支付宝） |
 | 计划 4 | 营销、平台计费与平台超管的完整实现 |

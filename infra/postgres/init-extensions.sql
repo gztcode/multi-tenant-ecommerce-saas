@@ -1,0 +1,14 @@
+-- PostgreSQL 首次初始化时执行（官方镜像的 /docker-entrypoint-initdb.d 机制）。
+--
+-- 为什么需要这一步：计划 2 的迁移里有 `CREATE EXTENSION IF NOT EXISTS pg_trgm`，
+-- 而创建扩展需要超级用户或数据库所有者权限。本地 compose 里应用用户
+-- `ecommerce` 是超级用户所以能跑，但在托管数据库（RDS / Cloud SQL 等）
+-- 上应用用户往往不是 owner，那条迁移会直接 permission denied 而让整个部署失败。
+--
+-- 所以把扩展的安装提前到「建库阶段」——那时执行的是容器初始化脚本，
+-- 用的是超级用户，权限没问题。迁移里那条 CREATE EXTENSION 保留着，
+-- 因为它是 IF NOT EXISTS 的幂等语句，已装的环境不会重复执行。
+--
+-- ⚠️ 真实部署（不用本 compose）时，必须由 DBA 先手工装好 pg_trgm，
+--    否则 migrate deploy 会失败。步骤见 README 的部署章节。
+CREATE EXTENSION IF NOT EXISTS pg_trgm;

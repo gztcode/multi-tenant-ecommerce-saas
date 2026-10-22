@@ -13,21 +13,24 @@
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\"",
-    "test": "jest --passWithNoTests",
+    "test": "node test/deploy-test-db.mjs && jest --passWithNoTests",
     "test:watch": "jest --watch",
-    "test:cov": "jest --coverage --passWithNoTests",
+    "test:cov": "node test/deploy-test-db.mjs && jest --coverage --passWithNoTests",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json --runInBand",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "prisma db seed",
-    "test:cov:e2e": "jest --config ./test/jest-e2e.json --coverage --collectCoverageFrom='src/**/*.ts' --collectCoverageFrom='!src/**/*.module.ts' --collectCoverageFrom='!src/main.ts'"
+    "test:cov:e2e": "jest --config ./test/jest-e2e.json --coverage --collectCoverageFrom='src/**/*.ts' --collectCoverageFrom='!src/**/*.module.ts' --collectCoverageFrom='!src/main.ts'",
+    "db:test:deploy": "node test/deploy-test-db.mjs"
   },
   "prisma": {
     "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1155.0",
+    "@aws-sdk/s3-request-presigner": "^3.1155.0",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^12.0.1",
     "@nestjs/core": "^11.0.1",

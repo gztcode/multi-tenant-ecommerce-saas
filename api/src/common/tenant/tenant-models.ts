@@ -53,8 +53,56 @@ export function isValidSubdomain(value: string): boolean {
  * 租户作用域模型白名单。
  * 名单内的模型：所有读写自动追加 tenantId 条件。
  * 新增业务表时必须同步登记到此处，否则等于没有隔离。
+ *
+ * ⚠️ 阶段 1 的 TenantPrismaService.assertTenantScopedModelsRegistered()
+ * 会在启动时扫描 schema，带 tenantId 却没登记的模型会直接让进程启动失败。
  */
-export const TENANT_SCOPED_MODELS = new Set<string>(['User', 'Store']);
+export const TENANT_SCOPED_MODELS = new Set<string>([
+  'User',
+  'Store',
+  // 商品中心（计划 2）
+  'Category',
+  'Product',
+  'ProductSpec',
+  'ProductSpecValue',
+  'Sku',
+  'SkuSpecValue',
+  'Media',
+  'ProductMedia',
+  'InventoryMovement',
+]);
+
+/**
+ * 走软删除的模型：扩展自动合并 `deletedAt: null` 条件。
+ *
+ * 不含 InventoryMovement —— 流水表是 append-only 的审计凭证，
+ * 既不软删也不允许物理删除。
+ */
+/**
+ * 走软删除的模型：扩展自动合并 `deletedAt: null` 条件，并禁止物理删除。
+ *
+ * ⚠️ 这份名单必须与 schema 里带 `deletedAt` 的模型**一一对应**。
+ * 漏登记一张表，后果不是「少过滤一点」，而是那两张表上的软删完全失效：
+ * 顶层查询读得到已软删的记录，物理删除也拦不住。
+ *
+ * 真实踩过的坑：`ProductSpec` / `ProductSpecValue` 漏登记，而
+ * `spec-matrix.service.ts` 的注释写着「已软删的值会被扩展过滤掉，所以复用
+ * 分支命中的一定是活的」——前提不成立。商家把规格值删掉再加回来时会命中
+ * 已软删的旧行并复用它，而它的 deletedAt 仍是过去时间，于是**加回来的值
+ * 在界面上依然不可见**，规格值凭空消失。
+ *
+ * 改这张表前先对一遍 schema：
+ *   grep -l 'deletedAt' prisma/schema.prisma
+ *   再列出所有带 deletedAt 的 model 名，两边必须一致。
+ */
+export const SOFT_DELETE_MODELS = new Set<string>([
+  'Category',
+  'Product',
+  'ProductSpec',
+  'ProductSpecValue',
+  'Sku',
+  'Media',
+]);
 
 /**
  * Prisma 中只接受唯一字段作为 where 的方法。
