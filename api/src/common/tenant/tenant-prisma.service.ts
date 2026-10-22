@@ -3,6 +3,7 @@ import { Prisma, PrismaClient } from '@prisma/client';
 import { TenantScopeError } from './tenant-scope.error';
 import {
   RECOMMENDED_REPLACEMENT,
+  SOFT_DELETE_MODELS,
   TENANT_SCOPED_MODELS,
   UNIQUE_ONLY_OPERATIONS,
 } from './tenant-models';
@@ -142,6 +143,65 @@ function withMergedWhere<T>(args: T, extra: object): T {
   return { ...args, where: nextWhere };
 }
 
+/**
+ * 软删除模型：自动把 `deletedAt: null` 合并进 where。
+ *
+ * 合并而不是由调用方写，是为了「漏写一处就漏过滤一处」这种失效模式
+ * 不会发生——过滤条件由扩展统一施加，业务代码无从绕过。
+ *
+ * 与 tenantId 的合并是两次独立的 merge：两次都调用 withMergedWhere，
+ * 后一次会保留前一次已经写进去的键（withMergedWhere 是 {...base, ...extra}）。
+ */
+function withSoftDeleteFilter<T>(args: T, model: string): T {
+  if (!SOFT_DELETE_MODELS.has(model)) return args;
+  return withMergedWhere(args, { deletedAt: null });
+}
+
+/**
+ * 禁止通过普通更新把软删除的行「复活」。
+ *
+ * 过滤方向是 fail-closed 的：软删模型的查询恒定带上 `deletedAt: null`，
+ * 缺上下文时直接抛错。但**解除过滤的方向原本是 fail-open 的**——
+ * `updateMany({ data: { deletedAt: null } })` 会把已软删的行改回可见状态，
+ * 一次普通的更新就能抹掉删除痕迹。
+ *
+ * 这个不对称意味着：过滤做得再严，也只是「默认拒绝」而不是「不可能穿透」。
+ * 两个方向应该对称加固，所以这里堵上。
+ *
+ * 只拦 `null`：软删除本身写的是 `new Date()`，必须放行。
+ * 将来若确实需要「恢复」功能，走一个显式命名的入口（如 `restore()`），
+ * 由它单独决定要不要放开这道闸，而不是让任何 updateMany 都能绕过。
+ */
+function assertNotRevivingSoftDelete(model: string, args: unknown): void {
+  if (!SOFT_DELETE_MODELS.has(model)) return;
+  const data = (args as { data?: unknown }).data;
+  if (typeof data !== 'object' || data === null) return;
+  if (!('deletedAt' in (data as Record<string, unknown>))) return;
+  if ((data as Record<string, unknown>).deletedAt !== null) return;
+  throw new TenantScopeError(
+    `模型 ${model} 是软删除模型，禁止通过 updateMany 把 deletedAt 置 null 来复活记录。` +
+      '这会绕过扩展的软删除过滤。若确需恢复，请走显式命名的恢复入口。',
+  );
+}
+
+/**
+ * 软删除模型禁止物理删除。
+ *
+ * 物理删除会连带毁掉审计链：SKU 被物理删除后，它的历史库存流水
+ * 就失去了指向对象（数据库层面还有 Restrict 外键兜着，但品类、
+ * 媒体这类没有流水引用的模型就没有第二道防线了）。
+ *
+ * 「删除」的正确做法是软删除：
+ *   await prisma.product.updateMany({ where: { id }, data: { deletedAt: new Date() } })
+ */
+function assertNotPhysicallyDeletable(model: string, operation: string): void {
+  if (!SOFT_DELETE_MODELS.has(model)) return;
+  throw new TenantScopeError(
+    `模型 ${model} 是软删除模型，禁止使用 ${operation} 物理删除。` +
+      '请改用 updateMany 设置 deletedAt。',
+  );
+}
+
 function withTenantIdInData<T>(args: T, model: string, tenantId: string): T {
   const holder = args as unknown as Record<string, unknown>;
   const data = holder.data as Record<string, unknown> | undefined;
@@ -181,38 +241,44 @@ const tenantExtension = Prisma.defineExtension({
 
       async findMany({ model, args, query }) {
         const scope = resolveScope(model, tenantContext.getStore());
-        if (scope.kind !== 'tenant') return query(args);
-        return query(withMergedWhere(args, scope.where));
+        const withDelete = withSoftDeleteFilter(args, model);
+        if (scope.kind !== 'tenant') return query(withDelete);
+        return query(withMergedWhere(withDelete, scope.where));
       },
 
       async findFirst({ model, args, query }) {
         const scope = resolveScope(model, tenantContext.getStore());
-        if (scope.kind !== 'tenant') return query(args);
-        return query(withMergedWhere(args, scope.where));
+        const withDelete = withSoftDeleteFilter(args, model);
+        if (scope.kind !== 'tenant') return query(withDelete);
+        return query(withMergedWhere(withDelete, scope.where));
       },
 
       async findFirstOrThrow({ model, args, query }) {
         const scope = resolveScope(model, tenantContext.getStore());
-        if (scope.kind !== 'tenant') return query(args);
-        return query(withMergedWhere(args, scope.where));
+        const withDelete = withSoftDeleteFilter(args, model);
+        if (scope.kind !== 'tenant') return query(withDelete);
+        return query(withMergedWhere(withDelete, scope.where));
       },
 
       async count({ model, args, query }) {
         const scope = resolveScope(model, tenantContext.getStore());
-        if (scope.kind !== 'tenant') return query(args);
-        return query(withMergedWhere(args, scope.where));
+        const withDelete = withSoftDeleteFilter(args, model);
+        if (scope.kind !== 'tenant') return query(withDelete);
+        return query(withMergedWhere(withDelete, scope.where));
       },
 
       async aggregate({ model, args, query }) {
         const scope = resolveScope(model, tenantContext.getStore());
-        if (scope.kind !== 'tenant') return query(args);
-        return query(withMergedWhere(args, scope.where));
+        const withDelete = withSoftDeleteFilter(args, model);
+        if (scope.kind !== 'tenant') return query(withDelete);
+        return query(withMergedWhere(withDelete, scope.where));
       },
 
       async groupBy({ model, args, query }) {
         const scope = resolveScope(model, tenantContext.getStore());
-        if (scope.kind !== 'tenant') return query(args);
-        return query(withMergedWhere(args, scope.where));
+        const withDelete = withSoftDeleteFilter(args, model);
+        if (scope.kind !== 'tenant') return query(withDelete);
+        return query(withMergedWhere(withDelete, scope.where));
       },
 
       // ---------- 唯一性方法：直接拒绝，避免绕过隔离 ----------
@@ -234,6 +300,7 @@ const tenantExtension = Prisma.defineExtension({
 
       async delete({ model, args, query }) {
         assertNotUniqueOnly(model, 'delete');
+        assertNotPhysicallyDeletable(model, 'delete');
         return query(args);
       },
 
@@ -315,7 +382,10 @@ const tenantExtension = Prisma.defineExtension({
 
       async updateMany({ model, args, query }) {
         const scope = resolveScope(model, tenantContext.getStore());
-        if (scope.kind !== 'tenant') return query(args);
+        const withDelete = withSoftDeleteFilter(args, model);
+        if (scope.kind !== 'tenant') return query(withDelete);
+        // 放在早退之后：非租户作用域下没有「替当前租户改数据」这回事
+        assertNotRevivingSoftDelete(model, args);
         // updateMany 的 data 也可能带嵌套写（如 `data: { tenant: { connect: { id } } }`），
         // 同样危险——一并做嵌套写检查
         assertNoNestedWrites(
@@ -323,25 +393,29 @@ const tenantExtension = Prisma.defineExtension({
           'data',
           getRelationFieldNames(model),
         );
-        return query(withMergedWhere(args, scope.where));
+        return query(withMergedWhere(withDelete, scope.where));
       },
 
       async updateManyAndReturn({ model, args, query }) {
-        // 与 updateMany 同形：合并 where.tenantId + 检查 data 嵌套写
+        // 与 updateMany 同形：合并 where.tenantId + 软删过滤 + 两道 data 检查
         const scope = resolveScope(model, tenantContext.getStore());
-        if (scope.kind !== 'tenant') return query(args);
+        const withDelete = withSoftDeleteFilter(args, model);
+        if (scope.kind !== 'tenant') return query(withDelete);
+        assertNotRevivingSoftDelete(model, args);
         assertNoNestedWrites(
           (args as unknown as Record<string, unknown>).data,
           'data',
           getRelationFieldNames(model),
         );
-        return query(withMergedWhere(args, scope.where));
+        return query(withMergedWhere(withDelete, scope.where));
       },
 
       async deleteMany({ model, args, query }) {
+        assertNotPhysicallyDeletable(model, 'deleteMany');
         const scope = resolveScope(model, tenantContext.getStore());
-        if (scope.kind !== 'tenant') return query(args);
-        return query(withMergedWhere(args, scope.where));
+        const withDelete = withSoftDeleteFilter(args, model);
+        if (scope.kind !== 'tenant') return query(withDelete);
+        return query(withMergedWhere(withDelete, scope.where));
       },
     },
   },
@@ -400,6 +474,42 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
 
   get refreshToken() {
     return this.client.refreshToken;
+  }
+
+  get category() {
+    return this.client.category;
+  }
+
+  get product() {
+    return this.client.product;
+  }
+
+  get productSpec() {
+    return this.client.productSpec;
+  }
+
+  get productSpecValue() {
+    return this.client.productSpecValue;
+  }
+
+  get sku() {
+    return this.client.sku;
+  }
+
+  get skuSpecValue() {
+    return this.client.skuSpecValue;
+  }
+
+  get media() {
+    return this.client.media;
+  }
+
+  get productMedia() {
+    return this.client.productMedia;
+  }
+
+  get inventoryMovement() {
+    return this.client.inventoryMovement;
   }
 
   // ------- PrismaClient 实例级方法代理 -------

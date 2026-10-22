@@ -12,11 +12,55 @@ services:
       - '${POSTGRES_PORT:-15432}:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # 首次初始化时以超级用户装 pg_trgm 等扩展。
+      # 迁移里的 CREATE EXTENSION 在托管数据库上会因权限不足失败，
+      # 提前到建库阶段解决——详见该 SQL 文件里的注释。
+      - ./postgres/init-extensions.sql:/docker-entrypoint-initdb.d/init-extensions.sql:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-ecommerce} -d ${POSTGRES_DB:-ecommerce}']
       interval: 5s
       timeout: 5s
       retries: 20
+
+  minio:
+    # ⚠️ 为什么不是官方的 minio/minio：
+    #
+    # MinIO 社区版已经停止维护，官方容器镜像先后从两个 registry 消失——
+    # 2026-09-11 `minio/minio` 从 Docker Hub 删除（拉取报 "not found"），
+    # 2026-09-24 `quay.io/minio/minio` 也改为要求认证（拉取报 401）。
+    # 最后那个社区版还带 CVE-2026-40344（认证绕过），钉老版本不是好答案。
+    #
+    # 这里用 Chainguard 从源码重建的 MinIO：API 与数据格式兼容，
+    # 无 shell 之外无多余依赖，S3 接口一致。
+    # 该 registry 只有 latest 一个 tag，当前 digest 记录在 .env.example 里备查。
+    image: cgr.dev/chainguard/minio:latest
+    container_name: ecommerce-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-ecommerce}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ecommerce-minio-secret}
+      # 浏览器直传要跨域。镜像里没有 mc 可以改服务端配置，只能走环境变量。
+      # 多个来源用英文逗号分隔；实测该变量对预检请求生效。
+      MINIO_CORS_ALLOW_ORIGIN: ${MINIO_CORS_ALLOW_ORIGIN:-http://localhost:3001,http://localhost:3002,http://localhost:3003,http://localhost}
+    ports:
+      # 宿主机端口 19000：本机标准端口已被其他项目栈占用
+      - '${MINIO_PORT:-19000}:9000'
+      # 控制台端口，与 API 端口不同
+      - '${MINIO_CONSOLE_PORT:-19001}:9001'
+    volumes:
+      # 必须挂 volume：不挂时 /data 在容器可写层上，MinIO 启动会报
+      # "Rename across devices not allowed"（.minio.sys/tmp 跨设备重命名）。
+      - minio-data:/data
+    healthcheck:
+      # 这个镜像里没有 mc / curl / wget / nc，只有 bash 与 coreutils。
+      # 用 bash 内置的 /dev/tcp 探活：连得上 9000 端口就算就绪。
+      # 注意 CMD-SHELL 默认走 /bin/sh，sh 没有 /dev/tcp，必须显式调 bash。
+      test: ['CMD-SHELL', 'bash -c "exec 3<>/dev/tcp/127.0.0.1/9000"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   api:
     build:
@@ -26,6 +70,8 @@ services:
     restart: unless-stopped
     depends_on:
       postgres:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     environment:
       # 容器之间用服务名 + 容器内端口通信，与宿主机映射的 15432 无关。
@@ -42,6 +88,23 @@ services:
       JWT_SECRET: local-dev-only-jwt-secret-at-least-32-chars-long
       JWT_EXPIRES_IN: 2h
       REFRESH_TOKEN_TTL_DAYS: '30'
+      # MinIO（媒体上传）。三个 endpoint 各管各的，含义见 api/.env.example。
+      # ⚠️ MINIO_ENDPOINT 必须是**宿主机**地址（localhost:19000）：
+      # 它会被签进 presigned URL，浏览器要能访问。浏览器跑在宿主机上，
+      # localhost:19000 正好是宿主机映射的端口。
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://localhost:19000}
+      # 后端自己 HEAD / 删除对象用的地址：容器内走服务名。
+      MINIO_INTERNAL_ENDPOINT: ${MINIO_INTERNAL_ENDPOINT:-http://minio:9000}
+      # 媒体对外访问地址（存进 media.url），浏览器要能访问。
+      MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:-http://localhost:19000}
+      MINIO_BUCKET: ${MINIO_BUCKET:-ecommerce-media}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      # ⚠️ 这里复用了 root 凭据，仅供本机开发。真实部署要换成独立的
+      # 非 root 账号——root 账号能删 bucket、能改服务配置，泄露的代价远高于
+      # 一个只能读写指定 bucket 的账号。
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-ecommerce}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-ecommerce-minio-secret}
+      MEDIA_MAX_SIZE: ${MEDIA_MAX_SIZE:-5242880}
     ports:
       - '${API_PORT:-3000}:3000'
     healthcheck:
@@ -123,3 +186,4 @@ services:
 
 volumes:
   pgdata:
+  minio-data:

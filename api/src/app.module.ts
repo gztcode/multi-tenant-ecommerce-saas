@@ -4,6 +4,9 @@ import { TenancyModule } from './modules/tenancy/tenancy.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { StoresModule } from './modules/stores/stores.module';
 import { TenantsModule } from './modules/tenants/tenants.module';
+import { CatalogModule } from './modules/catalog/catalog.module';
+import { MediaModule } from './modules/media/media.module';
+import { InventoryModule } from './modules/inventory/inventory.module';
 
 // TenantPrismaService 由全局的 TenancyModule 提供并导出，
 // 这里不再重复声明，避免出现两个实例（两个连接池）。
@@ -19,6 +22,9 @@ import { TenantsModule } from './modules/tenants/tenants.module';
     AuthModule,
     StoresModule,
     TenantsModule,
+    CatalogModule,
+    MediaModule,
+    InventoryModule,
   ],
 })
 export class AppModule {}
