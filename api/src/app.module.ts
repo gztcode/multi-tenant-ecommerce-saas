@@ -7,6 +7,7 @@ import { TenantsModule } from './modules/tenants/tenants.module';
 import { CatalogModule } from './modules/catalog/catalog.module';
 import { MediaModule } from './modules/media/media.module';
 import { InventoryModule } from './modules/inventory/inventory.module';
+import { ThemeModule } from './modules/theme/theme.module';
 
 // TenantPrismaService 由全局的 TenancyModule 提供并导出，
 // 这里不再重复声明，避免出现两个实例（两个连接池）。
@@ -25,6 +26,7 @@ import { InventoryModule } from './modules/inventory/inventory.module';
     CatalogModule,
     MediaModule,
     InventoryModule,
+    ThemeModule,
   ],
 })
 export class AppModule {}

@@ -33,6 +33,15 @@ export default async function DashboardLayout({
             <Link href="/settings" className="underline-offset-4 hover:underline">
               店铺设置
             </Link>
+            <Link href="/products" className="underline-offset-4 hover:underline">
+              商品
+            </Link>
+            <Link href="/categories" className="underline-offset-4 hover:underline">
+              品类
+            </Link>
+            <Link href="/inventory" className="underline-offset-4 hover:underline">
+              库存
+            </Link>
           </nav>
         </div>
         <div className="flex items-center gap-4 text-sm">

@@ -6,6 +6,7 @@ import {
 import { Category } from '@prisma/client';
 import { TenantPrismaService } from '../../../common/tenant/tenant-prisma.service';
 import { getTenantContext } from '../../../common/tenant/tenant-context';
+import { rethrowIfUniqueViolation } from '../../../common/errors/unique-constraint';
 import { CreateCategoryDto } from '../dto/create-category.dto';
 import { UpdateCategoryDto } from '../dto/update-category.dto';
 
@@ -170,14 +171,20 @@ export class CategoriesService {
     // as never：data 的类型与 UpdateCategoryDto / CreateCategoryDto 的可选字段
     // 无法直接对齐（展开后 TS 推断为含 undefined 的可选属性），扩展会在运行时
     // 把 tenantId 注入，这里只负责把已知字段传下去。
-    return this.prisma.category.create({
-      data: {
-        name: dto.name,
-        slug: dto.slug,
-        ...(dto.parentId !== undefined ? { parentId: dto.parentId } : {}),
-        ...(dto.sort !== undefined ? { sort: dto.sort } : {}),
-      } as never,
-    });
+    try {
+      return await this.prisma.category.create({
+        data: {
+          name: dto.name,
+          slug: dto.slug,
+          ...(dto.parentId !== undefined ? { parentId: dto.parentId } : {}),
+          ...(dto.sort !== undefined ? { sort: dto.sort } : {}),
+        } as never,
+      });
+    } catch (error) {
+      // 同租户内 slug 重复 → 409，而不是让 P2002 一路冒成 500。
+      // 这个函数签名是 never，所以 catch 之后必然抛出。
+      return rethrowIfUniqueViolation(error, '品类 slug');
+    }
   }
 
   async update(id: string, dto: UpdateCategoryDto): Promise<Category> {

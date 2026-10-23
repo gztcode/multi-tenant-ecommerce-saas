@@ -13,6 +13,7 @@ import {
 } from '@prisma/client';
 import { TenantPrismaService } from '../../../common/tenant/tenant-prisma.service';
 import { getTenantContext } from '../../../common/tenant/tenant-context';
+import { rethrowIfUniqueViolation } from '../../../common/errors/unique-constraint';
 import { MinPriceService } from '../pricing/min-price.service';
 import { CreateProductDto } from '../dto/create-product.dto';
 import { UpdateProductDto } from '../dto/update-product.dto';
@@ -160,20 +161,31 @@ export class ProductsService {
       await this.assertCategoryUsable(dto.categoryId);
     }
 
-    return this.prisma.product.create({
-      // as never 的理由同 CategoriesService.create：展开后 TS 推断出的是含
-      // undefined 的可选属性，与 ProductCreateInput 对不齐；tenantId 由扩展注入。
-      data: {
-        name: dto.name,
-        slug: dto.slug,
-        ...(dto.subtitle !== undefined ? { subtitle: dto.subtitle } : {}),
-        ...(dto.description !== undefined
-          ? { description: dto.description }
-          : {}),
-        ...(dto.categoryId !== undefined ? { categoryId: dto.categoryId } : {}),
-        ...(dto.attributes !== undefined ? { attributes: dto.attributes } : {}),
-      } as never,
-    });
+    try {
+      return await this.prisma.product.create({
+        // as never 的理由同 CategoriesService.create：展开后 TS 推断出的是含
+        // undefined 的可选属性，与 ProductCreateInput 对不齐；tenantId 由扩展注入。
+        data: {
+          name: dto.name,
+          slug: dto.slug,
+          ...(dto.subtitle !== undefined ? { subtitle: dto.subtitle } : {}),
+          ...(dto.description !== undefined
+            ? { description: dto.description }
+            : {}),
+          ...(dto.categoryId !== undefined
+            ? { categoryId: dto.categoryId }
+            : {}),
+          ...(dto.attributes !== undefined
+            ? { attributes: dto.attributes }
+            : {}),
+        } as never,
+      });
+    } catch (error) {
+      // 同租户内 slug 重复 → 409，而不是让 P2002 一路冒成 500。
+      // 这个函数签名是 never，所以 catch 之后必然抛出，TS 也能据此
+      // 判定 create 不会「隐式返回 undefined」。
+      return rethrowIfUniqueViolation(error, '商品 slug');
+    }
   }
 
   /**

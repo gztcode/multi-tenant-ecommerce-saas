@@ -19,34 +19,26 @@ interface StoreInfo {
   name: string;
   slug: string;
   status: string;
-  /** 后端存的是 JSON,字段结构由前端设计系统决定;这里约定嵌套一层 colors。 */
+  /** 主题配置由同一页面的 ThemeForm 独占读写，这里只读不用。 */
   themeTokens: Record<string, unknown>;
 }
 
 /**
- * 把后端返回的 themeTokens 收窄成 `{ colors: { primary: string } }`。
+ * 店铺基本信息表单——**只负责 name**。
  *
- * themeTokens 是 `Record<string, unknown>`（Json 字段直出）,
- * 任何访问都不能默认它有具体的 shape,先用 `typeof === 'object'` 探一遍,
- * 再依次断言键的存在。读取不到时回落到一个明确的兜底值,
- * 避免表单初始值直接是 undefined 给到 <input type="color">。
+ * ⚠️ 这里刻意不再提交 themeTokens。
+ *
+ * 早先本表单自带一个「主题主色」取色器，保存时写 `themeTokens: { colors: { primary } }`。
+ * 接入全量主题表单（ThemeForm）后这会出事：PATCH 是整体覆盖 themeTokens 字段，
+ * 商家在上面的主题分区配好 30 多个 token，只要在这里点一次「保存」，
+ * 整个 themeTokens 就被这个只含 primary 的对象整个盖掉——静默丢数据，且没有任何提示。
+ *
+ * 让一个组件独占某个字段的写入权，比在两处各自提交、各自覆盖要可靠得多。
+ * 主题的编辑入口统一是同一页面的「店铺主题」分区。
  */
-function readPrimary(tokens: Record<string, unknown>): string {
-  const colors = tokens.colors;
-  if (!colors || typeof colors !== 'object') {
-    return '#1677ff';
-  }
-  const primary = (colors as Record<string, unknown>).primary;
-  if (typeof primary !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(primary)) {
-    return '#1677ff';
-  }
-  return primary;
-}
-
 export function StoreSettingsForm({ initialStore }: { initialStore: StoreInfo }) {
   const router = useRouter();
   const [name, setName] = useState(initialStore.name);
-  const [primary, setPrimary] = useState(readPrimary(initialStore.themeTokens));
   const [pending, setPending] = useState(false);
   const [success, setSuccess] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -58,20 +50,15 @@ export function StoreSettingsForm({ initialStore }: { initialStore: StoreInfo })
     setError(null);
 
     try {
-      // 与后端约定一致:nest 一层 colors.primary。
-      // 后端对 themeTokens 内部形状不校验,但保持这个结构
-      // 后续 storefront 读它时就不用再改 schema。
-      //
-      // 走的是**同源中转**接口而不是直接调后端:后端没开 CORS,
+      // 走**同源中转**接口而不是直接调后端:后端没开 CORS,
       // 浏览器直连会变成 Failed to fetch;而且 accessToken 只留在服务端。
       // 详见 src/app/api/stores/me/route.ts 的说明。
+      //
+      // 请求体里**不含 themeTokens**:不传的字段后端保持原值。
       const response = await fetch('/api/stores/me', {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          name,
-          themeTokens: { colors: { primary } },
-        }),
+        body: JSON.stringify({ name }),
       });
 
       if (!response.ok) {
@@ -119,19 +106,6 @@ export function StoreSettingsForm({ initialStore }: { initialStore: StoreInfo })
               maxLength={60}
               required
             />
-          </div>
-          <div className="flex flex-col gap-1">
-            <Label htmlFor="primary">主题主色</Label>
-            <div className="flex items-center gap-2">
-              <input
-                id="primary"
-                type="color"
-                value={primary}
-                onChange={(event) => setPrimary(event.target.value)}
-                className="h-8 w-14 cursor-pointer rounded border border-input bg-transparent p-0"
-              />
-              <code className="rounded bg-muted px-1.5 py-0.5 text-xs">{primary}</code>
-            </div>
           </div>
           {error && <p className="text-sm text-destructive">{error}</p>}
           {success && <p className="text-sm text-primary">{success}</p>}

@@ -1,11 +1,15 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import {
   DeleteObjectCommand,
+  GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+
+/** 读 URL 的有效期：1 小时 */
+const READ_URL_TTL_SECONDS = 60 * 60;
 
 const MAX_PRESIGN_TTL_SECONDS = 15 * 60;
 
@@ -82,6 +86,33 @@ export class MinioService implements OnModuleInit {
     } catch {
       // 对象不存在时静默忽略——清理任务要能重复执行
     }
+  }
+
+  /**
+   * 签发一个**限时**的读 URL。
+   *
+   * 为什么不用固定 URL：Chainguard 版 MinIO 不支持 `PutBucketPolicy`
+   * （实测返回 NotImplemented），配不了匿名读；而 bucket 保持私有时，
+   * 浏览器 `<img src>` 直接 GET 会拿到 403，图片根本显示不出来。
+   *
+   * presigned GET 是 S3 标准 API，MinIO 支持（实测 200），
+   * 而且比匿名读更安全：URL 带时效、且只能读不能写。
+   *
+   * 时效 1 小时——够页面渲染与浏览器缓存，不够长期泄露。
+   */
+  async createReadUrl(key: string): Promise<string> {
+    const command = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+    });
+    return getSignedUrl(this.publicClient, command, {
+      expiresIn: READ_URL_TTL_SECONDS,
+    });
+  }
+
+  /** 批量签发读 URL（商品详情一次要返回多张图） */
+  async createReadUrls(keys: string[]): Promise<string[]> {
+    return Promise.all(keys.map((key) => this.createReadUrl(key)));
   }
 
   getBucketName(): string {

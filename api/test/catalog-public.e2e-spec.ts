@@ -305,6 +305,28 @@ describe('公开商品读取 (e2e)', () => {
     ).toBeUndefined();
   });
 
+  it('详情接口返回媒体列表，按 sort 升序', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const product = await publishProduct(merchant.token, '带图商品');
+
+    const response = await http(app)
+      .get(`/api/v1/public/products/${product.slug}`)
+      .set('x-tenant-subdomain', merchant.subdomain)
+      .expect(200);
+
+    // 没有媒体时是空数组，不是 undefined。
+    // storefront 的商品卡片直接取 media[0] 当封面、详情页 map 整个媒体列表，
+    // 两种写法都假定它是数组——undefined 会直接抛 TypeError 让整页 500。
+    const detail = detailBody(response) as unknown as {
+      media: Array<{
+        sort: number;
+        media: { id: string; url: string; mime: string };
+      }>;
+    };
+    expect(Array.isArray(detail.media)).toBe(true);
+    expect(detail.media).toHaveLength(0);
+  });
+
   it('草稿商品的详情对外不可见', async () => {
     const merchant = await createMerchant(app, prisma);
     const created = await http(app)
@@ -531,11 +553,32 @@ describe('公开商品读取 (e2e)', () => {
     const merchant = await createMerchant(app, prisma);
     await publishProduct(merchant.token, '长关键词商品');
 
-    const response = await http(app)
-      .get(`/api/v1/public/products?keyword=${'a'.repeat(500)}`)
+    // 阶段 2b 失败注入发现：截断到 64 字符这一条**没有覆盖**——
+    // 原来只断言 200，而不截断时 500 个 'a' 仍是合法的 ILIKE 模式串，照样 200。
+    //
+    // 截断要可观测，得让**区分度落在第 64 字符之后**：这样截断前的关键词
+    // 只匹配一个商品，截断后变成公共前缀、两个都匹配。匹配数从 1 变 2，
+    // 锚定的就是「截断真的发生了」。
+    //
+    // （注意不能只把关键词加长、商品名保持短——那样截断后的关键词仍是商品名
+    // 的前缀，子串匹配照样命中，测不出任何东西。）
+    const shared = '测'.repeat(70);
+    await publishProduct(merchant.token, shared + '甲商品');
+    await publishProduct(merchant.token, shared + '乙商品');
+
+    const long = await http(app)
+      .get(`/api/v1/public/products?keyword=${shared + '甲商品'}`)
       .set('x-tenant-subdomain', merchant.subdomain)
       .expect(200);
 
-    expect(response.status).toBe(200);
+    // 截断到 64 后两个商品的公共前缀一样 → 两条都命中
+    expect(listBody(long).total).toBe(2);
+
+    // 而截断范围内的关键词不受影响，仍然精确匹配
+    const short = await http(app)
+      .get(`/api/v1/public/products?keyword=${'测'.repeat(20)}`)
+      .set('x-tenant-subdomain', merchant.subdomain)
+      .expect(200);
+    expect(listBody(short).total).toBe(2);
   });
 });

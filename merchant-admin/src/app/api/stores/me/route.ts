@@ -16,6 +16,10 @@ import { ApiError, apiFetch } from '@/lib/api-client';
  *    `headers was called outside a request scope`。
  *
  * 这里复用后端已实现的 PATCH /stores/me，没有另造一套更新逻辑。
+ *
+ * themeTokens 的**唯一写入方**是设置页的「店铺主题」分区（ThemeForm）。
+ * 基本信息表单不再提交这个字段：PATCH 对 themeTokens 是整体覆盖，
+ * 两个入口各自提交会让后保存的一方把先保存的 token 整个盖掉。
  */
 export async function PATCH(request: Request) {
   const session = await auth();

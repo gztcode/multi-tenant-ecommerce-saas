@@ -110,6 +110,8 @@ async function seedDemoStore(): Promise<void> {
   await category('纯棉T恤', 'cotton-tshirt', 0, tshirt.id);
   const shoes = await category('鞋靴', 'shoes', 1, apparel.id);
   const digital = await category('手机数码', 'digital', 2, null);
+  // 软删演示用的空品类——刻意挂在**没有商品**的分支上。
+  const clearance = await category('清仓专区', 'clearance', 3, apparel.id);
 
   // ---- 商品 ----
   const product = async (data: {
@@ -311,6 +313,14 @@ async function seedDemoStore(): Promise<void> {
   });
 
   // ---- 软删除示例 ----
+  //
+  // ⚠️ 软删演示用的品类必须挂在**没有商品**的分支上。曾经这里软删的是「鞋靴」，
+  // 而「城市漫步运动鞋」挂在它下面——于是那个活跃商品在前台的品类页里不可达，
+  // 商家后台的品类列也显示「—」。
+  //
+  // 这个状态在正常业务里出不来：`CategoriesService.remove()` 会拒绝删除
+  // 有商品的品类。种子数据直接写 deletedAt 绕过了那个检查，才造出了这个
+  // 「活跃商品挂在已删品类下」的脏状态。
   // 留着这两条是为了让本地开发能亲眼验证软删除过滤确实生效：
   // 前台列表与搜索都查不到它们，但库里确实有记录。
   const staleProduct = await product({
@@ -328,7 +338,7 @@ async function seedDemoStore(): Promise<void> {
   });
 
   await prisma.category.update({
-    where: { id: shoes.id },
+    where: { id: clearance.id },
     data: { deletedAt: new Date() },
   });
 
@@ -336,7 +346,7 @@ async function seedDemoStore(): Promise<void> {
     `已创建示例店铺：${DEMO_SUBDOMAIN}.platform.test，` +
       `店主 ${merchantEmail} / ${merchantPassword}`,
   );
-  console.log('  3 层品类树（服饰 / T恤 / 纯棉T恤、鞋靴[已软删]、手机数码）');
+  console.log('  3 层品类树（服饰 / T恤 / 纯棉T恤、鞋靴、清仓专区[已软删]、手机数码）');
   console.log('  4 个商品（3 个已上架含规格矩阵、1 个草稿、1 个软删除示例）');
 }
 
