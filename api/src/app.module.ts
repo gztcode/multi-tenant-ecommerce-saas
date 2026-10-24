@@ -8,6 +8,10 @@ import { CatalogModule } from './modules/catalog/catalog.module';
 import { MediaModule } from './modules/media/media.module';
 import { InventoryModule } from './modules/inventory/inventory.module';
 import { ThemeModule } from './modules/theme/theme.module';
+import { QueueModule } from './modules/queue/queue.module';
+import { CartModule } from './modules/cart/cart.module';
+import { OrderModule } from './modules/order/order.module';
+import { PaymentModule } from './modules/payment/payment.module';
 
 // TenantPrismaService 由全局的 TenancyModule 提供并导出，
 // 这里不再重复声明，避免出现两个实例（两个连接池）。
@@ -27,6 +31,10 @@ import { ThemeModule } from './modules/theme/theme.module';
     MediaModule,
     InventoryModule,
     ThemeModule,
+    QueueModule,
+    CartModule,
+    OrderModule,
+    PaymentModule,
   ],
 })
 export class AppModule {}

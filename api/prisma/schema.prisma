@@ -49,6 +49,9 @@ model Tenant {
   productMedias      ProductMedia[]
   inventoryMovements InventoryMovement[]
 
+  // ---------- 交易链路（计划 3）反向关系 ----------
+  carts Cart[]
+
   @@map("tenants")
 }
 
@@ -65,6 +68,10 @@ model User {
 
   tenant        Tenant?        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   refreshTokens RefreshToken[]
+
+  // ---------- 交易链路（计划 3）反向关系 ----------
+  // Cart 声明了 customer User? @relation，Prisma 要求双向都声明。
+  carts Cart[]
 
   // 邮箱唯一性分三层，全部由原生 SQL 的**部分唯一索引**保证，Prisma schema
   // 表达不了条件唯一约束，因此这里刻意不再声明任何 @@unique：
@@ -259,6 +266,10 @@ model Sku {
   movements  InventoryMovement[]
   tenant     Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
+  // ---------- 交易链路（计划 3）反向关系 ----------
+  // CartItem 声明了 sku Sku @relation，Prisma 要求双向都声明。
+  cartItems CartItem[]
+
   // ⚠️ 唯一索引由迁移手写部分唯一索引，不在 schema 里声明。
   @@index([tenantId, productId])
   @@map("skus")
@@ -343,8 +354,28 @@ model InventoryMovement {
   stockBefore Int
   stockAfter  Int
   reason      String?
-  operatorId  String
+  // 谁做了这次库存变动。
+  //
+  // ⚠️ 可空：阶段 2 的库存调整是商家手动操作，填店主 id；
+  // 阶段 3 的预占（RESERVE）/释放（RELEASE）是**系统行为**，没有人工操作人——
+  // 游客下单时连 orders.customerId 都是空的，填不出一个消费者 id。
+  // 填 'system' 这类假值会让「谁动了库存」失真，所以宁可留空。
+  operatorId  String?
   createdAt   DateTime              @default(now())
+  // 这次库存变动属于哪个订单（订单的 uuid，不是 orderNo）。
+  //
+  // ⚠️ **流水与订单之间原本只有自由文本的 reason**（形如「订单 <uuid> 预占」），
+  // 没有任何数据层关联——要查「某个订单预占了多少」只能去解析 reason 文本。
+  // 于是「这些条目确实被预占过」这件事无法在数据层验证：
+  // 对一个从未预占过的 SKU 调释放，库存会凭空 +5，而流水与库存的净变化
+  // **是自洽的**，对账时看不出问题。
+  //
+  // 有了这个字段就能按 orderId 汇总出「尚未被冲抵的预占量」，
+  // 释放与扣减都拿它当上限校验——把「释放的正确性」从
+  // 「调用方记得先判赢家」变成数据层保证。
+  //
+  // ⚠️ 可空：阶段 2 的 INITIAL / ADJUST_IN / ADJUST_OUT 流水与订单无关。
+  orderId String?
 
   // Restrict 而非 Cascade：流水是审计凭证，物理删除有流水的 SKU 必须被数据库拒绝
   sku    Sku    @relation(fields: [skuId], references: [id], onDelete: Restrict)
@@ -354,5 +385,202 @@ model InventoryMovement {
   tenant Tenant @relation(fields: [tenantId], references: [id])
 
   @@index([tenantId, skuId, createdAt])
+  @@index([orderId])
   @@map("inventory_movements")
+}
+
+// ---------- 交易链路（计划 3） ----------
+
+model Cart {
+  id         String   @id @default(uuid())
+  tenantId   String
+  // 登录用户的购物车：customerId 有值、guestToken 为空
+  customerId String?
+  // 游客的购物车：guestToken 有值、customerId 为空
+  guestToken String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  tenant   Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer User?      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  items    CartItem[]
+
+  // ⚠️ 唯一索引刻意**不在 schema 里声明**：一个消费者在同一店铺只有一个购物车
+  // 是「登录合并」的前提，靠部分唯一索引保证（Prisma 表达不了条件唯一约束）。
+  // 见 add_transaction_tables 迁移里手写的两个部分唯一索引。
+  @@index([tenantId, customerId])
+  @@index([tenantId, guestToken])
+  @@map("carts")
+}
+
+model CartItem {
+  id        String   @id @default(uuid())
+  tenantId  String
+  cartId    String
+  skuId     String
+  quantity  Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cart Cart @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  sku  Sku  @relation(fields: [skuId], references: [id], onDelete: Cascade)
+
+  @@unique([cartId, skuId])
+  @@index([tenantId, cartId])
+  @@map("cart_items")
+}
+
+model Address {
+  id         String    @id @default(uuid())
+  tenantId   String
+  customerId String
+  receiver   String
+  phone      String
+  province   String
+  city       String
+  district   String
+  detail     String
+  isDefault  Boolean   @default(false)
+  deletedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  // ⚠️ **刻意不声明 tenant 关系**，只有 tenantId 标量。
+  // 加上外键的话「跨租户挂载」会被数据库悄悄放行（外键只引用 id 不带 tenantId），
+  // 由 service 层显式校验归属（设计 §3.3）。
+  //
+  // ⚠️ 默认地址唯一索引由迁移手写部分唯一索引，不在 schema 里声明。
+  @@index([tenantId, customerId])
+  @@map("addresses")
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  SHIPPED
+  COMPLETED
+  CANCELLED
+  REFUNDED
+  CLOSED
+}
+
+model Order {
+  id         String      @id @default(uuid())
+  tenantId   String
+  orderNo    String      @unique
+  customerId String?
+  status     OrderStatus @default(PENDING_PAYMENT)
+
+  totalAmount Int
+  itemCount   Int
+
+  // 收货信息快照（来自下单时选中的地址，之后地址簿改了也不影响订单）
+  receiverName  String
+  receiverPhone String
+  province      String
+  city          String
+  district      String
+  detail        String
+
+  remark String?
+
+  // 幂等键。同一个键重复下单返回同一个订单，而不是新建一个。
+  // 部分唯一索引：不同租户可以用同一个键（虽然不该，但不该因此报错）。
+  idempotencyKey String?
+
+  payChannel   String?
+  payExpiresAt DateTime?
+  paidAt       DateTime?
+  shippedAt    DateTime?
+  completedAt  DateTime?
+  cancelledAt  DateTime?
+  closedAt     DateTime?
+  trackingNo   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ⚠️ **刻意不声明 tenant 关系**，只有 tenantId 标量。
+  // 「跨租户挂载」由 service 层显式校验，而不是靠外键悄悄放行。
+  items    OrderItem[]
+  payments Payment[]
+
+  // ⚠️ 幂等键的部分唯一索引由迁移手写，不在 schema 里声明。
+  @@index([tenantId, customerId, status])
+  @@index([tenantId, createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id          String @id @default(uuid())
+  tenantId    String
+  orderId     String
+  skuId       String
+  productId   String
+  // 下单时的商品名与规格快照。商家后来改了名、改了价，订单里必须是当时的
+  productName String
+  skuSnapshot Json
+  quantity    Int
+  unitPrice   Int
+  subtotal    Int
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, orderId])
+  @@map("order_items")
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  CLOSED
+  REFUNDED
+}
+
+model Payment {
+  id            String        @id @default(uuid())
+  tenantId      String
+  orderId       String
+  channel       String
+  // ⚠️ provider 与 channel **不是一回事**：channel 是「微信 / 支付宝 / 假网关」
+  // 这类渠道名，provider 是「渠道背后的服务提供方」（微信支付 vs 微信服务商、
+  // 支付宝 vs 支付宝服务商）。幂等去重要按 provider 走——同一笔交易在服务商
+  // 模式下会同时收到「服务商」与「直连」两个渠道的通知。
+  provider      String
+  status        PaymentStatus @default(PENDING)
+  providerTxnId String?
+  amount        Int
+  rawResponse   Json          @default("{}")
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  // ⚠️ **刻意不声明 tenant 关系**，只有 tenantId 标量。
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  // ⚠️ (provider, providerTxnId) 的唯一索引由迁移手写，不在 schema 里声明：
+  // Prisma 的 @@unique 表达不了 NULL 不参与唯一判定这个语义。
+  // 缺了它，同一笔渠道交易会落成两条支付单（设计 §3.6）。
+  @@unique([orderId, channel])
+  @@index([tenantId, status])
+  @@map("payments")
+}
+
+model PaymentWebhookEvent {
+  id            String    @id @default(uuid())
+  provider      String
+  eventId       String
+  providerTxnId String?
+  payload       Json
+  processedAt   DateTime?
+  createdAt     DateTime  @default(now())
+
+  // ⚠️ 这张表**不带 tenantId**，因此不在 TENANT_SCOPED_MODELS 白名单里
+  // （它不是租户的数据，是渠道事件的数据）。租户从订单反查，不从事件里取。
+  //
+  // ⚠️ 唯一索引是「验签」之后的第二道防线，顺序不能反：
+  // 先验签再落库，否则攻击者能抢先占住 (provider, eventId)，
+  // 让真实回调被当成重复事件忽略——钱付了订单永不流转（设计 §3.7）。
+  @@unique([provider, eventId])
+  @@map("payment_webhook_events")
 }

@@ -1,6 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 import { TenantContextInterceptor } from './modules/tenancy/tenant-context.interceptor';
 import { assertSecureConfig } from './common/config/assert-secure-config';
@@ -11,9 +12,17 @@ async function bootstrap() {
   // 配置不安全时进程必须立刻退出，不能先监听端口再失败。
   assertSecureConfig();
 
-  const app = await NestFactory.create(AppModule);
+  // ⚠️ `rawBody: true`：让 Nest 把请求的**原始字节**挂在 `req.rawBody` 上。
+  //
+  // 支付回调要用它验签——签名验的是原始 body，不是解析后的字段。
+  // 默认的 JSON body parser 会把请求流消费掉，那时拿不到原始字节了。
+  const app = await NestFactory.create(AppModule, { rawBody: true });
 
   app.setGlobalPrefix('api/v1');
+  // 读取 cookie 必须有 cookie-parser 中间件：
+  // Express 自带 res.cookies.set()（写），但 req.cookies（读）要靠它。
+  // 游客购物车靠 cookie 里的 cart_token 标识，缺了它读不到 token。
+  app.use(cookieParser());
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,

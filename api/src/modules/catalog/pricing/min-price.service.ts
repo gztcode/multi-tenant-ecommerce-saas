@@ -1,22 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import { TenantPrismaService } from '../../../common/tenant/tenant-prisma.service';
-
-/**
- * 事务客户端的类型：就是 `prisma.$transaction(async (tx) => ...)` 的回调参数类型。
- *
- * 从 TenantPrismaService 上 `Omit` 一个同形类型行不通，有两个原因：
- * 1. `$transaction` 有数组与回调两个重载，从它反解回调参数需要经过一层
- *    Parameters 索引，写出来比它省下的还多；
- * 2. TenantPrismaService 上没有 `$executeRaw`——阶段 1 刻意把这几个原生 SQL
- *    方法从 Service 上摘掉了（见该类的类注释）。而事务里的 tx 是真正的扩展
- *    client，$executeRaw 是有的（它不经过扩展，也就绕过了扩展——所以租户条件
- *    必须在这条 SQL 里手写）。
- * 所以直接向编译器要 tx 自己的类型，签名更短也不会说谎。
- */
-export type PrismaTransaction = Parameters<
-  Parameters<TenantPrismaService['$transaction']>[0]
->[0];
+import type { PrismaTransaction } from '../../../common/prisma/prisma-transaction';
 
 /**
  * 商品最低价的维护。

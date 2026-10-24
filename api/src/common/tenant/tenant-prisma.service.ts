@@ -512,6 +512,37 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
     return this.client.inventoryMovement;
   }
 
+  // ------- 交易链路（计划 3）模型 delegate 代理 -------
+
+  get cart() {
+    return this.client.cart;
+  }
+
+  get cartItem() {
+    return this.client.cartItem;
+  }
+
+  get address() {
+    return this.client.address;
+  }
+
+  get order() {
+    return this.client.order;
+  }
+
+  get orderItem() {
+    return this.client.orderItem;
+  }
+
+  get payment() {
+    return this.client.payment;
+  }
+
+  // 不在租户白名单里，但业务代码要读写它（webhook 幂等表）
+  get paymentWebhookEvent() {
+    return this.client.paymentWebhookEvent;
+  }
+
   // ------- PrismaClient 实例级方法代理 -------
   // $connect / $disconnect 由生命周期钩子分别调用，
   // 这里仍然透传出来让服务消费者可以手动关闭连接（例如测试用例）。

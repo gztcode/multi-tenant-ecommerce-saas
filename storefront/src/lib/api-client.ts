@@ -17,13 +17,32 @@ export class ApiError extends Error {
 
 export async function apiFetch<T>(
   path: string,
-  options: {
-    method?: string;
-    body?: unknown;
-    token?: string;
-    subdomain?: string;
-  } = {},
+  options: ApiFetchOptions = {},
 ): Promise<T> {
+  const response = await request(path, options);
+
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
+  return (await response.json()) as T;
+}
+
+/** 调后端的公共选项 */
+export interface ApiFetchOptions {
+  method?: string;
+  body?: unknown;
+  token?: string;
+  subdomain?: string;
+  /** 转发给后端的 Cookie 头。游客购物车靠它把 cart_token 送过去 */
+  cookie?: string;
+}
+
+/** 发请求并把错误响应转成 ApiError */
+async function request(
+  path: string,
+  options: ApiFetchOptions,
+): Promise<Response> {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
   };
@@ -33,6 +52,9 @@ export async function apiFetch<T>(
   }
   if (options.subdomain) {
     headers['x-tenant-subdomain'] = options.subdomain;
+  }
+  if (options.cookie) {
+    headers.cookie = options.cookie;
   }
 
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -58,11 +80,7 @@ export async function apiFetch<T>(
     );
   }
 
-  if (response.status === 204) {
-    return undefined as T;
-  }
-
-  return (await response.json()) as T;
+  return response;
 }
 
 /** 带登录态调用后端 */
@@ -75,4 +93,31 @@ export async function apiFetchAuthed<T>(
     ...options,
     token: session?.accessToken,
   });
+}
+
+/**
+ * 调后端并把 `Set-Cookie` 一并带回来。
+ *
+ * 游客购物车需要这个：后端在第一次访问购物车时生成 `cart_token` 写进
+ * `Set-Cookie`（HttpOnly，浏览器拿不到）。storefront 是服务端渲染，
+ * 后端种下的 cookie 必须由 storefront **转写**到浏览器自己的 cookie 上，
+ * 否则下一次请求（换页、刷新）就没有 cart_token，游客车就「丢了」。
+ *
+ * ⚠️ 后端返回的 `Set-Cookie` 带了 `HttpOnly` 与 `SameSite` 等属性，
+ * 转写时要**原样保留**——丢掉 HttpOnly 会让 JS 能读到 token，
+ * 丢掉 SameSite 会让 cookie 的跨站行为变松。
+ */
+export async function apiFetchWithSetCookie<T>(
+  path: string,
+  options: ApiFetchOptions = {},
+): Promise<{ data: T; setCookie: string | null }> {
+  const response = await request(path, options);
+
+  const setCookie = response.headers.get('set-cookie');
+
+  if (response.status === 204) {
+    return { data: undefined as T, setCookie };
+  }
+
+  return { data: (await response.json()) as T, setCookie };
 }

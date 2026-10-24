@@ -22,6 +22,22 @@ services:
       timeout: 5s
       retries: 20
 
+  redis:
+    image: redis:7-alpine
+    container_name: ecommerce-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      # 宿主机端口 16380：本机标准端口 6379 已被其他项目栈占用
+      - '${REDIS_PORT:-16380}:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
   minio:
     # ⚠️ 为什么不是官方的 minio/minio：
     #
@@ -73,10 +89,14 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       # 容器之间用服务名 + 容器内端口通信，与宿主机映射的 15432 无关。
       DATABASE_URL: postgresql://${POSTGRES_USER:-ecommerce}:${POSTGRES_PASSWORD:-ecommerce}@postgres:5432/${POSTGRES_DB:-ecommerce}?schema=public
       DATABASE_URL_TEST: postgresql://${POSTGRES_USER:-ecommerce}:${POSTGRES_PASSWORD:-ecommerce}@postgres:5432/ecommerce_test?schema=public
+      # Redis（BullMQ 队列）。容器内走服务名 redis，与宿主机映射的 16380 无关。
+      REDIS_URL: redis://redis:6379
       NODE_ENV: production
       PORT: '3000'
       API_PREFIX: api/v1
@@ -187,3 +207,4 @@ services:
 volumes:
   pgdata:
   minio-data:
+  redis-data:

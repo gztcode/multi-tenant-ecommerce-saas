@@ -13,11 +13,24 @@ const DEMO_SUBDOMAIN = 'demo';
 
 /** 平台超管账号（阶段 1 起就有，保留原逻辑） */
 async function seedPlatformAdmin(): Promise<void> {
-  const email = process.env.SEED_PLATFORM_ADMIN_EMAIL ?? 'admin@platform.test';
+  // ⚠️ **必须小写化**：登录路径（auth.service.ts 的 login）会把输入的邮箱
+  // `toLowerCase()` 后**精确匹配**查询。而唯一索引是 `UNIQUE (lower(email))`，
+  // 存大写也能通过唯一约束——于是库里就可能出现一条 `ADMIN@PLATFORM.TEST`，
+  // 登录时按小写查不到，用户永远登不进去。
+  //
+  // 写之前统一小写化，存进去的形态就与登录时的查询形态一致。
+  const email = (
+    process.env.SEED_PLATFORM_ADMIN_EMAIL ?? 'admin@platform.test'
+  ).toLowerCase();
   const password = process.env.SEED_PLATFORM_ADMIN_PASSWORD ?? 'Admin12345!';
 
   const existing = await prisma.user.findFirst({
-    where: { email, role: UserRole.PLATFORM_ADMIN },
+    // 查重也大小写不敏感：与 lower(email) 唯一索引的语义对齐，
+    // 否则库里已有大写形态时会走插入分支，然后被唯一索引拦下抛 P2002。
+    where: {
+      email: { equals: email, mode: 'insensitive' },
+      role: UserRole.PLATFORM_ADMIN,
+    },
   });
 
   if (existing) {
@@ -59,7 +72,12 @@ async function seedPlatformAdmin(): Promise<void> {
  * 每一次写入都必须显式带上 tenantId——这也是为什么下面到处都能看到 tenantId。
  */
 async function seedDemoStore(): Promise<void> {
-  const merchantEmail = process.env.SEED_DEMO_MERCHANT_EMAIL ?? 'owner@demo.platform.test';
+  // ⚠️ **必须小写化**：登录路径（auth.service.ts 的 login）会把输入的邮箱
+  // `toLowerCase()` 后**精确匹配**查询，存大写就登不进去。详见
+  // seedPlatformAdmin 处的说明。
+  const merchantEmail = (
+    process.env.SEED_DEMO_MERCHANT_EMAIL ?? 'owner@demo.platform.test'
+  ).toLowerCase();
   const merchantPassword = process.env.SEED_DEMO_MERCHANT_PASSWORD ?? 'Demo12345!';
 
   const existingTenant = await prisma.tenant.findUnique({
@@ -350,9 +368,73 @@ async function seedDemoStore(): Promise<void> {
   console.log('  4 个商品（3 个已上架含规格矩阵、1 个草稿、1 个软删除示例）');
 }
 
+/**
+ * 示例消费者账号（阶段 3 起）。
+ *
+ * 独立于 seedDemoStore：那个函数在店铺已存在时会整棵跳过，
+ * 把消费者塞进去就永远建不出来。
+ */
+async function seedDemoCustomer(): Promise<void> {
+  // ⚠️ **必须小写化**：登录路径（auth.service.ts 的 login）会把输入的邮箱
+  // `toLowerCase()` 后**精确匹配**查询。而唯一索引是 `UNIQUE (lower(email))`，
+  // 存大写也能通过唯一约束——于是库里就可能出现一条
+  // `CUSTOMER@DEMO.PLATFORM.TEST`，登录时按小写查不到，用户永远登不进去。
+  //
+  // 写之前统一小写化，存进去的形态就与登录时的查询形态一致。
+  const email = (
+    process.env.SEED_DEMO_CUSTOMER_EMAIL ?? 'customer@demo.platform.test'
+  ).toLowerCase();
+  const password = process.env.SEED_DEMO_CUSTOMER_PASSWORD ?? 'Demo12345!';
+
+  const existing = await prisma.user.findFirst({
+    // ⚠️ 必须大小写不敏感：数据库的唯一索引是
+    // users_customer_email_ci_key —— UNIQUE (lower(email), "tenantId")
+    // WHERE role IN (CUSTOMER, MERCHANT_STAFF)。若这里用大小写敏感的精确匹配，
+    // 库里已有 customer@demo.platform.test 时，查 CUSTOMER@DEMO.PLATFORM.TEST
+    // 会查不到而走插入分支，然后被 lower(email) 索引拦下抛 P2002。
+    where: { email: { equals: email, mode: 'insensitive' }, role: UserRole.CUSTOMER },
+  });
+  if (existing) {
+    console.log(`示例消费者已存在，跳过：${email}`);
+    return;
+  }
+
+  const tenant = await prisma.tenant.findUnique({
+    where: { subdomain: DEMO_SUBDOMAIN },
+  });
+  if (!tenant) {
+    console.log('示例店铺不存在，跳过消费者账号');
+    return;
+  }
+
+  try {
+    await prisma.user.create({
+      data: {
+        email,
+        passwordHash: await argon2.hash(password),
+        displayName: '示例消费者',
+        role: UserRole.CUSTOMER,
+        tenantId: tenant.id,
+      },
+    });
+  } catch (error) {
+    // 邮箱由部分唯一索引 users_customer_email_ci_key 兜底，
+    // 并发执行 seed 时后到的一方会撞唯一约束，此时同样视为幂等成功。
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+      console.log(`示例消费者已存在（并发创建），跳过：${email}`);
+      return;
+    }
+    throw error;
+  }
+
+  console.log(`已创建示例消费者：${email} / ${password}`);
+}
+
 async function main() {
   await seedPlatformAdmin();
   await seedDemoStore();
+  // 消费者账号依赖租户已建出来，所以放在 seedDemoStore 之后
+  await seedDemoCustomer();
 }
 
 main()
