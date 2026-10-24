@@ -53,3 +53,61 @@ curl -X POST http://localhost:3000/api/v1/auth/register/merchant \
   `session` 回调透出，服务端组件据此调后端。
 - **`themeTokens` 的结构是 `{ colors: { primary: '#rrggbb' } }`。** 后端只把它当
   不透明的 JSON 存，约定由前端定；storefront 读它渲染主题色时依赖同一结构。
+
+## 单元测试
+
+```bash
+npm test          # 跑一遍（CI 用）
+npm run test:watch   # watch 模式
+```
+
+框架是 **Vitest**（不是 Jest——Next.js 15 + React 19 生态里 Vitest 是主流，
+原生 ESM/TS，`vi.mock` 好用）。配置见 `vitest.config.ts`。
+
+### 测什么、不测什么
+
+只测两类东西：
+
+1. **Route Handler。** Next.js 的 Route Handler 就是普通导出函数
+   （`export async function POST(request: Request)`），**可以直接 import 并调用**，
+   传一个 `new Request(url, { method, body })` 就能拿到返回的 `Response`。
+   **不需要起服务器，也不需要 jsdom。**
+   - mock `@/auth` 的 `auth()`，让它返回 `{ accessToken: 'test-token' }` 或 null；
+   - mock `@/lib/api-client` 的 `apiFetch`，**断言它被调用时收到的参数**
+     ——这是验证「白名单真的重建了 body」的唯一办法。
+2. **纯函数。** 例如 `src/lib/theme.ts` 的 `buildThemeCss`（在 storefront 那边）。
+
+**明确不测 React 组件渲染**：那需要 jsdom + React Testing Library，
+是另一个成本量级的事，本轮不做。
+
+测试放在顶层 `test/` 目录（`src/` 之外），`next build` 不会编译它们。
+
+### 现有测试覆盖的护栏
+
+| 测试文件 | 护栏 |
+| --- | --- |
+| `test/app/api/auth-guard.test.ts` | 中转路由的认证：未登录必须 401，且**不得**调后端 |
+| `test/app/api/body-whitelist.test.ts` | 中转路由的请求体白名单：未知字段必须被丢弃（不透传给后端） |
+| `test/app/api/malformed-body.test.ts` | 中转路由拦截数组 / 字符串 / null 请求体 → 400 |
+| `test/app/api/batch-ids-limit.test.ts` | 批量接口的 ids 数量上限（> 200 → 400） |
+
+### 写这类测试的坑
+
+- **`vi.mock` 的路径要与被测文件里的 import 路径一致。**
+  被测文件写 `import { auth } from '@/auth'`，测试里就写 `vi.mock('@/auth', ...)`。
+  路径不一致 mock 不生效——症状是「测试跑起来但断言的是真实现」。
+- **`@/auth` 会 import `next-auth`，`next-auth` 可能 import `server-only`**，
+  在 Vitest（node 环境）里会直接抛错。`vitest.config.ts` 里把 `server-only`
+  alias 到了一个空模块兜底。
+- **断言要具体。** 这个项目栽过好几次「断言对了但没测到东西」：
+  - 「只断言 200」——畸形入参也 200，等于没测；
+  - 「只断言报错」——报错也可能来自别的原因。
+  所以 401 就断言状态码**且**断言 `apiFetch` 没被调；400 就断言状态码**且**
+  断言 body 里的错误文案；白名单就断言 `apiFetch` 收到的**完整 body**
+  （用 `toEqual`，不是「不含某字段」——后者能被「全部丢弃」的实现蒙混过关）。
+
+### 覆盖的护栏
+
+认证未登录 401 且不碰后端、请求体白名单重建、数组/字符串/null 请求体拦截、
+批量 ids 上限（200）、**查询参数白名单重建**。
+

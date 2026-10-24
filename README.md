@@ -76,12 +76,23 @@ cd platform-admin && npm install && cp .env.example .env && npm run dev   # :300
 
 ```bash
 cd api
-npm test              # 单元测试（隔离机制，88 条）
-npm run test:e2e      # 端到端（173 条，11 个套件）
-npm run test:cov:e2e  # 项目真实覆盖率（74.55%）
+npm test              # 单元测试（隔离机制，89 条）
+npm run test:e2e      # 端到端（184 条，12 个套件）
+npm run test:cov:e2e  # 项目真实覆盖率
 ```
 
 三个前端各自 `npx tsc --noEmit && npm run lint && npm run build`。
+其中 `storefront` 与 `merchant-admin` 另有单元测试（Vitest）：
+
+```bash
+cd merchant-admin && npm test   # 26 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限）
+cd storefront    && npm test   #  7 条：主题 token 的键名白名单
+```
+
+详见两个项目各自的 README「单元测试」一节。
+
+> **遗留项**：`platform-admin` 本轮**没有**配单元测试框架——它阶段 2b 没有改动，
+> 没有需要保护的护栏。等它开始有改动时再补。
 
 e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物理隔离。
 
