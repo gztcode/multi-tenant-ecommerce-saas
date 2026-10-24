@@ -486,8 +486,13 @@ describe('租户隔离版 PrismaClient', () => {
 
     const product = await tenantContext.run(context, async () =>
       prisma.product.create({
-        data: { name: '待复活商品', slug: `rv-${Date.now()}` },
-      } as unknown as Prisma.ProductCreateInput),
+        // 断言套在 data 的**值**上而不是整个参数上：ProductCreateInput 要求
+        // 带关系字段 tenant，而扩展在运行时注入 tenantId，静态类型看不到。
+        data: {
+          name: '待复活商品',
+          slug: `rv-${Date.now()}`,
+        } as unknown as Prisma.ProductCreateInput,
+      }),
     );
 
     // 先软删

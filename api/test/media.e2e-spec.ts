@@ -591,4 +591,36 @@ describe('媒体上传 (e2e)', () => {
       .set('authorization', `Bearer ${merchant.token}`)
       .expect(400);
   });
+  // 阶段 2b 失败注入发现：confirm 时的媒体大小复核**没有 e2e 覆盖**。
+  // 而它才是这条路径上唯一真正的防线——presigned PUT 的签名里没有长度约束，
+  // 商家可以为 1KB 的申请签发凭证，再直传一个远超上限的文件。
+  it('confirm 时复核大小：直传超大文件后确认被拒', async () => {
+    const merchant = await createMerchant(app, prisma);
+
+    // 按上限（5MB）申报，实际会传得更多
+    const signed = await http(app)
+      .post('/api/v1/media/upload-url')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ filename: 'huge.jpg', mime: 'image/jpeg', size: 1024 })
+      .expect(201);
+
+    // 直传一个超过 MEDIA_MAX_SIZE 的对象
+    const tooBig = Buffer.alloc(6 * 1024 * 1024, 7);
+    const put = await fetch(signed.body.uploadUrl as string, {
+      method: 'PUT',
+      headers: { 'content-type': 'image/jpeg' },
+      body: tooBig,
+    });
+    expect(put.ok).toBe(true);
+
+    // 确认时必须被拦下——不能因为「签发时申报的是 1KB」就放行
+    const response = await http(app)
+      .post(`/api/v1/media/${signed.body.media.id}/confirm`)
+      .set('authorization', `Bearer ${merchant.token}`);
+
+    expect(response.status).toBe(400);
+    expect(String((response.body as { message?: string }).message)).toContain(
+      '上限',
+    );
+  });
 });

@@ -132,7 +132,14 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
     });
 
     const uploadUrl = await this.minio.createUploadUrl(key, dto.mime);
-    return { media, uploadUrl };
+    // 浏览器真正用 readUrl：bucket 是私有的，media.url 那个固定地址直接
+    // GET 会 403。Chainguard 版 MinIO 不支持 PutBucketPolicy（实测
+    // NotImplemented），配不了匿名读，所以走限时签名 URL。
+    const readUrl = await this.minio.createReadUrl(key);
+    return {
+      media: { ...media, readUrl } as Media & { readUrl: string },
+      uploadUrl,
+    };
   }
 
   /**
@@ -175,12 +182,15 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
     });
 
     const updated = await this.prisma.media.findFirst({ where: { id } });
-    if (!updated) {
-      // 上一行刚确认过它存在，这里查不到只可能是并发软删；状态已写入，
-      // 返回刚才的快照比抛错更贴近调用方的预期
-      return { ...media, status: 'READY', size: actualSize };
-    }
-    return updated;
+    const result = updated ?? {
+      ...media,
+      status: 'READY' as const,
+      size: actualSize,
+    };
+    return {
+      ...result,
+      readUrl: await this.minio.createReadUrl(media.key),
+    } as Media & { readUrl: string };
   }
 
   async list(page: number, pageSize: number) {
@@ -193,7 +203,14 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
       }),
       this.prisma.media.count(),
     ]);
-    return { items, total, page, pageSize };
+    // 媒体列表是给前端展示用的，逐个签发限时读 URL（bucket 私有）
+    const withUrls = await Promise.all(
+      items.map(async (item) => ({
+        ...item,
+        readUrl: await this.minio.createReadUrl(item.key),
+      })),
+    );
+    return { items: withUrls, total, page, pageSize };
   }
 
   /** 软删除媒体 */

@@ -1275,6 +1275,46 @@ describe('商品 (e2e)', () => {
     const winner = first.status === 200 ? '并发改名甲' : '并发改名乙';
     expect(afterBody.name).toBe(winner);
   });
+  it('重复的 slug 返回 409 而不是 500', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const slug = `dup-${unique()}`;
+
+    await http(app)
+      .post('/api/v1/catalog/categories')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ name: '第一次', slug })
+      .expect(201);
+
+    // Prisma 的 P2002（唯一约束冲突）不处理的话会一路冒成 500
+    // 「服务器内部错误」——用户建了个重名的品类只看到一句看不懂的话。
+    // service 层用 rethrowIfUniqueViolation 把它转成 409 并指出哪个字段重复了。
+    const second = await http(app)
+      .post('/api/v1/catalog/categories')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ name: '第二次', slug });
+
+    expect(second.status).toBe(409);
+    expect(String((second.body as { message?: string }).message)).toContain(
+      '已被占用',
+    );
+  });
+
+  it('商品的重复 slug 同样返回 409', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const slug = `dup-p-${unique()}`;
+
+    await http(app)
+      .post('/api/v1/catalog/products')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ name: '商品甲', slug })
+      .expect(201);
+
+    await http(app)
+      .post('/api/v1/catalog/products')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ name: '商品乙', slug })
+      .expect(409);
+  });
 });
 
 /**
