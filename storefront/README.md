@@ -36,3 +36,43 @@ npm run dev              # http://localhost:3001（固定 3001，3000 留给 api
   客户端组件用 `signIn` / `signOut`。
 - **令牌存 JWT session。** `accessToken`、`role`、`tenantId` 由 `jwt` 回调写入，
   `session` 回调透出，服务端组件据此调后端。
+
+## 单元测试
+
+```bash
+npm test          # 跑一遍（CI 用）
+npm run test:watch   # watch 模式
+```
+
+框架是 **Vitest**（不是 Jest——Next.js 15 + React 19 生态里 Vitest 是主流，
+原生 ESM/TS，`vi.mock` 好用）。配置见 `vitest.config.ts`。
+
+### 测什么、不测什么
+
+只测**纯函数**。目前是 `src/lib/theme.ts` 的 `buildThemeCss`——
+主题 token 的**键名**白名单：分组标量是「前缀 + 键」拼出来的
+（`--text-` + key），若只靠前缀约束，键名就成了可注入面
+（`tokens.textScale['sm; } body{']` 会拼出 `--text-sm; } body{ : 1rem;`，
+直接逃出这条声明）。所以键必须显式列在 `GROUP_KEYS` 白名单里。
+
+**明确不测 React 组件渲染**：那需要 jsdom + React Testing Library，
+是另一个成本量级的事，本轮不做。
+
+测试放在顶层 `test/` 目录（`src/` 之外），`next build` 不会编译它们。
+
+### 现有测试覆盖的护栏
+
+| 测试文件 | 护栏 |
+| --- | --- |
+| `test/lib/theme.test.ts` | 主题 token 的键名白名单：恶意键名不能逃出 `:root` 块 |
+
+断言要两边都测：恶意键名**不出现**在输出里，**且**正常键名
+（`textScale.xs` 等）**必须出现**在输出里——只测「恶意被丢弃」不够，
+一个「全部丢弃」的实现也能通过那些断言。
+
+### 写这类测试的坑
+
+- **`vi.mock` 的路径要与被测文件里的 import 路径一致。**
+  路径不一致 mock 不生效——症状是「测试跑起来但断言的是真实现」。
+- **`server-only` 在 Vitest（node 环境）里会直接抛错。**
+  `vitest.config.ts` 里把它 alias 到了一个空模块兜底。
