@@ -7,7 +7,7 @@
     "^.+\\.(t|j)s$": "ts-jest"
   },
   "transformIgnorePatterns": [
-    "node_modules/(?!(@nestjs/jwt|@nestjs/passport)/)"
+    "node_modules/(?!(@nestjs/jwt|@nestjs/passport|@nestjs/bullmq|@nestjs/bull-shared)/)"
   ],
   "globalSetup": "<rootDir>/test/setup-e2e.ts",
   "setupFilesAfterEnv": ["<rootDir>/test/setup.ts"]

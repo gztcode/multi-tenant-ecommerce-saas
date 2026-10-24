@@ -70,6 +70,15 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   'Media',
   'ProductMedia',
   'InventoryMovement',
+  // 交易链路（计划 3）
+  'Cart',
+  'CartItem',
+  'Address',
+  'Order',
+  'OrderItem',
+  'Payment',
+  // ⚠️ PaymentWebhookEvent 刻意**不在**这里：它是渠道事件的数据，不是租户的数据，
+  // 租户从订单反查。
 ]);
 
 /**
@@ -102,6 +111,10 @@ export const SOFT_DELETE_MODELS = new Set<string>([
   'ProductSpecValue',
   'Sku',
   'Media',
+  // 交易链路（计划 3）：只有地址簿走软删。
+  // Cart / CartItem 不软删——购物车是临时数据，清空即删。
+  // Order / OrderItem / Payment 不软删——它们是财务凭证，只能靠状态机流转，不能删。
+  'Address',
 ]);
 
 /**

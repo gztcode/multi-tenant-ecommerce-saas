@@ -1,4 +1,5 @@
 import { headers } from 'next/headers';
+import Link from 'next/link';
 import { resolveTenantSubdomain } from '@/lib/tenant';
 import { fetchPublicCategories, fetchPublicProducts } from '@/lib/catalog';
 import { ProductCard } from '@/components/product/product-card';
@@ -32,6 +33,16 @@ export default async function StorefrontHome() {
             {category.name}
           </a>
         ))}
+        {/* 交易链路的入口。与品类导航分开：品类是「逛」，这三个是「我的」。 */}
+        <Link href="/cart" className="ml-auto underline">
+          购物车
+        </Link>
+        <Link href="/orders" className="underline">
+          我的订单
+        </Link>
+        <Link href="/account" className="underline">
+          账户
+        </Link>
       </nav>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
