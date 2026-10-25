@@ -52,6 +52,16 @@ export interface CouponCandidate {
   startsAt: Date;
   /** 生效截止时间 */
   endsAt: Date;
+  /**
+   * 券的作用域：SHOP = 本店券；PLATFORM = 平台券（全店可用）。
+   *
+   * ⚠️ **引擎本身不用它**（适用范围在 service 层查询时就已经过滤过了）。
+   * 它随候选一路带到核销环节——核销时要按它选更新口径：
+   * 平台券的计数快照在**平台租户**的行上，租户作用域更新不到它。
+   */
+  scope: 'SHOP' | 'PLATFORM';
+  /** 券所在租户——平台券不在当前租户下 */
+  tenantId: string;
 }
 
 /** 满减活动的输入形状 */
@@ -117,6 +127,38 @@ export interface DiscountResult {
   couponDiscountAmount: number;
   /** 最终应付（整数分）。恒 >= 0 */
   payableAmount: number;
+}
+
+/**
+ * 下单时的优惠结果（引擎输出 + 命中的活动 + 命中券的作用域）。
+ *
+ * ⚠️ **比 `DiscountResult` 多两个东西**：
+ * 1. `appliedPromotion`：引擎只输出「活动减免了多少」，不输出「是哪张活动」——
+ *    订单要存 `promotionId` 这个快照字段，所以 service 层把命中的活动补上。
+ * 2. `appliedCoupon.scope` / `tenantId`：核销时要按它选更新口径——
+ *    平台券的计数快照在**平台租户**的行上，不能用租户作用域去改。
+ */
+export interface OrderDiscount extends Omit<DiscountResult, 'appliedCoupon'> {
+  /** 命中的券（没命中就是 null） */
+  appliedCoupon: {
+    id: string;
+    code: string;
+    name: string;
+    discountAmount: number;
+    /** 券的作用域：SHOP = 本店券；PLATFORM = 平台券（全店可用） */
+    scope: 'SHOP' | 'PLATFORM';
+    /** 券所在租户——平台券不在当前租户下 */
+    tenantId: string;
+  } | null;
+  /** 命中的满减活动（没命中就是 null） */
+  appliedPromotion: {
+    id: string;
+    name: string;
+    minAmount: number;
+    discountAmount: number;
+    startsAt: Date;
+    endsAt: Date;
+  } | null;
 }
 
 /**

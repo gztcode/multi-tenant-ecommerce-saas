@@ -591,6 +591,28 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * 取数据库的当前时间（`SELECT now()`）。
+   *
+   * ⚠️ **这是本类唯一暴露的原生 SQL 入口**，而且只查 `now()`——
+   * 不涉及任何租户数据，所以不需要手写 tenantId 条件。
+   *
+   * 为什么需要它（阶段 5a 的 M15）：过期判定统一用**数据库的时钟**，
+   * 不用应用进程的时钟。多副本部署时各机器的时钟有偏差，边界时刻会出现
+   * 「这张券在这台机器上过期了、在那台机器上还没过期」。
+   * 数据库的 `now()` 是单一事实来源。
+   *
+   * ⚠️ **刻意不裸暴露 `$queryRaw`**：原生 SQL 完全不经过租户扩展，
+   * 一旦放开就成了「绕过隔离的后门」。要加新的原生 SQL 时，
+   * 同样以这种专用 wrapper 的形式加，并显式注入 tenantId 条件。
+   */
+  async databaseNow(): Promise<Date> {
+    const rows = await this.client.$queryRaw<Array<{ now: Date }>>`
+      SELECT now() as now
+    `;
+    return rows[0].now;
+  }
+
+  /**
    * 启动时校验：schema 里凡是带 tenantId 字段的模型，都必须登记在租户作用域白名单里。
    *
    * 否则新增业务表时忘了登记，那张表的所有读写都不会附加 tenantId 条件——

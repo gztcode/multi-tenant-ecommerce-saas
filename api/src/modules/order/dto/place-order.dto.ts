@@ -50,6 +50,10 @@ export class PlaceOrderItemDto {
  * ⚠️ **不接受任何价格字段**（`unitPrice` / `totalAmount` / `price`）：
  * 金额只从 SKU 读。请求体里带价格字段会被 `forbidNonWhitelisted` 直接 400。
  *
+ * ⚠️ **不接受任何优惠相关字段**（`discountAmount` / `couponValue` /
+ * `couponMinAmount` / `promotionDiscountAmount`）：优惠金额只由服务端算出来。
+ * 客户端只能传 `couponId`，面额与门槛一律从库里读（M1 / M2）。
+ *
  * ⚠️ 也不接受 `tenantId`（租户扩展注入）、`customerId`（从登录身份推导）、
  * `orderNo`（服务端生成）。
  */
@@ -79,4 +83,13 @@ export class PlaceOrderDto {
   @IsString()
   @MaxLength(500)
   remark?: string;
+
+  @ApiProperty({
+    required: false,
+    description: '使用的优惠券 id（只传 id，面额与门槛一律从库里读）',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  couponId?: string;
 }

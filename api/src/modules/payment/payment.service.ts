@@ -20,6 +20,7 @@ import { QueueService } from '../queue/queue.service';
 import { PAYMENT_WEBHOOK_QUEUE } from '../../common/queue/queue.constants';
 import { OrderService } from '../order/order.service';
 import { OrderInventoryService } from '../order/inventory.service';
+import { CouponRedemptionService } from '../coupon/coupon-redemption.service';
 import {
   NormalizedWebhookEvent,
   PaymentProvider,
@@ -79,6 +80,7 @@ export class PaymentService {
     private readonly orderService: OrderService,
     private readonly inventory: OrderInventoryService,
     private readonly queue: QueueService,
+    private readonly couponRedemption: CouponRedemptionService,
     @Inject(PAYMENT_PROVIDERS)
     private readonly providers: Map<string, PaymentProvider>,
   ) {}
@@ -458,6 +460,17 @@ export class PaymentService {
         quantity: item.quantity,
       })),
     );
+
+    // ---- **确认券的核销**（设计文档 §5.3）----
+    //
+    // ⚠️ **必须在同一个事务里**：订单转 PAID 与券的核销确认同生共死。
+    // 分成两个事务的话，订单已支付而券还停在 RESERVED——
+    // 券的额度被占着，用户看到「我的券」里它还在却用不了。
+    //
+    // ⚠️ **与取消路径互斥**：支付成功后订单不再是 PENDING_PAYMENT，
+    // 取消路径的条件更新会拦住它。两条路径都靠「核销状态的条件更新」
+    // 保证只生效一次。
+    await this.couponRedemption.markUsedInTx(tx, order.id);
   }
 
   /** 标记事件已处理 */
@@ -588,6 +601,15 @@ export class PaymentService {
         // 订单转 REFUNDED（条件更新，走 order 模块的转移表校验）
         //
         // ⚠️ **不碰库存、不记 RELEASE 流水**——货已发出。
+        //
+        // ⚠️ **这里不重算优惠是有意的，不是漏了**（M13）：
+        // 退款额读的是 `order.totalAmount`，而它就是下单时算出的**实付额**
+        // （已含券与活动的减免）。所以退款额天然等于实付额，
+        // 不会多退也不会少退。
+        //
+        // **为什么不重算**：券的规则将来可能改，改了就对不上历史账（M12）。
+        // 历史订单存的是**快照**（原价 / 活动减免 / 券减免各字段），
+        // 退款读快照而不是重算——这正是 M12 的兑现点。
         const won = await this.orderService.transitionInTx(
           tx,
           order.id,

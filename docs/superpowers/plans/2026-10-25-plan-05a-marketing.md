@@ -102,6 +102,15 @@ merchant-admin/src/app/(dashboard)/
 | 6 | Task 2 的「门槛为 0 = 无门槛」用例**自相矛盾**：`originalAmount: 1` + `value: 1000` 断言优惠 1000、实付 0，与「满减额不能把金额减成负数」冲突 | 引擎行为正确（封顶到 1），改的是断言 | Task 2 |
 | 7 | **M15 的失败注入测不出来**：原用例的 `NOW` 与真实时钟仅差 9 小时，有效期窗口覆盖两种时刻，变异后 26 例全绿 | 把测试时间改到 2019 年（真实时钟永远到不了），并补一条「只改 `context.now` 就换判定结果」的专用断言 | Task 2 |
 | 8 | `prisma migrate diff` 仍会输出 3 条 `DROP INDEX`（`payments_provider_txn_uniq` 与两条 `products_*_trgm`） | 迁移文件里剔除它们（它们是手写索引，被 diff 误判为漂移） | Task 1（迁移） |
+| 9 | 计划 §3.3 的 `upsert` 写法与**同一页**「租户扩展禁止 upsert」的注解自相矛盾 | 照 §3.3 写会撞 `TenantScopeError`。按注解实现：先 `findFirst` 再 `create`/`updateMany` | Task 3（领取） |
+| 10 | 计划 §3.4 的 `createCoupon` 读 `context.tenantId` —— **平台超管的 `tenantId` 恒为 null** | 照抄则平台超管永远建不了券，与 §3.1「平台超管创建的券 scope 才是 PLATFORM」的用例冲突。拆出 `POST /platform/coupons`（`@Roles(PLATFORM_ADMIN)`），平台券走独立的 controller | Task 3 |
+| 11 | schema 里 `CouponClaim` **只有标量 `couponId`，没有 coupon 关系** | 计划 §4.5 的 `include: { coupon: ... }` 编译不过。Task 4 要改成分两步查（或补 schema 关系） | Task 4 |
+| 12 | `TenantPrismaService` 上**没有 `$queryRaw`**（阶段 1 刻意移除的） | M15 要用数据库的 `now()` → 加一个窄 wrapper `databaseNow()`（只查 `now()`，不裸暴露 `$queryRaw`） | Task 3 |
+| 13 | M15 的失败注入「测不出来」：本机两个时钟只差 1ms，原写法区分不了 | 把**应用时钟冻到 2019 年**（券的有效期窗口跨两个时钟）即可区分。⚠️ 必须**先冻结再注册**（否则 JWT 验签用 `Date.now()` 会失败）；且 `Date` 的静态 `now`/`parse`/`UTC` 要一并替换，否则 BullMQ 在 `app.close()` 时报 `Date.now is not a function` | Task 3 |
+| 14 | 计划 §5.1 的 `releaseInTx` 伪码是 `updateMany({ where: { id: couponId } })` 直接改计数，**没做 scope 分流** | 平台券的计数在**平台租户的行**上，租户作用域的 `updateMany` 改不到 → 平台券的 `reservedCount` 永远减不回去。实现按 `scope` 分流（PLATFORM 走 `platformScope()`，where 必带 `scope: PLATFORM`） | Task 5 |
+| 15 | 计划 §5.1 只给了「两处结果一致」的断言形态 | 「释放与改状态同一事务」这条护栏**测不出来**——要额外补「释放失败时订单不能已经 CANCELLED」的结构性断言 | Task 5 |
+| 16 | 设计 §3.3 的 `CouponRedemption` **没有 `scope` 字段** | 释放/核销时只能现查券的作用域（多一次查询）。若将来平台券要按租户归属统计，这里需要加字段 | Task 5 |
+| 17 | `releaseReservationInTx` 原本有「没有订单项就提前 return」 | 无订单项的订单用着的券**不会被释放** → 去掉那个提前 return | Task 5 |
 
 ### 0.6 护栏对照表（验收以这张表为准）
 
