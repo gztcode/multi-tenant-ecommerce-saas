@@ -40,6 +40,9 @@ export default async function StorefrontHome() {
         <Link href="/orders" className="underline">
           我的订单
         </Link>
+        <Link href="/account/addresses" className="underline">
+          地址
+        </Link>
         <Link href="/account" className="underline">
           账户
         </Link>

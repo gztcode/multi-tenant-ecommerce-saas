@@ -13,6 +13,26 @@
  */
 
 /**
+ * 字段名 → 中文名。
+ *
+ * ⚠️ **错误消息要直接显示给用户**——界面上出现「receiver 必须是非空字符串」
+ * 对中文用户毫无意义（阶段 4 勘误第 20 条）。
+ */
+const FIELD_LABELS: Record<string, string> = {
+  receiver: '收件人',
+  phone: '手机号',
+  province: '省份',
+  city: '城市',
+  district: '区 / 县',
+  detail: '详细地址',
+};
+
+/** 字段名的中文显示名（未知字段原样返回） */
+export function fieldLabel(field: string): string {
+  return FIELD_LABELS[field] ?? field;
+}
+
+/**
  * 按白名单重建地址请求体。
  *
  * 逐个字段确认类型而不是整体透传：后端 ValidationPipe 开了
@@ -31,7 +51,7 @@ export function sanitizeAddressBody(body: Record<string, unknown>): {
     const value = body[field];
     if (value === undefined) continue;
     if (typeof value !== 'string' || value.trim() === '') {
-      return { ok: false, message: `${field} 必须是非空字符串` };
+      return { ok: false, message: `${fieldLabel(field)} 必须是非空字符串` };
     }
     sanitized[field] = value.trim();
   }

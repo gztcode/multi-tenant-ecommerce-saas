@@ -2,13 +2,18 @@
 
 前后端完全分离的多租户电商底座。一个实例服务多个商家：每个商家有自己的店铺、商品、订单与客户。
 
-**当前进度：阶段 3「交易链路」已完成并验收通过（有条件通过，附 1 项功能缺口与 1 项已修的真 bug）。**
-阶段 3 打通了「购物车 → 下单（库存预占）→ 支付 → 发货 → 确认收货 → 退款 → 超时释放」整条闭环。
+**当前进度：阶段 4「前端补齐与打磨」已完成并验收通过（有条件通过）。**
+阶段 4 补上了四件事：**storefront 的前端组件测试基建**（Vitest + jsdom + Testing Library）、
+**merchant-admin 的访问令牌自动刷新**（此前 2 小时后后台整体不可用）、**消费者侧的地址簿独立页**
+（`/account/addresses`）、**主题改动在前台实时生效**（不刷新页面，30 秒内变色）。
+后端**一行未改**（e2e 282 条、单元测试 102 条，与阶段 3 完全一致）。
+
 验收记录见
+[`docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md`](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md)；
+阶段 3 的验收记录见
 [`docs/superpowers/plans/2026-10-24-plan-03-acceptance.md`](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md)；
-阶段 2b 的验收记录见
-[`docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md)；
-阶段 2a 与阶段 1 的见
+阶段 2b / 2a / 1 的见
+[`2026-10-22-plan-02b-acceptance.md`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md) /
 [`2026-10-22-plan-02a-acceptance.md`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md) /
 [`2026-10-21-plan-01-acceptance.md`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md)。
 
@@ -119,9 +124,13 @@ npm run test:cov:e2e  # 项目真实覆盖率
 其中 `storefront` 与 `merchant-admin` 另有单元测试（Vitest）：
 
 ```bash
-cd merchant-admin && npm test   # 50 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）
-cd storefront    && npm test   # 45 条：主题 token 的键名白名单、购物车金额计算、订单白名单
+cd merchant-admin && npm test   # 75 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 令牌刷新（13 + 12）
+cd storefront    && npm test   # 120 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）
 ```
+
+> ⚠️ **组件测试只在 `storefront` 上有基建**（`vitest.config.ts` + `test/setup.ts`）。
+> `merchant-admin` 还没有 —— 这直接导致 `merchant-admin/src/auth.ts` 的
+> `jwt` 回调**零自动化覆盖**（详见阶段 4 验收记录 §四）。
 
 详见两个项目各自的 README「单元测试」一节。
 
@@ -173,7 +182,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 - 设计文档：[`docs/superpowers/specs/2026-10-21-multi-tenant-ecommerce-saas-design.md`](docs/superpowers/specs/2026-10-21-multi-tenant-ecommerce-saas-design.md)
 - 实施计划：[`docs/superpowers/plans/`](docs/superpowers/plans/)
-- 验收记录：[`阶段 1`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md) / [`阶段 2a`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md) / [`阶段 2b`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md) / [`阶段 3`](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md)
+- 验收记录：[`阶段 1`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md) / [`阶段 2a`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md) / [`阶段 2b`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md) / [`阶段 3`](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md) / [`阶段 4`](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md)
 
 ---
 
@@ -204,17 +213,34 @@ node tools/push-via-api.mjs <本地分支> <远端分支>
 | 计划 2a | 商品中心后端 —— **已完成并验收通过** |
 | 计划 2b | 商品中心前端：主题 token、storefront 浏览页、商家后台 —— **已完成并验收通过** |
 | 计划 3 | 交易链路：购物车 → 库存 → 订单 → 支付 —— **已完成并验收通过** |
-| 计划 4 | 前端补齐与体验打磨、营销、平台计费与平台超管的完整实现 |
+| 计划 4 | 前端补齐与打磨 —— **已完成并验收通过**（有条件通过） |
+| 计划 5 | 修阶段 4 挖出来的问题、营销、平台计费与平台超管的完整实现 |
 
-阶段 3 验收发现的下一阶段优先项（详见
-[验收记录 §七](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md)）：
+阶段 4 验收发现的下一阶段优先项（详见
+[验收记录 §七](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md)）：
 
-1. **补「加入购物车」的界面入口** —— 优先级最高：后端与中转路由都在，但 storefront
-   的商品列表/详情/搜索页**都没有「加入购物车」按钮**，购物车在真实用户路径上进不去。
-2. **给 e2e 的队列做隔离** —— 否则每次跑 e2e 都要先停 api 容器，会持续制造
-   「实测报缺陷、复现不出来」的假象。
-3. **地址簿的独立页面** —— 现在的地址只能在结算页里加，改默认地址要进结算页。
-4. **购物车金额改成服务端实时价** —— 现在页面上的合计是估算值（当前价 × 数量），
-   下单时按实时价重算。
-5. **退货入库流程** —— 退款不回补库存是有意的取舍，但配套的退货入库始终没实现。
-6. **跨店会员** —— 等有了会员体系的需求再动。
+1. **修多标签页的「先后」刷新竞态** —— 优先级最高：本阶段实测发现，**商家只要同时开
+   两个后台标签页就会被踢出登录**（旧 refreshToken 被判成「真正的重放」→
+   吊销全设备登录）。需要后端配合：给轮换后的旧令牌一个**宽限期**，
+   或提供**幂等刷新端点**。
+2. **给 `merchant-admin` 补组件测试基建** —— 不补这套基建，`auth.ts` 的 `jwt` 回调
+   **永远测不了**（失败注入 #6 / #8 证明：把「过期时刷新」整段删掉，75 条测试全绿）。
+   护栏 3 / 5 现在只有手测在守。
+3. **把分组标量（字阶 / 间距 / 阴影 / 字重）在前台接上消费者** —— 商家改这些值，
+   前台**纹丝不动且无提示**（实测 `--text-base` 变了，渲染出来的字号没变）。
+   要么在 `@theme inline` 里补上映射，要么**先把这些输入框在前台隐藏掉**。
+4. **修字体 token 在服务端就失效** —— `@layer theme{...--font-sans:var(--font-sans)}`
+   是循环引用，`--font-geist-sans` 又只挂在 `<body>` 上 → **商家改字体前台从来没生效过**。
+   要两端一起改。
+5. **统一前台的错误处理** —— 后端挂掉时页面把 Node 原始错误串 `fetch failed`
+   显示给了用户，没有重试按钮。
+6. **给商家后台做主题实时预览** —— 商家改主色时**自己都看不到变化**，
+   只能切到另一个标签页看前台。
+7. **给 e2e 的队列做隔离 + 每轮清库** —— 否则每次跑 e2e 都要先停 api 容器，
+   会持续制造「实测报缺陷、复现不出来」的假象。
+8. **退货入库流程** —— 退款不回补库存是有意的取舍，但配套的退货入库始终没实现。
+9. **跨店会员** —— 等有了会员体系的需求再动。
+
+阶段 3 遗留、本阶段仍未解决的（详见阶段 4 验收记录 §六）：
+跨店会员不支持、游客订单查不到、退款不回补库存、购物车金额是估算值、
+`20261022071848_add_sku_stock_version` 迁移在全新库上会失败（不要动它）。

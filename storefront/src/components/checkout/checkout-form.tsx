@@ -2,9 +2,9 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { AddressForm } from '@/components/address/address-form';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
 import {
   formatAddress,
   itemSubtotal,
@@ -215,6 +215,7 @@ export function CheckoutForm({
 
         {showAddressForm && (
           <AddressForm
+            mode="create"
             onCreated={(address) => {
               setAddressesAndSelect(address);
             }}
@@ -261,122 +262,6 @@ export function CheckoutForm({
 
       <Button type="submit" disabled={busy || !idempotencyKey}>
         {busy ? '提交中…' : '提交订单'}
-      </Button>
-    </form>
-  );
-}
-
-/**
- * 新增收货地址的表单。
- *
- * 独立成一个组件是因为它有自己的一套表单状态，与结算表单的状态互不干扰
- * （结算表单在提交时不能被地址表单的重渲染带偏）。
- */
-function AddressForm({ onCreated }: { onCreated: (address: Address) => void }) {
-  const [form, setForm] = useState({
-    receiver: '',
-    phone: '',
-    province: '',
-    city: '',
-    district: '',
-    detail: '',
-  });
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  function update(field: keyof typeof form, value: string) {
-    setForm((prev) => ({ ...prev, [field]: value }));
-  }
-
-  async function submit(event: React.FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError(null);
-
-    try {
-      const response = await fetch('/api/addresses', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(form),
-      });
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => ({}))) as {
-          message?: string;
-        };
-        throw new Error(payload.message ?? '新增地址失败');
-      }
-      const address = (await response.json()) as Address;
-      onCreated(address);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '新增地址失败');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <form onSubmit={submit} className="flex flex-col gap-2 rounded-md border p-3">
-      <div className="grid gap-2 md:grid-cols-2">
-        <div className="flex flex-col gap-1">
-          <Label htmlFor="receiver">收件人</Label>
-          <Input
-            id="receiver"
-            value={form.receiver}
-            onChange={(event) => update('receiver', event.target.value)}
-            required
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <Label htmlFor="phone">手机号</Label>
-          <Input
-            id="phone"
-            value={form.phone}
-            onChange={(event) => update('phone', event.target.value)}
-            required
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <Label htmlFor="province">省份</Label>
-          <Input
-            id="province"
-            value={form.province}
-            onChange={(event) => update('province', event.target.value)}
-            required
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <Label htmlFor="city">城市</Label>
-          <Input
-            id="city"
-            value={form.city}
-            onChange={(event) => update('city', event.target.value)}
-            required
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <Label htmlFor="district">区 / 县</Label>
-          <Input
-            id="district"
-            value={form.district}
-            onChange={(event) => update('district', event.target.value)}
-            required
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <Label htmlFor="detail">详细地址</Label>
-          <Input
-            id="detail"
-            value={form.detail}
-            onChange={(event) => update('detail', event.target.value)}
-            required
-          />
-        </div>
-      </div>
-
-      {error && <p className="text-sm text-destructive">{error}</p>}
-
-      <Button type="submit" variant="outline" disabled={busy} className="self-start">
-        {busy ? '保存中…' : '保存地址'}
       </Button>
     </form>
   );

@@ -57,12 +57,12 @@ describe('sanitizeAddressBody：地址请求体的白名单重建', () => {
 
   it('空串的字段被拒，并说清是哪个字段', () => {
     const result = sanitizeAddressBody({ receiver: '   ', phone: '13800000000' });
-    expect(result).toEqual({ ok: false, message: 'receiver 必须是非空字符串' });
+    expect(result).toEqual({ ok: false, message: '收件人 必须是非空字符串' });
   });
 
   it('非字符串的字段被拒', () => {
     const result = sanitizeAddressBody({ receiver: 123 });
-    expect(result).toEqual({ ok: false, message: 'receiver 必须是非空字符串' });
+    expect(result).toEqual({ ok: false, message: '收件人 必须是非空字符串' });
   });
 
   it('isDefault 是布尔值时收下', () => {
