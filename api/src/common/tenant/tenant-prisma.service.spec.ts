@@ -1,6 +1,6 @@
 import { TenantPrismaService } from './tenant-prisma.service';
 import { TenantScopeError } from './tenant-scope.error';
-import { TENANT_SCOPED_MODELS } from './tenant-models';
+import { SOFT_DELETE_MODELS, TENANT_SCOPED_MODELS } from './tenant-models';
 import {
   TenantContextValue,
   platformScope,
@@ -544,5 +544,28 @@ describe('租户隔离版 PrismaClient', () => {
   it('webhook 幂等表不登记进白名单：它是渠道事件的数据，租户从订单反查', () => {
     // 反向断言，锁住一个刻意的决定。
     expect(TENANT_SCOPED_MODELS.has('PaymentWebhookEvent')).toBe(false);
+  });
+
+  it('阶段 5a 的新表全部登记在租户作用域白名单里', () => {
+    // 漏登记的后果是「那张表的所有读写都不附加 tenantId 条件」——
+    // 彻底失去隔离且没有任何报错。所以这条断言守着它。
+    const expected = ['Coupon', 'CouponClaim', 'CouponRedemption', 'Promotion'];
+    for (const model of expected) {
+      expect(TENANT_SCOPED_MODELS.has(model)).toBe(true);
+    }
+  });
+
+  it('券与活动走软删：软删后商家还能查历史核销记录', () => {
+    // 券是营销配置，商家可能想「下架」但保留历史核销记录的可追溯性。
+    expect(SOFT_DELETE_MODELS.has('Coupon')).toBe(true);
+    expect(SOFT_DELETE_MODELS.has('Promotion')).toBe(true);
+  });
+
+  it('领取记录与核销记录不软删：它们是财务凭证', () => {
+    // ⚠️ **反向断言**，锁住一个刻意的决定。
+    // 核销记录软删掉的话，「这张券被用掉了」这件事就没了——
+    // 对账时无法回答「用户手里的券为什么不见了」。
+    expect(SOFT_DELETE_MODELS.has('CouponClaim')).toBe(false);
+    expect(SOFT_DELETE_MODELS.has('CouponRedemption')).toBe(false);
   });
 });

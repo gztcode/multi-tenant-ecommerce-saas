@@ -543,6 +543,24 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
     return this.client.paymentWebhookEvent;
   }
 
+  // ------- 营销（计划 5a）模型 delegate 代理 -------
+
+  get coupon() {
+    return this.client.coupon;
+  }
+
+  get couponClaim() {
+    return this.client.couponClaim;
+  }
+
+  get couponRedemption() {
+    return this.client.couponRedemption;
+  }
+
+  get promotion() {
+    return this.client.promotion;
+  }
+
   // ------- PrismaClient 实例级方法代理 -------
   // $connect / $disconnect 由生命周期钩子分别调用，
   // 这里仍然透传出来让服务消费者可以手动关闭连接（例如测试用例）。
