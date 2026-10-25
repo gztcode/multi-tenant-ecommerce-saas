@@ -21,6 +21,8 @@ import { clampPagination } from '../../common/http/pagination';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
 import { PAYMENT_TIMEOUT_QUEUE } from '../../common/queue/queue.constants';
 import { QueueService } from '../queue/queue.service';
+import { CouponService } from '../coupon/coupon.service';
+import { CouponRedemptionService } from '../coupon/coupon-redemption.service';
 import { OrderInventoryService } from './inventory.service';
 import { canTransition } from './order-status';
 import {
@@ -67,6 +69,8 @@ export class OrderService {
     private readonly prisma: TenantPrismaService,
     private readonly inventory: OrderInventoryService,
     private readonly queue: QueueService,
+    private readonly coupon: CouponService,
+    private readonly couponRedemption: CouponRedemptionService,
   ) {}
 
   /**
@@ -257,6 +261,12 @@ export class OrderService {
     // 否则锁 SKU 时会对同一个 id 执行两次 FOR UPDATE（见 inventory.service.ts）。
     const merged = mergeItems(dto.items);
 
+    // ⚠️ **下单必须登录**（placeOrder 里已经用 requireCustomerId 校验过，
+    // 游客下单在这里根本走不到）。这里再收一次窄，让下面不用写
+    // `customerId!` 这种非空断言——券的领取记录要记 customerId，
+    // 写成非空断言的话，类型系统就不再提醒「这里可能没有用户」。
+    const owner = this.requireCustomerId(customerId);
+
     // ---- 4a. 锁 SKU ----
     //
     // ⚠️ **锁必须先于「读价格」**（设计 §5.1 的顺序：锁 → 校验 → 建单）。
@@ -280,7 +290,53 @@ export class OrderService {
       merged.map((item) => item.skuId),
     );
 
-    // ---- 4c. 建订单 ----
+    // ---- 4c. **算优惠**（插在锁 SKU 之后）----
+    //
+    // ⚠️ **优惠计算必须在「锁 SKU 之后」**（设计文档 §五）：
+    // 券的门槛与活动都要按**实时价**判定，而实时价只有在锁住 SKU 之后才稳定。
+    //
+    // ⚠️ 优惠计算与券的核销在**同一个事务**里（与建单一起）：
+    // 券的额度被占住与订单被创建必须同生共死。
+    // ⚠️ **一次遍历同时算出原价小计与引擎要的 SKU 明细**：
+    // 两者用的是同一份锁内读到的实时价，分开算就得写两遍取详情的代码，
+    // 迟早会漂移（改了一处忘了另一处）。
+    const pricedItems: Array<{
+      skuId: string;
+      quantity: number;
+      price: number;
+    }> = [];
+    let originalAmount = 0;
+    for (const item of merged) {
+      const detail = skuDetails.get(item.skuId);
+      // 读不到详情说明 SKU 不存在或跨租户 —— 前面已经查过并抛错了，
+      // 这里必然拿得到。⚠️ 用显式抛错而不是 `?? 0`：静默按 0 计价
+      // 会让订单金额变成 0，比报错难查得多。
+      if (!detail) {
+        throw new NotFoundException('SKU 不存在或不可售');
+      }
+      pricedItems.push({
+        skuId: item.skuId,
+        quantity: item.quantity,
+        price: detail.price,
+      });
+      originalAmount += detail.price * item.quantity;
+    }
+
+    const discount = await this.coupon.computeForOrder({
+      tenantId,
+      customerId: owner,
+      originalAmount,
+      items: pricedItems,
+      requestedCouponId: dto.couponId,
+    });
+
+    // ⚠️ **下单前再校验一次实付不为负**（M6）：
+    // 引擎保证了它，但这里是最后一道闸——负金额订单会破坏账目。
+    if (discount.payableAmount < 0) {
+      throw new BadRequestException('优惠计算结果异常，请重试');
+    }
+
+    // ---- 4d. 建订单（含优惠快照字段）----
     //
     // ⚠️ **订单号唯一冲突的重试在事务外做**（见 placeOrder 的循环）：
     // P2002 让 PostgreSQL 事务进入 aborted 状态，事务内重试必然失败。
@@ -294,9 +350,20 @@ export class OrderService {
       idempotencyKey: dto.idempotencyKey,
       merged,
       skuDetails,
+      // ⚠️ **金额只由引擎算出来**（M1 / M2 / M6）：
+      // `totalAmount` 是**实付**（支付链路读的是它，见 payment.service.ts），
+      // `originalAmount` 存优惠前的原价。
+      payableAmount: discount.payableAmount,
+      originalAmount,
+      promotionDiscountAmount: discount.promotionDiscountAmount,
+      promotionId: discount.appliedPromotion?.id ?? null,
+      couponDiscountAmount: discount.couponDiscountAmount,
+      couponId: discount.appliedCoupon?.id ?? null,
+      couponCode: discount.appliedCoupon?.code ?? null,
+      couponName: discount.appliedCoupon?.name ?? null,
     });
 
-    // ---- 4d. 扣库存 + 记 RESERVE 流水 ----
+    // ---- 4e. 扣库存 + 记 RESERVE 流水 ----
     //
     // 校验、扣库存、记流水都在 `reserveInTx` 里（Task 3 写的）：
     // 行锁、排序加锁、stockVersion 条件、以及「未冲抵预占量」的校验都在那边。
@@ -306,6 +373,24 @@ export class OrderService {
       order.id,
       merged.map((item) => ({ skuId: item.skuId, quantity: item.quantity })),
     );
+
+    // ---- 4f. **预占券的核销** ----
+    //
+    // ⚠️ **在建单之后、事务提交之前**：
+    // 建单失败 → 整个事务回滚 → 券没被占住；
+    // 券占不住 → 整个事务回滚 → 订单没建成。这就是「同生共死」。
+    if (discount.appliedCoupon) {
+      await this.couponRedemption.reserveInTx(tx, {
+        tenantId,
+        couponId: discount.appliedCoupon.id,
+        customerId: owner,
+        orderId: order.id,
+        discountAmount: discount.couponDiscountAmount,
+        // ⚠️ **平台券的计数快照在平台租户的那一行上**——
+        // 核销服务要按它选更新口径（租户作用域 / 平台作用域）。
+        scope: discount.appliedCoupon.scope,
+      });
+    }
 
     return order;
   }
@@ -337,20 +422,22 @@ export class OrderService {
       idempotencyKey?: string;
       merged: Array<{ skuId: string; quantity: number }>;
       skuDetails: Map<string, SkuDetail>;
+      /** 实付金额（整数分）——由优惠引擎算出来，**不是**这里重算的 */
+      payableAmount: number;
+      /** 优惠前的原价小计（整数分） */
+      originalAmount: number;
+      /** 满减活动减免（整数分） */
+      promotionDiscountAmount: number;
+      promotionId: string | null;
+      /** 优惠券减免（整数分） */
+      couponDiscountAmount: number;
+      couponId: string | null;
+      couponCode: string | null;
+      couponName: string | null;
     },
   ): Promise<Order> {
     const { merged, skuDetails, ...rest } = input;
 
-    const totalAmount = merged.reduce((sum, item) => {
-      const detail = skuDetails.get(item.skuId);
-      // 读不到详情说明 SKU 不存在或跨租户 —— 前面已经查过并抛错了，
-      // 这里必然拿得到。⚠️ 用显式抛错而不是 `?? 0`：静默按 0 计价
-      // 会让订单金额变成 0，比报错难查得多。
-      if (!detail) {
-        throw new NotFoundException('SKU 不存在或不可售');
-      }
-      return sum + detail.price * item.quantity;
-    }, 0);
     const itemCount = merged.reduce((sum, item) => sum + item.quantity, 0);
 
     const order = await tx.order.create({
@@ -359,7 +446,19 @@ export class OrderService {
         orderNo: generateOrderNo(),
         customerId: rest.customerId,
         status: OrderStatus.PENDING_PAYMENT,
-        totalAmount,
+        // ⚠️ **`totalAmount` 是实付**（设计文档 §3.5 / 勘误表第 1 条）：
+        // 支付链路的金额核对读的就是它（payment.service.ts 的
+        // `event.amount !== order.totalAmount`），所以优惠后的实付写在这里，
+        // 支付金额自动就是实付额。
+        totalAmount: rest.payableAmount,
+        // ⚠️ **优惠前的原价小计**（快照）
+        originalAmount: rest.originalAmount,
+        promotionDiscountAmount: rest.promotionDiscountAmount,
+        promotionId: rest.promotionId,
+        couponDiscountAmount: rest.couponDiscountAmount,
+        couponId: rest.couponId,
+        couponCode: rest.couponCode,
+        couponName: rest.couponName,
         itemCount,
         // ⚠️ **支付期限与队列的延迟窗口一致**（15 分钟，设计 §九）。
         //
@@ -668,10 +767,14 @@ export class OrderService {
   }
 
   /**
-   * 释放订单的预占（库存还回去 + 记 RELEASE 流水）。
+   * 释放订单的预占（库存还回去 + 记 RELEASE 流水 + **释放券的核销**）。
    *
-   * ⚠️ **取消订单与支付超时释放共用这个函数**（设计 §5.4）。
-   * 两处各写一套逻辑必然漂移——这是「同一件事只有一处实现」的最朴素的应用。
+   * ⚠️ **取消订单与支付超时释放共用这个函数**（M9，设计文档 §5.1）。
+   * 两处各写一套「释放」逻辑必然漂移——比如改了取消却忘了改超时释放，
+   * 就会出现「取消的订单库存没还回去、券还占着」。
+   *
+   * ⚠️ **库存与券的释放必须在同一个事务里**：订单已取消而券还占着，
+   * 用户的券就再也用不了（M8）。
    *
    * ⚠️ **刻意不提供「自己开事务」的版本**：调用方必须在自己的事务里
    * 组合「条件更新状态 + 释放预占」。分成两个事务的话，
@@ -690,10 +793,15 @@ export class OrderService {
       where: { orderId },
       select: { skuId: true, quantity: true },
     });
-    if (items.length === 0) {
-      return;
+    if (items.length > 0) {
+      await this.inventory.releaseInTx(tx, orderId, items);
     }
-    await this.inventory.releaseInTx(tx, orderId, items);
+
+    // ⚠️ **释放券的核销**（设计文档 §5.1）：
+    // 核销从 RESERVED 转 RELEASED、券的 reservedCount 减 1。
+    // ⚠️ **不能因为没有订单项就提前 return**——没订单项的订单
+    // 同样可能用着券（订单项是库存维度的，券是金额维度的）。
+    await this.couponRedemption.releaseInTx(tx, orderId);
   }
 
   /**

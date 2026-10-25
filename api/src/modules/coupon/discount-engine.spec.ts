@@ -61,6 +61,10 @@ function coupon(
     value: 1000,
     minAmount: 5000,
     ...WINDOW,
+    // ⚠️ 引擎**不用**这两个字段（适用范围在 service 层查询时就过滤了），
+    // 它们随候选一路带到核销环节。测试里给默认值即可。
+    scope: 'SHOP' as const,
+    tenantId: 'tenant-1',
     ...overrides,
   };
 }

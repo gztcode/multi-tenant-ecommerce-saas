@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
+import { CouponModule } from '../coupon/coupon.module';
 import { OrderInventoryService } from './inventory.service';
 import { OrderService } from './order.service';
 import { OrderTimeoutService } from './order-timeout.service';
@@ -20,13 +21,17 @@ import { MerchantOrderController } from './merchant-order.controller';
  * Passport 策略（JwtStrategy 由 AuthModule 提供）。
  * QueueModule 是 `@Global()`，QueueService 在任何模块里都能直接注入。
  *
+ * ⚠️ **导入 CouponModule**（阶段 5a Task 4）：下单要调 `computeForOrder`
+ * 与预占核销。模块依赖方向是 `order` → `coupon`（单向）——
+ * 反过来（coupon import order）会造成循环依赖。
+ *
  * 导出服务：
  * - `OrderService`：Task 5 的 payment 模块要调它把订单转 `PAID` / `REFUNDED`
  *   （依赖方向 `payment → order`，单向）
  * - `OrderInventoryService`：Task 5 的支付成功要调 `deductInTx` 确认售出
  */
 @Module({
-  imports: [AuthModule],
+  imports: [AuthModule, CouponModule],
   controllers: [OrderController, MerchantOrderController],
   providers: [
     OrderInventoryService,

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { OrderModule } from '../order/order.module';
+import { CouponModule } from '../coupon/coupon.module';
 import { PaymentController } from './payment.controller';
 import { WebhookController } from './webhook.controller';
 import { FakePaymentController } from './fake-payment.controller';
@@ -24,6 +25,12 @@ import { PAYMENT_PROVIDERS } from './payment.constants';
  * （流转订单）→ **循环依赖**。所以退款端点归 payment 模块，
  * order 只提供状态流转能力。
  *
+ * ⚠️ **导入 CouponModule**（阶段 5a Task 5）：支付成功时要确认券的核销
+ * （`RESERVED` → `USED`）。依赖方向是 `payment → coupon`（单向）——
+ * `coupon` 模块**不**依赖 `payment` 也不依赖 `order`，
+ * 所以 `payment → coupon`、`order → coupon`、`payment → order`
+ * 三条边都不构成环。
+ *
  * ## 渠道注册
  *
  * ⚠️ 渠道表用 `Map` 而不是逐个注入具体的 provider 类：
@@ -31,7 +38,7 @@ import { PAYMENT_PROVIDERS } from './payment.constants';
  * 而 `Map` 让「按渠道名找 provider」不需要 switch/if 链。
  */
 @Module({
-  imports: [AuthModule, OrderModule],
+  imports: [AuthModule, OrderModule, CouponModule],
   controllers: [PaymentController, WebhookController, FakePaymentController],
   providers: [
     PaymentService,
