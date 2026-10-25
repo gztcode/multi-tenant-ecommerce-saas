@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { ORDER_STATUS_LABEL, consumerActions } from '@/lib/cart';
+import { formatPrice } from '@/lib/format';
 import type { Order, OrderStatus } from '@/lib/cart';
 
 /**
@@ -158,6 +159,30 @@ export function OrderDetail({ initial }: { initial: Order }) {
       <section className="flex flex-col gap-2">
         <h3 className="font-semibold">支付信息</h3>
         <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+          {/* ⚠️ **优惠快照**（护栏 M12）：这三行显示的是**下单那一刻**
+              算出来的金额，不是现在重新算的。券的规则改了、券被删了，
+              历史订单的金额都不受影响——所以它们是订单上的快照字段。 */}
+          {initial.originalAmount > initial.totalAmount && (
+            <>
+              <dt className="text-muted-foreground">商品原价</dt>
+              <dd>{formatPrice(initial.originalAmount)}</dd>
+              {initial.promotionDiscountAmount > 0 && (
+                <>
+                  <dt className="text-muted-foreground">活动减免</dt>
+                  <dd>-{formatPrice(initial.promotionDiscountAmount)}</dd>
+                </>
+              )}
+              {initial.couponDiscountAmount > 0 && (
+                <>
+                  <dt className="text-muted-foreground">优惠券</dt>
+                  <dd>
+                    -{formatPrice(initial.couponDiscountAmount)}
+                    {initial.couponName ? `（${initial.couponName}）` : ''}
+                  </dd>
+                </>
+              )}
+            </>
+          )}
           <dt className="text-muted-foreground">应付金额</dt>
           <dd>¥{(initial.totalAmount / 100).toFixed(2)}</dd>
           <dt className="text-muted-foreground">件数</dt>

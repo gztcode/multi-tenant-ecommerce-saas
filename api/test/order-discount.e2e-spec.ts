@@ -1059,6 +1059,45 @@ describe('下单优惠与券的预占核销 (e2e)', () => {
       expect(order.couponDiscountAmount).toBe(0);
       expect(order.totalAmount).toBe(7000);
     });
+
+    /**
+     * ⚠️ **这条是阶段 5a 验收时补的**（失败注入发现的真实缺陷）：
+     * 活动的选取原来只按「减免额最大」排序取一个，取到门槛没达成的那个时，
+     * 引擎判「门槛不满足」→ **整单没有活动优惠**，
+     * 而另一个门槛已达、减免额较小的活动被跳过了。
+     *
+     * 修法：先按门槛过滤掉没达标的，再在达标的活动里取减免额最大的。
+     */
+    it('多个活动同时生效：门槛已达的优先，哪怕它的减免额更小', async () => {
+      const merchant = await createMerchant(app, prisma);
+      const skuId = await publishSku(merchant.token, '两个活动的商品', 30_000);
+      await stockIn(merchant.token, skuId, 10);
+      const customer = await registerCustomer(merchant.subdomain);
+      const addressId = await createAddress(customer.token);
+
+      // 减免额更大但门槛没达到（30000 < 50000）
+      const big = await createPromotion(merchant.token, {
+        minAmount: 50_000,
+        discountAmount: 8888,
+      });
+      // 门槛已达到，但减免额更小
+      const small = await createPromotion(merchant.token, {
+        minAmount: 20_000,
+        discountAmount: 3000,
+      });
+
+      const response = await placeOrder(customer.token, {
+        addressId,
+        items: [{ skuId, quantity: 1 }],
+      }).expect(201);
+
+      const order = orderBody(response);
+      // ⚠️ 命中的必须是门槛已达的那个，而不是减免额更大的那个
+      expect(order.promotionId).toBe(small.id);
+      expect(order.promotionDiscountAmount).toBe(3000);
+      expect(order.totalAmount).toBe(27_000);
+      expect(big.id).not.toBe(small.id);
+    });
   });
 
   // ============================================================
@@ -1196,6 +1235,25 @@ describe('下单优惠与券的预占核销 (e2e)', () => {
         prisma.sku.findFirst({ where: { id: skuId } }),
       );
       expect(sku?.stock).toBe(9);
+
+      // ⚠️ **这两条是阶段 5a 验收时补的**（失败注入发现的测试缺口）：
+      // 原来只断言了订单数与库存，**没断言计数**。
+      // 失败注入把「改 reservedCount 的 updateMany」移出建单事务时，
+      // 这两条断言全绿，但库里已经分叉了（reservedCount=2 而 RESERVED 行只有 1）。
+      //
+      // 所以：第二单失败之后，**计数必须被回退**——
+      // 核销记录与计数是「同生共死」的，不只是订单与库存。
+      const couponRow = await asTenant(merchant.tenantId, () =>
+        prisma.coupon.findFirst({ where: { id: coupon.id } }),
+      );
+      expect(couponRow?.reservedCount).toBe(1);
+
+      const redemptions = await asTenant(merchant.tenantId, () =>
+        prisma.couponRedemption.findMany({
+          where: { couponId: coupon.id, status: 'RESERVED' },
+        }),
+      );
+      expect(redemptions).toHaveLength(1);
     });
   });
 

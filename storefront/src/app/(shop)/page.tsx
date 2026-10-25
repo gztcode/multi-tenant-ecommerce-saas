@@ -37,6 +37,9 @@ export default async function StorefrontHome() {
         <Link href="/cart" className="ml-auto underline">
           购物车
         </Link>
+        <Link href="/coupons" className="underline">
+          领券中心
+        </Link>
         <Link href="/orders" className="underline">
           我的订单
         </Link>

@@ -111,6 +111,14 @@ merchant-admin/src/app/(dashboard)/
 | 15 | 计划 §5.1 只给了「两处结果一致」的断言形态 | 「释放与改状态同一事务」这条护栏**测不出来**——要额外补「释放失败时订单不能已经 CANCELLED」的结构性断言 | Task 5 |
 | 16 | 设计 §3.3 的 `CouponRedemption` **没有 `scope` 字段** | 释放/核销时只能现查券的作用域（多一次查询）。若将来平台券要按租户归属统计，这里需要加字段 | Task 5 |
 | 17 | `releaseReservationInTx` 原本有「没有订单项就提前 return」 | 无订单项的订单用着的券**不会被释放** → 去掉那个提前 return | Task 5 |
+| 18 | **计划 §6 的文件清单漏了 `storefront/src/app/api/orders/route.ts`** —— 它的下单白名单只有 `addressId`/`items`/`idempotencyKey`/`remark`，**没有 `couponId`** | 结算页选了券 → 请求发到中转路由后 `couponId` 被**静默丢掉** → 后端收不到券 → **用户选了券却完全不生效，而且没有任何报错**。计划 §6.4 写了「提交时带上 `couponId`」，但清单里没有这个文件 | Task 6（前端） |
+| 19 | **后端没有「优惠预览」接口** —— 计划 §6.4 要求结算页显示四行金额，但「活动减」与「这张券实际减多少」前端无从得知 | 券的减免额**不等于面额**：面额按 `min(面额, 活动后金额)` 封顶、门槛按**活动后金额**判。前端自己算就要把优惠引擎的逻辑复制一份，两处必然漂移 → 新增 `GET /coupons/preview?originalAmount=<整数分>`，由**已有的纯函数引擎**算（候选券逐张算 + 全量取最优）。⚠️ `originalAmount` 是客户端传的**估算值**，只用于预览，下单时服务端按实时价重算（M17） | Task 6（后端补充） |
+| 20 | **`GET /coupons/mine` 不返回 per-user 状态** | 「我的券」分不出「已用掉」的券 → 结算页下拉会显示**选了必然 409** 的券 → `mine` 的每项增加 `used`（这个用户有没有核销过）与 `claimedQuantity`（领了几张）。⚠️ 核销记录的 `tenantId` 是**下单的那家店**（不是券的租户），所以租户作用域内查就能查全，平台券也一样 | Task 6（后端补充） |
+| 21 | 计划 §6.4 的下拉默认项是「**不使用优惠券**」 | 后端在没收到 `couponId` 时会**自动取最优券**（`computeForOrder`）→ 前端显示「不使用」却让后端自动用了券，界面上的实付和真实实付对不上（M17）。默认项改成「**自动选择最优**」（提交时不传 `couponId`） | Task 6（前端） |
+| 22 | 计划 §6.3 的 `couponUsable` 用 `originalAmount >= coupon.minAmount` 判门槛 | 与引擎**不一致**（引擎按**活动后金额**判）→ 前端会说一张券「可用」，点下去必然拿到后端 400「优惠券不可用」。判据改成后端算出的 `discountAmount > 0` | Task 6（前端） |
+| 23 | 计划 §6.3 的 `MyCoupon` 有 `usedQuantity` | 后端没有这个概念（券是「领了就是你的，用一次」，设计文档 §九.4）→ 改成 `used`（布尔） | Task 6（前端） |
+| 24 | 计划 §6.6 要建 `storefront/src/app/api/coupons/route.ts`（GET 中转） | **没有客户端消费者**：领券中心与结算页都是 Server Component，取数直接走 `lib/shop-api.ts`（与地址簿、订单列表同一套做法）→ 不建这个文件 | Task 6（前端） |
+| 25 | 计划 §6.4 留了个待定项：「改了券再提交会命中第一次的订单，**实施时把这个交互定清楚**」 | **决定：幂等键不改。** 改券重下会命中第一次的订单（幂等的正确语义），页面在**提交失败后**给一句提示说明这一点。⚠️ 反过来「改券就换键」更糟：第一次其实已经下单成功时，换键会变成**两个订单**抢同一批库存，第二个多半因库存被占而失败 | Task 6（前端） |
 
 ### 0.6 护栏对照表（验收以这张表为准）
 
@@ -2622,11 +2630,21 @@ git commit -m "feat(api): 取消与支付超时时释放券的核销
 - Modify: `storefront/src/components/checkout/checkout-form.tsx`
 - Create: `storefront/src/app/(shop)/coupons/page.tsx`
 - Create: `storefront/src/components/coupon/coupon-list.tsx`
-- Create: `storefront/src/app/api/coupons/route.ts`（中转）
 - Create: `storefront/src/app/api/coupons/claim/route.ts`（中转）
+- Modify: `storefront/src/app/api/orders/route.ts`（**下单白名单加 `couponId`** —— 勘误表第 18 条，清单里原本漏了）
+- Modify: `storefront/src/lib/shop-api.ts`（取数：预览、可领取的券、我的券）
 - Modify: `storefront/src/components/order/order-detail.tsx`（显示优惠快照）
 - Test: `storefront/test/lib/coupon.test.ts`
 - Test: `storefront/test/app/api/coupon-whitelist.test.ts`
+- Test: `storefront/test/components/coupon/coupon-list.test.tsx`
+
+> ✅ **实施时补了后端的两处缺口**（勘误表第 19、20 条）：
+> - `api/src/modules/coupon/coupon.service.ts` 新增 `preview()`，
+>   `coupon.controller.ts` 新增 `GET /coupons/preview`；
+>   `computeForOrder` 与 `preview` 抽出 `buildDiscountContext()` 复用
+>   （两边要算的是同一件事，不共用就会出现「预览减 20、下单减 0」）。
+> - `listMine()` 的每项增加 `used` / `claimedQuantity` 两个字段。
+> - Test: `api/test/coupon-preview.e2e-spec.ts`
 
 ### 6.1 约束（阶段 2b / 3 / 4 踩过的坑）
 
@@ -2941,6 +2959,13 @@ export function couponUsable(
 > 它与服务端用数据库时钟的判定（M15）**可能不一致**（边界时刻）。
 > 这是刻意的：前端只是**少显示**一张券，真正能不能用由后端说了算。
 > 代码注释里写清楚这一点，别让后来的人以为它与 M15 矛盾。
+>
+> ⚠️ **实施时改掉了（勘误表第 22 条）**：上面这个写法按
+> `originalAmount >= coupon.minAmount` 判门槛，与引擎**不一致**——
+> 引擎按**活动后金额**判（`afterPromotion < coupon.minAmount` 就不满足）。
+> 有满减活动时两边会给出相反的结论：前端说「可用」，点下去必然拿到
+> 后端 400「优惠券不可用」。
+> 改用后端算好的 `discountAmount > 0` 作判据——**前端不再自己判门槛**。
 
 ### 6.4 改结算页
 
@@ -2965,7 +2990,7 @@ export function couponUsable(
             onChange={(event) => setCouponId(event.target.value)}
             className="rounded-md border p-2 text-sm"
           >
-            <option value="">不使用优惠券</option>
+            <option value="">自动选择最优</option>
             {usableCoupons.map((coupon) => (
               <option key={coupon.id} value={coupon.id}>
                 {coupon.name}（减 {formatPrice(coupon.value)}
@@ -2992,6 +3017,12 @@ export function couponUsable(
         }),
 ```
 
+> ✅ **实施时改了默认项（勘误表第 21 条）**：默认项不能是「不使用优惠券」。
+> 后端在没收到 `couponId` 时会**自动取最优券**（`computeForOrder`），
+> 前端显示「不使用」却让后端自动用了券，界面上的实付和真实实付就对不上（M17）。
+> 默认项改成「自动选择最优」，提交时**不传** `couponId`；
+> 用户手动选了某张券才传它的 id。
+
 > ⚠️ **结算页显示的优惠是「估算值」**（M17）：
 > 结算页按购物车的当前金额算一个预览，但**真实金额由后端在下单时算**
 > （下单时 SKU 价格可能已经变了）。所以页面要有一行提示：
@@ -3009,6 +3040,11 @@ export function couponUsable(
 > 或者更简单：**下单成功后清掉幂等键**（现有代码第 138 行已经这么做了），
 > 用户改了券再提交会命中旧订单。**实施时把这个交互定清楚**，
 > 记进 §0.5 勘误表。
+>
+> ✅ **实施结论（勘误表第 25 条）**：**幂等键不改。** 改券重下会命中第一次的
+> 订单（幂等的正确语义），页面在**提交失败后**给一句提示说明这一点。
+> ⚠️ 反过来「改券就换键」更糟：第一次其实已经下单成功时，换键会变成
+> **两个订单**抢同一批库存，第二个多半因库存被占而失败。
 
 ### 6.5 写领券中心
 
@@ -3067,8 +3103,12 @@ export function CouponList({
 
 ### 6.6 写中转路由
 
-`storefront/src/app/api/coupons/route.ts`（GET 可领的券 + 我的券）与
 `storefront/src/app/api/coupons/claim/route.ts`（POST 领券）：
+
+> ✅ **实施时不建 `storefront/src/app/api/coupons/route.ts`（GET 中转）**
+> （勘误表第 24 条）：**没有客户端消费者**。领券中心与结算页都是
+> Server Component，取数直接走 `src/lib/shop-api.ts` 调后端——
+> 与地址簿、订单列表同一套做法。领完券后 `router.refresh()` 就能刷新。
 
 ```typescript
 import { NextResponse } from 'next/server';

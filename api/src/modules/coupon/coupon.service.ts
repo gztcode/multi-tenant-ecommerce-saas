@@ -11,6 +11,7 @@ import {
   CouponScope,
   CouponStatus,
   CouponType,
+  Promotion,
   PromotionStatus,
   UserRole,
 } from '@prisma/client';
@@ -46,6 +47,60 @@ import { ClaimCouponDto } from './dto/claim-coupon.dto';
  * 第三次是留给「多个请求同时首抢」的余量。
  */
 const CLAIM_MAX_ATTEMPTS = 3;
+
+/**
+ * 「我持有的券」列表里的每一项。
+ *
+ * ⚠️ **在 Prisma 生成的 `Coupon` 上加了两个字段**：
+ * 原始行是「券本身」的信息（面额、门槛、计数快照），
+ * 而前端要显示的是**这个用户**与这张券的关系——
+ * 「我有没有用掉过它」「我领了几张」。这两个信息不在 `coupons` 表里，
+ * 只在 `coupon_claims` / `coupon_redemptions` 里。
+ *
+ * ⚠️ **不去改 Prisma 生成的类型**：`Coupon` 是 `@prisma/client` 生成的，
+ * 改了会被 `prisma generate` 冲掉。所以在这里定义交叉类型。
+ */
+export type MyCoupon = Coupon & {
+  /** 这个用户是否已经核销过这张券（RESERVED 或 USED 都算） */
+  used: boolean;
+  /** 这个用户领取这张券的张数 */
+  claimedQuantity: number;
+};
+
+/**
+ * 优惠预览的响应形状。
+ *
+ * ⚠️ **全部是整数分**：与全局约定一致，绝不出现浮点。
+ */
+export interface CouponPreview {
+  /** 回显传入的原价（整数分） */
+  originalAmount: number;
+  /** 满减活动减免（整数分） */
+  promotionDiscountAmount: number;
+  /** 命中的活动名（没有生效的活动就是 null） */
+  promotionName: string | null;
+  /** 每张候选券在当前原价下能减多少 */
+  coupons: Array<{
+    id: string;
+    code: string;
+    name: string;
+    type: CouponType;
+    /** 面额（整数分） */
+    value: number;
+    /** 门槛（整数分） */
+    minAmount: number;
+    /** 这张券在当前原价下能减多少（整数分）；门槛不满足就是 0 */
+    discountAmount: number;
+    /** 用这张券之后的实付（整数分） */
+    payableAmount: number;
+  }>;
+  /** 自动取最优时的券 id */
+  bestCouponId: string | null;
+  /** 自动取最优时减了多少（整数分） */
+  bestCouponDiscountAmount: number;
+  /** 自动取最优时的实付（整数分） */
+  payableAmount: number;
+}
 
 /**
  * 优惠券服务（阶段 5a Task 3）。
@@ -556,15 +611,30 @@ export class CouponService {
    *
    * ⚠️ **软删过滤自动生效**：券被软删后，`coupon.findMany` 查不到它，
    * 「我的券」列表里就不会出现——不需要手写 `deletedAt: null`。
+   *
+   * ## 每用户状态（`used` / `claimedQuantity`）
+   *
+   * ⚠️ **「这个用户有没有用过」不能从 `coupons.usedCount` 读**——
+   * 那是**全店**的计数快照，不是某个用户的。要判「这个用户」，
+   * 必须查 `coupon_redemptions` 里**这个 customerId** 的行。
+   *
+   * ⚠️ **核销记录的 tenantId 是「下单的那家店」，不是券的租户**
+   * （见 `coupon-redemption.service.ts` 的注释）：
+   * 平台券在多家店被核销时，每家店都有自己的核销记录。
+   * 所以**租户作用域内查就能查全**，不需要切平台作用域。
+   *
+   * ⚠️ **`RELEASED` 不算「用过」**：释放意味着额度已退回，券还能再用。
+   * 所以只认 `RESERVED`（预占住）与 `USED`（真的用掉了）。
    */
   async listMine(
     customerId: string,
-  ): Promise<{ items: Coupon[]; total: number }> {
+  ): Promise<{ items: MyCoupon[]; total: number }> {
     const tenantId = this.currentTenantId();
     const claims = await this.prisma.couponClaim.findMany({
       where: { tenantId, customerId },
       orderBy: { createdAt: 'asc' },
-      select: { couponId: true },
+      // ⚠️ **quantity 一起 select 出来**：它就是「这个用户领了几张」。
+      select: { couponId: true, quantity: true },
     });
     if (claims.length === 0) {
       return { items: [], total: 0 };
@@ -583,7 +653,37 @@ export class CouponService {
       }),
     );
 
-    const items = [...shopCoupons, ...platformCoupons];
+    // ---- 每用户状态 ----
+    //
+    // ⚠️ **领取张数**：一个用户对一张券只有一行（唯一索引 (couponId, customerId)），
+    // 所以直接取那一行的 quantity 就是张数。
+    const quantityByCouponId = new Map<string, number>();
+    for (const claim of claims) {
+      quantityByCouponId.set(claim.couponId, claim.quantity);
+    }
+
+    // ⚠️ **已核销的券**：只查**这个用户**的核销记录。
+    // 租户作用域内查（核销记录的 tenantId 是「下单的那家店」），
+    // 平台券的核销记录也在当前租户下，不需要切平台作用域。
+    const redemptions = await this.prisma.couponRedemption.findMany({
+      where: {
+        customerId,
+        couponId: { in: claimedIds },
+        status: {
+          in: [CouponRedemptionStatus.RESERVED, CouponRedemptionStatus.USED],
+        },
+      },
+      select: { couponId: true },
+    });
+    const usedCouponIds = new Set(redemptions.map((row) => row.couponId));
+
+    const items: MyCoupon[] = [...shopCoupons, ...platformCoupons].map(
+      (coupon) => ({
+        ...coupon,
+        used: usedCouponIds.has(coupon.id),
+        claimedQuantity: quantityByCouponId.get(coupon.id) ?? 0,
+      }),
+    );
     return { items, total: items.length };
   }
 
@@ -619,41 +719,12 @@ export class CouponService {
     /** 客户端指定的券（只传 id，面额与门槛一律从库里读） */
     requestedCouponId?: string;
   }): Promise<OrderDiscount> {
-    // ⚠️ **有效期判定用数据库的 `now()`**（M15），不用应用进程的时钟。
-    const dbNow = await this.databaseNow(this.prisma);
-
-    // ---- 1. 候选券 ----
-    const found = await this.findCandidateCoupons(input.customerId, dbNow);
-
-    // ---- 2. 当前生效的满减活动（租户作用域内）----
-    const promotion = await this.prisma.promotion.findFirst({
-      where: {
-        status: PromotionStatus.ACTIVE,
-        startsAt: { lte: dbNow },
-        endsAt: { gt: dbNow },
-      },
-      // ⚠️ 多个活动同时生效时取**减免额最大**的那个。
-      orderBy: { discountAmount: 'desc' },
-    });
-
-    const context: DiscountContext = {
+    const { context, found, promotion } = await this.buildDiscountContext({
       tenantId: input.tenantId,
       customerId: input.customerId,
       originalAmount: input.originalAmount,
       items: input.items,
-      candidateCoupons: found.candidates,
-      promotion: promotion
-        ? {
-            id: promotion.id,
-            name: promotion.name,
-            minAmount: promotion.minAmount,
-            discountAmount: promotion.discountAmount,
-            startsAt: promotion.startsAt,
-            endsAt: promotion.endsAt,
-          }
-        : null,
-      now: dbNow,
-    };
+    });
 
     // ---- 3. 手动指定了券 → 收窄成那一张 ----
     //
@@ -713,6 +784,162 @@ export class CouponService {
           ? { ...result.appliedCoupon, ...picked }
           : null,
       appliedPromotion: promotion,
+    };
+  }
+
+  /**
+   * 组装 `DiscountContext`（查候选券 + 查生效的活动 + 组 context）。
+   *
+   * ⚠️ **为什么抽出来**：下单（`computeForOrder`）与预览（`preview`）要算的是
+   * **同一件事**——同一套候选券、同一个活动、同一套门槛与封顶语义。
+   * 抽出来是为了让两边**永远看到同一份上下文**：
+   * 预览显示的金额与下单实际算出的金额必然一致（M17）。
+   * 两处各写一遍的话，活动「取哪个」的规则一旦漂移，
+   * 就会出现「预览显示减 20，下单只减 0」。
+   *
+   * ⚠️ **有效期判定用数据库的 `now()`**（M15），不用应用进程的时钟。
+   */
+  private async buildDiscountContext(input: {
+    tenantId: string;
+    customerId: string;
+    originalAmount: number;
+    items: Array<{ skuId: string; quantity: number; price: number }>;
+  }): Promise<{
+    context: DiscountContext;
+    found: { candidates: CouponCandidate[]; alreadyUsedIds: Set<string> };
+    promotion: Promotion | null;
+  }> {
+    // ---- 1. 候选券 ----
+    const dbNow = await this.databaseNow(this.prisma);
+    const found = await this.findCandidateCoupons(input.customerId, dbNow);
+
+    // ---- 2. 当前生效的满减活动（租户作用域内）----
+    const promotion = await this.prisma.promotion.findFirst({
+      where: {
+        status: PromotionStatus.ACTIVE,
+        startsAt: { lte: dbNow },
+        endsAt: { gt: dbNow },
+        // ⚠️ **门槛先过滤掉没达标的**（这是阶段 5a 验收时发现的真实缺陷）：
+        // 原来这里只按「减免额最大」排序取一个，取到门槛没达成的活动时，
+        // 引擎会判定「门槛不满足」→ **整单没有活动优惠**，
+        // 而同一时间另一个门槛已达、减免额较小的活动被跳过了。
+        // 例：同时有「满500减88」与「满200减30」，订单 ¥459 时——
+        // 「满500减88」门槛没达到，但「满200减30」达到了，
+        // 用户本该减 ¥30，却一分钱没减（只按减免额排序取最大的那个）。
+        //
+        // ⚠️ **先过滤门槛、再按减免额排序**：达标的活动里挑减免额最大的。
+        // 引擎里那道 `originalAmount >= promotion.minAmount` 的判定保留着
+        // （纯函数不查库，两边都要有）。
+        minAmount: { lte: input.originalAmount },
+      },
+      // ⚠️ 多个活动同时生效时取**减免额最大**的那个（达标的前提下）。
+      orderBy: { discountAmount: 'desc' },
+    });
+
+    const context: DiscountContext = {
+      tenantId: input.tenantId,
+      customerId: input.customerId,
+      originalAmount: input.originalAmount,
+      items: input.items,
+      candidateCoupons: found.candidates,
+      promotion: promotion
+        ? {
+            id: promotion.id,
+            name: promotion.name,
+            minAmount: promotion.minAmount,
+            discountAmount: promotion.discountAmount,
+            startsAt: promotion.startsAt,
+            endsAt: promotion.endsAt,
+          }
+        : null,
+      now: dbNow,
+    };
+
+    return { context, found, promotion };
+  }
+
+  // ============================================================
+  // 优惠预览（阶段 5a Task 6 的后端部分）
+  // ============================================================
+
+  /**
+   * 优惠预览：结算页要显示的四行金额（原价 / 活动减 / 券减 / 实付）。
+   *
+   * ## 为什么预览要放在后端
+   *
+   * ⚠️ **券的减免额不等于券的面额**：
+   * - 面额会被**封顶**（`min(coupon.value, 活动后金额)`）
+   * - 门槛也是按**活动后金额**判的（`afterPromotion < coupon.minAmount` 就不满足）
+   *
+   * 前端自己算就要把引擎的逻辑复制一份，两处必然漂移。
+   * 所以预览由后端用**已有的纯函数引擎**算，前端只负责展示。
+   *
+   * ## M17：预览值是估算值
+   *
+   * ⚠️ **`originalAmount` 是客户端传的估算值**（前端用购物车里 SKU 的价格算出来的），
+   * **只用于预览**。下单时服务端会在锁住 SKU 之后按**实时价**重算，
+   * 预览值不参与实付计算。页面上要提示「以提交时为准」。
+   *
+   * ## 只读
+   *
+   * ⚠️ **预览不做任何写操作**：不预占券、不核销、不改计数。
+   * 预览是给用户看的，不能因为「看一眼」就把券占住。
+   *
+   * ## 门槛与封顶的语义
+   *
+   * ⚠️ **一律由引擎决定**：每张券单独调一次 `computeDiscount`，
+   * service 层**不另写一套**门槛/封顶判断——那是本阶段最容易出错的地方
+   * （设计文档 §4.2）。
+   */
+  async preview(
+    customerId: string,
+    originalAmount: number,
+  ): Promise<CouponPreview> {
+    const { context, found, promotion } = await this.buildDiscountContext({
+      tenantId: this.currentTenantId(),
+      customerId,
+      originalAmount,
+      // ⚠️ **items 只用于判定券的适用范围**，本阶段恒为全店，
+      // 所以留空数组不影响结果。真正的适用范围判定在候选查询里。
+      items: [],
+    });
+
+    // ---- 每张候选券单独算一次 ----
+    //
+    // ⚠️ **候选集里包含「门槛不满足」的券**：前端要显示它「不可用」，
+    // 不能把它悄悄去掉（用户会以为券不见了）。
+    // 门槛不满足时引擎算出的 `couponDiscountAmount` 恒为 0。
+    const coupons = found.candidates.map((coupon) => {
+      const single = computeDiscount({
+        ...context,
+        candidateCoupons: [coupon],
+      });
+      return {
+        id: coupon.id,
+        code: coupon.code,
+        name: coupon.name,
+        type: coupon.type,
+        value: coupon.value,
+        minAmount: coupon.minAmount,
+        discountAmount: single.couponDiscountAmount,
+        payableAmount: single.payableAmount,
+      };
+    });
+
+    // ---- 最优券 ----
+    //
+    // ⚠️ **一次性把所有候选券交给引擎**取最优，
+    // 不自己比较「折后总价」——那个判据由引擎实现（M16）。
+    const best = computeDiscount(context);
+
+    return {
+      originalAmount,
+      promotionDiscountAmount: best.promotionDiscountAmount,
+      promotionName: promotion?.name ?? null,
+      coupons,
+      bestCouponId: best.appliedCoupon?.id ?? null,
+      bestCouponDiscountAmount: best.couponDiscountAmount,
+      payableAmount: best.payableAmount,
     };
   }
 

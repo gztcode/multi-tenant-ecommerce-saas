@@ -12,6 +12,7 @@ import type {
   OrderListResponse,
   OrderStatus,
 } from './cart';
+import type { AvailableCoupon, CouponPreview, MyCoupon } from './coupon';
 
 /**
  * 消费者侧的接口封装（地址簿 / 订单），供 Server Component 在**服务端**取数。
@@ -141,6 +142,96 @@ export async function fetchOrder(orderNo: string): Promise<{
     return {
       order: null,
       error: cause instanceof Error ? cause.message : '订单加载失败',
+    };
+  }
+}
+
+/**
+ * 优惠预览（结算页的四行金额）。
+ *
+ * ⚠️ **返回的是「估算值」**（护栏 M17）：`originalAmount` 是前端按购物车里
+ * SKU 的价格算出来的，下单时服务端会锁住 SKU 按**实时价**重算。
+ * 所以页面要提示「金额以提交时为准」，下单响应里的金额才是真的。
+ *
+ * ⚠️ **为什么要后端算**：券能减多少不是券的面额——面额会被封顶
+ * （`min(面额, 活动后金额)`），门槛也是按**活动后金额**判的。
+ * 前端自己算就要把优惠引擎的逻辑复制一份，两处必然漂移。
+ */
+export async function fetchCouponPreview(originalAmount: number): Promise<{
+  preview: CouponPreview | null;
+  error: string | null;
+}> {
+  const token = await currentToken();
+  if (!token) {
+    return { preview: null, error: null };
+  }
+  const subdomain = await currentSubdomain();
+
+  try {
+    const preview = await apiFetch<CouponPreview>(
+      `/coupons/preview?originalAmount=${originalAmount}`,
+      { subdomain, token },
+    );
+    return { preview, error: null };
+  } catch (cause) {
+    return {
+      preview: null,
+      error: cause instanceof Error ? cause.message : '优惠信息加载失败',
+    };
+  }
+}
+
+/**
+ * 当前可领取的券。
+ *
+ * ⚠️ **必须登录**：后端的领券接口整组挂了 JwtAuthGuard
+ * （领取记录记的是 customerId，游客领了也没地方记）。
+ */
+export async function fetchAvailableCoupons(): Promise<{
+  coupons: AvailableCoupon[];
+  error: string | null;
+}> {
+  const token = await currentToken();
+  if (!token) {
+    return { coupons: [], error: null };
+  }
+  const subdomain = await currentSubdomain();
+
+  try {
+    const payload = await apiFetch<{ items: AvailableCoupon[] }>(
+      '/coupons/available',
+      { subdomain, token },
+    );
+    return { coupons: payload.items ?? [], error: null };
+  } catch (cause) {
+    return {
+      coupons: [],
+      error: cause instanceof Error ? cause.message : '优惠券加载失败',
+    };
+  }
+}
+
+/** 我持有的券（含每用户状态：这个用户有没有用过、领了几张） */
+export async function fetchMyCoupons(): Promise<{
+  coupons: MyCoupon[];
+  error: string | null;
+}> {
+  const token = await currentToken();
+  if (!token) {
+    return { coupons: [], error: null };
+  }
+  const subdomain = await currentSubdomain();
+
+  try {
+    const payload = await apiFetch<{ items: MyCoupon[] }>('/coupons/mine', {
+      subdomain,
+      token,
+    });
+    return { coupons: payload.items ?? [], error: null };
+  } catch (cause) {
+    return {
+      coupons: [],
+      error: cause instanceof Error ? cause.message : '我的优惠券加载失败',
     };
   }
 }
