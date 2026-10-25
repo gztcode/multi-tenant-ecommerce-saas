@@ -84,7 +84,20 @@ export interface Order {
   orderNo: string;
   customerId: string | null;
   status: OrderStatus;
+  /** 实付（优惠后，整数分）——金额快照 */
   totalAmount: number;
+  /** 原价小计（优惠前，整数分）——金额快照 */
+  originalAmount: number;
+  /** 满减活动减免（整数分）——金额快照 */
+  promotionDiscountAmount: number;
+  /** 券减免（整数分）——金额快照 */
+  couponDiscountAmount: number;
+  /** 用的券 id（快照） */
+  couponId: string | null;
+  /** 用的券码（快照） */
+  couponCode: string | null;
+  /** 用的券名（快照） */
+  couponName: string | null;
   itemCount: number;
   receiverName: string;
   receiverPhone: string;

@@ -1,7 +1,12 @@
 import { redirect } from 'next/navigation';
 import { auth } from '@/auth';
 import { CheckoutForm } from '@/components/checkout/checkout-form';
-import { fetchAddresses, fetchCurrentCart } from '@/lib/shop-api';
+import { totalAmount } from '@/lib/cart';
+import {
+  fetchAddresses,
+  fetchCouponPreview,
+  fetchCurrentCart,
+} from '@/lib/shop-api';
 
 /**
  * 结算页（Server Component）。
@@ -35,6 +40,10 @@ export default async function CheckoutPage() {
     redirect('/cart');
   }
 
+  // ⚠️ **优惠预览必须在拿到购物车之后才请求**——它要按购物车的金额算。
+  // 预览失败不当作错误处理：没有优惠也能下单，只是页面不显示优惠行。
+  const { preview } = await fetchCouponPreview(totalAmount(cart.items ?? []));
+
   return (
     <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-6 p-6">
       <h1 className="text-2xl font-bold">结算</h1>
@@ -43,6 +52,7 @@ export default async function CheckoutPage() {
         cart={cart}
         addresses={addresses}
         loggedIn={Boolean(session)}
+        preview={preview}
       />
     </main>
   );

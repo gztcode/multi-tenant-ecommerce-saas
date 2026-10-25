@@ -46,11 +46,16 @@ export async function GET(request: Request) {
  * 下单。
  *
  * 请求体按白名单重建：`addressId`、`items`（skuId + quantity）、
- * `idempotencyKey`、可选 `remark`。
+ * `idempotencyKey`、可选 `remark`、可选 `couponId`。
  *
  * ⚠️ **绝不接受价格字段**——后端 ValidationPipe 开了 forbidNonWhitelisted，
  * 传了 price / unitPrice / totalAmount 都会 400；而更根本的是，
  * 金额只能由后端从 SKU 读（护栏 8：客户端传的价格一律不信）。
+ *
+ * ⚠️ **同样不接受任何优惠金额字段**（`discountAmount` / `couponValue` /
+ * `couponMinAmount` / `promotionDiscountAmount`）：
+ * 优惠金额只由服务端算出来。客户端只能传 `couponId`，
+ * 面额与门槛一律从库里读（护栏 M1 / M2）。
  */
 export async function POST(request: Request) {
   const token = await currentToken();
@@ -127,6 +132,21 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: 'remark 必须是字符串' }, { status: 400 });
     }
     payload.remark = remark;
+  }
+
+  // ⚠️ **couponId 必须放进白名单**（护栏 M2）：
+  // 结算页选了券，请求发到中转路由后 couponId 被**静默丢掉**的话，
+  // 后端收不到券 → 用户选了券却完全不生效，而且没有任何报错。
+  // 只传 id：面额与门槛一律由后端从库里读，绝不接受客户端算的减免额。
+  const couponId = body.couponId;
+  if (couponId !== undefined) {
+    if (typeof couponId !== 'string' || couponId === '') {
+      return NextResponse.json(
+        { message: 'couponId 必须是非空字符串' },
+        { status: 400 },
+      );
+    }
+    payload.couponId = couponId;
   }
 
   try {
