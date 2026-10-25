@@ -77,6 +77,11 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   'Order',
   'OrderItem',
   'Payment',
+  // 营销（计划 5a）
+  'Coupon',
+  'CouponClaim',
+  'CouponRedemption',
+  'Promotion',
   // ⚠️ PaymentWebhookEvent 刻意**不在**这里：它是渠道事件的数据，不是租户的数据，
   // 租户从订单反查。
 ]);
@@ -115,6 +120,13 @@ export const SOFT_DELETE_MODELS = new Set<string>([
   // Cart / CartItem 不软删——购物车是临时数据，清空即删。
   // Order / OrderItem / Payment 不软删——它们是财务凭证，只能靠状态机流转，不能删。
   'Address',
+  // 营销（计划 5a）：券与活动是**营销配置**，商家可能想「下架」但保留
+  // 历史核销记录的可追溯性，所以走软删。
+  //
+  // ⚠️ CouponClaim / CouponRedemption **不软删**——它们是财务凭证
+  //（与 InventoryMovement 同款理由：append-only 的审计记录）。
+  'Coupon',
+  'Promotion',
 ]);
 
 /**

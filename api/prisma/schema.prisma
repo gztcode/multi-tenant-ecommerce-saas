@@ -497,6 +497,26 @@ model Order {
   closedAt     DateTime?
   trackingNo   String?
 
+  // ---------- 阶段 5a：优惠快照 ----------
+  //
+  // ⚠️ **全部是快照**：券的名称、码、活动将来改了或删了，
+  // 历史订单的金额与凭证都不受影响（设计文档 §7.2 M12）。
+  //
+  // ⚠️ `originalAmount` 是「优惠前的原价小计」，
+  // `totalAmount` 是「优惠后的实付」——
+  // **totalAmount 保持它现有的语义**（阶段 3 的支付金额核对读的是它，
+  // 见 payment.service.ts 的 checkWebhookEvent：`event.amount !== order.totalAmount`），
+  // 所以支付金额自动就是实付额，不需要改支付链路。
+  originalAmount Int @default(0)
+  // 满减活动减免
+  promotionDiscountAmount Int @default(0)
+  promotionId String?
+  // 优惠券减免
+  couponDiscountAmount Int @default(0)
+  couponId String?
+  couponCode String?
+  couponName String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -583,4 +603,135 @@ model PaymentWebhookEvent {
   // 让真实回调被当成重复事件忽略——钱付了订单永不流转（设计 §3.7）。
   @@unique([provider, eventId])
   @@map("payment_webhook_events")
+}
+
+// ---------- 阶段 5a：营销（优惠券与满减活动） ----------
+
+enum CouponType {
+  FIXED
+  PERCENT
+}
+
+enum CouponScope {
+  SHOP
+  PLATFORM
+}
+
+enum CouponStatus {
+  ACTIVE
+  PAUSED
+  EXPIRED
+}
+
+model Coupon {
+  id          String   @id @default(uuid())
+  tenantId    String
+  // 平台券的 tenantId 指向平台租户；店铺券指向商家租户
+  code        String
+  name        String
+  description String?
+  // FIXED：满减券（本阶段唯一实现的类型）
+  // PERCENT：折扣券（预留，本阶段不实现）
+  type        CouponType @default(FIXED)
+  // FIXED 时是面额（整数分）；PERCENT 时是折扣数（85 = 85 折）
+  value       Int
+  // 使用门槛（整数分）。0 = 无门槛
+  minAmount  Int      @default(0)
+  // 每用户限领张数；null = 不限
+  perUserLimit Int?
+  // 总发放上限；null = 不限
+  totalLimit  Int?
+  // 已领取总数（用于限总量的并发判定）
+  claimedCount Int    @default(0)
+  // 已发放的券里，当前被订单预占核销的数量
+  reservedCount Int    @default(0)
+  // 已被订单实际使用的数量
+  usedCount   Int      @default(0)
+  // 平台券对所有店铺生效；店铺券只在本店生效
+  scope       CouponScope @default(SHOP)
+  status      CouponStatus @default(ACTIVE)
+  startsAt    DateTime
+  endsAt      DateTime
+  deletedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // ⚠️ **刻意不声明 tenant 关系**，只有 tenantId 标量。
+  // 与 Order / Address 同款做法：外键只引用 id 不带 tenantId，
+  // 「跨租户挂载」由 service 层显式校验，而不是靠外键悄悄放行。
+  //
+  // ⚠️ 唯一索引由迁移手写部分唯一索引（软删后 code 仍占用唯一性）。
+  @@index([tenantId, status])
+  @@map("coupons")
+}
+
+model CouponClaim {
+  id        String   @id @default(uuid())
+  tenantId  String
+  couponId  String
+  customerId String
+  quantity  Int      @default(1)
+  createdAt DateTime @default(now())
+
+  // ⚠️ **刻意不声明 tenant 关系**，只有 tenantId 标量。
+  //
+  // ⚠️ 唯一索引 (couponId, customerId) 由迁移手写，
+  // 不在 schema 里声明（见 migration.sql）。
+  @@index([tenantId, customerId])
+  @@map("coupon_claims")
+}
+
+enum CouponRedemptionStatus {
+  RESERVED
+  USED
+  RELEASED
+}
+
+model CouponRedemption {
+  id         String   @id @default(uuid())
+  tenantId   String
+  couponId   String
+  customerId String
+  orderId    String
+  // RESERVED：订单已创建，额度被占住；订单取消/超时后释放
+  // USED：订单已支付，额度真正消耗
+  // RELEASED：额度已退回
+  status     CouponRedemptionStatus @default(RESERVED)
+  // 下单时的优惠额快照
+  discountAmount Int
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // ⚠️ **刻意不声明 tenant 关系**，只有 tenantId 标量（与 Order 同款）。
+  //
+  // ⚠️ 唯一索引由迁移手写部分唯一索引（见 migration.sql）。
+  @@index([tenantId, customerId])
+  @@map("coupon_redemptions")
+}
+
+enum PromotionStatus {
+  ACTIVE
+  PAUSED
+  EXPIRED
+}
+
+model Promotion {
+  id          String   @id @default(uuid())
+  tenantId    String
+  name        String
+  description String?
+  // 门槛（整数分）：订单商品原价小计 ≥ minAmount 才享受
+  minAmount   Int      @default(0)
+  // 减免金额（整数分）
+  discountAmount Int
+  status      PromotionStatus @default(ACTIVE)
+  startsAt    DateTime
+  endsAt      DateTime
+  deletedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // ⚠️ **刻意不声明 tenant 关系**，只有 tenantId 标量。
+  @@index([tenantId, status])
+  @@map("promotions")
 }
