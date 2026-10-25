@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { readJson, toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
 import { currentSubdomain, currentToken, fetchBackend } from '@/lib/server-cart';
-import { sanitizeAddressBody } from '@/lib/addresses';
+import { sanitizeAddressBody, fieldLabel } from '@/lib/addresses';
 import type { Address } from '@/lib/cart';
 
 /**
@@ -51,7 +51,11 @@ export async function POST(request: Request) {
   // 必填字段缺一不可
   for (const required of ['receiver', 'phone', 'province', 'city', 'district', 'detail']) {
     if (!(required in sanitized.value)) {
-      return NextResponse.json({ message: `${required} 是必填项` }, { status: 400 });
+      // ⚠️ 用中文字段名：这个 message 直接显示给用户（勘误第 20 条）。
+      return NextResponse.json(
+        { message: `${fieldLabel(required)} 是必填项` },
+        { status: 400 },
+      );
     }
   }
 

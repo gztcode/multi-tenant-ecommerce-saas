@@ -2,6 +2,7 @@ import { headers } from 'next/headers';
 import { apiFetch } from '@/lib/api-client';
 import { resolveTenantSubdomain } from '@/lib/tenant';
 import { buildThemeCss, ThemeTokenValues } from '@/lib/theme';
+import { ThemeWatcher } from '@/components/theme/theme-watcher';
 
 interface ThemeResponse {
   tokens: ThemeTokenValues;
@@ -51,6 +52,10 @@ export default async function ShopLayout({
           dangerouslySetInnerHTML={{ __html: `:root {\n${css}\n}` }}
         />
       ) : null}
+      {/* 客户端轮询主题并重注入 CSS 变量——服务端注入的那份只在渲染时写一次，
+          页面不刷新就看不到新主题。放在 <style> 之后、{children} 之前：
+          ThemeWatcher 渲染 null，不占布局位置。 */}
+      <ThemeWatcher />
       {children}
     </>
   );

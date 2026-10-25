@@ -1,4 +1,5 @@
 import { auth } from '@/auth';
+import Link from 'next/link';
 import { redirect } from 'next/navigation';
 
 export default async function CustomerAccountPage() {
@@ -16,6 +17,9 @@ export default async function CustomerAccountPage() {
       <p>邮箱：{session.user?.email}</p>
       <p>角色：{session.role}</p>
       <p>租户：{session.tenantId ?? '（无）'}</p>
+      <Link href="/account/addresses" className="text-sm underline">
+        收货地址
+      </Link>
     </main>
   );
 }

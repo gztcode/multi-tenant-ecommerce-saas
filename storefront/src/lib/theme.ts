@@ -21,8 +21,19 @@ export interface ThemeTokenValues {
   shadows: Record<string, string>;
 }
 
-/** 与后端 theme-tokens.ts 一一对应的 CSS 变量名 */
-const CSS_VARS: Record<string, string[]> = {
+/**
+ * 与后端 theme-tokens.ts 一一对应的 CSS 变量名。
+ *
+ * ⚠️ **导出**是为了让客户端的 ThemeWatcher 用同一份映射
+ * （components/theme/theme-watcher.tsx）——客户端与服务端各写一份
+ * 映射表，迟早会漂移：服务端加了新 token 而客户端没加，
+ * 那个 token 在客户端就永远不生效。
+ *
+ * 这是**纯模块**，没有 'use client'——两端都能 import。
+ * ⚠️ **不要给它加 'use client'**：加了会让 Server Component 那边
+ * 多一层客户端边界。
+ */
+export const CSS_VARS: Record<string, string[]> = {
   // colors
   background: ['--background'],
   foreground: ['--foreground'],
@@ -46,8 +57,12 @@ const CSS_VARS: Record<string, string[]> = {
   fontMono: ['--font-mono'],
 };
 
-/** 分组标量：键 → CSS 变量名 */
-const GROUP_CSS_VARS: Record<string, string> = {
+/**
+ * 分组标量：键 → CSS 变量名。
+ *
+ * ⚠️ 同样**导出**给客户端的 ThemeWatcher 用（理由同 CSS_VARS）。
+ */
+export const GROUP_CSS_VARS: Record<string, string> = {
   textScale: '--text-',
   weights: '--font-weight-',
   spacing: '--spacing-',
@@ -65,8 +80,10 @@ const GROUP_CSS_VARS: Record<string, string> = {
  *
  * 这些键与后端 theme-tokens.ts 的定义一一对应，后端加了新 token 时要同步这里
  * （这是前后端唯一需要手动同步的地方，也是把它收窄到这个数量的原因）。
+ *
+ * ⚠️ 同样**导出**给客户端的 ThemeWatcher 用（理由同 CSS_VARS）。
  */
-const GROUP_KEYS: Record<string, ReadonlySet<string>> = {
+export const GROUP_KEYS: Record<string, ReadonlySet<string>> = {
   textScale: new Set(['xs', 'sm', 'base', 'lg', 'xl']),
   weights: new Set(['normal', 'medium', 'semibold', 'bold']),
   spacing: new Set(['xs', 'sm', 'base', 'lg', 'xl']),

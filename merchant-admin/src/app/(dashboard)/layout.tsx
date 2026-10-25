@@ -17,7 +17,12 @@ export default async function DashboardLayout({
 
   // 未登录时 redirect 会抛特殊错误（NEXT_REDIRECT）中断渲染,
   // 因此下面的 session 一定是非空的。
-  if (!session) {
+  //
+  // ⚠️ 判 `!session?.accessToken` 而不是 `!session`：
+  // 会话作废（刷新失败）后 session 仍存在，只是 accessToken 是 ''。
+  // 只判 !session 的话页面仍显示「已登录」，点任何操作都是 401
+  // ——L1 的症状不会因为 session 回调的 `?? ''` 而消失。
+  if (!session?.accessToken) {
     redirect('/login');
   }
 
@@ -48,7 +53,7 @@ export default async function DashboardLayout({
           </nav>
         </div>
         <div className="flex items-center gap-4 text-sm">
-          <span className="text-muted-foreground">{session.user?.email}</span>
+          <span className="text-muted-foreground">{session?.user?.email}</span>
           <form
             action={async () => {
               'use server';
