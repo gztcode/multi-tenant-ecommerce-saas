@@ -35,6 +35,16 @@ export default function CustomerLoginPage() {
       return;
     }
 
+    // 登录后把**游客购物车**合并进账号购物车（设计 §4.2）。
+    //
+    // 合并是幂等的（游客车不存在时后端也返回成功），失败也不该挡住登录——
+    // 顾客都登录成功了，不能因为合并失败把他拦在这里。
+    try {
+      await fetch('/api/cart/merge', { method: 'POST' });
+    } catch {
+      // 合并失败不影响登录；游客车里的东西还在，登录后可以手动再加
+    }
+
     router.push('/account');
     router.refresh();
   }

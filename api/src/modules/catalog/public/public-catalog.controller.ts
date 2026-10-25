@@ -1,28 +1,8 @@
 import { Controller, Get, Param, Query } from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { Public } from '../../../common/decorators/public.decorator';
+import { toIntOr } from '../../../common/http/pagination';
 import { PublicCatalogService } from './public-catalog.service';
-
-/**
- * 把查询串安全地解析成整数。
- *
- * controller 的 `@Query('page') page?: string` 拿到的是裸字符串，而
- * `ValidationPipe` 只作用于带 DTO 的路由——公开列表这里没有 DTO，
- * 所以 `?page=abc` 会让 `Number()` 得到 NaN，一路传到 Prisma 变成
- * `skip: NaN`，整个查询抛错、接口返回 500。
- *
- * 公开接口面对的是全网匿名流量，把畸形入参变成 500 是最容易被拿来
- * 刷错误日志、触发告警的形态。这里统一收敛：解析失败就落回默认值。
- */
-function toIntOr(
-  value: string | undefined,
-  fallback: number | undefined,
-): number | undefined {
-  if (value === undefined || value === '') return fallback;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.trunc(parsed);
-}
 
 @ApiTags('public-catalog')
 @Controller('public')

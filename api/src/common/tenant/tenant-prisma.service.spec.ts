@@ -1,5 +1,6 @@
 import { TenantPrismaService } from './tenant-prisma.service';
 import { TenantScopeError } from './tenant-scope.error';
+import { TENANT_SCOPED_MODELS } from './tenant-models';
 import {
   TenantContextValue,
   platformScope,
@@ -522,5 +523,26 @@ describe('租户隔离版 PrismaClient', () => {
     await raw.$disconnect();
 
     await prisma.tenant.deleteMany({ where: { id: tenant.id } });
+  });
+
+  it('阶段 3 的新表全部登记在租户作用域白名单里', () => {
+    // 漏登记的后果是「那张表的所有读写都不附加 tenantId 条件」——
+    // 彻底失去隔离且没有任何报错。所以这条断言守着它。
+    const expected = [
+      'Cart',
+      'CartItem',
+      'Address',
+      'Order',
+      'OrderItem',
+      'Payment',
+    ];
+    for (const model of expected) {
+      expect(TENANT_SCOPED_MODELS.has(model)).toBe(true);
+    }
+  });
+
+  it('webhook 幂等表不登记进白名单：它是渠道事件的数据，租户从订单反查', () => {
+    // 反向断言，锁住一个刻意的决定。
+    expect(TENANT_SCOPED_MODELS.has('PaymentWebhookEvent')).toBe(false);
   });
 });

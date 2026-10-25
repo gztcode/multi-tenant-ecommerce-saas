@@ -24,4 +24,17 @@ export function assertSecureConfig(): void {
       '生产环境禁止使用 .env.example 里的 JWT_SECRET 占位符，请换成真实密钥。',
     );
   }
+
+  // ⚠️ 假支付网关在生产环境开启 = 任何人知道 paymentId 就能免费下单（R3）。
+  //
+  // 假网关的支付页面**无需登录**——知道 paymentId 就能把订单付掉。
+  // 所以这个开关在生产环境必须**拒绝启动**，而不是「配错了就那样吧」。
+  if (
+    process.env.NODE_ENV === 'production' &&
+    process.env.FAKE_PAYMENT_ENABLED === 'true'
+  ) {
+    throw new Error(
+      '生产环境禁止启用 FAKE_PAYMENT_ENABLED：假支付网关无需登录即可支付订单。',
+    );
+  }
 }
