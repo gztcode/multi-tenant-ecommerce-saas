@@ -86,6 +86,9 @@ async function seedDemoStore(): Promise<void> {
 
   if (existingTenant) {
     console.log(`示例店铺已存在（子域名 ${DEMO_SUBDOMAIN}），跳过商品中心种子`);
+    // ⚠️ 订阅仍要补：店铺已存在时下面那段不会跑到，
+    // 但 5b 之后 demo 店铺要接单就必须有订阅（upsert 幂等）。
+    await seedDemoSubscription(existingTenant.id);
     return;
   }
 
@@ -94,10 +97,13 @@ async function seedDemoStore(): Promise<void> {
     data: {
       name: '示例店铺',
       subdomain: DEMO_SUBDOMAIN,
-      status: 'TRIAL',
+      status: 'ACTIVE',
     },
   });
   const tenantId = tenant.id;
+
+  // 阶段 5b：demo 租户的试用订阅（没有它，demo 店铺接不了单）
+  await seedDemoSubscription(tenantId);
 
   await prisma.store.create({
     data: { tenantId, name: '示例店铺', slug: 'default' },
@@ -369,6 +375,75 @@ async function seedDemoStore(): Promise<void> {
 }
 
 /**
+ * 阶段 5b 的试用套餐（平台的数据）。
+ *
+ * ⚠️ **套餐是平台的数据，不带 tenantId** —— 所以它不在租户作用域白名单里，
+ * `prisma.plan.upsert` 的 where 是普通的业务键条件（`UNIQUE_ONLY_OPERATIONS`
+ * 的限制只作用于租户作用域模型）。
+ *
+ * ⚠️ 用 upsert 而不是 create：seed 会被反复跑（e2e 每次都会 seed）。
+ */
+async function seedTrialPlan(): Promise<void> {
+  await prisma.plan.upsert({
+    where: { code: 'trial' },
+    update: {},
+    create: {
+      code: 'trial',
+      name: '试用套餐',
+      description: '14 天试用，含基础额度',
+      price: 0,
+      periodDays: 30,
+      trialDays: 14,
+      commissionBps: 500,
+      maxProducts: 10,
+      maxSkus: 50,
+      maxStores: 1,
+      // ⚠️ **试用套餐开着营销功能**：demo 商家的手动验收
+      // （阶段 5a 的「商家建券 → 消费者领券 → 用券」）要能跑通。
+      // 功能开关的「关掉会怎样」由 e2e 覆盖（套餐 features 里没有 marketing 时建券被拒）。
+      features: { marketing: true },
+      status: 'ACTIVE',
+      sortOrder: 0,
+    },
+  });
+}
+
+/**
+ * 给 demo 租户建一条试用订阅（阶段 5b）。
+ *
+ * 目的：让阶段 3/5a 的既有手测仍可复现 —— 否则 5b 之后 demo 店铺不能接单。
+ *
+ * ⚠️ 用 upsert：seed 会被反复跑，create 会撞 subscriptions_tenantId_key。
+ *
+ * ⚠️ **试用窗口设到 2099 年**：本地开发环境的 demo 店铺不该因为
+ * 「试用到期」而突然卖不了货 —— 那会让阶段 3/5a 的手动验收随时间失效
+ * （半年后重跑手测全挂，而挂的原因跟被测的功能毫无关系）。
+ * 真正的到期行为由 e2e 覆盖（把 currentPeriodEnd 挪到过去 → 下单被拒）。
+ */
+async function seedDemoSubscription(tenantId: string): Promise<void> {
+  const trialPlan = await prisma.plan.findUnique({ where: { code: 'trial' } });
+  if (!trialPlan) {
+    console.log('试用套餐不存在，跳过 demo 订阅');
+    return;
+  }
+
+  const trialEndsAt = new Date('2099-12-31T23:59:59.000Z');
+  await prisma.subscription.upsert({
+    where: { tenantId },
+    update: {},
+    create: {
+      tenantId,
+      planId: trialPlan.id,
+      status: 'TRIAL',
+      startedAt: new Date(),
+      trialEndsAt,
+      currentPeriodStart: new Date(),
+      currentPeriodEnd: trialEndsAt,
+    },
+  });
+}
+
+/**
  * 示例消费者账号（阶段 3 起）。
  *
  * 独立于 seedDemoStore：那个函数在店铺已存在时会整棵跳过，
@@ -432,6 +507,10 @@ async function seedDemoCustomer(): Promise<void> {
 
 async function main() {
   await seedPlatformAdmin();
+  // ⚠️ 试用套餐要在订阅之前建好——订阅要挂到套餐上。
+  // 放在 seedDemoStore 之前，这样即使 demo 店铺已存在（store 那段会跳过），
+  // 套餐也保证存在。
+  await seedTrialPlan();
   await seedDemoStore();
   // 消费者账号依赖租户已建出来，所以放在 seedDemoStore 之后
   await seedDemoCustomer();

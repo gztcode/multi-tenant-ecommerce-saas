@@ -8,6 +8,7 @@ import type { TenantPrismaService } from '../../../common/tenant/tenant-prisma.s
 import { ReplaceSpecsDto } from '../dto/replace-specs.dto';
 import { SpecMatrixService } from './spec-matrix.service';
 import { MinPriceService } from '../pricing/min-price.service';
+import type { QuotaService } from '../../billing/quota.service';
 
 /**
  * 规格矩阵服务里**只靠 HTTP 测不到**的那部分守卫。
@@ -31,7 +32,14 @@ describe('SpecMatrixService 的服务层守卫', () => {
     recalculate: jest.fn().mockResolvedValue(undefined),
   } as unknown as MinPriceService;
 
-  const service = new SpecMatrixService(prisma, minPrice);
+  // 第三个依赖是 QuotaService：额度检查在这里也是一道闸，
+  // 但这个 spec 只测校验阶段，给个「不拦」的空壳即可
+  // （额度本身由 e2e 覆盖）。
+  const quota = {
+    assertWithinQuota: jest.fn().mockResolvedValue(undefined),
+  } as unknown as QuotaService;
+
+  const service = new SpecMatrixService(prisma, minPrice, quota);
 
   /** 在租户上下文里调用（currentTenantId 依赖它） */
   function replace(dto: unknown, productId = 'p1') {

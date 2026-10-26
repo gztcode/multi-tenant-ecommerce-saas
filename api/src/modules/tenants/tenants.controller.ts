@@ -11,9 +11,9 @@ class UpdateTenantStatusDto {
     enum: TenantStatus,
     enumName: 'TenantStatus',
     description:
-      '目标状态：TRIAL 试用中 / ACTIVE 正式启用 / SUSPENDED 已停用（停用后其签发的令牌立即失效）',
+      '目标状态：ACTIVE 正式启用 / SUSPENDED 已停用（停用后其签发的令牌立即失效）',
   })
-  @IsEnum(TenantStatus, { message: 'status 必须是 TRIAL / ACTIVE / SUSPENDED' })
+  @IsEnum(TenantStatus, { message: 'status 必须是 ACTIVE / SUSPENDED' })
   status!: TenantStatus;
 }
 

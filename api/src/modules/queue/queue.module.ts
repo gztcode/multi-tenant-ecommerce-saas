@@ -1,6 +1,7 @@
 import { BullModule } from '@nestjs/bullmq';
 import { Global, Module } from '@nestjs/common';
 import {
+  BILLING_QUEUE,
   PAYMENT_TIMEOUT_QUEUE,
   PAYMENT_WEBHOOK_QUEUE,
 } from '../../common/queue/queue.constants';
@@ -53,6 +54,7 @@ import { QueueService } from './queue.service';
     BullModule.registerQueue(
       { name: PAYMENT_TIMEOUT_QUEUE },
       { name: PAYMENT_WEBHOOK_QUEUE },
+      { name: BILLING_QUEUE },
     ),
   ],
   providers: [QueueService],

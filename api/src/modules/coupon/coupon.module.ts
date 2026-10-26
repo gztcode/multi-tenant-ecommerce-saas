@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
+import { BillingModule } from '../billing/billing.module';
 import { CouponController } from './coupon.controller';
 import { MerchantCouponController } from './merchant-coupon.controller';
 import { MerchantPromotionController } from './merchant-coupon.controller';
@@ -19,7 +20,7 @@ import { PromotionService } from './promotion.service';
  * 反过来（coupon import order）会造成循环依赖。
  */
 @Module({
-  imports: [AuthModule],
+  imports: [AuthModule, BillingModule],
   controllers: [
     CouponController,
     MerchantCouponController,

@@ -12,6 +12,7 @@ import {
 import type { RawBodyRequest } from '@nestjs/common';
 import { Skip } from '../../common/decorators/skip.decorator';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { PaymentKind } from '@prisma/client';
 import type { Request } from 'express';
 import { PaymentService } from './payment.service';
 import { PaymentProvider } from './payment-provider.interface';
@@ -47,7 +48,7 @@ import { PAYMENT_PROVIDERS } from './payment.constants';
  * 金额都不对的事件根本不该进入处理流程。
  */
 @ApiTags('payment-webhooks')
-@Controller('webhooks/payment')
+@Controller('webhooks')
 // ⚠️ **跳过租户上下文拦截器**（`@Skip()`）：渠道回调**不带子域名**，
 // 拦截器按子域名解析租户会直接 404。
 //
@@ -62,12 +63,54 @@ export class WebhookController {
     private readonly providers: Map<string, PaymentProvider>,
   ) {}
 
-  @Post(':channel')
+  /**
+   * 订单付款的回调。
+   *
+   * ⚠️ **与订阅的回调分成两个端点**（而不是一个端点里判断类型）：
+   * 分流点由**端点本身**决定 —— 渠道适配器不需要猜「这笔是什么」。
+   */
+  @Post('payment/:channel')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: '渠道回调（验签后入队）' })
-  async handle(
+  async payment(
     @Param('channel') channel: string,
     @Req() request: RawBodyRequest<Request>,
+  ) {
+    return this.handleWebhook(request, channel, PaymentKind.ORDER);
+  }
+
+  /**
+   * 订阅付款的回调。
+   *
+   * ⚠️ **与订单的回调分成两个端点**（而不是一个端点里判断类型）：
+   * 分流点由**端点本身**决定 —— 渠道适配器不需要猜「这笔是什么」。
+   */
+  @Post('subscription/:channel')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: '订阅付款的渠道回调（验签后入队）' })
+  async subscription(
+    @Param('channel') channel: string,
+    @Req() request: RawBodyRequest<Request>,
+  ) {
+    return this.handleWebhook(request, channel, PaymentKind.SUBSCRIPTION);
+  }
+
+  /**
+   * 两个端点共用的处理逻辑。
+   *
+   * ⚠️ **验签必须在落库之前**，失败抛异常 → HTTP 层转 401
+   * （阶段 3 的顺序，不能反）。
+   *
+   * ⚠️ `kind` 决定反查哪张业务单（订单 / 账单），由**端点**传入，
+   * 渠道适配器不需要猜「这笔是什么」。
+   *
+   * ⚠️ **`kind` 必须一路带到队列里**（`enqueueWebhookEvent` → 消费端
+   * `applyEvent`）：消费端要靠它决定反查订单还是反查账单。
+   */
+  private async handleWebhook(
+    request: RawBodyRequest<Request>,
+    channel: string,
+    kind: PaymentKind,
   ) {
     const provider = this.providers.get(channel);
     if (!provider) {
@@ -87,11 +130,11 @@ export class WebhookController {
     // ---- 1. 验签（失败会抛 401，**一个字都不写进数据库**）----
     const event = provider.parseWebhook(raw, request.headers);
 
-    // ---- 2. 金额核对 + 从订单反查租户（R13 / R14）----
+    // ---- 2. 金额核对 + 从业务单反查租户（R13 / R14）----
     //
     // ⚠️ **不核对就流转，等于「付 1 分钱买 100 元商品」**。
-    // ⚠️ **租户从订单反查**，绝不采信请求体里的 tenantId。
-    const checked = await this.paymentService.checkWebhookEvent(event);
+    // ⚠️ **租户从业务单反查**，绝不采信请求体里的 tenantId。
+    const checked = await this.paymentService.checkWebhookEvent(event, kind);
     if (!checked.accepted || !checked.tenantId) {
       // 金额不符或订单不存在：只回「收到了」，不流转订单。
       // ⚠️ 回 200 而不是 4xx/5xx：渠道会因非 2xx 而**无限重投**同一个
@@ -109,7 +152,14 @@ export class WebhookController {
     }
 
     // ---- 4. 投递到 payment-webhook 队列异步消费 ----
-    await this.paymentService.enqueueWebhookEvent(event, checked.tenantId);
+    //
+    // ⚠️ **`kind` 必须带进队列**：消费端要靠它决定反查订单还是反查账单。
+    // 少了它，订阅回调会被当成订单回调而查不到订单——**静默丢掉**。
+    await this.paymentService.enqueueWebhookEvent(
+      event,
+      checked.tenantId,
+      kind,
+    );
 
     return { received: true, processed: true };
   }

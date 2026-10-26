@@ -33,6 +33,7 @@ import {
 import { CreateCouponDto } from './dto/create-coupon.dto';
 import { UpdateCouponDto } from './dto/update-coupon.dto';
 import { ClaimCouponDto } from './dto/claim-coupon.dto';
+import { FEATURE_MARKETING, QuotaService } from '../billing/quota.service';
 
 /**
  * 领取时撞 `coupon_claims_coupon_customer_uniq` 的重试次数。
@@ -116,7 +117,12 @@ export interface CouponPreview {
  */
 @Injectable()
 export class CouponService {
-  constructor(private readonly prisma: TenantPrismaService) {}
+  constructor(
+    private readonly prisma: TenantPrismaService,
+    // ⚠️ **模块依赖方向是 `coupon` → `billing`**（单向）。
+    // `billing` 绝不能 import `coupon` —— 那就成了环。
+    private readonly quota: QuotaService,
+  ) {}
 
   /**
    * 当前租户 ID。
@@ -157,6 +163,12 @@ export class CouponService {
     if (context.role === UserRole.PLATFORM_ADMIN) {
       throw new ForbiddenException('平台超管请使用平台券接口创建平台券');
     }
+
+    // ⚠️ **功能开关检查在 service 层**（护栏 M14 / M16）：
+    // 只在 controller 层拦的话，绕过 controller 直接调 service 就拦不住。
+    // ⚠️ **平台券不受这个限制**（它归平台管，不受某个商家的套餐约束）——
+    // 所以检查放在「不是平台超管」这个分支之后。
+    await this.quota.assertHasFeature(tenantId, FEATURE_MARKETING);
 
     const { startsAt, endsAt } = this.parseWindow(dto.startsAt, dto.endsAt);
 
@@ -235,6 +247,9 @@ export class CouponService {
    */
   async updateCoupon(id: string, dto: UpdateCouponDto): Promise<Coupon> {
     const tenantId = this.currentTenantId();
+
+    // ⚠️ **功能开关检查在 service 层**（护栏 M14 / M16）
+    await this.quota.assertHasFeature(tenantId, FEATURE_MARKETING);
 
     const data: Record<string, unknown> = {};
     if (dto.code !== undefined) data.code = dto.code;

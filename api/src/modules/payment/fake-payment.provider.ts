@@ -4,8 +4,10 @@ import {
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
+  ChargeAuthorizedInput,
+  ChargeAuthorizedResult,
   CreatePaymentInput,
   CreatePaymentResult,
   NormalizedWebhookEvent,
@@ -78,14 +80,14 @@ export class FakePaymentProvider implements PaymentProvider {
       throw new ServiceUnavailableException('本地假支付网关未启用');
     }
     return Promise.resolve({
-      // ⚠️ 用 paymentId 本身当渠道交易号：假网关的「支付单」与「渠道交易」
+      // ⚠️ 用支付单 id 本身当渠道交易号：假网关的「支付单」与「渠道交易」
       // 是一一对应的，省掉一层映射。
-      providerTxnId: input.orderId,
+      providerTxnId: input.referenceId,
       payload: {
         // 支付页面 URL。**不带 host**——前端拿到的相对路径自己拼域名，
         // 免得后端猜错了对外地址。
-        payUrl: `/api/v1/pay/fake/${input.orderId}`,
-        orderNo: input.orderNo,
+        payUrl: `/api/v1/pay/fake/${input.referenceId}`,
+        referenceNo: input.referenceNo,
         amount: input.amount,
         subject: input.subject,
       },
@@ -115,6 +117,59 @@ export class FakePaymentProvider implements PaymentProvider {
     void amount;
     void reason;
     return Promise.resolve({ status: 'REFUNDED' });
+  }
+
+  /**
+   * 用已授权的支付方式扣款（自动续费）。
+   *
+   * ⚠️ **假网关的「已授权扣款」是立即成功的** —— 本地没有真的资金通道。
+   * 但它**走的是与 `createPayment` 一样的形状**（返回渠道交易号），
+   * 让调用方能像对待普通支付一样处理它（落 `providerTxnId`、比对金额）。
+   *
+   * ⚠️ **前提：同一笔支付单只会走一条路** —— 要么跳页面付款
+   * （`createPayment`），要么用已授权方式扣款（`chargeAuthorized`），
+   * **不会既走 `createPayment` 又走 `chargeAuthorized`**。
+   *
+   * 之所以要写明：两条路都把 `input.referenceId`（支付单 id）当渠道交易号，
+   * 而 `(provider, providerTxnId)` 是**唯一索引**。同一笔支付单若两条路都走过，
+   * 第二次落库会撞唯一索引——写起来像「幂等保护」，实际是「第二次写失败」。
+   * 订阅侧靠 `payments` 的 `(invoiceId, channel)` 唯一索引保证只走一条：
+   * 建了支付单就不会再扣第二次，扣款与跳页面天然互斥。
+   *
+   * ⚠️ **不能省掉这个方法**：没有它，「自动续费」只能降级成
+   * 「自动生成账单 + 通知」，订阅链路就只验证了「跳页面付款」那一半。
+   */
+  chargeAuthorized(
+    input: ChargeAuthorizedInput,
+  ): Promise<ChargeAuthorizedResult> {
+    if (!isFakePaymentEnabled()) {
+      throw new ServiceUnavailableException('本地假支付网关未启用');
+    }
+    return Promise.resolve({
+      providerTxnId: input.referenceId,
+      status: 'SUCCESS',
+    });
+  }
+
+  /**
+   * 创建一个已授权的支付方式。
+   *
+   * ⚠️ **假网关给的是一个假 token** —— 本地没有真的支付方式。
+   * 真实渠道这里要换成「跳授权页 + 回调」（Stripe 的 SetupIntent）。
+   *
+   * ⚠️ **token 由渠道给，不是客户端给的**：客户端传 token 的话，
+   * 商家就能绑一个「不属于自己的」支付方式 —— 续费时扣的是别人的钱。
+   */
+  createPaymentMethod(input: { type: string }): Promise<{ token: string }> {
+    if (!isFakePaymentEnabled()) {
+      throw new ServiceUnavailableException('本地假支付网关未启用');
+    }
+    // ⚠️ 参数照收不用——真实渠道要用支付方式类型（选卡组织/钱包 appId），
+    // 这里记一笔免得 IDE 报「未使用」。
+    void input;
+    return Promise.resolve({
+      token: `fake_pm_${randomUUID()}`,
+    });
   }
 
   /**
@@ -159,11 +214,13 @@ export class FakePaymentProvider implements PaymentProvider {
 
     const eventId = readString(payload, 'eventId');
     const providerTxnId = readString(payload, 'providerTxnId');
-    const orderNo = readString(payload, 'orderNo');
+    // ⚠️ **读 body 的键仍是 `orderNo`** —— 那是假网关自己的报文格式，不改；
+    // 只是**归一化后**的字段改名成 `referenceNo`。
+    const referenceNo = readString(payload, 'orderNo');
     const amount = readNumber(payload, 'amount');
     const success = payload.success === true;
 
-    if (!eventId || !providerTxnId || !orderNo) {
+    if (!eventId || !providerTxnId || !referenceNo) {
       throw new BadRequestException('支付回调缺少必要字段');
     }
     if (amount === null || !Number.isInteger(amount) || amount < 0) {
@@ -175,7 +232,7 @@ export class FakePaymentProvider implements PaymentProvider {
       channel: this.channel,
       eventId,
       providerTxnId,
-      orderNo,
+      referenceNo,
       amount,
       success,
     };

@@ -42,10 +42,10 @@ export class FakePaymentController {
   ): Promise<void> {
     this.assertEnabled();
 
-    const { payment, order } =
-      await this.paymentService.readPaymentWithOrder(paymentId);
+    const { payment, reference } =
+      await this.paymentService.readPaymentWithReference(paymentId);
 
-    res.type('text/html; charset=utf-8').send(renderPage(order, payment));
+    res.type('text/html; charset=utf-8').send(renderPage(reference, payment));
   }
 
   @Post(':paymentId/confirm')
@@ -81,14 +81,17 @@ export class FakePaymentController {
  * 渲染极简支付页。
  *
  * ⚠️ 金额显示的是**整数分**——这里刻意不做「分转元」的格式化，
- * 因为那是给用户看的金额，与账目金额是两个东西。订单号与金额都原样显示，
+ * 因为那是给用户看的金额，与账目金额是两个东西。业务单号与金额都原样显示，
  * 免得看的人以为页面上的数就是系统里的数。
+ *
+ * ⚠️ 页面上标的仍是「订单号」——本阶段只有订单支付能走到这里
+ * （订阅支付单的分支 Task 5 才补上）。
  */
 function renderPage(
-  order: { orderNo: string },
+  reference: { number: string },
   payment: { id: string; amount: number },
 ): string {
-  const escapedOrderNo = escapeHtml(order.orderNo);
+  const escapedReferenceNo = escapeHtml(reference.number);
   const escapedPaymentId = escapeHtml(payment.id);
   return `<!doctype html>
 <html lang="zh-CN">
@@ -106,7 +109,7 @@ function renderPage(
 <h1>本地假支付网关</h1>
 <p>⚠️ 这是本机开发用的假网关，不是真实支付渠道。</p>
 <dl>
-  <dt>订单号</dt><dd>${escapedOrderNo}</dd>
+  <dt>订单号</dt><dd>${escapedReferenceNo}</dd>
   <dt>应付金额</dt><dd>${payment.amount}（整数分）</dd>
 </dl>
 <form method="post" action="/api/v1/pay/fake/${escapedPaymentId}/confirm">

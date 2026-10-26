@@ -24,7 +24,7 @@ export class TenantsService {
   }
 
   /**
-   * 变更商家状态（平台超管）：TRIAL / ACTIVE / SUSPENDED。
+   * 变更商家状态（平台超管）：ACTIVE / SUSPENDED。
    *
    * 用 updateMany 而非 update，与店铺更新同理——update 的 where 只接受唯一字段。
    * 先 findFirst 判存在再写，是为了把「商家不存在」表达成 404 而不是静默成功。

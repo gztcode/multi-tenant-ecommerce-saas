@@ -2,10 +2,15 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { OrderModule } from '../order/order.module';
 import { CouponModule } from '../coupon/coupon.module';
+import { BillingModule } from '../billing/billing.module';
 import { PaymentController } from './payment.controller';
 import { WebhookController } from './webhook.controller';
 import { FakePaymentController } from './fake-payment.controller';
+import { SubscriptionPaymentController } from './subscription-payment.controller';
 import { PaymentService } from './payment.service';
+import { PaymentMethodService } from './payment-method.service';
+import { RenewalService } from './renewal.service';
+import { RenewalWorker } from './renewal.worker';
 import { WebhookWorker } from './webhook.worker';
 import { FakePaymentProvider } from './fake-payment.provider';
 import { PaymentProvider } from './payment-provider.interface';
@@ -31,6 +36,22 @@ import { PAYMENT_PROVIDERS } from './payment.constants';
  * 所以 `payment → coupon`、`order → coupon`、`payment → order`
  * 三条边都不构成环。
  *
+ * ⚠️ **导入 BillingModule**（阶段 5b Task 5）：订阅付款成功时要
+ * 「账单付清 → 订阅期延长」，那是 billing 的 `InvoiceService` 的活。
+ * 依赖方向是 `payment → billing`（单向）。
+ *
+ * ⚠️ **依赖图（阶段 5b 的铁律）**：
+ * ```
+ * payment  →  billing  →  （无）
+ *    ↓          ↑
+ *  order ────────┘
+ * ```
+ * ⚠️ **`billing` 模块绝对不能 import `payment`** —— 那就成了
+ * `order → billing → payment → order` 的环，NestJS 启动直接报错。
+ * 所以「凡是要碰支付渠道的事一律在 `payment` 模块里」：
+ * 订阅付款的 webhook、建订阅支付单、自动扣款、支付方式的绑定 —— 全在 payment。
+ * `billing` 只管「账目与权益」（套餐、订阅、账单、额度、报表）。
+ *
  * ## 渠道注册
  *
  * ⚠️ 渠道表用 `Map` 而不是逐个注入具体的 provider 类：
@@ -38,10 +59,18 @@ import { PAYMENT_PROVIDERS } from './payment.constants';
  * 而 `Map` 让「按渠道名找 provider」不需要 switch/if 链。
  */
 @Module({
-  imports: [AuthModule, OrderModule, CouponModule],
-  controllers: [PaymentController, WebhookController, FakePaymentController],
+  imports: [AuthModule, OrderModule, CouponModule, BillingModule],
+  controllers: [
+    PaymentController,
+    WebhookController,
+    FakePaymentController,
+    SubscriptionPaymentController,
+  ],
   providers: [
     PaymentService,
+    PaymentMethodService,
+    RenewalService,
+    RenewalWorker,
     WebhookWorker,
     FakePaymentProvider,
     {
@@ -54,6 +83,6 @@ import { PAYMENT_PROVIDERS } from './payment.constants';
       inject: [FakePaymentProvider],
     },
   ],
-  exports: [PaymentService],
+  exports: [PaymentService, PaymentMethodService, RenewalService],
 })
 export class PaymentModule {}

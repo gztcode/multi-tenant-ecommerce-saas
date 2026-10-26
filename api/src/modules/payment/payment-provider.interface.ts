@@ -23,14 +23,42 @@
 
 /** 发起支付时要传给渠道的信息 */
 export interface CreatePaymentInput {
-  /** 订单 id（uuid） */
-  orderId: string;
-  /** 订单号（对外可见的凭证，会出现在渠道页面与对账单里） */
-  orderNo: string;
-  /** 支付金额（**整数分**）。⚠️ 只从订单读，绝不从请求体读。 */
+  /**
+   * 支付单 id（uuid）——渠道侧的「支付单号」，也是幂等去重的依据。
+   *
+   * ⚠️ **阶段 5b 之前这个字段叫 `orderId`，但传的是支付单 id**
+   * （`provider.createPayment({ orderId: payment.id, ... })`）——
+   * 只有 `orderNo` 才是订单号。名字有误导，5b 借泛化一并改掉。
+   */
+  referenceId: string;
+  /** 业务单号（订单号 / 账单号），渠道页面与对账单上显示的 */
+  referenceNo: string;
+  /** 支付金额（**整数分**）。⚠️ 只从订单/账单读，绝不从请求体读。 */
   amount: number;
   /** 商品标题（渠道页面上的显示名） */
   subject: string;
+}
+
+/** 用已授权的支付方式扣款的输入（自动续费用） */
+export interface ChargeAuthorizedInput {
+  referenceId: string;
+  referenceNo: string;
+  amount: number;
+  subject: string;
+  /** 已授权的支付方式凭证（`payment_methods.token`） */
+  paymentMethodToken: string;
+}
+
+/** 用已授权的支付方式扣款的结果 */
+export interface ChargeAuthorizedResult {
+  /** 渠道交易号。幂等去重要按它走 */
+  providerTxnId: string;
+  /**
+   * 渠道侧的支付状态。
+   * ⚠️ **开放字符串**：'SUCCESS' / 'FAILED' / 'PENDING' 各渠道不同。
+   * 调用方只认 'SUCCESS'，其余走失败路径。
+   */
+  status: string;
 }
 
 /** 渠道返回的支付信息 */
@@ -75,8 +103,13 @@ export interface NormalizedWebhookEvent {
   eventId: string;
   /** 渠道交易号 */
   providerTxnId: string;
-  /** 订单号 */
-  orderNo: string;
+  /**
+   * 业务单号（订单号 / 账单号）。
+   *
+   * ⚠️ **靠它反查租户**（不采信请求体里的 tenantId，阶段 3 的 R14）——
+   * 订单路径反查订单，订阅路径反查账单。
+   */
+  referenceNo: string;
   /** 支付金额（整数分） */
   amount: number;
   /** 这次回调表示「支付成功」还是「支付失败」 */
@@ -114,6 +147,30 @@ export interface PaymentProvider {
     amount: number,
     reason: string,
   ): Promise<RefundResult>;
+
+  /**
+   * 用**已授权的支付方式**直接扣款（自动续费用）。
+   *
+   * ⚠️ **同步返回结果，不跳页面** —— 没有人来点。真实渠道的
+   * off-session charge 也是这个形态。
+   * ⚠️ **重复调用由调用方保证幂等**：本项目用 `payments` 表的
+   * `(invoiceId, channel)` 唯一索引（建支付单时就会撞）。
+   */
+  chargeAuthorized(
+    input: ChargeAuthorizedInput,
+  ): Promise<ChargeAuthorizedResult>;
+
+  /**
+   * 创建一个**已授权**的支付方式，返回渠道侧的凭证。
+   *
+   * ⚠️ **真实渠道这里要换成「跳授权页 + 回调」**（Stripe 的 SetupIntent
+   * 就是这个形态）—— 本阶段的假网关直接给一个假 token。
+   * 签名保持「同步返回 token」是为了让 service 层不用管两种流程。
+   */
+  createPaymentMethod(input: {
+    /** 支付方式类型：CARD / WECHAT / ALIPAY */
+    type: string;
+  }): Promise<{ token: string }>;
 
   /**
    * 解析渠道回调：验签 + 归一化。
