@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { CouponModule } from '../coupon/coupon.module';
+import { BillingModule } from '../billing/billing.module';
 import { OrderInventoryService } from './inventory.service';
 import { OrderService } from './order.service';
 import { OrderTimeoutService } from './order-timeout.service';
@@ -31,7 +32,7 @@ import { MerchantOrderController } from './merchant-order.controller';
  * - `OrderInventoryService`：Task 5 的支付成功要调 `deductInTx` 确认售出
  */
 @Module({
-  imports: [AuthModule, CouponModule],
+  imports: [AuthModule, CouponModule, BillingModule],
   controllers: [OrderController, MerchantOrderController],
   providers: [
     OrderInventoryService,

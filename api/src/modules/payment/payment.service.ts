@@ -7,7 +7,14 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { OrderStatus, Payment, PaymentStatus, Prisma } from '@prisma/client';
+import {
+  InvoiceStatus,
+  OrderStatus,
+  Payment,
+  PaymentKind,
+  PaymentStatus,
+  Prisma,
+} from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   getTenantContext,
@@ -21,6 +28,7 @@ import { PAYMENT_WEBHOOK_QUEUE } from '../../common/queue/queue.constants';
 import { OrderService } from '../order/order.service';
 import { OrderInventoryService } from '../order/inventory.service';
 import { CouponRedemptionService } from '../coupon/coupon-redemption.service';
+import { InvoiceService } from '../billing/invoice.service';
 import {
   NormalizedWebhookEvent,
   PaymentProvider,
@@ -40,6 +48,51 @@ export interface CreatedPayment {
   payUrl: string;
   /** 渠道返回的原始数据 */
   rawResponse: Prisma.JsonValue;
+}
+
+/**
+ * 订阅支付单创建后的返回（与订单侧的 `CreatedPayment` 分开）。
+ *
+ * ⚠️ **刻意不复用 `CreatedPayment`**：那个结构里的 `orderNo` 是订单专用字段，
+ * 而账单的对外凭证叫 `number`（账单号）。塞进 `orderNo` 是命名漂移，
+ * 而且那个结构里既没有 `kind` 也没有 `invoiceNumber`——调用方分不清
+ * 拿到的是订单号还是账单号。
+ *
+ * ⚠️ 订单侧的 `CreatedPayment` **不动**：中转路由与 storefront 的前端都在用它，
+ * 改它会波及阶段 3 已验收的链路。
+ */
+export interface CreatedInvoicePayment {
+  paymentId: string;
+  /** 跳支付页的地址 */
+  payUrl: string;
+  /** 应付金额（整数分） */
+  amount: number;
+  /** 账单号（对外凭证） */
+  invoiceNumber: string;
+}
+
+/**
+ * 自动续费扣款的结果。
+ *
+ * ⚠️ **调用方必须判 `status === 'SUCCESS'`，其余一律当失败路径处理**——
+ * `status` 是**开放字符串**（各渠道的枚举不同，可能是 'PENDING' /
+ * 'FAILED' / 'REQUIRE_ACTION'）。把它当成功落库，等于把「还没扣到钱」
+ * 的账单标记成已付。
+ *
+ * ⚠️ **带 `paymentId`**：Task 5 要建支付单、落 `providerTxnId`、回写 `payments` 行，
+ * 调用方拿不到 `paymentId` 就无法把「扣款成功」与「支付单落库失败」这种
+ * 中间态表达出来。
+ */
+export interface InvoiceChargeResult {
+  /** 支付单 id（本地） */
+  paymentId: string;
+  /** 渠道交易号。幂等去重要按它走 */
+  providerTxnId: string;
+  /**
+   * 渠道侧的支付状态。
+   * ⚠️ **开放字符串**：只有 `'SUCCESS'` 算成功，其余走失败路径。
+   */
+  status: string;
 }
 
 /**
@@ -81,12 +134,15 @@ export class PaymentService {
     private readonly inventory: OrderInventoryService,
     private readonly queue: QueueService,
     private readonly couponRedemption: CouponRedemptionService,
+    // ⚠️ **`payment → billing` 是单向依赖** —— 与依赖图一致（不是环）。
+    // 账单付清要延长订阅期，那件事由 billing 的 `InvoiceService` 做。
+    private readonly billingInvoices: InvoiceService,
     @Inject(PAYMENT_PROVIDERS)
     private readonly providers: Map<string, PaymentProvider>,
   ) {}
 
   /** 当前租户 ID */
-  private currentTenantId(): string {
+  currentTenantId(): string {
     const context = getTenantContext();
     if (!context.tenantId) {
       throw new NotFoundException('无法确定店铺');
@@ -171,8 +227,8 @@ export class PaymentService {
 
     const subject = order.items[0]?.productName ?? `订单 ${order.orderNo}`;
     const result = await provider.createPayment({
-      orderId: payment.id,
-      orderNo: order.orderNo,
+      referenceId: payment.id,
+      referenceNo: order.orderNo,
       amount,
       subject,
     });
@@ -219,6 +275,266 @@ export class PaymentService {
   }
 
   // ============================================================
+  // 订阅付款（阶段 5b Task 2 只留骨架，Task 5 补业务逻辑）
+  // ============================================================
+
+  /**
+   * 建订阅的支付单并调渠道（**手动续费**走这条：跳页面付款）。
+   *
+   * ⚠️ **金额只从账单读**，请求体不接受任何金额字段。
+   * ⚠️ **归属校验**：账单号不是秘密（它出现在渠道页面与对账单里），
+   * 所以必须校验账单属于当前租户。
+   *
+   * ⚠️ **返回的是 `CreatedInvoicePayment` 而不是 `CreatedPayment`**：
+   * 后者的 `orderNo` 是订单专用字段，账单号只能塞进 `invoiceNumber`。
+   */
+  async createInvoicePayment(
+    invoiceNumber: string,
+    channel: string,
+  ): Promise<CreatedInvoicePayment> {
+    const tenantId = this.currentTenantId();
+    const provider = this.providerOf(channel);
+
+    const invoice = await this.prisma.invoice.findFirst({
+      where: { tenantId, number: invoiceNumber },
+    });
+    if (!invoice) {
+      throw new NotFoundException('账单不存在');
+    }
+    // ⚠️ **`FAILED` 的账单也要允许支付**。
+    //
+    // `FAILED` 的语义是「上一次支付尝试失败了」——自动扣款失败时
+    // 续费扫描会把它置成 FAILED，等商家手动补付。
+    // 只放行 `OPEN` 的话，商家会永远付不了款：点「去支付」一直 409，
+    // 订阅也永远不过期（钱交不出去、服务也开不了）。
+    if (
+      invoice.status !== InvoiceStatus.OPEN &&
+      invoice.status !== InvoiceStatus.FAILED
+    ) {
+      throw new ConflictException('账单当前状态不允许支付');
+    }
+
+    // ⚠️ **同一个账单同一渠道只有一笔支付单** ——
+    // `payments_invoice_channel_uniq` 兜底。已有的一笔：
+    // - SUCCESS → 真的付过了 → 抛冲突
+    // - PENDING / FAILED → 上一轮没成功 → **复用**它重试
+    const { payment } = await this.obtainInvoicePayment(
+      invoice.id,
+      channel,
+      provider.provider,
+      invoice.amount,
+      tenantId,
+    );
+
+    // ⚠️ **复用时要重新调渠道拿 payUrl** —— 旧的支付页面可能已经过期
+    // （假网关的支付页 15 分钟失效）。
+    const result = await provider.createPayment({
+      referenceId: payment.id,
+      referenceNo: invoice.number,
+      amount: invoice.amount,
+      subject: `订阅账单 ${invoice.number}`,
+    });
+
+    // ⚠️ **`providerTxnId` 不重置** —— 它是**渠道侧的幂等单号**
+    // （假网关用 `payment.id` 当渠道交易号），同一个 id 重试
+    // 不会被渠道扣两次。复用支付单时它已经有了，
+    // 所以这里的条件更新（`providerTxnId: null`）不命中 → 保持原值。
+    //
+    // ⚠️ `rawResponse` **无条件刷新**（含复用场景）：旧的 payUrl 可能已过期，
+    // 渠道给的新 payload 才是当前有效的那个。
+    await this.prisma.payment.updateMany({
+      where: { id: payment.id, providerTxnId: null },
+      data: {
+        providerTxnId: result.providerTxnId,
+        rawResponse: result.payload as Prisma.InputJsonValue,
+      },
+    });
+    await this.prisma.payment.updateMany({
+      where: { id: payment.id },
+      data: {
+        rawResponse: result.payload as Prisma.InputJsonValue,
+      },
+    });
+
+    return {
+      paymentId: payment.id,
+      payUrl: this.payUrlFromPayload(result.payload),
+      amount: invoice.amount,
+      invoiceNumber: invoice.number,
+    };
+  }
+
+  /**
+   * 拿到（必要时复用）某个账单在某渠道上的支付单。
+   *
+   * ## 三种情况
+   *
+   * | 已有的支付单 | 含义 | 动作 |
+   * |---|---|---|
+   * | 没有 | 从没付过 | 建一笔（`kind = SUBSCRIPTION`，status 默认 PENDING） |
+   * | `SUCCESS` | **真的付过了** | 抛冲突（「该账单已支付」） |
+   * | `PENDING` / `FAILED` | **上一轮没成功** | 复用它（重置为 PENDING） |
+   *
+   * ⚠️ **为什么不能把「已有支付单」等同于「已扣款」**：
+   * 自动扣款失败时支付单会被留在 `PENDING`（渠道返回非 SUCCESS）。
+   * 如果这里一律抛冲突，那次扫描之后**这个订阅在该渠道上永久无法再自动扣款**
+   * —— 商家既不能自动续费，也只能拿到一个「该账单已有支付单」的 409。
+   *
+   * ⚠️ **复用而不是新建**：`(invoiceId, channel)` 上有唯一索引
+   * （`payments_invoice_channel_uniq`），新建会撞。
+   *
+   * ⚠️ **`providerTxnId` 不重置**：它是**渠道侧的幂等单号**
+   * （假网关用 `payment.id` 当渠道交易号），**同一个 id 重试不会被渠道扣两次**。
+   * 置 null 反而会让渠道以为是一笔新交易 —— 那就是重复扣款。
+   */
+  private async obtainInvoicePayment(
+    invoiceId: string,
+    channel: string,
+    providerName: string,
+    amount: number,
+    tenantId: string,
+  ): Promise<{ payment: Payment; reused: boolean }> {
+    const existing = await this.prisma.payment.findFirst({
+      where: { invoiceId, channel },
+    });
+
+    if (!existing) {
+      const payment = await this.prisma.payment.create({
+        data: {
+          tenantId,
+          kind: PaymentKind.SUBSCRIPTION,
+          invoiceId,
+          channel,
+          provider: providerName,
+          amount,
+        },
+      });
+      return { payment, reused: false };
+    }
+
+    if (existing.status === PaymentStatus.SUCCESS) {
+      // ⚠️ **真的付过了** —— 不重复收钱
+      throw new ConflictException('该账单已支付');
+    }
+
+    // ⚠️ **上一轮没成功**（PENDING / FAILED / REFUNDED / CLOSED）→ 复用
+    await this.prisma.payment.updateMany({
+      where: { id: existing.id },
+      data: {
+        status: PaymentStatus.PENDING,
+        amount,
+        updatedAt: new Date(),
+      },
+    });
+    return {
+      payment: { ...existing, status: PaymentStatus.PENDING },
+      reused: true,
+    };
+  }
+
+  /**
+   * 从渠道返回的 payload 里取支付页面 URL。
+   *
+   * ⚠️ **只接受字符串**：payload 是渠道给的开放字典，`payUrl` 可能是
+   * 数字或对象，直接 `String()` 会得到「[object Object]」这种没意义的地址。
+   */
+  private payUrlFromPayload(payload: Record<string, unknown>): string {
+    const url = payload.payUrl;
+    return typeof url === 'string' ? url : '';
+  }
+
+  /**
+   * 自动续费的扣款（**已授权的支付方式直接扣**，不跳页面）。
+   *
+   * ⚠️ **幂等靠 `payments` 的 `(invoiceId, channel)` 唯一索引**：
+   * 建支付单时撞了就不再扣第二次。
+   *
+   * ⚠️ **但「已有支付单」≠「已扣款」**：上一轮扣款失败时支付单会停在
+   * `PENDING` / `FAILED`，那一次**没扣到钱**，所以**可以复用重试**。
+   * 只有支付单已经是 `SUCCESS` 时才是「真付过了」，才抛冲突。
+   *
+   * ⚠️ **调用方必须判 `status === 'SUCCESS'`**——`status` 是开放字符串，
+   * `'PENDING'` 不是成功。其余一律当失败路径处理。
+   */
+  async chargeInvoice(
+    invoiceNumber: string,
+    channel: string,
+    paymentMethodToken: string,
+  ): Promise<InvoiceChargeResult> {
+    const tenantId = this.currentTenantId();
+    const provider = this.providerOf(channel);
+
+    const invoice = await this.prisma.invoice.findFirst({
+      where: { tenantId, number: invoiceNumber },
+    });
+    if (!invoice) {
+      throw new NotFoundException('账单不存在');
+    }
+    // ⚠️ **`FAILED` 的账单也允许再扣**：`FAILED` 的语义是
+    // 「上一次支付尝试失败了」，重试是它的正常后续流程。
+    // 只放行 `OPEN` 的话，商家自动扣款失败一次之后，
+    // 这张账单**永远无法再自动续费**。
+    if (
+      invoice.status !== InvoiceStatus.OPEN &&
+      invoice.status !== InvoiceStatus.FAILED
+    ) {
+      throw new ConflictException('账单当前状态不允许支付');
+    }
+
+    // ⚠️ **拿到（必要时复用）支付单**：
+    // - 没有 → 建一笔
+    // - 已 SUCCESS → 真付过了 → 抛冲突
+    // - PENDING / FAILED → 上一轮没成功 → 复用重试
+    const { payment } = await this.obtainInvoicePayment(
+      invoice.id,
+      channel,
+      provider.provider,
+      invoice.amount,
+      tenantId,
+    );
+
+    const result = await provider.chargeAuthorized({
+      referenceId: payment.id,
+      referenceNo: invoice.number,
+      amount: invoice.amount,
+      subject: `订阅账单 ${invoice.number}`,
+      paymentMethodToken,
+    });
+
+    // ⚠️ **`providerTxnId` 不重置** —— 它是**渠道侧的幂等单号**
+    // （假网关用 `payment.id` 当渠道交易号），同一个 id 重试
+    // 不会被渠道扣两次。复用支付单时它已经有了 → 条件更新不命中。
+    await this.prisma.payment.updateMany({
+      where: { id: payment.id, providerTxnId: null },
+      data: { providerTxnId: result.providerTxnId },
+    });
+
+    if (result.status !== 'SUCCESS') {
+      // ⚠️ **扣款没成功 → 支付单置 FAILED**。
+      //
+      // 不落这个状态的话，支付单永远停在 `PENDING`：
+      // - 状态上看不出来「扣款失败了」
+      // - 下次扫描复用它时无从判断上一轮到底扣没扣成功
+      await this.prisma.payment.updateMany({
+        where: { id: payment.id },
+        data: { status: PaymentStatus.FAILED },
+      });
+    }
+
+    // ⚠️ **返回库里真正存着的那个渠道交易号**。
+    //
+    // 复用支付单时，库里那个是**上一轮**的（条件更新不命中 → 保持原值），
+    // 而渠道这次给的是新的。两者不一致时，**以库里的为准** ——
+    // 那是渠道侧已经认识的那个幂等单号。
+    const stored = await this.readPaymentById(payment.id);
+    return {
+      paymentId: payment.id,
+      providerTxnId: stored.providerTxnId ?? result.providerTxnId,
+      status: result.status,
+    };
+  }
+
+  // ============================================================
   // webhook 事件的处理
   // ============================================================
 
@@ -236,18 +552,43 @@ export class PaymentService {
    *    └─ 金额相等 → 进幂等流程
    * ```
    *
-   * ⚠️ **租户从订单反查**（R14）：webhook 端点没有租户上下文
-   * （渠道回调不带子域名），所以必须先按订单号找到订单，
+   * ⚠️ **租户从业务单反查**（R14）：webhook 端点没有租户上下文
+   * （渠道回调不带子域名），所以必须先按业务单号找到订单（或账单），
    * 拿到它的 tenantId。**绝不采信请求体里的 tenantId**——
    * 采信了就等于「构造回调指定别的租户」，能跨租户篡改订单。
+   *
+   * ⚠️ **kind 决定反查哪张单** —— 由 webhook 的**端点**决定，
+   * 渠道适配器不需要猜「这笔是什么」。
    */
   async checkWebhookEvent(
     event: NormalizedWebhookEvent,
+    kind: PaymentKind = PaymentKind.ORDER,
   ): Promise<WebhookEventCheck> {
-    const order = await this.findOrderAcrossTenants(event.orderNo);
+    if (kind === PaymentKind.SUBSCRIPTION) {
+      // ⚠️ **订阅分支**：反查账单（`referenceNo` 是账单号）、比对账单金额。
+      const invoice = await this.findInvoiceAcrossTenants(event.referenceNo);
+      if (!invoice) {
+        this.logger.warn(
+          `订阅回调找不到账单：${event.referenceNo}（事件 ${event.eventId}）`,
+        );
+        return { accepted: false, tenantId: null, orderId: null };
+      }
+      // ⚠️ **金额先核对**（护栏 M10）。不核对就流转，等于
+      // 「付 1 分钱续一年的费」。
+      if (event.amount !== invoice.amount) {
+        this.logger.error(
+          `订阅回调金额不符，拒绝流转：账单 ${invoice.number} ` +
+            `应付 ${invoice.amount}，实付 ${event.amount}（事件 ${event.eventId}）`,
+        );
+        return { accepted: false, tenantId: invoice.tenantId, orderId: null };
+      }
+      return { accepted: true, tenantId: invoice.tenantId, orderId: null };
+    }
+
+    const order = await this.findOrderAcrossTenants(event.referenceNo);
     if (!order) {
       this.logger.warn(
-        `支付回调找不到订单：${event.orderNo}（事件 ${event.eventId}）`,
+        `支付回调找不到订单：${event.referenceNo}（事件 ${event.eventId}）`,
       );
       return { accepted: false, tenantId: null, orderId: null };
     }
@@ -286,7 +627,7 @@ export class PaymentService {
           providerTxnId: event.providerTxnId,
           payload: {
             channel: event.channel,
-            orderNo: event.orderNo,
+            referenceNo: event.referenceNo,
             amount: event.amount,
             success: event.success,
           } as Prisma.InputJsonValue,
@@ -328,23 +669,29 @@ export class PaymentService {
    * ⚠️ 任务里的 `tenantId` **来自订单反查**（见 `checkWebhookEvent`），
    * 绝不能取自客户端提交的内容——否则「重建上下文」本身就成了越权通道。
    *
+   * ⚠️ **`kind` 必须一路带进队列**：消费端（`applyEvent`）要靠它决定
+   * 反查哪张业务单（订单 / 账单）。少了它，订阅回调会被**无条件**当成订单回调
+   * 去反查订单——查不到就静默丢掉，那笔续费的钱就没了。
+   *
    * ⚠️ **jobId 用连字符**而不是冒号：BullMQ v6 拒绝含 `:` 的自定义 id
    * （`Custom Id cannot contain :`）。同一个 eventId 只排一个任务。
    */
   async enqueueWebhookEvent(
     event: NormalizedWebhookEvent,
     tenantId: string,
+    kind: PaymentKind = PaymentKind.ORDER,
   ): Promise<void> {
     await this.queue.add(
       PAYMENT_WEBHOOK_QUEUE,
       'payment',
       {
         tenantId,
+        kind,
         eventId: event.eventId,
         provider: event.provider,
         channel: event.channel,
         providerTxnId: event.providerTxnId,
-        orderNo: event.orderNo,
+        referenceNo: event.referenceNo,
         amount: event.amount,
         success: event.success,
       },
@@ -432,12 +779,18 @@ export class PaymentService {
     // ⚠️ **条件更新是 R5 的支付侧**：支付回调与超时释放都用
     // `status = 'PENDING_PAYMENT'` 的条件更新，数据库保证只有一方能赢。
     // 少了这一侧，超时释放与支付并发时仍会超卖。
+    //
+    // ⚠️ **支付时间用数据库的时钟**（护栏 M15，与退款路径、账单路径一致）：
+    // 报表把 `Order.paidAt` 与 `Order.refundedAt` 聚到了一起，
+    // 两个时间字段的时钟口径必须一致 —— 一个用应用时钟、一个用数据库时钟，
+    // 多副本部署时各机器时钟有偏差，边界时刻会漏计或错计。
+    const paidAt = await this.prisma.databaseNow();
     const won = await this.orderService.transitionInTx(
       tx,
       order.id,
       OrderStatus.PENDING_PAYMENT,
       OrderStatus.PAID,
-      { paidAt: new Date() },
+      { paidAt },
     );
     if (!won) {
       // 订单已经不是 PENDING_PAYMENT（已支付 / 已超时关闭 / 已取消）。
@@ -521,6 +874,37 @@ export class PaymentService {
   }
 
   /**
+   * 按账单号查账单（**跨租户**）。
+   *
+   * ⚠️ webhook 端点**没有租户上下文**——渠道回调不带子域名。
+   * 所以订阅回调必须先按账单号找到账单，拿到它的 tenantId。
+   * **绝不采信请求体里的 tenantId**（R14）。
+   */
+  private async findInvoiceAcrossTenants(invoiceNumber: string): Promise<{
+    id: string;
+    number: string;
+    tenantId: string;
+    amount: number;
+  } | null> {
+    // ⚠️ 用 `platformScope()`：显式的跨租户读取必须收敛到可审计的少数几处。
+    return tenantContext.run(platformScope(), async () => {
+      const rows = await this.prisma.invoice.findMany({
+        where: { number: invoiceNumber },
+      });
+      const invoice = rows[0];
+      if (!invoice) {
+        return null;
+      }
+      return {
+        id: invoice.id,
+        number: invoice.number,
+        tenantId: invoice.tenantId,
+        amount: invoice.amount,
+      };
+    });
+  }
+
+  /**
    * 在指定租户的上下文里执行一段逻辑。
    *
    * ⚠️ 队列消费是**跨进程边界**的，AsyncLocalStorage 的上下文不跟着走，
@@ -596,6 +980,10 @@ export class PaymentService {
       throw new BadRequestException('渠道拒绝了本次退款');
     }
 
+    // ⚠️ **退款时间用数据库的时钟**（护栏 M15，与本仓库其它地方一致）：
+    // 多副本部署时各机器的时钟有偏差，边界时刻会摇摆。
+    const refundedAt = await this.prisma.databaseNow();
+
     await this.prisma.$transaction(
       async (tx) => {
         // 订单转 REFUNDED（条件更新，走 order 模块的转移表校验）
@@ -610,12 +998,17 @@ export class PaymentService {
         // **为什么不重算**：券的规则将来可能改，改了就对不上历史账（M12）。
         // 历史订单存的是**快照**（原价 / 活动减免 / 券减免各字段），
         // 退款读快照而不是重算——这正是 M12 的兑现点。
+        //
+        // ⚠️ **顺手记下退款时间**（阶段 5b Task 1 加的 `Order.refundedAt`）：
+        // 报表的「退款冲回」要按**退款发生的期间**归期，
+        // 不是按订单支付的期间 —— 阶段 3 的退款没记这个时间，
+        // 补上之前冲回那一栏永远是 0。
         const won = await this.orderService.transitionInTx(
           tx,
           order.id,
           order.status,
           OrderStatus.REFUNDED,
-          {},
+          { refundedAt },
         );
         if (!won) {
           throw new ConflictException('订单当前状态不允许退款');
@@ -646,12 +1039,26 @@ export class PaymentService {
   /**
    * 假网关「确认支付」：置支付单 SUCCESS 并**主动调用同一段 webhook 处理逻辑**。
    *
+   * ⚠️ **按 `kind` 分流**：订单支付走订单那条路，订阅支付走订阅那条路
+   * （Task 5 补）。
+   */
+  async fakeConfirmPayment(paymentId: string): Promise<void> {
+    const payment = await this.readPaymentAcrossTenants(paymentId);
+    if (payment.kind === PaymentKind.SUBSCRIPTION) {
+      await this.confirmInvoicePayment(payment);
+      return;
+    }
+    await this.confirmOrderPayment(payment);
+  }
+
+  /**
+   * 假网关「确认支付」（**订单支付**这条路）。
+   *
    * ⚠️ **直接调处理逻辑，而不是发 HTTP 请求到 webhook 端点**——
    * 「服务调自己」会引入自我依赖（容器编排里还要处理网络地址问题）。
    * 直接调用同一段逻辑，既真实（幂等与状态机都被走到）又不脆弱。
    */
-  async fakeConfirmPayment(paymentId: string): Promise<void> {
-    const payment = await this.readPaymentAcrossTenants(paymentId);
+  private async confirmOrderPayment(payment: Payment): Promise<void> {
     const order = await this.findOrderAcrossTenantsById(payment.orderId);
 
     // ⚠️ 走的是**与 webhook 端点完全相同**的那条路：
@@ -664,12 +1071,12 @@ export class PaymentService {
       // 落进幂等表的还是同一行。
       eventId: `fake-${payment.id}`,
       providerTxnId: payment.providerTxnId ?? payment.id,
-      orderNo: order.orderNo,
+      referenceNo: order.orderNo,
       amount: payment.amount,
       success: true,
     };
 
-    const check = await this.checkWebhookEvent(event);
+    const check = await this.checkWebhookEvent(event, PaymentKind.ORDER);
     if (!check.accepted || !check.tenantId) {
       return;
     }
@@ -678,6 +1085,38 @@ export class PaymentService {
       return;
     }
     await this.applyEvent(event, check.tenantId);
+  }
+
+  /**
+   * 假网关「确认支付」（**订阅支付**这条路）。
+   *
+   * ⚠️ 反查账单、比对金额、流转账单与订阅。
+   */
+  private async confirmInvoicePayment(payment: Payment): Promise<void> {
+    const invoice = await this.findInvoiceAcrossTenantsById(payment.invoiceId);
+
+    // ⚠️ 走的是**与 webhook 端点完全相同**的那条路：
+    // 验签后的核对 → 幂等落库 → 业务流转。
+    // 区别只是这里省掉了「验签」——事件是自己发的，不必自己签。
+    const event: NormalizedWebhookEvent = {
+      provider: payment.provider,
+      channel: payment.channel,
+      eventId: `fake-${payment.id}`,
+      providerTxnId: payment.providerTxnId ?? payment.id,
+      referenceNo: invoice.number,
+      amount: payment.amount,
+      success: true,
+    };
+
+    const check = await this.checkWebhookEvent(event, PaymentKind.SUBSCRIPTION);
+    if (!check.accepted || !check.tenantId) {
+      return;
+    }
+    const inserted = await this.insertEvent(event);
+    if (!inserted) {
+      return;
+    }
+    await this.applyEvent(event, check.tenantId, PaymentKind.SUBSCRIPTION);
   }
 
   /**
@@ -691,19 +1130,38 @@ export class PaymentService {
    * ⚠️ 订单的查询**在这个租户的作用域内**做（租户扩展自动附加
    * `tenantId` 条件）：租户不对就查不到订单，什么都不做。
    * 这正是 R14 的兑现点——采信了别的租户，订单就**转不动**。
+   *
+   * ## `kind` 决定反查哪张业务单
+   *
+   * ⚠️ **不能省**：`referenceNo` 在订单路径是订单号、在订阅路径是账单号。
+   * 少了 `kind` 就只能反查订单——订阅回调会**静默失败**（查不到订单 → 记告警 →
+   * 正常返回 → 事件被标成已处理 → 这笔续费的钱永远不流转）。
+   *
+   * ⚠️ **默认值是 `ORDER`**：既有调用方（阶段 3 的 e2e 直接调本方法）
+   * 只传两个参数，行为必须与之前**完全一致**。
    */
   async applyEvent(
     event: NormalizedWebhookEvent,
     tenantId: string,
+    kind: PaymentKind = PaymentKind.ORDER,
   ): Promise<void> {
+    // ⚠️ **按 kind 分流**：订阅那条路先走，订单那条路的逻辑一字不改。
+    if (kind === PaymentKind.SUBSCRIPTION) {
+      await runForTenant(tenantId, async () => {
+        await this.applySubscriptionEvent(event, tenantId, kind);
+      });
+      await this.markEventProcessed(event);
+      return;
+    }
+
     await runForTenant(tenantId, async () => {
       // ⚠️ 用**返回 null** 的那个变体：查不到订单时**不抛异常**——
       // 抛了会让 BullMQ 把任务判为失败，而重试也不会让它变对
       // （订单确实不在这个租户下）。
-      const order = await this.findOrderByNo(event.orderNo);
+      const order = await this.findOrderByNo(event.referenceNo);
       if (!order) {
         this.logger.warn(
-          `租户 ${tenantId} 下找不到订单 ${event.orderNo}（事件 ${event.eventId}）`,
+          `租户 ${tenantId} 下找不到订单 ${event.referenceNo}（事件 ${event.eventId}）`,
         );
         return;
       }
@@ -733,6 +1191,51 @@ export class PaymentService {
       );
     });
     await this.markEventProcessed(event);
+  }
+
+  /**
+   * 处理订阅付款的业务流转（幂等落库之后的那段）。
+   *
+   * ⚠️ **金额必须与账单一致**（护栏 M10）：不一致就拒绝 ——
+   * 付了 A 金额、开通了 B 金额的套餐，是最典型的资金漏洞。
+   * ⚠️ **租户从账单反查**（不采信请求体里的 tenantId，阶段 3 的 R14）。
+   */
+  private async applySubscriptionEvent(
+    event: NormalizedWebhookEvent,
+    tenantId: string,
+    kind: PaymentKind,
+  ): Promise<void> {
+    // ⚠️ `kind` 只用于把「这条是订阅回调」写进日志——
+    // 分流已经在 `applyEvent` 里做过了。
+    this.logger.debug(
+      `处理订阅付款事件（${kind}）：${event.referenceNo}（事件 ${event.eventId}）`,
+    );
+
+    const invoice = await this.prisma.invoice.findFirst({
+      where: { tenantId, number: event.referenceNo },
+    });
+    if (!invoice) {
+      this.logger.warn(
+        `订阅回调找不到账单：${event.referenceNo}（事件 ${event.eventId}）`,
+      );
+      return;
+    }
+    // ⚠️ **金额核对**（护栏 M10）
+    if (invoice.amount !== event.amount) {
+      this.logger.error(
+        `订阅回调金额不符：账单 ${invoice.amount}，事件 ${event.amount}`,
+      );
+      return;
+    }
+    if (!event.success) {
+      await this.prisma.invoice.updateMany({
+        where: { id: invoice.id, status: InvoiceStatus.OPEN },
+        data: { status: InvoiceStatus.FAILED },
+      });
+      return;
+    }
+    // ⚠️ **付清 → 延长周期**（条件更新，重复回调不会延长两次）
+    await this.billingInvoices.markInvoicePaid(invoice.id);
   }
 
   /**
@@ -847,24 +1350,77 @@ export class PaymentService {
   }
 
   /**
-   * 读「支付单 + 它的订单」的摘要（**跨租户**）。
+   * 读支付单与它引用的业务单（**跨租户**）。
    *
-   * ⚠️ 给假网关的支付页面用——页面要显示订单号与金额，
-   * 而渠道侧的请求没有租户上下文。
+   * ⚠️ 渠道侧场景用（渠道的请求不带子域名，租户由支付单自己带）。
+   * ⚠️ **按 `kind` 分支**：订单支付读订单，订阅支付读账单。
    */
-  async readPaymentWithOrder(paymentId: string): Promise<{
+  async readPaymentWithReference(paymentId: string): Promise<{
     payment: Payment;
-    order: { id: string; orderNo: string; totalAmount: number };
+    reference: { id: string; number: string; amount: number };
   }> {
     const payment = await this.readPaymentAcrossTenants(paymentId);
+
+    if (payment.kind === PaymentKind.SUBSCRIPTION) {
+      const invoice = await this.findInvoiceAcrossTenantsById(
+        payment.invoiceId,
+      );
+      return {
+        payment,
+        reference: {
+          id: invoice.id,
+          number: invoice.number,
+          amount: invoice.amount,
+        },
+      };
+    }
+
     const order = await this.findOrderAcrossTenantsById(payment.orderId);
     return {
       payment,
-      order: {
+      reference: {
         id: order.id,
-        orderNo: order.orderNo,
-        totalAmount: order.totalAmount,
+        number: order.orderNo,
+        amount: order.totalAmount,
       },
+    };
+  }
+
+  /**
+   * 按 id 读账单（**跨租户**）。
+   *
+   * ⚠️ 与 `readPaymentAcrossTenants` 同理：渠道侧场景用
+   * （假网关的支付页面、假网关的「确认支付」）。
+   *
+   * ⚠️ **`invoiceId` 可空**（`payments.invoiceId` 在阶段 5b 变成可空——
+   * 订单支付单没有账单）。传 null 表示「这笔支付单不指向账单」，
+   * 直接当「账单不存在」处理。
+   */
+  private async findInvoiceAcrossTenantsById(
+    invoiceId: string | null,
+  ): Promise<{
+    id: string;
+    number: string;
+    tenantId: string;
+    amount: number;
+  }> {
+    if (!invoiceId) {
+      throw new NotFoundException('账单不存在');
+    }
+    const invoice = await tenantContext.run(platformScope(), async () => {
+      const rows = await this.prisma.invoice.findMany({
+        where: { id: invoiceId },
+      });
+      return rows[0] ?? null;
+    });
+    if (!invoice) {
+      throw new NotFoundException('账单不存在');
+    }
+    return {
+      id: invoice.id,
+      number: invoice.number,
+      tenantId: invoice.tenantId,
+      amount: invoice.amount,
     };
   }
 
@@ -872,13 +1428,20 @@ export class PaymentService {
    * 按 id 读订单（**跨租户**）。
    *
    * ⚠️ 与 `readPaymentAcrossTenants` 同理：渠道侧场景用。
+   *
+   * ⚠️ `orderId` **可空**（`payments.orderId` 在阶段 5b 变成可空——
+   * 订阅支付单没有订单）。传 null 表示「这笔支付单不指向订单」，
+   * 直接当「订单不存在」处理。
    */
-  private async findOrderAcrossTenantsById(orderId: string): Promise<{
+  private async findOrderAcrossTenantsById(orderId: string | null): Promise<{
     id: string;
     orderNo: string;
     tenantId: string;
     totalAmount: number;
   }> {
+    if (!orderId) {
+      throw new NotFoundException('订单不存在');
+    }
     const order = await tenantContext.run(platformScope(), async () => {
       const rows = await this.prisma.order.findMany({
         where: { id: orderId },

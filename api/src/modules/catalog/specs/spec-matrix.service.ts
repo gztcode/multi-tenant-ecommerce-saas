@@ -8,6 +8,7 @@ import { TenantPrismaService } from '../../../common/tenant/tenant-prisma.servic
 import { getTenantContext } from '../../../common/tenant/tenant-context';
 import { ReplaceSpecsDto } from '../dto/replace-specs.dto';
 import { MinPriceService } from '../pricing/min-price.service';
+import { QuotaService } from '../../billing/quota.service';
 
 /** 最多允许的规格维度数 */
 export const MAX_SPEC_DIMENSIONS = 2;
@@ -32,6 +33,9 @@ export class SpecMatrixService {
   constructor(
     private readonly prisma: TenantPrismaService,
     private readonly minPrice: MinPriceService,
+    // ⚠️ **模块依赖方向是 `catalog` → `billing`**（单向）。
+    // `billing` 绝不能 import `catalog` —— 那就成了环。
+    private readonly quota: QuotaService,
   ) {}
 
   private currentTenantId(): string {
@@ -71,6 +75,15 @@ export class SpecMatrixService {
 
   async replace(productId: string, dto: ReplaceSpecsDto) {
     const tenantId = this.currentTenantId();
+
+    // ⚠️ **额度检查在 service 层**（护栏 M13 / M16）：
+    // 只在 controller 层拦的话，绕过 controller 直接调 service 就拦不住。
+    //
+    // ⚠️ **按「当前 SKU 数」保守判断**：替换规格矩阵会把这个商品的 SKU
+    // 全删重建，替换后的总数可能不变（也可能是新的组合数）。
+    // 这里不去预测替换后的数量（那要先把笛卡尔积算出来），
+    // 而是「已达上限就不许再动规格」——保守但绝不会让商家超限。
+    await this.quota.assertWithinQuota(tenantId, 'SKU');
 
     const product = await this.prisma.product.findFirst({
       where: { id: productId },

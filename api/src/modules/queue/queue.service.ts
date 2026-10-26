@@ -2,12 +2,15 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Injectable } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import {
+  BILLING_QUEUE,
   PAYMENT_TIMEOUT_QUEUE,
   PAYMENT_WEBHOOK_QUEUE,
 } from '../../common/queue/queue.constants';
 
 export type QueueName =
-  typeof PAYMENT_TIMEOUT_QUEUE | typeof PAYMENT_WEBHOOK_QUEUE;
+  | typeof PAYMENT_TIMEOUT_QUEUE
+  | typeof PAYMENT_WEBHOOK_QUEUE
+  | typeof BILLING_QUEUE;
 
 /**
  * 任务失败时的重试次数与退避策略。
@@ -43,9 +46,11 @@ export class QueueService {
   constructor(
     @InjectQueue(PAYMENT_TIMEOUT_QUEUE) timeoutQueue: Queue,
     @InjectQueue(PAYMENT_WEBHOOK_QUEUE) webhookQueue: Queue,
+    @InjectQueue(BILLING_QUEUE) billingQueue: Queue,
   ) {
     this.queues.set(PAYMENT_TIMEOUT_QUEUE, timeoutQueue);
     this.queues.set(PAYMENT_WEBHOOK_QUEUE, webhookQueue);
+    this.queues.set(BILLING_QUEUE, billingQueue);
   }
 
   /**
@@ -77,6 +82,34 @@ export class QueueService {
       jobId,
       ...DEFAULT_JOB_OPTIONS,
     });
+  }
+
+  /**
+   * 投递一个**周期性**任务。
+   *
+   * ⚠️ **固定 `jobSchedulerId` 是去重的关键**：BullMQ 的作业调度器按
+   * `jobSchedulerId` 去重，重复注册是**覆盖**而不是**叠加** ——
+   * 否则每次重启应用都会多一个扫描任务。
+   *
+   * ⚠️ **BullMQ v6 的 `Queue.add` 不再接受 `repeat` 选项**（类型上已被移除，
+   * 官方要求改用 `upsertJobScheduler`）。这里用它而不是自己拼 jobId。
+   */
+  async addRepeating(
+    queueName: QueueName,
+    jobName: string,
+    data: unknown,
+    everyMs: number,
+    jobSchedulerId: string,
+  ): Promise<void> {
+    await this.queueOf(queueName).upsertJobScheduler(
+      jobSchedulerId,
+      { every: everyMs },
+      {
+        name: jobName,
+        data: data as never,
+        opts: DEFAULT_JOB_OPTIONS,
+      },
+    );
   }
 
   private queueOf(queueName: QueueName): Queue {

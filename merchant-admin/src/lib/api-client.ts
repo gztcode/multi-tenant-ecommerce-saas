@@ -3,6 +3,19 @@ import { auth } from '@/auth';
 const API_BASE_URL =
   process.env.API_BASE_URL ?? 'http://localhost:3000/api/v1';
 
+/**
+ * 后端的**绝对地址**。
+ *
+ * ⚠️ **后端给的 `payUrl` 是相对路径**（如 `/api/v1/pay/fake/xxx`），
+ * 直接丢给浏览器会打到商家后台的域名上——404。
+ * ⚠️ **要拼的是 origin 而不是整个 base**：`payUrl` 自带 `/api/v1` 前缀，
+ * 再拼一遍就成了 `/api/v1/api/v1/...`。
+ */
+export function apiAbsoluteUrl(path: string): string {
+  const origin = new URL(API_BASE_URL).origin;
+  return `${origin}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -60,7 +73,13 @@ export async function apiFetch<T>(
     return undefined as T;
   }
 
-  return (await response.json()) as T;
+  // ⚠️ **空响应体当成 null**：后端在没有数据时返回 200 + 空 body
+  // （NestJS 的 handler 返回 null 就是这样），`response.json()` 碰到空 body
+  // 会抛「Unexpected end of JSON input」—— 真实情况是「没有数据」，
+  // 界面上却显示成「加载失败」。
+  const text = await response.text();
+  if (text.trim() === '') return null as T;
+  return JSON.parse(text) as T;
 }
 
 /** 带登录态调用后端 */

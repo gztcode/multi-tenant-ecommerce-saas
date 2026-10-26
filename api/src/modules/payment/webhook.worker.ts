@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import type { Job } from 'bullmq';
+import { PaymentKind } from '@prisma/client';
 import { PAYMENT_WEBHOOK_QUEUE } from '../../common/queue/queue.constants';
 import { runForTenant } from '../../common/tenant/tenant-context';
 import { PaymentService } from './payment.service';
@@ -10,11 +11,23 @@ import { NormalizedWebhookEvent } from './payment-provider.interface';
 export interface PaymentWebhookJob {
   /** 订单所属租户 id（**从订单反查**，不是客户端提交的） */
   tenantId: string;
+  /**
+   * 这笔是订单支付还是订阅支付。
+   *
+   * ⚠️ **必须带着走**：`referenceNo` 在订单路径是订单号、在订阅路径是账单号，
+   * 消费端要靠它决定反查哪张业务单。少了它，订阅回调会被当成订单回调，
+   * 查不到订单就**静默丢掉**——这笔续费的钱永远不流转。
+   *
+   * ⚠️ 由 **webhook 端点**写入（端点自己知道是哪个端点），
+   * 不是渠道适配器猜的。
+   */
+  kind: PaymentKind;
   eventId: string;
   provider: string;
   channel: string;
   providerTxnId: string;
-  orderNo: string;
+  /** 业务单号（订单号 / 账单号） */
+  referenceNo: string;
   amount: number;
   success: boolean;
 }
@@ -61,7 +74,7 @@ export class WebhookWorker extends WorkerHost {
         channel: data.channel,
         eventId: data.eventId,
         providerTxnId: data.providerTxnId,
-        orderNo: data.orderNo,
+        referenceNo: data.referenceNo,
         amount: data.amount,
         success: data.success,
       };
@@ -72,7 +85,10 @@ export class WebhookWorker extends WorkerHost {
       // ⚠️ 任务里的 `tenantId` 是**可信源**——它由 webhook 端点从订单反查后
       // 签发。订单的查询在这个租户的作用域内做，租户不对就查不到订单，
       // 什么都不会发生（R14）。
-      await this.paymentService.applyEvent(event, data.tenantId);
+      //
+      // ⚠️ **`kind` 一路带下来**：它决定 `applyEvent` 反查订单还是反查账单。
+      // 少了它，订阅回调会被当成订单回调而查不到订单——**静默丢掉**。
+      await this.paymentService.applyEvent(event, data.tenantId, data.kind);
     });
   }
 }

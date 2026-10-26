@@ -9,6 +9,7 @@ import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { getTenantContext } from '../../common/tenant/tenant-context';
 import { CreatePromotionDto } from './dto/create-promotion.dto';
 import { UpdatePromotionDto } from './dto/update-promotion.dto';
+import { FEATURE_MARKETING, QuotaService } from '../billing/quota.service';
 
 /**
  * 满减活动服务（阶段 5a Task 3）。
@@ -25,7 +26,12 @@ import { UpdatePromotionDto } from './dto/update-promotion.dto';
  */
 @Injectable()
 export class PromotionService {
-  constructor(private readonly prisma: TenantPrismaService) {}
+  constructor(
+    private readonly prisma: TenantPrismaService,
+    // ⚠️ **模块依赖方向是 `coupon` → `billing`**（单向）。
+    // `billing` 绝不能 import `coupon` —— 那就成了环。
+    private readonly quota: QuotaService,
+  ) {}
 
   /** 当前租户 ID（租户从上下文读，不当参数传） */
   private currentTenantId(): string {
@@ -44,6 +50,11 @@ export class PromotionService {
    */
   async create(dto: CreatePromotionDto): Promise<Promotion> {
     const tenantId = this.currentTenantId();
+
+    // ⚠️ **功能开关检查在 service 层**（护栏 M14 / M16）：
+    // 只在 controller 层拦的话，绕过 controller 直接调 service 就拦不住。
+    await this.quota.assertHasFeature(tenantId, FEATURE_MARKETING);
+
     const { startsAt, endsAt } = this.parseWindow(dto.startsAt, dto.endsAt);
 
     return this.prisma.promotion.create({
@@ -68,6 +79,9 @@ export class PromotionService {
    */
   async update(id: string, dto: UpdatePromotionDto): Promise<Promotion> {
     const tenantId = this.currentTenantId();
+
+    // ⚠️ **功能开关检查在 service 层**（护栏 M14 / M16）
+    await this.quota.assertHasFeature(tenantId, FEATURE_MARKETING);
 
     const data: Record<string, unknown> = {};
     if (dto.name !== undefined) data.name = dto.name;

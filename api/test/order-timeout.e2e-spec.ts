@@ -427,7 +427,7 @@ describe('支付超时释放 (e2e)', () => {
       channel: 'fake',
       eventId: `evt-${unique()}`,
       providerTxnId: `txn-${unique()}`,
-      orderNo: order.orderNo,
+      referenceNo: order.orderNo,
       amount: order.totalAmount,
       success: true,
     };

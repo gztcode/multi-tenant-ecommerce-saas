@@ -60,7 +60,13 @@ export async function apiFetch<T>(
     return undefined as T;
   }
 
-  return (await response.json()) as T;
+  // ⚠️ **空响应体当成 null**：后端在没有数据时返回 200 + 空 body
+  // （NestJS 的 handler 返回 null 就是这样），`response.json()` 碰到空 body
+  // 会抛「Unexpected end of JSON input」—— 真实情况是「没有数据」，
+  // 界面上却显示成「加载失败」。
+  const text = await response.text();
+  if (text.trim() === '') return null as T;
+  return JSON.parse(text) as T;
 }
 
 /** 带登录态调用后端 */

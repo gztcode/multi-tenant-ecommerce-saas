@@ -45,6 +45,8 @@ interface OrderBody {
   status: string;
   totalAmount: number;
   itemCount: number;
+  /** 退款时间（阶段 5b 加的字段）。报表的「退款冲回」按它归期 */
+  refundedAt: Date | null;
   items: Array<{ skuId: string; quantity: number; unitPrice: number }>;
 }
 
@@ -963,7 +965,7 @@ describe('支付与 webhook (e2e)', () => {
       channel: FAKE_CHANNEL,
       eventId: `evt-${unique()}`,
       providerTxnId: `txn-${unique()}`,
-      orderNo: order.orderNo,
+      referenceNo: order.orderNo,
       amount: order.totalAmount,
       success: true,
     };
@@ -1168,6 +1170,12 @@ describe('支付与 webhook (e2e)', () => {
     // ⚠️ 订单转 REFUNDED
     const rows = await readOrder(merchant.tenantId, order.orderNo);
     expect(rows.status).toBe('REFUNDED');
+
+    // ⚠️ **退款时间被记上了**（阶段 5b Task 8a 补的）：
+    // 报表的「退款冲回」按**退款发生的期间**归期，不是按订单支付的期间。
+    // 这个字段没写上时，冲回那一栏永远是 0。
+    expect(rows.refundedAt).not.toBeNull();
+    expect(rows.refundedAt).toBeInstanceOf(Date);
 
     // ⚠️ 支付单转 REFUNDED
     const payments = await readPayments(merchant.tenantId, order.id);

@@ -15,7 +15,6 @@ enum UserRole {
 }
 
 enum TenantStatus {
-  TRIAL
   ACTIVE
   SUSPENDED
 }
@@ -30,7 +29,7 @@ model Tenant {
   id        String       @id @default(uuid())
   name      String
   subdomain String       @unique
-  status    TenantStatus @default(TRIAL)
+  status    TenantStatus @default(ACTIVE)
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
 
@@ -517,6 +516,23 @@ model Order {
   couponCode String?
   couponName String?
 
+  // ---------- 阶段 5b：抽佣与退款快照 ----------
+  //
+  // ⚠️ 同样是快照：抽佣费率将来随套餐调整，历史订单的抽佣额不能跟着变。
+  /** 抽佣费率快照（基点）。下单时从套餐读，写死在订单上 */
+  commissionRate Int @default(0)
+  /** 抽佣额快照（整数分）。下单时按实付算出 */
+  commissionAmount Int @default(0)
+  /**
+   * 退款时间。
+   *
+   * ⚠️ **阶段 3 的退款没有记时间** —— 报表的「退款冲回」要按**退款发生的
+   * 期间**归期（不是按订单支付期间），所以这个字段是必需的。
+   * 退款路径（`api/src/modules/payment/payment.service.ts` 的退款方法）
+   * 要顺手写上 —— 但**那是下一个 Task 的事**。
+   */
+  refundedAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -561,7 +577,14 @@ enum PaymentStatus {
 model Payment {
   id            String        @id @default(uuid())
   tenantId      String
-  orderId       String
+  // 这笔支付单是订单支付还是订阅支付
+  // ⚠️ `kind` 与 `orderId`/`invoiceId` 的一致性**目前没有 DB 层约束**
+  // （`payments` 表上没有 CHECK），由应用层保证。
+  kind          PaymentKind   @default(ORDER)
+  /** 订单支付时填；订阅支付为 null */
+  orderId       String?
+  /** 订阅支付时填；订单支付为 null */
+  invoiceId     String?
   channel       String
   // ⚠️ provider 与 channel **不是一回事**：channel 是「微信 / 支付宝 / 假网关」
   // 这类渠道名，provider 是「渠道背后的服务提供方」（微信支付 vs 微信服务商、
@@ -576,12 +599,26 @@ model Payment {
   updatedAt     DateTime      @updatedAt
 
   // ⚠️ **刻意不声明 tenant 关系**，只有 tenantId 标量。
-  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  order   Order?   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  invoice Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
 
-  // ⚠️ (provider, providerTxnId) 的唯一索引由迁移手写，不在 schema 里声明：
-  // Prisma 的 @@unique 表达不了 NULL 不参与唯一判定这个语义。
-  // 缺了它，同一笔渠道交易会落成两条支付单（设计 §3.6）。
-  @@unique([orderId, channel])
+  // ⚠️ 下面三条唯一索引**在 schema 里都不声明**，索引名只存在于迁移 SQL 中：
+  // Prisma 的 @@unique 表达不了「NULL 不参与唯一判定」这个语义。
+  //
+  // 1. (provider, providerTxnId) → 迁移里的 `payments_provider_txn_uniq`。
+  //    缺了它，同一笔渠道交易会落成两条支付单（设计 §3.6）。
+  //
+  // 2. (orderId, channel) → 迁移里的 `payments_order_channel_uniq`。
+  //
+  // 3. (invoiceId, channel) → 迁移里的 `payments_invoice_channel_uniq`。
+  //
+  // 第 2、3 条是**部分唯一索引**（WHERE ... IS NOT NULL）——
+  // orderId / invoiceId 变可空后，PostgreSQL 的 NULL 不参与唯一判定，
+  // 普通唯一索引会直接失效。
+  //
+  // ⚠️ 因此**不要**在这里补 `@@unique([orderId, channel])` 或
+  // `@@unique([invoiceId, channel])`：写了也不生效
+  // （schema 里补不出部分唯一索引），只会让人误以为约束已经在数据库层。
   @@index([tenantId, status])
   @@map("payments")
 }
@@ -734,4 +771,147 @@ model Promotion {
   // ⚠️ **刻意不声明 tenant 关系**，只有 tenantId 标量。
   @@index([tenantId, status])
   @@map("promotions")
+}
+
+// ---------- 阶段 5b：平台计费（套餐、订阅、账单、支付方式） ----------
+
+enum PlanStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum InvoiceStatus {
+  OPEN
+  PAID
+  VOID
+  FAILED
+}
+
+enum PaymentKind {
+  ORDER
+  SUBSCRIPTION
+}
+
+model Plan {
+  id          String    @id @default(uuid())
+  code        String
+  name        String
+  description String?
+  /** 周期价格（整数分）。0 = 免费 */
+  price       Int
+  /** 订阅周期（天）。30 = 按月 */
+  periodDays  Int       @default(30)
+  /** 试用期（天）。0 = 无试用 */
+  trialDays   Int       @default(0)
+  /** 抽佣比例（基点，万分之一）。500 = 5% */
+  commissionBps Int     @default(0)
+  /** 商品数上限。null = 不限 */
+  maxProducts Int?
+  /** SKU 数上限。null = 不限 */
+  maxSkus     Int?
+  /** 店铺数上限。null = 不限。默认 1（绝大多数套餐只允许一个店铺） */
+  maxStores   Int?     @default(1)
+  /** 功能开关。缺省一律视为 false（保守） */
+  features    Json      @default("{}")
+  status      PlanStatus @default(ACTIVE)
+  /** 展示顺序（小的在前） */
+  sortOrder   Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // ⚠️ **这张表刻意不带 tenantId**：套餐是「平台的数据」而不是「租户的数据」
+  //（先例是阶段 3 的 PaymentWebhookEvent）。所以它不在 TENANT_SCOPED_MODELS 里。
+  @@unique([code])
+  @@index([status, sortOrder])
+  @@map("plans")
+}
+
+model Subscription {
+  id           String             @id @default(uuid())
+  tenantId     String
+  /** 套餐 id。⚠️ **纯标量，不声明 Prisma 关系** —— 套餐是平台的数据
+   *  （不带 tenantId），订阅是租户的数据，
+   *  跨域的外键会让「挂到一张不存在的套餐上」悄悄通过。
+   *  与阶段 5a 的 `CouponClaim.couponId` 同款。 */
+  planId       String
+  /** 待生效的套餐（下个周期生效）。null = 不换 */
+  pendingPlanId String?
+  status       SubscriptionStatus @default(TRIAL)
+  startedAt    DateTime           @default(now())
+  /** 试用截止。null = 不是试用 */
+  trialEndsAt  DateTime?
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  /** 到期后不自动续费 */
+  cancelAtPeriodEnd  Boolean        @default(false)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  invoices Invoice[]
+
+  @@unique([tenantId])
+  @@index([tenantId, status])
+  @@map("subscriptions")
+}
+
+model Invoice {
+  id             String        @id @default(uuid())
+  tenantId       String
+  subscriptionId String
+  /** 套餐 id 快照（纯标量，同上） */
+  planId         String
+  /** 账单号（对外凭证，会出现在渠道页面与对账单里） */
+  number         String
+  /** 应付金额（整数分）。只从套餐价格读，不从请求体读 */
+  amount         Int
+  status         InvoiceStatus @default(OPEN)
+  periodStart    DateTime
+  periodEnd      DateTime
+  /** 应付截止（一般是周期结束日） */
+  dueAt          DateTime
+  paidAt         DateTime?
+  voidedAt       DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  // ⚠️ 账单与订阅**同租户**，所以是真关系（不像 planId 那样是跨租户纯标量）
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  payments Payment[]
+
+  @@unique([tenantId, number])
+  @@unique([subscriptionId, periodStart])
+  @@index([tenantId, status])
+  @@map("invoices")
+}
+
+model PaymentMethod {
+  id        String   @id @default(uuid())
+  tenantId  String
+  provider  String
+  channel   String
+  /** 支付方式类型：CARD / WECHAT / ALIPAY */
+  type      String
+  /**
+   * 渠道侧的授权凭证。
+   * ⚠️ **真实渠道必须加密存**（可解密的密文，不能是哈希 ——
+   *  自动续费要拿它去扣款，不是用来比对的）。
+   *  本阶段的假网关给的是明文假 token。
+   */
+  token     String
+  isDefault Boolean  @default(false)
+  /** 授权过期时间。null = 不过期 */
+  expiresAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@map("payment_methods")
 }

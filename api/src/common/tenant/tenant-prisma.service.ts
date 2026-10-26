@@ -561,6 +561,25 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
     return this.client.promotion;
   }
 
+  // ------- 平台计费（计划 5b）模型 delegate 代理 -------
+
+  get subscription() {
+    return this.client.subscription;
+  }
+
+  get invoice() {
+    return this.client.invoice;
+  }
+
+  get paymentMethod() {
+    return this.client.paymentMethod;
+  }
+
+  // ⚠️ plan 不在租户白名单里，但业务代码要读它（套餐是平台的数据）
+  get plan() {
+    return this.client.plan;
+  }
+
   // ------- PrismaClient 实例级方法代理 -------
   // $connect / $disconnect 由生命周期钩子分别调用，
   // 这里仍然透传出来让服务消费者可以手动关闭连接（例如测试用例）。

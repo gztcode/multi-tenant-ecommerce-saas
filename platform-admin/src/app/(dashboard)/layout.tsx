@@ -34,6 +34,15 @@ export default async function DashboardLayout({
             <Link href="/" className="underline-offset-4 hover:underline">
               商家列表
             </Link>
+            <Link href="/plans" className="underline-offset-4 hover:underline">
+              套餐
+            </Link>
+            <Link href="/subscriptions" className="underline-offset-4 hover:underline">
+              订阅
+            </Link>
+            <Link href="/reports" className="underline-offset-4 hover:underline">
+              报表
+            </Link>
           </nav>
         </div>
         <div className="flex items-center gap-4 text-sm">

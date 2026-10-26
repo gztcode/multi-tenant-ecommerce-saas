@@ -2,16 +2,21 @@
 
 前后端完全分离的多租户电商底座。一个实例服务多个商家：每个商家有自己的店铺、商品、订单与客户。
 
-**当前进度：阶段 5a「营销（优惠券与满减活动）」已完成并验收通过（有条件通过）。**
-阶段 5a 让商家能在自己的店铺发**优惠券**与**满减活动**，消费者领券、结算时自动享受优惠；
-订单**快照**优惠信息（历史订单不重算），券的额度在**下单时预占核销**、订单取消或支付超时时
-**释放**——与阶段 3 的库存预占/释放完全同构。
+**当前进度：阶段 5b「平台计费（SaaS 订阅 / 套餐 / 额度 / 抽佣 / 报表）」已完成并验收通过（有条件通过）。**
+阶段 5b 让每个商家**按套餐付费**：平台超管配置**套餐**（价格、周期、试用期、抽佣费率、
+额度、功能开关），商家**订阅**、到期**自动续费**（绑支付方式）或**手动去支付**；
+订阅到期后**消费者侧不能下单**（商家后台仍可用）；
+平台按订单**实付抽佣**记账，并出一份**平台收入报表**。
 
-新增能力：后端 4 张表 + 优惠引擎（纯函数）+ 消费侧/商家侧/平台侧三套接口；
-storefront 加**领券中心**（`/coupons`）与结算页的**券下拉 + 四行金额**（原价/活动减/券减/实付）；
-merchant-admin 加**营销页**（券与活动的新建、编辑、暂停/启用、删除）。
+新增能力：后端 4 张表（`plans` / `subscriptions` / `invoices` / `payment_methods`）+
+抽佣纯函数 + 商家侧与平台侧两套接口；
+merchant-admin 加**订阅页**（当前订阅 / 套餐 / 账单 / 支付方式四个块）；
+platform-admin 加**套餐、订阅、报表三页**（**平台超管后台第一次有单元测试**）。
+订单上的抽佣费率与金额是**下单那一刻的快照**，套餐后来改费率不影响历史订单。
 
 验收记录见
+[`docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md`](docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md)；
+阶段 5a 的验收记录见
 [`docs/superpowers/plans/2026-10-25-plan-05a-acceptance.md`](docs/superpowers/plans/2026-10-25-plan-05a-acceptance.md)；
 阶段 4 的验收记录见
 [`docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md`](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md)；
@@ -114,8 +119,8 @@ cd api && FAKE_PAYMENT_ENABLED=true \
 
 ```bash
 cd api
-npm test              # 单元测试（隔离机制 / 状态机转移表等，102 条）
-npm run test:e2e      # 端到端（282 条，17 个套件）
+npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数等，151 条）
+npm run test:e2e      # 端到端（470 条，26 个套件）
 npm run test:cov:e2e  # 项目真实覆盖率
 ```
 
@@ -126,21 +131,17 @@ npm run test:cov:e2e  # 项目真实覆盖率
 > [验收记录 §一](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md)。
 
 三个前端各自 `npx tsc --noEmit && npm run lint && npm run build`。
-其中 `storefront` 与 `merchant-admin` 另有单元测试（Vitest）：
+**三个前端都有单元测试**（Vitest）：
 
 ```bash
-cd merchant-admin && npm test   # 75 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 令牌刷新（13 + 12）
-cd storefront    && npm test   # 120 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）
+cd merchant-admin  && npm test   # 191 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费白名单 + 令牌刷新
+cd storefront     && npm test   # 175 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）
+cd platform-admin && npm test   # 181 条：计费中转路由的白名单 + 三个页面的页面级测试 + 套餐表单的组件测试
 ```
 
-> ⚠️ **组件测试只在 `storefront` 上有基建**（`vitest.config.ts` + `test/setup.ts`）。
+> ⚠️ **组件测试的基建在 `storefront` 与 `platform-admin` 上**（`vitest.config.ts` + `test/setup.ts`）。
 > `merchant-admin` 还没有 —— 这直接导致 `merchant-admin/src/auth.ts` 的
 > `jwt` 回调**零自动化覆盖**（详见阶段 4 验收记录 §四）。
-
-详见两个项目各自的 README「单元测试」一节。
-
-> **遗留项**：`platform-admin` 本轮**没有**配单元测试框架——它阶段 2b 没有改动，
-> 没有需要保护的护栏。等它开始有改动时再补。
 
 e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物理隔离。
 
@@ -187,7 +188,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 - 设计文档：[`docs/superpowers/specs/2026-10-21-multi-tenant-ecommerce-saas-design.md`](docs/superpowers/specs/2026-10-21-multi-tenant-ecommerce-saas-design.md)
 - 实施计划：[`docs/superpowers/plans/`](docs/superpowers/plans/)
-- 验收记录：[`阶段 1`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md) / [`阶段 2a`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md) / [`阶段 2b`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md) / [`阶段 3`](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md) / [`阶段 4`](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md)
+- 验收记录：[`阶段 1`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md) / [`阶段 2a`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md) / [`阶段 2b`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md) / [`阶段 3`](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md) / [`阶段 4`](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md) / [`阶段 5a`](docs/superpowers/plans/2026-10-25-plan-05a-acceptance.md) / [`阶段 5b`](docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md)
 
 ---
 
@@ -220,19 +221,45 @@ node tools/push-via-api.mjs <本地分支> <远端分支>
 | 计划 3 | 交易链路：购物车 → 库存 → 订单 → 支付 —— **已完成并验收通过** |
 | 计划 4 | 前端补齐与打磨 —— **已完成并验收通过**（有条件通过） |
 | 计划 5a | 营销：优惠券与满减活动 —— **已完成并验收通过**（有条件通过） |
-| 计划 5b | 平台计费：SaaS 订阅、套餐、额度（下一步） |
+| 计划 5b | 平台计费：SaaS 订阅、套餐、额度、抽佣、报表 —— **已完成并验收通过**（有条件通过） |
+| 计划 5c | 修阶段 4 的技术债（下一步） |
 
-### 阶段 5b（平台计费）的起点
+### 阶段 5c（修阶段 4 的技术债）的起点
 
-阶段 5a 已经把「平台级资源」跑通了第一遍：`Coupon.scope = PLATFORM` +
-`tenantId` 指向平台租户，各店铺引用平台券。5b 的套餐/订阅可以照这个形态做。
+阶段 4 验收时列的技术债清单里，有几条在阶段 5b 之后**变得更值钱**了
+（详见[阶段 5b 验收记录 §八](docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md)）：
 
-5a 留给 5b 的两件事（详见
-[阶段 5a 验收记录 §六 / §八](docs/superpowers/plans/2026-10-25-plan-05a-acceptance.md)）：
+1. **抽佣流水明细** —— 现在的报表只有四个总数，超管看不到「哪个商家贡献了多少」。
+   要出明细得补一张抽佣流水表（设计文档 §九当初的取舍：不建独立表，代价就是跨订单聚合）。
+2. **套餐的 `maxStores` 只声明不约束** —— 没有「新增店铺」接口，那个上限当前无处可施。
+3. **换套餐时账单的周期长度语义** —— 定价已修正（按待生效的套餐出账），
+   但周期长度按新套餐的 `periodDays` 算这一点还没定论。
+4. **M11 的可观测性** —— `markInvoicePaid` 里的 `status` 条件在当前实现下测不到
+   （订阅期写的是绝对值，天然幂等）。
 
-1. **平台超管创建平台券没有前端入口** —— 后端有 `POST /platform/coupons`，
-   但 `platform-admin` 里只有「概览」与「租户详情」两个页面。5b 做平台后台时一并补上。
-2. **「金额一律整数分」的约定在 5b 会被反复用到**（套餐价、账单、税费），沿用即可。
+阶段 4 验收时列的**下一阶段优先项**（与 5b 无关、仍然有效）：
+
+1. **修多标签页的「先后」刷新竞态** —— 优先级最高：本阶段实测发现，**商家只要同时开
+   两个后台标签页就会被踢出登录**（旧 refreshToken 被判成「真正的重放」→
+   吊销全设备登录）。需要后端配合：给轮换后的旧令牌一个**宽限期**，
+   或提供**幂等刷新端点**。
+2. **给 `merchant-admin` 补组件测试基建** —— 不补这套基建，`auth.ts` 的 `jwt` 回调
+   **永远测不了**（失败注入 #6 / #8 证明：把「过期时刷新」整段删掉，75 条测试全绿）。
+   护栏 3 / 5 现在只有手测在守。
+   （⚠️ 阶段 5b 已经把同一套基建搬到了 `platform-admin`，照着搬一遍即可。）
+3. **把分组标量（字阶 / 间距 / 阴影 / 字重）在前台接上消费者** —— 商家改这些值，
+   前台**纹丝不动且无提示**（实测 `--text-base` 变了，渲染出来的字号没变）。
+   要么在 `@theme inline` 里补上映射，要么**先把这些输入框在前台隐藏掉**。
+4. **修字体 token 在服务端就失效** —— `@layer theme{...--font-sans:var(--font-sans)}`
+   是循环引用，`--font-geist-sans` 又只挂在 `<body>` 上 → **商家改字体前台从来没生效过**。
+   要两端一起改。
+5. **统一前台的错误处理** —— 后端挂掉时页面把 Node 原始错误串 `fetch failed`
+   显示给了用户，没有重试按钮。
+6. **给商家后台做主题实时预览** —— 商家改主色时**自己都看不到变化**，
+   只能切到另一个标签页看前台。
+7. **给 e2e 的队列做隔离 + 每轮清库** —— 否则每次跑 e2e 都要先停 api 容器，
+   会持续制造「实测报缺陷、复现不出来」的假象。
+8. **退货入库流程** —— 退款不回补库存是有意的取舍，但配套的退货入库始终没实现。
 
 ### 阶段 4 验收发现的下一阶段优先项（详见
 [验收记录 §七](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md)）：

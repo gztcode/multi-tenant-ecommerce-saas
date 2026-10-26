@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { randomBytes } from 'node:crypto';
@@ -23,6 +24,9 @@ import { PAYMENT_TIMEOUT_QUEUE } from '../../common/queue/queue.constants';
 import { QueueService } from '../queue/queue.service';
 import { CouponService } from '../coupon/coupon.service';
 import { CouponRedemptionService } from '../coupon/coupon-redemption.service';
+import { SubscriptionService } from '../billing/subscription.service';
+import { QuotaService } from '../billing/quota.service';
+import { computeCommission } from '../billing/commission';
 import { OrderInventoryService } from './inventory.service';
 import { canTransition } from './order-status';
 import {
@@ -71,6 +75,11 @@ export class OrderService {
     private readonly queue: QueueService,
     private readonly coupon: CouponService,
     private readonly couponRedemption: CouponRedemptionService,
+    // ⚠️ **模块依赖方向是 `order` → `billing`**（单向）。
+    // `billing` 绝不能 import `order` —— 那就成了
+    // `order → billing → order` 的环，NestJS 启动直接报错。
+    private readonly billing: SubscriptionService,
+    private readonly quota: QuotaService,
   ) {}
 
   /**
@@ -281,6 +290,18 @@ export class OrderService {
       merged.map((item) => item.skuId),
     );
 
+    // ---- 4a-2. **订阅已到期 → 不接新单**（护栏 M12）----
+    //
+    // ⚠️ **只拦消费者侧的下单**：发货、退款这些**必须**还能做，
+    // 否则等于把商家锁死（客诉会直接落到平台头上）。
+    //
+    // ⚠️ **「从未订阅」不拦**：商家还没选套餐，不是不允许卖货 ——
+    // 拦的是「到期后」。判定同时看状态与时间，不依赖
+    // 「有没有人来把过期的改成 EXPIRED」。
+    if (!(await this.billing.canAcceptOrders(tenantId))) {
+      throw new ServiceUnavailableException('该店铺暂未开通服务');
+    }
+
     // ---- 4b. 读单价与快照（此时行锁在握，读到的是最新值）----
     //
     // ⚠️ **单价只从 SKU 读**（护栏 8）：请求体里的价格字段
@@ -336,6 +357,20 @@ export class OrderService {
       throw new BadRequestException('优惠计算结果异常，请重试');
     }
 
+    // ---- 4c-2. **抽佣快照**（护栏 M7）----
+    //
+    // ⚠️ **费率从套餐读，金额按实付算**：抽佣的基数是商家**实际收到**的钱
+    // （已含券与活动的减免），不是商品原价。
+    //
+    // ⚠️ **快照在订单上**：改套餐的费率**不影响已成交的订单** ——
+    // 与阶段 5a 的券减免额同款做法（订单存的是下单那一刻算出来的值）。
+    const plan = await this.quota.currentPlan(tenantId);
+    const rateBps = plan?.commissionBps ?? 0;
+    const commission = computeCommission({
+      payableAmount: discount.payableAmount,
+      rateBps,
+    });
+
     // ---- 4d. 建订单（含优惠快照字段）----
     //
     // ⚠️ **订单号唯一冲突的重试在事务外做**（见 placeOrder 的循环）：
@@ -361,6 +396,10 @@ export class OrderService {
       couponId: discount.appliedCoupon?.id ?? null,
       couponCode: discount.appliedCoupon?.code ?? null,
       couponName: discount.appliedCoupon?.name ?? null,
+      // ⚠️ **抽佣快照**（护栏 M7）：费率与抽佣额都是下单这一刻定的，
+      // 改套餐不影响已成交的订单。
+      commissionRate: rateBps,
+      commissionAmount: commission.amount,
     });
 
     // ---- 4e. 扣库存 + 记 RESERVE 流水 ----
@@ -434,6 +473,10 @@ export class OrderService {
       couponId: string | null;
       couponCode: string | null;
       couponName: string | null;
+      /** 抽佣费率快照（基点，万分之一） */
+      commissionRate: number;
+      /** 抽佣额快照（整数分） */
+      commissionAmount: number;
     },
   ): Promise<Order> {
     const { merged, skuDetails, ...rest } = input;
@@ -459,6 +502,10 @@ export class OrderService {
         couponId: rest.couponId,
         couponCode: rest.couponCode,
         couponName: rest.couponName,
+        // ⚠️ **抽佣快照**（护栏 M7）：费率与抽佣额都是下单这一刻定的，
+        // 改套餐不影响已成交的订单（与券减免额同款做法）。
+        commissionRate: rest.commissionRate,
+        commissionAmount: rest.commissionAmount,
         itemCount,
         // ⚠️ **支付期限与队列的延迟窗口一致**（15 分钟，设计 §九）。
         //

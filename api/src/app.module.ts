@@ -13,6 +13,7 @@ import { CartModule } from './modules/cart/cart.module';
 import { OrderModule } from './modules/order/order.module';
 import { PaymentModule } from './modules/payment/payment.module';
 import { CouponModule } from './modules/coupon/coupon.module';
+import { BillingModule } from './modules/billing/billing.module';
 
 // TenantPrismaService 由全局的 TenancyModule 提供并导出，
 // 这里不再重复声明，避免出现两个实例（两个连接池）。
@@ -37,6 +38,7 @@ import { CouponModule } from './modules/coupon/coupon.module';
     OrderModule,
     PaymentModule,
     CouponModule,
+    BillingModule,
   ],
 })
 export class AppModule {}

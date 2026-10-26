@@ -555,6 +555,15 @@ describe('租户隔离版 PrismaClient', () => {
     }
   });
 
+  it('billing 的三张租户作用域表都登记了，plans 刻意不登记', () => {
+    // ⚠️ **plans 刻意不在名单里**：它不带 tenantId 字段，
+    // 是「平台的数据」而不是「租户的数据」——先例是阶段 3 的 PaymentWebhookEvent。
+    expect(TENANT_SCOPED_MODELS.has('Subscription')).toBe(true);
+    expect(TENANT_SCOPED_MODELS.has('Invoice')).toBe(true);
+    expect(TENANT_SCOPED_MODELS.has('PaymentMethod')).toBe(true);
+    expect(TENANT_SCOPED_MODELS.has('Plan')).toBe(false);
+  });
+
   it('券与活动走软删：软删后商家还能查历史核销记录', () => {
     // 券是营销配置，商家可能想「下架」但保留历史核销记录的可追溯性。
     expect(SOFT_DELETE_MODELS.has('Coupon')).toBe(true);

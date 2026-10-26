@@ -15,6 +15,7 @@ import { TenantPrismaService } from '../../../common/tenant/tenant-prisma.servic
 import { getTenantContext } from '../../../common/tenant/tenant-context';
 import { rethrowIfUniqueViolation } from '../../../common/errors/unique-constraint';
 import { MinPriceService } from '../pricing/min-price.service';
+import { QuotaService } from '../../billing/quota.service';
 import { CreateProductDto } from '../dto/create-product.dto';
 import { UpdateProductDto } from '../dto/update-product.dto';
 import { BatchProductsDto } from '../dto/batch-products.dto';
@@ -52,6 +53,9 @@ export class ProductsService {
   constructor(
     private readonly prisma: TenantPrismaService,
     private readonly minPrice: MinPriceService,
+    // ⚠️ **模块依赖方向是 `catalog` → `billing`**（单向）。
+    // `billing` 绝不能 import `catalog` —— 那就成了环。
+    private readonly quota: QuotaService,
   ) {}
 
   private currentTenantId(): string {
@@ -154,7 +158,11 @@ export class ProductsService {
   }
 
   async create(dto: CreateProductDto): Promise<Product> {
-    this.currentTenantId();
+    const tenantId = this.currentTenantId();
+
+    // ⚠️ **额度检查在 service 层**（护栏 M13 / M16）：
+    // 只在 controller 层拦的话，绕过 controller 直接调 service 就拦不住。
+    await this.quota.assertWithinQuota(tenantId, 'PRODUCT');
 
     // null 表示「不分类」，不需要校验归属；非 null 才要查
     if (dto.categoryId) {

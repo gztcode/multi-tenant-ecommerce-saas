@@ -52,7 +52,7 @@ import {
   PATCH as patchPromotion,
 } from '@/app/api/promotions/[id]/route';
 
-import { TEST_SESSION, getRequest, postRequest } from '../../helpers/route-harness';
+import { TEST_SESSION, postRequest } from '../../helpers/route-harness';
 
 const authMock = vi.mocked(auth);
 const apiFetchMock = vi.mocked(apiFetch);
@@ -68,14 +68,14 @@ beforeEach(() => {
 
 describe('营销中转：商家侧的路径带 merchant/ 前缀', () => {
   it('券列表打到 /merchant/coupons', async () => {
-    await couponsGet(getRequest('http://localhost/api/coupons'));
+    await couponsGet();
 
     const [path] = apiFetchMock.mock.calls[0];
     expect(path).toBe('/merchant/coupons');
   });
 
   it('活动列表打到 /merchant/promotions', async () => {
-    await promotionsGet(getRequest('http://localhost/api/promotions'));
+    await promotionsGet();
 
     const [path] = apiFetchMock.mock.calls[0];
     expect(path).toBe('/merchant/promotions');
@@ -410,7 +410,7 @@ describe('营销中转：未登录不碰后端', () => {
   it('GET 券列表 → 401 且不调后端', async () => {
     authMock.mockResolvedValue(null as never);
 
-    const response = await couponsGet(getRequest('http://localhost/api/coupons'));
+    const response = await couponsGet();
 
     expect(response.status).toBe(401);
     expect(apiFetchMock).not.toHaveBeenCalled();
