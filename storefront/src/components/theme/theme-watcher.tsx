@@ -4,7 +4,6 @@ import { useEffect } from 'react';
 import {
   CSS_VARS,
   GROUP_CSS_VARS,
-  GROUP_KEYS,
   type ThemeTokenValues,
 } from '@/lib/theme';
 
@@ -33,9 +32,9 @@ const DEFAULT_INTERVAL_MS = 30_000;
  *
  * ## 为什么用 setProperty 而不是重建 <style>
  *
- * 服务端注入的是 `:root { --primary: ... }`。
+ * 服务端注入的是 `:root { --brand-primary: ... }`。
  * CSS 的**行内样式优先级高于任何样式表规则**，所以
- * `documentElement.style.setProperty('--primary', v)` 会**覆盖** `:root`
+ * `documentElement.style.setProperty('--brand-primary', v)` 会**覆盖** `:root`
  * 里的同名变量，而其它没被覆盖的变量继续走 `:root`——
  * 这正是「增量更新」想要的语义，且不需要删掉服务端那份。
  */
@@ -140,29 +139,18 @@ function serializeTokens(tokens: ThemeTokenValues): string {
 }
 
 /**
- * 顶层标量里**只写 radius**，不写 fontSans / fontMono。
+ * 顶层标量里写哪些：圆角 + 两个字体。
  *
- * ⚠️ **字体 token 的行为与其它 token 不一致**（设计文档 §5.2 的 L21）。
- * 这里说清楚事实，不假装它们一样：
+ * ⚠️ **字体现在能生效了**（5d 之前不能）：
+ * - `globals.css` 的 `@theme inline` 里 `--font-sans` 的自引用已去掉；
+ * - next/font 的 `--font-geist-sans` 已从 `<body>` 挪到 `<html>`，
+ *   所以 `:root` 作用域解析得到它；
+ * - 自定义属性在**声明元素处**替换 —— 留在 `<body>` 上时 `<html>` 取不到值，
+ *   body 的同名变量也不会来补救。
  *
- * - `globals.css` 第 10 行是 `--font-sans: var(--font-sans)`——**自引用**。
- *   编译产物里它落在 `@layer theme{:host,:root{--font-sans:var(--font-sans)}}`，
- *   是个**循环引用** → 计算值阶段无效。
- * - `globals.css` 第 128 行的 `html { @apply font-sans }` 编译成
- *   `html{font-family:var(--font-sans)}`，而 `--font-geist-sans` 由 next/font
- *   通过 `.__variable_*` 类挂在 **`<body>` 上**（`src/app/layout.tsx` 第 28 行）
- *   ——它只在 body 子树里存在，**root 作用域看不到**。
- * - 所以**服务端注入的那份 `--font-sans` 本来就不生效**（商家改字体，
- *   前台看不到变化）。客户端若写行内 `--font-sans: var(--font-geist-sans)`，
- *   值里的 `--font-geist-sans` 在 root 作用域同样不存在 → 仍然无效，
- *   只是把 `getComputedStyle` 读到的值从「无效/回退」变成了「字面量文本」。
- *
- * 结论：写它**没有任何视觉收益**，却会改变可观察状态。
- * 所以这里**排除出客户端注入范围**。⚠️ 若将来把 `--font-geist-sans`
- * 也挂到 `<html>` 上、并且去掉 globals.css 里的自引用，
- * 这一条就可以放开了——但那要先改服务端，两端要一起改。
+ * 商家改字体 → 前台的 `font-family` 真的会变 → 所以字体也要写。
  */
-const CLIENT_SCALAR_KEYS = ['radius'] as const;
+const CLIENT_SCALAR_KEYS = ['radius', 'fontSans', 'fontMono'] as const;
 
 /**
  * 把 token 写进 documentElement 的行内样式。
@@ -193,26 +181,19 @@ function applyTokens(tokens: ThemeTokenValues) {
     style.setProperty(vars[0], value);
   }
 
-  // 分组标量：键名是「前缀 + 键」拼出来的
+  // 分组标量：组 → 键 → CSS 变量名的**显式映射**。
   //
-  // ⚠️ 这四组（--text-* / --spacing-* / --shadow-* / --font-weight-*）
-  // **在前台没有任何消费者**——`globals.css` 的 `@theme inline` 块
-  // 只映射 colors / radius / fonts。写与不写，视觉完全一样。
-  //
-  // 那为什么还写？理由是「**写了无害但也无用**」：保留写入以**对齐服务端
-  // 行为**（`buildThemeCss` 会写全部 token），成本为零，将来 CSS 侧接上
-  // 消费者时不需要再改客户端。⚠️ **不是**「不写会更糟」——那个前提不成立。
-  for (const [group, prefix] of Object.entries(GROUP_CSS_VARS)) {
+  // ⚠️ 映射即白名单：键不在映射里就不写，键名逃不出 CSS 声明。
+  for (const [group, mapping] of Object.entries(GROUP_CSS_VARS)) {
     const values = tokens[group as keyof ThemeTokenValues] as
       | Record<string, string>
       | undefined;
     if (!values) continue;
-    const allowed = GROUP_KEYS[group];
     for (const [key, value] of Object.entries(values)) {
       if (typeof value !== 'string') continue;
-      // 键必须在白名单内，否则可从键名逃出 CSS 声明
-      if (!allowed.has(key)) continue;
-      style.setProperty(`${prefix}${key}`, value);
+      const varName = mapping[key];
+      if (!varName) continue;
+      style.setProperty(varName, value);
     }
   }
 }

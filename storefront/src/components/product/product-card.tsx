@@ -11,7 +11,7 @@ export function ProductCard({ product }: { product: PublicProductCard }) {
   return (
     <Link
       href={`/p/${product.slug}`}
-      className="flex flex-col overflow-hidden rounded-lg border transition hover:shadow-md"
+      className="flex flex-col overflow-hidden rounded-lg border transition hover:shadow-base"
     >
       <div className="aspect-square bg-muted">
         {cover ? (

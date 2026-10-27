@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, type CSSProperties } from 'react';
 
 export interface ColorToken {
   key: string;
@@ -24,6 +24,54 @@ export interface ThemeSchema {
   weights: ScalarToken[];
   spacing: ScalarToken[];
   shadows: ScalarToken[];
+}
+
+/**
+ * 由 draft 算出预览区要用的内联 CSS 变量。
+ *
+ * ⚠️ **变量名来自后端 schema 的 `cssVar`** —— schema 里给的就是完整变量名
+ * （`--brand-primary`、`--brand-text-sm`…），所以这里不需要另建一张映射表。
+ *
+ * ⚠️ **draft 的分组名与 schema 的分组名有一处不一致**：schema 里字体在
+ * `fonts` 数组（顶层标量 `fontSans` / `fontMono`），而 draft 里是**顶层字段**
+ * `fontSans` / `fontMono`（不在分组里）→ 这里分开处理。
+ */
+function buildPreviewStyle(
+  draft: Record<string, unknown>,
+  schema: ThemeSchema,
+): CSSProperties {
+  const vars: Record<string, string> = {};
+
+  const put = (varName: string, value: unknown) => {
+    if (typeof value === 'string' && value !== '') {
+      vars[varName] = value;
+    }
+  };
+
+  // 颜色
+  const colors = (draft.colors ?? {}) as Record<string, unknown>;
+  for (const token of schema.colors) {
+    put(token.cssVar, colors[token.key]);
+  }
+
+  // 顶层标量：圆角
+  put(schema.radius.cssVar, draft.radius);
+
+  // 顶层标量：字体（draft 里是顶层字段，不在 fonts 分组里）
+  for (const token of schema.fonts) {
+    put(token.cssVar, draft[token.key]);
+  }
+
+  // 分组标量
+  const groups = ['textScale', 'weights', 'spacing', 'shadows'] as const;
+  for (const group of groups) {
+    const values = (draft[group] ?? {}) as Record<string, unknown>;
+    for (const token of schema[group]) {
+      put(token.cssVar, values[token.key]);
+    }
+  }
+
+  return vars as CSSProperties;
 }
 
 export function ThemeForm({
@@ -106,9 +154,32 @@ export function ThemeForm({
     );
   }
 
+  const previewStyle = buildPreviewStyle(draft, schema);
+
   return (
     <section className="flex flex-col gap-6">
       <h3 className="text-lg font-semibold">店铺主题</h3>
+
+      {/* 实时预览：CSS 变量是继承的 → 内联变量只在这个子树里生效，
+          预览区外面的页面（后台自己的按钮）不受影响。 */}
+      <div
+        data-testid="theme-preview"
+        style={previewStyle}
+        className="flex flex-col gap-3 rounded-lg border p-4"
+      >
+        <p className="text-xs">实时预览</p>
+        <div className="flex items-center gap-3">
+          <span className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">
+            主要按钮
+          </span>
+          <span className="rounded-lg border bg-card px-4 py-2 text-sm text-card-foreground shadow-lg">
+            卡片
+          </span>
+        </div>
+        <p className="font-sans text-sm text-muted-foreground">
+          正文示例：商城里的商品标题与描述
+        </p>
+      </div>
 
       <div className="flex flex-col gap-2">
         <h4 className="text-sm font-medium">颜色</h4>

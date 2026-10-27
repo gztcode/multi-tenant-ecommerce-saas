@@ -7,7 +7,12 @@ export default async function CustomerAccountPage() {
 
   // 未登录时 redirect 会抛特殊错误（NEXT_REDIRECT）中断渲染，
   // 因此下面的 session 一定是非空的。
-  if (!session) {
+  // ⚠️ **判 `!session?.accessToken` 而不是 `!session`**：
+  //    凭证失效时 `jwt-callback.ts` 的 session 回调会把 `accessToken`
+  //    兜底成空串，`session` 对象本身仍在 → `!session` 不成立 →
+  //    不跳登录页，而是带着空 token 去请求 → 401 → 页面显示「Unauthorized」。
+  //    判 `accessToken` 之后，会话失效直接跳登录页（与商家后台一致）。
+  if (!session?.accessToken) {
     redirect('/login');
   }
 

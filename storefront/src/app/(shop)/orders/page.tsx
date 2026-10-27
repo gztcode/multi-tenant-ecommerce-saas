@@ -21,7 +21,7 @@ export default async function OrdersPage({
   searchParams: Promise<{ status?: string; page?: string }>;
 }) {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     redirect('/login');
   }
 

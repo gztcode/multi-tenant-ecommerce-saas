@@ -23,7 +23,7 @@ export const dynamic = 'force-dynamic';
 
 export default async function CouponsPage() {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     redirect('/login');
   }
 

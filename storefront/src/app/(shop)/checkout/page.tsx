@@ -26,14 +26,35 @@ export const dynamic = 'force-dynamic';
 
 export default async function CheckoutPage() {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     redirect('/login');
   }
 
-  const [{ cart }, { addresses }] = await Promise.all([
-    fetchCurrentCart(),
-    fetchAddresses(),
-  ]);
+  const [{ cart, error: cartError }, { addresses, error: addressError }] =
+    await Promise.all([fetchCurrentCart(), fetchAddresses()]);
+
+  // ⚠️ 后端不可达时 fetchCurrentCart 返回 { cart: null, error: '…' }。
+  //    之前不读 error，直接把 cart === null 当成「空购物车」→ 把用户弹回购物车页，
+  //    错误信息在跳转中丢失。
+  if (cartError) {
+    return (
+      <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-6 p-6">
+        <h1 className="text-2xl font-bold">结算</h1>
+        <p className="text-destructive">{cartError}</p>
+      </main>
+    );
+  }
+
+  // ⚠️ 地址加载失败同样要显示错误：否则用户只看到一个空的地址选择框，
+  //    只能自己猜「为什么不能下单」。
+  if (addressError) {
+    return (
+      <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-6 p-6">
+        <h1 className="text-2xl font-bold">结算</h1>
+        <p className="text-destructive">{addressError}</p>
+      </main>
+    );
+  }
 
   // 购物车是空的没什么可结算的——回到购物车页而不是给一个空表单。
   if (!cart || (cart.items ?? []).length === 0) {
@@ -51,7 +72,7 @@ export default async function CheckoutPage() {
       <CheckoutForm
         cart={cart}
         addresses={addresses}
-        loggedIn={Boolean(session)}
+        loggedIn={Boolean(session?.accessToken)}
         preview={preview}
       />
     </main>

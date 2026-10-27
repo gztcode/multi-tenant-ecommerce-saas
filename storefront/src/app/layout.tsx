@@ -24,10 +24,17 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="zh-CN">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
-      >
+    /* ⚠️ **字体变量必须留在 `<html>` 上**：`:root`（= `<html>`）声明
+        `--brand-font-sans: var(--font-geist-sans)`，而自定义属性的 `var()`
+        替换发生在**声明它的那个元素上** —— 若 `--font-geist-sans` 只挂在
+        `<body>` 上，`<html>` 处解析不到 → `--brand-font-sans` 变成无效值，
+        且 `<body>` 的同名变量**不会来补救** → 商家改字体前台看不到变化。
+        挪到 `<body>` 会让品牌字体失效。 */
+    <html
+      lang="zh-CN"
+      className={`${geistSans.variable} ${geistMono.variable}`}
+    >
+      <body className="antialiased">
         {children}
         {/* 会话同步：把刷新后的会话 cookie 送回浏览器，并协调多标签页。
             挂在根 layout 上，所以**每个页面**都会跑一次。 */}
