@@ -6,3 +6,6 @@ export const PAYMENT_WEBHOOK_QUEUE = 'payment-webhook';
 
 /** 计费的每日扫描队列（生成账单 + 自动扣款） */
 export const BILLING_QUEUE = 'billing';
+
+/** 刷新令牌宽限记录清理队列 */
+export const AUTH_QUEUE = 'auth';

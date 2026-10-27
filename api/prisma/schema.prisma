@@ -108,6 +108,14 @@ model RefreshToken {
   tokenHash     String                     @unique
   expiresAt     DateTime
   revokedAt     DateTime?
+  // ⚠️ 阶段 5c：宽限期记录。
+  //
+  // rotatedToToken 存的是本枚令牌轮换出的**新令牌的密文**（AES-256-GCM），
+  // 不是明文 —— 沿用 token.util.ts 里「不存明文」的原则
+  // （这张表经常被备份与只读分析）。
+  // graceExpiresAt 是宽限截止时刻，轮换时一次定死，不因重放而延长。
+  rotatedToToken String?
+  graceExpiresAt DateTime?
   createdAt     DateTime                   @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)

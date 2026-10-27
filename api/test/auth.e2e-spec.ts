@@ -1,8 +1,14 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { RefreshTokenRevokedReason } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
 import { AppModule } from '../src/app.module';
+import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
 import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.interceptor';
+import {
+  hashRefreshToken,
+  REFRESH_GRACE_PERIOD_MS,
+} from '../src/modules/auth/token.util';
 import { http } from './helpers';
 
 /**
@@ -28,6 +34,7 @@ function body(response: { body: unknown }): AuthResponseBody {
 
 describe('认证 (e2e)', () => {
   let app: INestApplication;
+  let prisma: TenantPrismaService;
 
   const unique = () => randomBytes(6).toString('hex');
   const subdomain = () => `shop-${unique()}`;
@@ -51,6 +58,7 @@ describe('认证 (e2e)', () => {
     );
     // 与 main.ts 保持一致：租户上下文拦截器是消费者注册能否拿到租户的前提。
     app.useGlobalInterceptors(app.get(TenantContextInterceptor));
+    prisma = app.get(TenantPrismaService);
     await app.init();
   });
 
@@ -186,11 +194,12 @@ describe('认证 (e2e)', () => {
     expect(body(refreshed).accessToken).toBeTruthy();
     expect(body(refreshed).refreshToken).not.toBe(original);
 
-    // 轮换：旧令牌必须立刻失效，否则泄漏的刷新令牌可以无限续期
-    await http(app)
-      .post('/api/v1/auth/refresh')
-      .send({ refreshToken: original })
-      .expect(401);
+    // 轮换：旧令牌换到的是**新令牌**，不是原样返回——
+    // 否则泄漏的刷新令牌可以无限续期。
+    // ⚠️ 旧令牌**不是立刻 401**：阶段 5c 给了它 60 秒宽限期，
+    // 期间重复提交会拿回**同一枚**新令牌（见「刷新令牌宽限期」那组用例）。
+    // 这里只断言「换到的不是自己」，失效判定交给宽限期那组用例。
+    expect(body(refreshed).refreshToken).not.toBe(original);
   });
 
   it('登出后刷新令牌失效', async () => {
@@ -521,9 +530,27 @@ describe('认证 (e2e)', () => {
       expect(rotated).not.toBe(original);
     });
 
-    it('再次使用已轮换的旧令牌返回 401，并连带作废整个令牌族', async () => {
-      // 重放检测：旧令牌被再次使用说明它可能已泄露，
-      // 按安全最佳实践吊销该用户的全部刷新令牌。
+    it('宽限期内再次使用已轮换的旧令牌，返回同一枚新令牌', async () => {
+      // 阶段 5c 的宽限期：同一枚令牌在 60 秒内被重复提交时，
+      // 返回**第一次那枚**新令牌，不吊销令牌族。
+      // 这是「客户端超时后重试」不再把用户踢下线的关键。
+      const refreshed = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: original })
+        .expect(200);
+
+      // 关键断言：拿到的**就是**第一次那枚，不是新签的一枚。
+      expect(body(refreshed).refreshToken).toBe(rotated);
+    });
+
+    it('超出宽限期后再次使用旧令牌返回 401，并连带作废整个令牌族', async () => {
+      // 把这枚令牌的宽限截止时刻改成过去，模拟「已经过了 60 秒」。
+      // ⚠️ 直接改库比冻时钟精确：只影响这一行，不影响别的用例。
+      await prisma.refreshToken.updateMany({
+        where: { tokenHash: hashRefreshToken(original) },
+        data: { graceExpiresAt: new Date(Date.now() - 1000) },
+      });
+
       await http(app)
         .post('/api/v1/auth/refresh')
         .send({ refreshToken: original })
@@ -555,6 +582,371 @@ describe('认证 (e2e)', () => {
         .post('/api/v1/auth/refresh')
         .send({ refreshToken: fresh })
         .expect(200);
+    });
+  });
+
+  describe('刷新令牌宽限期（阶段 5c）', () => {
+    /**
+     * 造一个商家并登录，返回它的邮箱与刷新令牌。
+     */
+    async function loginMerchant(): Promise<{
+      email: string;
+      token: string;
+    }> {
+      const account = email();
+      await http(app)
+        .post('/api/v1/auth/register/merchant')
+        .send({
+          email: account,
+          password: 'Passw0rd123',
+          merchantName: '宽限期商家',
+          subdomain: subdomain(),
+          storeName: '宽限期店铺',
+        })
+        .expect(201);
+      const response = await http(app)
+        .post('/api/v1/auth/login')
+        .send({ email: account, password: 'Passw0rd123', scope: 'MERCHANT' })
+        .expect(200);
+      return { email: account, token: body(response).refreshToken };
+    }
+
+    it('宽限期内重用旧令牌不牵连其它设备（G3）', async () => {
+      const account = email();
+      await http(app)
+        .post('/api/v1/auth/register/merchant')
+        .send({
+          email: account,
+          password: 'Passw0rd123',
+          merchantName: '多设备商家',
+          subdomain: subdomain(),
+          storeName: '多设备店铺',
+        })
+        .expect(201);
+
+      // 两台设备各登录一次，各有独立的令牌
+      const deviceA = await http(app)
+        .post('/api/v1/auth/login')
+        .send({ email: account, password: 'Passw0rd123', scope: 'MERCHANT' })
+        .expect(200);
+      const deviceB = await http(app)
+        .post('/api/v1/auth/login')
+        .send({ email: account, password: 'Passw0rd123', scope: 'MERCHANT' })
+        .expect(200);
+
+      const tokenA = body(deviceA).refreshToken;
+      const tokenB = body(deviceB).refreshToken;
+
+      // 设备 A 的令牌被轮换
+      const first = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: tokenA })
+        .expect(200);
+      const rotated = body(first).refreshToken;
+
+      // 宽限期内重用 A 的旧令牌 → 200，且拿到同一枚
+      const replay = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: tokenA })
+        .expect(200);
+      expect(body(replay).refreshToken).toBe(rotated);
+
+      // 关键断言：设备 B 完全没参与，必须仍然能刷新。
+      // 改造前这一条会挂 —— 重放会吊销该 userId 下的**全部**令牌。
+      await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: tokenB })
+        .expect(200);
+    });
+
+    it('宽限期不因重放而延长（G4）', async () => {
+      const { token } = await loginMerchant();
+
+      const first = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: token })
+        .expect(200);
+
+      const before = await prisma.refreshToken.findFirst({
+        where: { tokenHash: hashRefreshToken(token) },
+        select: { graceExpiresAt: true, revokedAt: true },
+      });
+      expect(before?.graceExpiresAt).not.toBeNull();
+
+      // 在宽限期内再重放一次
+      await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: token })
+        .expect(200);
+
+      const after = await prisma.refreshToken.findFirst({
+        where: { tokenHash: hashRefreshToken(token) },
+        select: { graceExpiresAt: true },
+      });
+
+      // 关键断言：宽限截止时刻**没有**被推后。
+      // 延长等于给泄漏的令牌开更大的口子。
+      expect(after?.graceExpiresAt?.getTime()).toBe(
+        before?.graceExpiresAt?.getTime(),
+      );
+      expect(body(first).refreshToken).not.toBe(token);
+
+      // 关键断言：宽限期就是常量里写的那个长度（防漂移）。
+      //
+      // ⚠️ **基准是 `graceExpiresAt - revokedAt`，不是 `- createdAt`**：
+      // `createdAt` 是这一行**创建**（登录）的时刻，而 `graceExpiresAt` 是
+      // **轮换**时刻 + 宽限期长度。两者之间隔了「登录到刷新」的那段时间，
+      // 差值必然大于宽限期长度，拿它断言是错的。
+      //
+      // `revokedAt` 才是对的基准：它与 `graceExpiresAt` 在**同一次原子
+      // updateMany** 里写入，都取自轮换的那一刻。
+      expect(
+        (before?.graceExpiresAt?.getTime() ?? 0) -
+          (before?.revokedAt?.getTime() ?? 0),
+      ).toBe(REFRESH_GRACE_PERIOD_MS);
+    });
+
+    it('宽限密文解不开时走超期分支，不返回空令牌（G5）', async () => {
+      const { token } = await loginMerchant();
+
+      await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: token })
+        .expect(200);
+
+      // 把密文改成**合法长度**的乱码（模拟密文被篡改 / 密钥被换）。
+      // ⚠️ 长度必须够 —— 不足 28 字节会被长度守卫拦下，
+      // 走不到 GCM 的认证失败分支，测的就不是同一件事了。
+      await prisma.refreshToken.updateMany({
+        where: { tokenHash: hashRefreshToken(token) },
+        data: { rotatedToToken: 'A'.repeat(40) },
+      });
+
+      // 关键断言：401，**不是** 200 + 空的 refreshToken。
+      // 响应体里绝不能出现 `refreshToken` 字段。
+      const response = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: token })
+        .expect(401);
+
+      expect(response.body).not.toHaveProperty('refreshToken');
+    });
+
+    it('并发重用同一枚令牌：两个都成功且拿到同一枚（G6）', async () => {
+      const { token } = await loginMerchant();
+
+      const results = await Promise.all([
+        http(app).post('/api/v1/auth/refresh').send({ refreshToken: token }),
+        http(app).post('/api/v1/auth/refresh').send({ refreshToken: token }),
+      ]);
+
+      // ⚠️ 改造后两个都是 200 —— 宽限期统一处理「并发」与「先后」，
+      // 判定不再依赖时序（这正是设计文档 §5.3 的实测结论）。
+      const statuses = results.map((r) => r.status).sort();
+      expect(statuses).toEqual([200, 200]);
+
+      // 关键断言：两个拿到的是**同一枚**令牌。
+      const tokens = results.map((r) => body(r).refreshToken);
+      expect(tokens[0]).toBe(tokens[1]);
+      expect(tokens[0]).not.toBe(token);
+
+      // 关键断言：那枚令牌仍然可用（没有把整个令牌族误吊销）
+      await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: tokens[0] })
+        .expect(200);
+    });
+
+    it('链式自愈：回退到已轮换的令牌后能再换回下一枚（G8）', async () => {
+      const { token: t0 } = await loginMerchant();
+
+      // ① 用 T0 刷新 → 得到 T1
+      const r1 = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t0 })
+        .expect(200);
+      const t1 = body(r1).refreshToken;
+
+      // ② 用 T1 刷新 → 得到 T2（T1 此时已作废）
+      const r2 = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t1 })
+        .expect(200);
+      const t2 = body(r2).refreshToken;
+      expect(t2).not.toBe(t1);
+
+      // ③ 用 T0 刷新（仍在宽限期内）→ 拿到 T1 —— 一枚**已作废**的令牌
+      const r3 = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t0 })
+        .expect(200);
+      expect(body(r3).refreshToken).toBe(t1);
+
+      // ④ 用 ③ 拿到的 T1 再刷新 → 命中 T1 自己的宽限记录 → 拿回 T2
+      // 这一步才是「链式自愈」的真正验证。
+      const r4 = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t1 })
+        .expect(200);
+      expect(body(r4).refreshToken).toBe(t2);
+    });
+
+    it('登出后重放前身令牌返回 401，且不牵连其它设备（洞二）', async () => {
+      // ⚠️ **必须建两台设备**：这个特性的价值就是「拒绝时也不牵连其它设备」。
+      // 只建一台的话，「拒绝时吊销全族」这个行为根本不会被锁住 ——
+      // 将来有人把 `handleRevokedToken` 的拒绝分支改成调 `revokeTokenFamily`，
+      // 不会有任何测试挂。
+      const account = email();
+      await http(app)
+        .post('/api/v1/auth/register/merchant')
+        .send({
+          email: account,
+          password: 'Passw0rd123',
+          merchantName: '多设备登出商家',
+          subdomain: subdomain(),
+          storeName: '多设备登出店铺',
+        })
+        .expect(201);
+
+      // 两台设备各登录一次，各有独立的 refreshToken 行
+      const deviceA = await http(app)
+        .post('/api/v1/auth/login')
+        .send({ email: account, password: 'Passw0rd123', scope: 'MERCHANT' })
+        .expect(200);
+      const deviceB = await http(app)
+        .post('/api/v1/auth/login')
+        .send({ email: account, password: 'Passw0rd123', scope: 'MERCHANT' })
+        .expect(200);
+
+      const t0 = body(deviceA).refreshToken;
+      const tokenB = body(deviceB).refreshToken;
+
+      // ① 设备 A 的令牌被轮换：T0 → T1
+      const r1 = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t0 })
+        .expect(200);
+      const t1 = body(r1).refreshToken;
+      const access1 = body(r1).accessToken;
+
+      // ② 用 T1 登出
+      // ⚠️ 登出接口有 JwtAuthGuard，**必须带 Authorization 头**
+      await http(app)
+        .post('/api/v1/auth/logout')
+        .set('Authorization', `Bearer ${access1}`)
+        .send({ refreshToken: t1 })
+        .expect(204);
+
+      // ③ 关键断言：重放**前身** T0 → 401。
+      // 不检查目标令牌状态的话，这里会返回 200 + 一枚有效的 accessToken
+      // —— 登出的意图被撤销。
+      const replay = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t0 })
+        .expect(401);
+
+      expect(replay.body).not.toHaveProperty('accessToken');
+
+      // ④ 关键断言：**设备 B 完全没参与，必须仍然能刷新**。
+      //
+      // ⚠️ 这是「不牵连其它设备」这条语义的**唯一**锁点：
+      // 设备 B 的令牌是**另一个 refreshToken 行**，与设备 A 的链完全无关。
+      // 拒绝时若调了 `revokeTokenFamily`（按 userId 吊销全族），
+      // 设备 B 会被连带吊掉 → 这条断言会挂。
+      //
+      // ⚠️ 注意顺序：**先重放 T0，再刷设备 B**。若反过来的话，
+      // 设备 B 先被轮换，断言就验不到「设备 B 那枚**没被碰过**的令牌」
+      // 是否还能用。
+      await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: tokenB })
+        .expect(200);
+    });
+
+    it('全族吊销后重放族内已轮换的令牌返回 401（洞一）', async () => {
+      const { token: t0 } = await loginMerchant();
+
+      // ① T0 刷新 → T1
+      const r1 = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t0 })
+        .expect(200);
+      const t1 = body(r1).refreshToken;
+
+      // ② **再轮换一次** → T2。
+      //
+      // ⚠️ 这一步不是多余的：它让 **T1 那一行变成 ROTATED**，
+      // 从而带上「可兑换的宽限密文」。只有**已经轮换过**的行才落在
+      // 修补 2 的 `OR: [{ revokedReason: ROTATED }]` 分支里 ——
+      // 只轮换一次的话，T1 是族里最新的令牌（`revokedAt` 为空），
+      // 早就被 `{ revokedAt: null }` 覆盖，**测不到那个分支**。
+      const r2 = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t1 })
+        .expect(200);
+      const t2 = body(r2).refreshToken;
+
+      // ③ 让 T0 超出宽限期 → 触发全族吊销
+      await prisma.refreshToken.updateMany({
+        where: { tokenHash: hashRefreshToken(t0) },
+        data: { graceExpiresAt: new Date(Date.now() - 1000) },
+      });
+      await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t0 })
+        .expect(401);
+
+      // 关键断言：族内那枚**已轮换**的行（T1）必须被改写成 REPLAY，
+      // 且宽限密文被清空 —— 这是「吊销全族」名副其实的**直接证据**。
+      //
+      // ⚠️ **必须查库**：只断言 HTTP 状态码的话，删掉 `revokeTokenFamily`
+      // 的 OR 分支也不会有任何测试挂（响应层已经被另一道防线挡住了）。
+      //
+      // ⚠️ **位置很重要**：必须在「已触发全族吊销之后、刷新 T1 之前」。
+      // 一旦 T1 被重放，行为路径可能已经改写了它的状态。
+      const t1Row = await prisma.refreshToken.findFirst({
+        where: { tokenHash: hashRefreshToken(t1) },
+        select: { revokedReason: true, rotatedToToken: true },
+      });
+      expect(t1Row?.revokedReason).toBe(RefreshTokenRevokedReason.REPLAY);
+      expect(t1Row?.rotatedToToken).toBeNull();
+
+      // ④ 关键断言：族内那枚**已轮换**的令牌（T1，它自己也有宽限记录
+      // 指向 T2）不能再换回令牌 —— 它指向的 T2 已经被吊销了。
+      //
+      // ⚠️ 这条只锁「结果是 401」，**不锁「走的是哪条路径」**：
+      // 修补 1（放行前查目标令牌）与修补 2（全族吊销覆盖 ROTATED 行）
+      // 都能让这条变绿。单靠它区分不了两者。
+      await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t1 })
+        .expect(401);
+
+      // 关键断言：族里最新的那枚（T2）也必须失效 ——
+      // 「吊销全族」覆盖的是**每一枚**，不只是被轮换过的那些。
+      await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: t2 })
+        .expect(401);
+    });
+
+    it('宽限期内多次重放拿到的始终是同一枚令牌', async () => {
+      const { token } = await loginMerchant();
+
+      const first = await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: token })
+        .expect(200);
+      const rotated = body(first).refreshToken;
+
+      // 连续重放 3 次，每次都必须是**同一枚**
+      for (let i = 0; i < 3; i += 1) {
+        const again = await http(app)
+          .post('/api/v1/auth/refresh')
+          .send({ refreshToken: token })
+          .expect(200);
+        expect(body(again).refreshToken).toBe(rotated);
+      }
     });
   });
 
@@ -648,11 +1040,14 @@ describe('认证 (e2e)', () => {
   });
 
   describe('并发刷新', () => {
-    it('同一枚令牌并发刷新两次只有一次成功，且不牵连其它设备', async () => {
+    it('同一枚令牌并发刷新两次都成功，且不牵连其它设备', async () => {
       // 客户端双击刷新、SDK 自动重试都会让同一枚令牌被并发提交两次。
       // 若轮换是「先查后写」，两个请求都会读到 revokedAt === null，
       // 后一个会把前一个刚签发的新令牌误判为重放并作废全族——
       // 一次无害的重试会让用户自己被踢下线。
+      //
+      // ⚠️ 阶段 5c 之后，两个请求都是 200：宽限期统一处理「并发」与「先后」，
+      // 判定不再依赖时序（设计文档 §5.3 的实测结论）。
       const account = email();
 
       await http(app)
@@ -687,14 +1082,15 @@ describe('认证 (e2e)', () => {
       ]);
 
       const statuses = results.map((r) => r.status).sort();
-      expect(statuses).toEqual([200, 401]);
+      expect(statuses).toEqual([200, 200]);
 
-      // 成功的那次必须真的换到了新令牌
-      const winner = results.find((r) => r.status === 200);
-      const winnerToken = body(winner!).refreshToken;
-      expect(winnerToken).not.toBe(tokenA);
+      // 两个请求拿到的是**同一枚**令牌（幂等）
+      const tokens = results.map((r) => body(r).refreshToken);
+      expect(tokens[0]).toBe(tokens[1]);
+      expect(tokens[0]).not.toBe(tokenA);
+      const winnerToken = tokens[0];
 
-      // 关键断言 1：winner 刚签发的那枚令牌必须仍然可用。
+      // 关键断言 1：刚签发的那枚令牌必须仍然可用。
       // 竞态修复之前，loser 会把这枚「合法的新令牌」当成重放标成 REPLAY
       // 并连带作废全族——用户刚刷新成功，拿到的令牌却当场失效。
       await http(app)
