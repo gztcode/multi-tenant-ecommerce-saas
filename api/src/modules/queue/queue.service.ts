@@ -1,5 +1,5 @@
 import { InjectQueue } from '@nestjs/bullmq';
-import { Injectable } from '@nestjs/common';
+import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import {
   AUTH_QUEUE,
@@ -7,6 +7,7 @@ import {
   PAYMENT_TIMEOUT_QUEUE,
   PAYMENT_WEBHOOK_QUEUE,
 } from '../../common/queue/queue.constants';
+import { TimeoutError, withTimeout } from '../../common/util/with-timeout';
 
 export type QueueName =
   | typeof PAYMENT_TIMEOUT_QUEUE
@@ -29,6 +30,15 @@ const DEFAULT_JOB_OPTIONS = {
   attempts: 3,
   backoff: { type: 'exponential' as const, delay: 1000 },
 };
+
+/**
+ * 队列投递超时（毫秒）。
+ *
+ * ⚠️ BullMQ 覆盖了 ioredis 的 `retryStrategy` → **无限退避重试** →
+ * Redis 不可达时 `queue.add()` 的 Promise **永远不 settle**。
+ * 不设超时的话，请求会永远挂住（订单已落库、响应一直转圈）。
+ */
+export const QUEUE_OPERATION_TIMEOUT_MS = 3_000;
 
 /**
  * BullMQ 队列封装的**入队侧**。
@@ -69,11 +79,14 @@ export class QueueService {
     delayMs: number,
     jobId: string,
   ): Promise<void> {
-    await this.queueOf(queueName).add(jobName, data, {
-      delay: delayMs,
-      jobId,
-      ...DEFAULT_JOB_OPTIONS,
-    });
+    await this.withQueueTimeout(
+      this.queueOf(queueName).add(jobName, data, {
+        delay: delayMs,
+        jobId,
+        ...DEFAULT_JOB_OPTIONS,
+      }),
+      `${queueName}/${jobName}`,
+    );
   }
 
   async add(
@@ -82,10 +95,13 @@ export class QueueService {
     data: unknown,
     jobId: string,
   ): Promise<void> {
-    await this.queueOf(queueName).add(jobName, data, {
-      jobId,
-      ...DEFAULT_JOB_OPTIONS,
-    });
+    await this.withQueueTimeout(
+      this.queueOf(queueName).add(jobName, data, {
+        jobId,
+        ...DEFAULT_JOB_OPTIONS,
+      }),
+      `${queueName}/${jobName}`,
+    );
   }
 
   /**
@@ -105,15 +121,50 @@ export class QueueService {
     everyMs: number,
     jobSchedulerId: string,
   ): Promise<void> {
-    await this.queueOf(queueName).upsertJobScheduler(
-      jobSchedulerId,
-      { every: everyMs },
-      {
-        name: jobName,
-        data: data as never,
-        opts: DEFAULT_JOB_OPTIONS,
-      },
+    await this.withQueueTimeout(
+      this.queueOf(queueName).upsertJobScheduler(
+        jobSchedulerId,
+        { every: everyMs },
+        {
+          name: jobName,
+          data: data as never,
+          opts: DEFAULT_JOB_OPTIONS,
+        },
+      ),
+      `${queueName}/${jobName}`,
     );
+  }
+
+  /**
+   * 给队列操作加超时。
+   *
+   * 超时 → `ServiceUnavailableException`（HTTP 503）。
+   * ⚠️ **超时不会取消底层操作**：那个 `add()` 仍在跑，Redis 恢复后它可能
+   * **还会成功入队**。调用方要按「超时后那个操作还算不算数」来决定怎么处理
+   * （下单链路选择「失败不致命」，见 order.service.ts）。
+   *
+   * ⚠️ **在 `onModuleInit` 里调用会失败启动**：NestJS 的 `onModuleInit` 抛异常
+   * 会让进程起不来。`addRepeating` 的两个调用点（token-grace.service.ts 的
+   * 每小时清理、renewal.service.ts 的每日扫描）都在 `onModuleInit` 里 →
+   * **Redis 在启动时不可达 = 进程 3 秒后报错退出**。
+   *
+   * 这是有意为之：周期任务没注册意味着账目与令牌清理都不跑，
+   * 与其让一个「看起来正常、其实不干活」的进程跑着，不如快速失败。
+   * 且它比「永远卡在 bootstrap、没有任何提示」更易恢复 ——
+   * 容器编排会重启它，Redis 恢复后自然就起来了。
+   */
+  private async withQueueTimeout<T>(
+    promise: Promise<T>,
+    what: string,
+  ): Promise<T> {
+    try {
+      return await withTimeout(promise, QUEUE_OPERATION_TIMEOUT_MS, what);
+    } catch (cause) {
+      if (cause instanceof TimeoutError) {
+        throw new ServiceUnavailableException(`队列操作超时：${what}`);
+      }
+      throw cause;
+    }
   }
 
   private queueOf(queueName: QueueName): Queue {

@@ -681,22 +681,31 @@ export class PaymentService {
     tenantId: string,
     kind: PaymentKind = PaymentKind.ORDER,
   ): Promise<void> {
-    await this.queue.add(
-      PAYMENT_WEBHOOK_QUEUE,
-      'payment',
-      {
-        tenantId,
-        kind,
-        eventId: event.eventId,
-        provider: event.provider,
-        channel: event.channel,
-        providerTxnId: event.providerTxnId,
-        referenceNo: event.referenceNo,
-        amount: event.amount,
-        success: event.success,
-      },
-      `webhook-${event.provider}-${event.eventId}`,
-    );
+    try {
+      await this.queue.add(
+        PAYMENT_WEBHOOK_QUEUE,
+        'payment',
+        {
+          tenantId,
+          kind,
+          eventId: event.eventId,
+          provider: event.provider,
+          channel: event.channel,
+          providerTxnId: event.providerTxnId,
+          referenceNo: event.referenceNo,
+          amount: event.amount,
+          success: event.success,
+        },
+        `webhook-${event.provider}-${event.eventId}`,
+      );
+    } catch (cause) {
+      // ⚠️ 支付已入库。报失败会诱导用户重复支付。
+      //    通知丢失的补偿机制不在本阶段范围（见设计文档 L1）。
+      this.logger.error(
+        `支付通知投递失败：provider=${event.provider} eventId=${event.eventId}`,
+        cause,
+      );
+    }
   }
 
   /**

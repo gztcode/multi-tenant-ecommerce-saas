@@ -21,7 +21,7 @@ export default async function OrderDetailPage({
   const { orderNo } = await params;
 
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     redirect('/login');
   }
 

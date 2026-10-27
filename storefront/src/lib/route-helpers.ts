@@ -25,23 +25,6 @@ export async function readJson(request: Request): Promise<unknown> {
 }
 
 /**
- * 把后端的错误码翻成**人能看懂**的中文提示。
- *
- * ⚠️ 只翻「后端的通用兜底文案」，不翻业务文案：
- * 后端自己的 message（如「同一商品的加购总量不能超过 99」）
- * 已经写得很清楚，原样透传即可——硬翻反而会丢掉精度。
- *
- * 后端认证失败时抛的是 Nest 默认的 `UnauthorizedException('Unauthorized')`，
- * 那是英文的框架默认文案，直接显示在页面上对消费者毫无意义。
- */
-function readableMessage(error: ApiError): string {
-  if (error.status === 401 && error.message === 'Unauthorized') {
-    return '登录已过期，请重新登录';
-  }
-  return error.message;
-}
-
-/**
  * 把后端错误转成同源响应。内部细节不泄给浏览器。
  *
  * ApiError 的 message 是后端已脱敏的业务提示，直接透传给页面上是可读的；
@@ -50,8 +33,10 @@ function readableMessage(error: ApiError): string {
  */
 export function toErrorResponse(cause: unknown): NextResponse {
   if (cause instanceof ApiError) {
+    // ⚠️ 不用再翻译 401：api-client 在源头就把 Nest 的默认文案 'Unauthorized'
+    //    翻成中文了（见 lib/api-client.ts 的 localizeApiMessage）。
     return NextResponse.json(
-      { message: readableMessage(cause), code: cause.code },
+      { message: cause.message, code: cause.code },
       { status: cause.status },
     );
   }

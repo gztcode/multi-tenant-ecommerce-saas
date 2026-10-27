@@ -4,117 +4,210 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/**
+ * ① Tailwind 命名空间层。
+ *
+ * ⚠️ **这里只出现 Tailwind 命名空间**，值一律指向 `--brand-*`。
+ * `@theme inline` 的语义是「utility 里直接内联值引用，而不是引用同名变量」
+ * → 与 Tailwind 内置的**同名**刻度不冲突。
+ *
+ * ⚠️ **不是所有被覆盖的变量都不落到 `:root`**：Tailwind 内置主题里**已存在**的键
+ * （`--font-sans` / `--spacing` / `--text-sm` / `--radius-md` /
+ * `--default-font-family` / `--default-mono-font-family` /
+ * `--color-destructive-foreground`）仍会落在 `@layer theme` 的 `:root` 里，
+ * 只是值指向 `--brand-*` —— **功能上无影响**（值一样、且 `@layer theme`
+ * 的优先级低于下面手写的 `:root`）。内置**不存在**的键
+ * （`--text-xs` / `--text-base` / `--text-lg` / `--text-xl` /
+ * `--font-weight-*` / `--shadow-*`）才彻底不落 `:root`。
+ *
+ * ⚠️ **一律不写 fallback**：默认值只存 `:root` 一处（②），避免两处漂移。
+ */
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-sans);
-  --font-mono: var(--font-geist-mono);
-  --font-heading: var(--font-sans);
-  --color-sidebar-ring: var(--sidebar-ring);
-  --color-sidebar-border: var(--sidebar-border);
-  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-  --color-sidebar-accent: var(--sidebar-accent);
-  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-  --color-sidebar-primary: var(--sidebar-primary);
-  --color-sidebar-foreground: var(--sidebar-foreground);
-  --color-sidebar: var(--sidebar);
-  --color-chart-5: var(--chart-5);
-  --color-chart-4: var(--chart-4);
-  --color-chart-3: var(--chart-3);
-  --color-chart-2: var(--chart-2);
-  --color-chart-1: var(--chart-1);
-  --color-ring: var(--ring);
-  --color-input: var(--input);
-  --color-border: var(--border);
-  --color-destructive: var(--destructive);
-  --color-accent-foreground: var(--accent-foreground);
-  --color-accent: var(--accent);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-muted: var(--muted);
-  --color-secondary-foreground: var(--secondary-foreground);
-  --color-secondary: var(--secondary);
-  --color-primary-foreground: var(--primary-foreground);
-  --color-primary: var(--primary);
-  --color-popover-foreground: var(--popover-foreground);
-  --color-popover: var(--popover);
-  --color-card-foreground: var(--card-foreground);
-  --color-card: var(--card);
-  --radius-sm: calc(var(--radius) * 0.6);
-  --radius-md: calc(var(--radius) * 0.8);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) * 1.4);
-  --radius-2xl: calc(var(--radius) * 1.8);
-  --radius-3xl: calc(var(--radius) * 2.2);
-  --radius-4xl: calc(var(--radius) * 2.6);
+  /* 颜色：32 个（全部改名，不只是商家能配的那 16 个） */
+  --color-background: var(--brand-background);
+  --color-foreground: var(--brand-foreground);
+  --color-card: var(--brand-card);
+  --color-card-foreground: var(--brand-card-foreground);
+  --color-popover: var(--brand-popover);
+  --color-popover-foreground: var(--brand-popover-foreground);
+  --color-primary: var(--brand-primary);
+  --color-primary-foreground: var(--brand-primary-foreground);
+  --color-secondary: var(--brand-secondary);
+  --color-secondary-foreground: var(--brand-secondary-foreground);
+  --color-muted: var(--brand-muted);
+  --color-muted-foreground: var(--brand-muted-foreground);
+  --color-accent: var(--brand-accent);
+  --color-accent-foreground: var(--brand-accent-foreground);
+  --color-destructive: var(--brand-destructive);
+  --color-destructive-foreground: var(--brand-destructive-foreground);
+  --color-border: var(--brand-border);
+  --color-input: var(--brand-input);
+  --color-ring: var(--brand-ring);
+  --color-chart-1: var(--brand-chart-1);
+  --color-chart-2: var(--brand-chart-2);
+  --color-chart-3: var(--brand-chart-3);
+  --color-chart-4: var(--brand-chart-4);
+  --color-chart-5: var(--brand-chart-5);
+  --color-sidebar: var(--brand-sidebar);
+  --color-sidebar-foreground: var(--brand-sidebar-foreground);
+  --color-sidebar-primary: var(--brand-sidebar-primary);
+  --color-sidebar-primary-foreground: var(--brand-sidebar-primary-foreground);
+  --color-sidebar-accent: var(--brand-sidebar-accent);
+  --color-sidebar-accent-foreground: var(--brand-sidebar-accent-foreground);
+  --color-sidebar-border: var(--brand-sidebar-border);
+  --color-sidebar-ring: var(--brand-sidebar-ring);
+
+  /* 圆角 */
+  --radius-sm: calc(var(--brand-radius) * 0.6);
+  --radius-md: calc(var(--brand-radius) * 0.8);
+  --radius-lg: var(--brand-radius);
+  --radius-xl: calc(var(--brand-radius) * 1.4);
+  --radius-2xl: calc(var(--brand-radius) * 1.8);
+  --radius-3xl: calc(var(--brand-radius) * 2.2);
+  --radius-4xl: calc(var(--brand-radius) * 2.6);
+
+  /* 字体 */
+  --font-sans: var(--brand-font-sans);
+  --font-mono: var(--brand-font-mono);
+  --font-heading: var(--brand-font-sans);
+
+  /* 字阶 */
+  --text-xs: var(--brand-text-xs);
+  --text-sm: var(--brand-text-sm);
+  --text-base: var(--brand-text-base);
+  --text-lg: var(--brand-text-lg);
+  --text-xl: var(--brand-text-xl);
+
+  /* 字重 */
+  --font-weight-normal: var(--brand-font-weight-normal);
+  --font-weight-medium: var(--brand-font-weight-medium);
+  --font-weight-semibold: var(--brand-font-weight-semibold);
+  --font-weight-bold: var(--brand-font-weight-bold);
+
+  /* 阴影 */
+  --shadow-sm: var(--brand-shadow-sm);
+  --shadow-base: var(--brand-shadow-base);
+  --shadow-lg: var(--brand-shadow-lg);
+
+  /* 间距（单一基础值） */
+  --spacing: var(--brand-spacing);
 }
 
+/**
+ * ② 品牌变量层——**默认值只在这里出现一次**。
+ *
+ * ⚠️ **手写的 `:root` 不在 `@layer` 里** → 优先级高于 Tailwind 编译产物
+ * （`@layer theme` 里的 `:root`）→ 手写的这份赢。
+ * 运行时的内联 `<style>` 同样是普通层的裸 `:root` → 同层、后出现者胜 →
+ * 商家注入的值赢。
+ *
+ * ⚠️ **商家能配的只有 16 个颜色**；另外 16 个（popover / input / chart-* /
+ * sidebar-*）商家配不了，值固定为 shadcn 默认。
+ *
+ * ⚠️ **阴影的默认值必须与 `api/src/modules/theme/theme-tokens.ts` 里的
+ * `SHADOW_TOKENS.defaultValue` 逐字一致**（两侧各有一条单测约束自己的
+ * 那份字面量，改动时需**同步核对两边**）。
+ */
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
-  --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --brand-background: oklch(1 0 0);
+  --brand-foreground: oklch(0.145 0 0);
+  --brand-card: oklch(1 0 0);
+  --brand-card-foreground: oklch(0.145 0 0);
+  --brand-popover: oklch(1 0 0);
+  --brand-popover-foreground: oklch(0.145 0 0);
+  --brand-primary: oklch(0.205 0 0);
+  --brand-primary-foreground: oklch(0.985 0 0);
+  --brand-secondary: oklch(0.97 0 0);
+  --brand-secondary-foreground: oklch(0.205 0 0);
+  --brand-muted: oklch(0.97 0 0);
+  --brand-muted-foreground: oklch(0.556 0 0);
+  --brand-accent: oklch(0.97 0 0);
+  --brand-accent-foreground: oklch(0.205 0 0);
+  --brand-destructive: oklch(0.577 0.245 27.325);
+  --brand-destructive-foreground: oklch(0.985 0 0);
+  --brand-border: oklch(0.922 0 0);
+  --brand-input: oklch(0.922 0 0);
+  --brand-ring: oklch(0.708 0 0);
+  --brand-chart-1: oklch(0.87 0 0);
+  --brand-chart-2: oklch(0.556 0 0);
+  --brand-chart-3: oklch(0.439 0 0);
+  --brand-chart-4: oklch(0.371 0 0);
+  --brand-chart-5: oklch(0.269 0 0);
+  --brand-sidebar: oklch(0.985 0 0);
+  --brand-sidebar-foreground: oklch(0.145 0 0);
+  --brand-sidebar-primary: oklch(0.205 0 0);
+  --brand-sidebar-primary-foreground: oklch(0.985 0 0);
+  --brand-sidebar-accent: oklch(0.97 0 0);
+  --brand-sidebar-accent-foreground: oklch(0.205 0 0);
+  --brand-sidebar-border: oklch(0.922 0 0);
+  --brand-sidebar-ring: oklch(0.708 0 0);
+
+  --brand-radius: 0.625rem;
+  --brand-font-sans: var(--font-geist-sans);
+  --brand-font-mono: var(--font-geist-mono);
+  --brand-text-xs: 0.75rem;
+  --brand-text-sm: 0.875rem;
+  --brand-text-base: 1rem;
+  --brand-text-lg: 1.125rem;
+  --brand-text-xl: 1.25rem;
+  --brand-font-weight-normal: 400;
+  --brand-font-weight-medium: 500;
+  --brand-font-weight-semibold: 600;
+  --brand-font-weight-bold: 700;
+  --brand-shadow-sm: 0 1px 3px 0 var(--tw-shadow-color, rgb(0 0 0 / 0.1)), 0 1px 2px -1px var(--tw-shadow-color, rgb(0 0 0 / 0.1));
+  --brand-shadow-base: 0 4px 6px -1px var(--tw-shadow-color, rgb(0 0 0 / 0.1));
+  --brand-shadow-lg: 0 10px 15px -3px var(--tw-shadow-color, rgb(0 0 0 / 0.1)), 0 4px 6px -4px var(--tw-shadow-color, rgb(0 0 0 / 0.1));
+  --brand-spacing: 0.25rem;
 }
 
+/**
+ * dark 模式。
+ *
+ * ⚠️ **dark 模式目前从未启用**（全仓没有给 `<html>` 加 `.dark` 类的代码），
+ * 这里保留是为了将来启用时不必重做。改名成 `--brand-*` 是为了守住
+ * 「`--brand-*` 是唯一命名空间」这条不变量。
+ *
+ * ⚠️ **`.dark` 只覆盖颜色与圆角**（32 个颜色 + `--brand-radius` = 33 个）；
+ * 字体 / 字阶 / 字重 / 阴影 / 间距这 15 个**继承 `:root`** 的值。
+ * 将来启用 dark 时要一并复核：暗色配色配亮色的字体与阴影未必好看。
+ *
+ * ⚠️ **将来启用 dark 时要重做主题分层**：`.dark` 的值会盖掉商家注入的
+ * `:root` 值（同优先级、`.dark` 在源码里更靠后）→ 商家主题在 dark 下失效。
+ */
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  --brand-background: oklch(0.145 0 0);
+  --brand-foreground: oklch(0.985 0 0);
+  --brand-card: oklch(0.205 0 0);
+  --brand-card-foreground: oklch(0.985 0 0);
+  --brand-popover: oklch(0.205 0 0);
+  --brand-popover-foreground: oklch(0.985 0 0);
+  --brand-primary: oklch(0.922 0 0);
+  --brand-primary-foreground: oklch(0.205 0 0);
+  --brand-secondary: oklch(0.269 0 0);
+  --brand-secondary-foreground: oklch(0.985 0 0);
+  --brand-muted: oklch(0.269 0 0);
+  --brand-muted-foreground: oklch(0.708 0 0);
+  --brand-accent: oklch(0.269 0 0);
+  --brand-accent-foreground: oklch(0.985 0 0);
+  --brand-destructive: oklch(0.704 0.191 22.216);
+  --brand-destructive-foreground: oklch(0.145 0 0);
+  --brand-border: oklch(1 0 0 / 10%);
+  --brand-input: oklch(1 0 0 / 15%);
+  --brand-ring: oklch(0.556 0 0);
+  --brand-chart-1: oklch(0.87 0 0);
+  --brand-chart-2: oklch(0.556 0 0);
+  --brand-chart-3: oklch(0.439 0 0);
+  --brand-chart-4: oklch(0.371 0 0);
+  --brand-chart-5: oklch(0.269 0 0);
+  --brand-sidebar: oklch(0.205 0 0);
+  --brand-sidebar-foreground: oklch(0.985 0 0);
+  --brand-sidebar-primary: oklch(0.488 0.243 264.376);
+  --brand-sidebar-primary-foreground: oklch(0.985 0 0);
+  --brand-sidebar-accent: oklch(0.269 0 0);
+  --brand-sidebar-accent-foreground: oklch(0.985 0 0);
+  --brand-sidebar-border: oklch(1 0 0 / 10%);
+  --brand-sidebar-ring: oklch(0.556 0 0);
+  --brand-radius: 0.625rem;
 }
 
 @layer base {

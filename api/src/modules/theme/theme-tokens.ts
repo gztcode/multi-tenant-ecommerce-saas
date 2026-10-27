@@ -12,7 +12,10 @@
 export interface ColorTokenDefinition {
   key: string;
   label: string;
-  /** CSS 变量名（shadcn 约定用裸名，Tailwind 侧由 @theme inline 映射） */
+  /**
+   * CSS 变量名（统一在 `--brand-*` 命名空间下，
+   * Tailwind 侧由 globals.css 的 `@theme inline` 映射成 `--color-*` 等）
+   */
   cssVar: string;
   defaultValue: string;
 }
@@ -20,6 +23,10 @@ export interface ColorTokenDefinition {
 export interface ScalarTokenDefinition {
   key: string;
   label: string;
+  /**
+   * CSS 变量名（统一在 `--brand-*` 命名空间下，
+   * Tailwind 侧由 globals.css 的 `@theme inline` 映射成 `--color-*` 等）
+   */
   cssVar: string;
   defaultValue: string;
 }
@@ -28,97 +35,97 @@ export const COLOR_TOKENS: ColorTokenDefinition[] = [
   {
     key: 'background',
     label: '背景色',
-    cssVar: '--background',
+    cssVar: '--brand-background',
     defaultValue: 'oklch(1 0 0)',
   },
   {
     key: 'foreground',
     label: '文字色',
-    cssVar: '--foreground',
+    cssVar: '--brand-foreground',
     defaultValue: 'oklch(0.145 0 0)',
   },
   {
     key: 'card',
     label: '卡片背景',
-    cssVar: '--card',
+    cssVar: '--brand-card',
     defaultValue: 'oklch(1 0 0)',
   },
   {
     key: 'cardForeground',
     label: '卡片文字',
-    cssVar: '--card-foreground',
+    cssVar: '--brand-card-foreground',
     defaultValue: 'oklch(0.145 0 0)',
   },
   {
     key: 'primary',
     label: '主色',
-    cssVar: '--primary',
+    cssVar: '--brand-primary',
     defaultValue: 'oklch(0.205 0 0)',
   },
   {
     key: 'primaryForeground',
     label: '主色上的文字',
-    cssVar: '--primary-foreground',
+    cssVar: '--brand-primary-foreground',
     defaultValue: 'oklch(0.985 0 0)',
   },
   {
     key: 'secondary',
     label: '次要色',
-    cssVar: '--secondary',
+    cssVar: '--brand-secondary',
     defaultValue: 'oklch(0.97 0 0)',
   },
   {
     key: 'secondaryForeground',
     label: '次要色上的文字',
-    cssVar: '--secondary-foreground',
+    cssVar: '--brand-secondary-foreground',
     defaultValue: 'oklch(0.205 0 0)',
   },
   {
     key: 'muted',
     label: '弱化色',
-    cssVar: '--muted',
+    cssVar: '--brand-muted',
     defaultValue: 'oklch(0.97 0 0)',
   },
   {
     key: 'mutedForeground',
     label: '弱化色上的文字',
-    cssVar: '--muted-foreground',
+    cssVar: '--brand-muted-foreground',
     defaultValue: 'oklch(0.556 0 0)',
   },
   {
     key: 'accent',
     label: '强调色',
-    cssVar: '--accent',
+    cssVar: '--brand-accent',
     defaultValue: 'oklch(0.97 0 0)',
   },
   {
     key: 'accentForeground',
     label: '强调色上的文字',
-    cssVar: '--accent-foreground',
+    cssVar: '--brand-accent-foreground',
     defaultValue: 'oklch(0.205 0 0)',
   },
   {
     key: 'destructive',
     label: '危险色',
-    cssVar: '--destructive',
+    cssVar: '--brand-destructive',
     defaultValue: 'oklch(0.577 0.245 27.325)',
   },
   {
     key: 'destructiveForeground',
     label: '危险色上的文字',
-    cssVar: '--destructive-foreground',
+    cssVar: '--brand-destructive-foreground',
     defaultValue: 'oklch(0.985 0 0)',
   },
   {
     key: 'border',
     label: '边框色',
-    cssVar: '--border',
+    cssVar: '--brand-border',
     defaultValue: 'oklch(0.922 0 0)',
   },
   {
     key: 'ring',
     label: '聚焦环',
-    cssVar: '--ring',
+    cssVar: '--brand-ring',
     defaultValue: 'oklch(0.708 0 0)',
   },
 ];
@@ -126,7 +133,7 @@ export const COLOR_TOKENS: ColorTokenDefinition[] = [
 export const RADIUS_TOKEN: ScalarTokenDefinition = {
   key: 'radius',
   label: '圆角',
-  cssVar: '--radius',
+  cssVar: '--brand-radius',
   defaultValue: '0.625rem',
 };
 
@@ -134,83 +141,101 @@ export const FONT_TOKENS: ScalarTokenDefinition[] = [
   {
     key: 'fontSans',
     label: '正文字体',
-    cssVar: '--font-sans',
+    cssVar: '--brand-font-sans',
     defaultValue: 'var(--font-geist-sans)',
   },
   {
     key: 'fontMono',
     label: '等宽字体',
-    cssVar: '--font-mono',
+    cssVar: '--brand-font-mono',
     defaultValue: 'var(--font-geist-mono)',
   },
 ];
 
 export const TEXT_SCALE_TOKENS: ScalarTokenDefinition[] = [
-  { key: 'xs', label: '最小', cssVar: '--text-xs', defaultValue: '0.75rem' },
-  { key: 'sm', label: '小', cssVar: '--text-sm', defaultValue: '0.875rem' },
-  { key: 'base', label: '正文', cssVar: '--text-base', defaultValue: '1rem' },
-  { key: 'lg', label: '大', cssVar: '--text-lg', defaultValue: '1.125rem' },
-  { key: 'xl', label: '特大', cssVar: '--text-xl', defaultValue: '1.25rem' },
+  { key: 'xs', label: '最小', cssVar: '--brand-text-xs', defaultValue: '0.75rem' },
+  { key: 'sm', label: '小', cssVar: '--brand-text-sm', defaultValue: '0.875rem' },
+  { key: 'base', label: '正文', cssVar: '--brand-text-base', defaultValue: '1rem' },
+  { key: 'lg', label: '大', cssVar: '--brand-text-lg', defaultValue: '1.125rem' },
+  { key: 'xl', label: '特大', cssVar: '--brand-text-xl', defaultValue: '1.25rem' },
 ];
 
 export const WEIGHT_TOKENS: ScalarTokenDefinition[] = [
   {
     key: 'normal',
     label: '常规',
-    cssVar: '--font-weight-normal',
+    cssVar: '--brand-font-weight-normal',
     defaultValue: '400',
   },
   {
     key: 'medium',
     label: '中等',
-    cssVar: '--font-weight-medium',
+    cssVar: '--brand-font-weight-medium',
     defaultValue: '500',
   },
   {
     key: 'semibold',
     label: '半粗',
-    cssVar: '--font-weight-semibold',
+    cssVar: '--brand-font-weight-semibold',
     defaultValue: '600',
   },
   {
     key: 'bold',
     label: '加粗',
-    cssVar: '--font-weight-bold',
+    cssVar: '--brand-font-weight-bold',
     defaultValue: '700',
   },
 ];
 
+/**
+ * 间距组：**只有一个**基础值。
+ *
+ * ⚠️ **为什么不是五档刻度**：Tailwind 4 的间距只有**单一** `--spacing`
+ * 基础值（`p-4` = `calc(var(--spacing) * 4)`），**没有** `--spacing-xs` 这种
+ * 刻度命名空间 —— 五档刻度在技术上无法表达。
+ * 语义因此从「五档刻度」变成「**全局间距密度**」。
+ *
+ * ⚠️ **老数据自动降级**：`sanitize()` 按本数组的定义取键，老数据里的
+ * `xs`/`sm`/`lg`/`xl` 不在白名单 → 被丢弃；`base` 保留 → 无需写迁移。
+ */
 export const SPACING_TOKENS: ScalarTokenDefinition[] = [
-  { key: 'xs', label: '最小', cssVar: '--spacing-xs', defaultValue: '0.25rem' },
-  { key: 'sm', label: '小', cssVar: '--spacing-sm', defaultValue: '0.5rem' },
   {
     key: 'base',
-    label: '标准',
-    cssVar: '--spacing-base',
-    defaultValue: '1rem',
+    label: '间距密度',
+    cssVar: '--brand-spacing',
+    defaultValue: '0.25rem',
   },
-  { key: 'lg', label: '大', cssVar: '--spacing-lg', defaultValue: '1.5rem' },
-  { key: 'xl', label: '特大', cssVar: '--spacing-xl', defaultValue: '2rem' },
 ];
 
+/**
+ * 阴影组。
+ *
+ * ⚠️ **默认值必须与 globals.css 的 `:root` 里的 `--brand-shadow-*` 逐字一致**：
+ * 前者决定「商家没配时接口返回什么」，后者决定「没人注入时页面用什么」。
+ * 两边不一样 → 商家清空某个字段后外观会跳变。
+ * 两边的默认值都写在这两个文件里，靠**同一次提交**保证不漂移；
+ * 两侧各有一条单测约束自己的那份字面量，改动时需**同步核对两边**。
+ */
 export const SHADOW_TOKENS: ScalarTokenDefinition[] = [
   {
     key: 'sm',
     label: '轻',
-    cssVar: '--shadow-sm',
-    defaultValue: '0 1px 2px 0 rgb(0 0 0 / 0.05)',
+    cssVar: '--brand-shadow-sm',
+    defaultValue:
+      '0 1px 3px 0 var(--tw-shadow-color, rgb(0 0 0 / 0.1)), 0 1px 2px -1px var(--tw-shadow-color, rgb(0 0 0 / 0.1))',
   },
   {
     key: 'base',
     label: '标准',
-    cssVar: '--shadow-base',
-    defaultValue: '0 4px 6px -1px rgb(0 0 0 / 0.1)',
+    cssVar: '--brand-shadow-base',
+    defaultValue: '0 4px 6px -1px var(--tw-shadow-color, rgb(0 0 0 / 0.1))',
   },
   {
     key: 'lg',
     label: '重',
-    cssVar: '--shadow-lg',
-    defaultValue: '0 10px 15px -3px rgb(0 0 0 / 0.1)',
+    cssVar: '--brand-shadow-lg',
+    defaultValue:
+      '0 10px 15px -3px var(--tw-shadow-color, rgb(0 0 0 / 0.1)), 0 4px 6px -4px var(--tw-shadow-color, rgb(0 0 0 / 0.1))',
   },
 ];
 

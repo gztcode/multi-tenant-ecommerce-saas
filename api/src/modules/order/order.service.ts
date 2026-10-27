@@ -3,6 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
   UnauthorizedException,
@@ -69,6 +70,8 @@ const ORDER_NO_MAX_ATTEMPTS = 3;
  */
 @Injectable()
 export class OrderService {
+  private readonly logger = new Logger(OrderService.name);
+
   constructor(
     private readonly prisma: TenantPrismaService,
     private readonly inventory: OrderInventoryService,
@@ -235,13 +238,25 @@ export class OrderService {
     // 不带就查不到订单、也碰不到库存。
     // 这里的 tenantId 来自**已认证的请求上下文**（可信源），
     // 绝不能取自客户端提交的内容——否则「重建上下文」本身就成了越权通道。
-    await this.queue.addDelayed(
-      PAYMENT_TIMEOUT_QUEUE,
-      'release',
-      { tenantId, orderId },
-      PAYMENT_TIMEOUT_MS,
-      `timeout-${orderId}`,
-    );
+    // ⚠️ **投递失败不致命**：订单已建成、库存已预占、用户可以正常支付。
+    //    这里报失败会让用户以为「没下单成功」而重下 → 重复订单。
+    //    投递失败只影响「超时后自动关单」这一件事，不影响下单本身。
+    //
+    // ⚠️ **投递的位置不能前移**：`payExpiresAt` 在事务内建单时算，
+    //    而 delayed job 从**入队时刻**起算延迟 —— 前移会让任务早于
+    //    `payExpiresAt` 触发，被 `order-timeout.service.ts` 的「还没到期限」
+    //    分支跳过且不重试 → 订单永远停在待支付、库存永久卡在预占。
+    try {
+      await this.queue.addDelayed(
+        PAYMENT_TIMEOUT_QUEUE,
+        'release',
+        { tenantId, orderId },
+        PAYMENT_TIMEOUT_MS,
+        `timeout-${orderId}`,
+      );
+    } catch (cause) {
+      this.logger.error(`支付超时释放任务投递失败：订单 ${orderId}`, cause);
+    }
 
     return this.readOrder(orderId);
   }

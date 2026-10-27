@@ -77,11 +77,13 @@ describe('ThemeWatcher', () => {
     render(<ThemeWatcher />);
 
     await waitFor(() =>
-      expect(document.documentElement.style.getPropertyValue('--primary')).toBe(
-        'oklch(0.7 0.19 40)',
-      ),
+      expect(
+        document.documentElement.style.getPropertyValue('--brand-primary'),
+      ).toBe('oklch(0.7 0.19 40)'),
     );
-    expect(document.documentElement.style.getPropertyValue('--radius')).toBe('1.5rem');
+    expect(
+      document.documentElement.style.getPropertyValue('--brand-radius'),
+    ).toBe('1.5rem');
   });
 
   it('轮询请求打在中转路由上，且明确不缓存', async () => {
@@ -108,11 +110,13 @@ describe('ThemeWatcher', () => {
     render(<ThemeWatcher />);
 
     await waitFor(() =>
-      expect(document.documentElement.style.getPropertyValue('--primary')).toBe(
-        'oklch(0.7 0.19 40)',
-      ),
+      expect(
+        document.documentElement.style.getPropertyValue('--brand-primary'),
+      ).toBe('oklch(0.7 0.19 40)'),
     );
-    expect(document.documentElement.style.getPropertyValue('--恶意键')).toBe('');
+    expect(
+      document.documentElement.style.getPropertyValue('--brand-恶意键'),
+    ).toBe('');
     expect(document.documentElement.getAttribute('style')).not.toContain('恶意键');
   });
 
@@ -128,16 +132,16 @@ describe('ThemeWatcher', () => {
     // ⚠️ 传一个小间隔，否则第二轮轮询要等 30 秒（生产默认值）才发生
     render(<ThemeWatcher intervalMs={20} />);
     await waitFor(() =>
-      expect(document.documentElement.style.getPropertyValue('--primary')).toBe(
-        'oklch(0.7 0.19 40)',
-      ),
+      expect(
+        document.documentElement.style.getPropertyValue('--brand-primary'),
+      ).toBe('oklch(0.7 0.19 40)'),
     );
 
     // 再失败一次，主题应该还在
     await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2));
-    expect(document.documentElement.style.getPropertyValue('--primary')).toBe(
-      'oklch(0.7 0.19 40)',
-    );
+    expect(
+      document.documentElement.style.getPropertyValue('--brand-primary'),
+    ).toBe('oklch(0.7 0.19 40)');
   });
 
   it('组件卸载后不再轮询', async () => {
@@ -154,20 +158,23 @@ describe('ThemeWatcher', () => {
     expect(fetchMock.mock.calls.length).toBe(callsBefore);
   });
 
-  it('字体 token 不写进行内样式（L21：客户端注入与服务端行为不一致）', async () => {
+  it('字体 token 也写进行内样式（5d 之后字体能生效）', async () => {
     const ThemeWatcher = await loadThemeWatcher();
-    // ⚠️ `--font-geist-sans` 只在 next/font 挂在 <body> 上的变量作用域里存在，
-    // root 作用域看不到它 → 写进去也解析不出来，纯属改变可观察状态而无视觉收益。
-    // 所以 fontSans / fontMono 被**排除出客户端注入范围**。
     mockFetchOk({ tokens: TOKENS });
 
     render(<ThemeWatcher />);
 
     await waitFor(() =>
-      expect(document.documentElement.style.getPropertyValue('--radius')).toBe('1.5rem'),
+      expect(
+        document.documentElement.style.getPropertyValue('--brand-radius'),
+      ).toBe('1.5rem'),
     );
-    expect(document.documentElement.style.getPropertyValue('--font-sans')).toBe('');
-    expect(document.documentElement.style.getPropertyValue('--font-mono')).toBe('');
+    expect(
+      document.documentElement.style.getPropertyValue('--brand-font-sans'),
+    ).toBe('var(--font-geist-sans)');
+    expect(
+      document.documentElement.style.getPropertyValue('--brand-font-mono'),
+    ).toBe('var(--font-geist-mono)');
   });
 
   it('主题没变时不重写 DOM（护栏 10 的性能部分 / 失败注入 #13）', async () => {
