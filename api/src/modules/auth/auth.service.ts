@@ -12,7 +12,14 @@ import {
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
-import { generateRefreshToken, hashRefreshToken } from './token.util';
+import {
+  decryptToken,
+  deriveGraceKey,
+  encryptToken,
+  generateRefreshToken,
+  hashRefreshToken,
+  REFRESH_GRACE_PERIOD_MS,
+} from './token.util';
 import { RegisterMerchantDto } from './dto/register-merchant.dto';
 import { RegisterCustomerDto } from './dto/register-customer.dto';
 import { LoginDto, LoginScope } from './dto/login.dto';
@@ -40,10 +47,23 @@ export interface AuthResult {
 
 @Injectable()
 export class AuthService {
+  /**
+   * 宽限记录用的加密密钥。
+   *
+   * ⚠️ **在构造时派生一次**：HKDF 不贵，但每次刷新都派生一遍是白跑的。
+   * 它只存在于进程内存，不落盘、不进日志。
+   */
+  private readonly graceKey: Buffer;
+
   constructor(
     private readonly prisma: TenantPrismaService,
     private readonly jwt: JwtService,
-  ) {}
+  ) {
+    this.graceKey = deriveGraceKey(
+      process.env.JWT_SECRET ??
+        'change-me-in-production-at-least-32-chars-long',
+    );
+  }
 
   /** 商家注册：一次创建租户 + 店主用户 + 首个店铺 */
   async registerMerchant(dto: RegisterMerchantDto): Promise<AuthResult> {
@@ -230,10 +250,6 @@ export class AuthService {
   }
 
   async refresh(refreshToken: string): Promise<AuthResult> {
-    // 本次请求的处理起点。重放判定要拿它和「轮换发生的时间」比较，
-    // 这是区分「并发竞态」与「真正的重放」的唯一可靠依据。
-    const requestStartedAt = new Date();
-
     const tokenHash = hashRefreshToken(refreshToken);
 
     const stored = await this.prisma.refreshToken.findFirst({
@@ -245,93 +261,192 @@ export class AuthService {
       throw new UnauthorizedException('刷新令牌无效或已过期');
     }
 
+    // 这枚令牌已经被吊销过，又被再次使用。
     if (stored.revokedAt) {
-      // 这枚令牌已经被吊销过，又被再次使用。分三种情况：
-      if (this.isConcurrentRace(stored.revokedAt, requestStartedAt)) {
-        // ① 并发竞态：轮换发生在本次请求开始之后。客户端双击刷新、
-        //    SDK 自动重试会让同一枚令牌被并发提交两次，那不是泄露。
-        //    只拒绝本请求，不牵连该用户的其它设备。
-        throw new UnauthorizedException('刷新令牌已被使用过，请重新登录');
-      }
-
-      if (stored.revokedReason === RefreshTokenRevokedReason.LOGOUT) {
-        // ② 登出后误用：用户只是误用了自己刚登出的旧令牌。把它当成泄露
-        //    处理会把手机、电脑等其它设备的登录一起踢掉。多设备并存是
-        //    商家后台的常态，不能为一次误用牺牲全部会话。
-        throw new UnauthorizedException('刷新令牌无效或已过期');
-      }
-
-      // ③ 真正的重放：轮换发生在本次请求开始之前，这枚令牌在抵达前
-      //    就已经离开了合法用户，说明它在别处还有第二个持有者。按 OAuth 2.0
-      //    安全最佳实践（RFC 9700 / BCP）作废整个令牌族——攻击者与真实用户
-      //    同时失效，重新登录即可恢复。
-      await this.revokeTokenFamily(stored.userId, stored.id);
-      throw new UnauthorizedException(
-        '刷新令牌已被使用过，出于安全考虑已吊销全部登录状态',
-      );
+      return this.handleRevokedToken(stored);
     }
 
     if (stored.expiresAt < new Date()) {
       throw new UnauthorizedException('刷新令牌无效或已过期');
     }
 
-    // 轮换：旧令牌立即吊销。刷新令牌是长期凭证且会在响应里明文回传客户端，
-    // 不轮换的话，一枚泄漏的刷新令牌可以一直换取新令牌，泄露窗口无上限。
+    // ⚠️ **轮换：旧令牌立即作废，并同时记下宽限记录。**
     //
-    // ⚠️ 必须是**条件**更新（where 里带 revokedAt: null），不能是「先查后写」。
+    // 刷新令牌是长期凭证且会在响应里明文回传客户端，不轮换的话，
+    // 一枚泄漏的刷新令牌可以一直换取新令牌，泄露窗口无上限。
+    //
+    // ⚠️ **「标旧行」与「建新行」必须在同一个事务里** ——
+    // 分成两步的话，中间失败会留下一枚「已作废但没有宽限记录」的旧令牌：
+    // 客户端在窗口内重试它 → 判真重放 → 吊销全族。
+    //
+    // ⚠️ **「标旧行」的那一次 updateMany 必须是条件更新**
+    //（where 带 revokedAt: null），不能是「先查后写」。
     // 同一枚令牌并发提交两次时，两个请求都会读到 revokedAt === null；
-    // 条件更新让并发下只有一个请求的 count 为 1，另一个拿到 count === 0。
-    const rotated = await this.prisma.refreshToken.updateMany({
-      where: { id: stored.id, revokedAt: null },
-      data: {
-        revokedAt: new Date(),
-        revokedReason: RefreshTokenRevokedReason.ROTATED,
-      },
-    });
+    // 条件更新让并发下只有一个请求的 count 为 1。
+    const { refreshToken: newRefreshToken, expiresAt } =
+      this.createRefreshToken();
 
-    if (rotated.count === 0) {
-      // 条件更新没命中：这枚令牌在我们读它之后、轮换它之前，被另一个请求
-      // 轮换掉了。重新读一次拿**准确的**轮换时间——刚才那份 stored 是
-      // 并发窗口开始前的快照，看不准。
-      const current = await this.prisma.refreshToken.findFirst({
-        where: { id: stored.id },
-        select: { revokedAt: true },
+    const rotated = await this.prisma.$transaction(async (tx) => {
+      // ⚠️ **同一次轮换只取一次时钟**。
+      // 原来 `revokedAt` 与 `graceExpiresAt` 各自调了一次 `new Date()`，
+      // 两次读之间跨过毫秒边界就会让「宽限期 = 60001ms」——
+      // e2e 断言的是**精确相等**，实测失败率约 10%。
+      const rotateNow = new Date();
+      const count = await tx.refreshToken.updateMany({
+        where: { id: stored.id, revokedAt: null },
+        data: {
+          revokedAt: rotateNow,
+          revokedReason: RefreshTokenRevokedReason.ROTATED,
+          // ⚠️ **宽限记录**：新令牌的**密文**。
+          // 存密文而不是明文 —— 这张表经常被备份与只读分析。
+          rotatedToToken: encryptToken(newRefreshToken, this.graceKey),
+          // ⚠️ **一次定死，不因重放而延长**。
+          graceExpiresAt: new Date(
+            rotateNow.getTime() + REFRESH_GRACE_PERIOD_MS,
+          ),
+        },
       });
 
-      if (this.isConcurrentRace(current?.revokedAt, requestStartedAt)) {
-        // 并发竞态：只拒绝本请求。客户端重试时用 winner 刚签发的那枚即可，
-        // 不影响任何其它会话。
-        throw new UnauthorizedException('刷新令牌已被使用过，请重新登录');
-      }
+      // count === 0 → 另一个请求抢先轮换了这一枚。
+      // 此时**不能**建新行（会多出一枚没人持有的令牌）。
+      if (count.count === 0) return false;
 
-      // 轮换发生在本次请求开始之前 → 真正的重放，作废整个令牌族。
-      await this.revokeTokenFamily(stored.userId, stored.id);
-      throw new UnauthorizedException(
-        '刷新令牌已被使用过，出于安全考虑已吊销全部登录状态',
-      );
+      await tx.refreshToken.create({
+        data: {
+          userId: stored.user.id,
+          tokenHash: hashRefreshToken(newRefreshToken),
+          expiresAt,
+        },
+      });
+      return true;
+    });
+
+    if (!rotated) {
+      // 条件更新没命中：这枚令牌在我们读它之后、轮换它之前，
+      // 被另一个请求轮换掉了。重新读一次拿**准确的**状态。
+      const current = await this.prisma.refreshToken.findFirst({
+        where: { id: stored.id },
+        include: { user: true },
+      });
+      if (!current) {
+        throw new UnauthorizedException('刷新令牌无效或已过期');
+      }
+      return this.handleRevokedToken(current);
     }
 
-    return this.issueTokens(stored.user);
+    return {
+      user: this.toAuthUser(stored.user),
+      // ⚠️ **在这里签，而不是在事务之前**：
+      // 并发下的 loser 分支（`rotated === false`）会白签一枚，
+      // 功能无害但读起来像「先签好待用」。
+      accessToken: await this.signAccessToken(stored.user),
+      refreshToken: newRefreshToken,
+    };
   }
 
   /**
-   * 判断一枚「已被轮换」的令牌再次出现时，属于并发竞态还是真正的重放。
+   * 处理一枚**已经被吊销过**的刷新令牌。
    *
-   * 判别依据是**轮换发生的时间**与**本次请求起始时间**的先后：
-   * - 轮换发生在本次请求开始之后 → 并发竞态。客户端双击刷新、SDK 重试
-   *   会让同一枚令牌被并发提交两次，毫秒级的窗口不是令牌泄漏。
-   * - 轮换发生在本次请求开始之前 → 真正的重放。这枚令牌在本次请求抵达前
-   *   就已经离开了合法用户，说明它在别处还有第二个持有者。
+   * 分四档（阶段 5c 之后）：
+   * ① 登出后误用 → 401，不牵连其它设备
+   * ② **宽限期内** → 返回**同一枚**新令牌，不吊销令牌族
+   * ③ 宽限期内、但**目标令牌已被明确吊销** → 401，**不吊销令牌族**
+   * ④ 其余（超期 / 密文解不开 / 已被判成重放）→ 吊销整个令牌族 → 401
    *
-   * 两个时间戳都来自应用进程的时钟（`revokedAt` 由应用写入），同一台机器
-   * 上时钟一致，可以直接比较。
+   * ⚠️ **② 与 ④ 之间不再区分「并发」与「先后」**（设计文档 §5.3 的实测结论）：
+   * 那个区分依赖「轮换时刻 vs 请求起始时刻」的毫秒级比较，
+   * 而两个请求是否重叠**取决于环境**——在别的机器上两个请求可能真串行抵达，
+   * 于是同一条用例时而走 ② 时而走 ④，测试会变成 flaky。
+   * 统一处理后判定不依赖任何时序。
    */
-  private isConcurrentRace(
-    revokedAt: Date | null | undefined,
-    requestStartedAt: Date,
-  ): boolean {
-    if (!revokedAt) return false;
-    return revokedAt.getTime() >= requestStartedAt.getTime();
+  private async handleRevokedToken(
+    stored: Prisma.RefreshTokenGetPayload<{ include: { user: true } }>,
+  ): Promise<AuthResult> {
+    // ① 登出后误用：用户只是误用了自己刚登出的旧令牌。
+    // 把它当成泄露处理会把手机、电脑等其它设备的登录一起踢掉。
+    if (stored.revokedReason === RefreshTokenRevokedReason.LOGOUT) {
+      throw new UnauthorizedException('刷新令牌无效或已过期');
+    }
+
+    // ② 宽限期：同一枚令牌在 60 秒内被重复提交
+    // （客户端超时重试、两个标签页串行抵达、跨副本各刷一次），
+    // 返回**第一次那枚**新令牌，不吊销令牌族。
+    //
+    // ⚠️ **解密失败一律按「宽限期不可用」处理** → 落到 ④。
+    // 绝不把 null 当成令牌返回给客户端。
+    if (
+      stored.revokedReason === RefreshTokenRevokedReason.ROTATED &&
+      stored.graceExpiresAt &&
+      new Date() < stored.graceExpiresAt
+    ) {
+      const restored =
+        stored.rotatedToToken === null
+          ? null
+          : decryptToken(stored.rotatedToToken, this.graceKey);
+
+      if (restored) {
+        // ⚠️ **那枚新令牌自己还活着吗？**（阶段 5c 审查补上）
+        //
+        // 宽限记录存的是「我轮换出了哪枚新令牌」，但**那枚新令牌可能已经被吊销了**：
+        // - 用户用它登出（LOGOUT）→ 不检查的话，**登出会被撤销**：
+        //   重放前身令牌能换回一枚有效的 accessToken
+        // - 它自己被判成真重放（REPLAY）→ 同理
+        //
+        // ⚠️ **这一步与后面的返回之间存在毫秒级竞态，但不构成漏洞**：
+        // 「查状态」与「据此返回」之间，目标令牌有可能刚好在那一刻被吊销。
+        // 这不构成漏洞 —— accessToken 是**无状态 JWT**（不查库也有效），
+        // 而本路径返回的 refreshToken **就是 `restored` 本身**，
+        // 它没有因为这次检查而发生任何变化。真正需要「目标令牌必须活着」
+        // 保证的是**刷新令牌链**（用它去换新令牌时会被再查一次状态），
+        // 那条链由 `refresh()` 的入口检查兜底。
+        // ⚠️ **不要把它当成 bug 去「修」**（例如加重试或加锁）——
+        // 那只会把一个不存在的漏洞变成真的复杂度和新的竞态。
+        const target = await this.prisma.refreshToken.findFirst({
+          // ⚠️ **显式带上 userId**：这一行是全局无过滤查询
+          // （`RefreshToken` 不在 `TENANT_SCOPED_MODELS` 里）。
+          // 当前安全（密文只由服务端写、`tokenHash` 全局唯一），
+          // 但完全依赖隐式不变量 —— 加一道显式约束当防御纵深。
+          where: {
+            tokenHash: hashRefreshToken(restored),
+            userId: stored.userId,
+          },
+          select: { revokedReason: true },
+        });
+
+        // ⚠️ **ROTATED 的目标要放行** —— 链式自愈（设计文档 §4.5）依赖它：
+        // 重放 T0 拿回 T1，而 T1 此时已经是 ROTATED。
+        // 若把它也拒绝，链就断了（G8 那条用例会挂）。
+        const alive =
+          target !== null &&
+          (target.revokedReason === null ||
+            target.revokedReason === RefreshTokenRevokedReason.ROTATED);
+
+        if (alive) {
+          return {
+            user: this.toAuthUser(stored.user),
+            // ⚠️ **accessToken 重新签发，refreshToken 是同一枚**。
+            // accessToken 是无状态 JWT，重签无害且顺延会话；
+            // refreshToken 必须同一枚才谈得上「幂等」。
+            accessToken: await this.signAccessToken(stored.user),
+            refreshToken: restored,
+          };
+        }
+
+        // ③ 那枚新令牌已被明确吊销 → 只拒本请求，**不吊销全族**。
+        // 「终止这条链」的意图已经表达过了；再吊销全族只会
+        // **牵连其它设备**（登出场景）或**毫无意义**（已被判重放场景）。
+        // 这与「登出后重用令牌 → 401，不牵连其它设备」是同一条原则。
+        throw new UnauthorizedException('刷新令牌无效或已过期');
+      }
+    }
+
+    // ④ 这枚令牌在抵达前就已经离开了合法用户，说明它在别处还有第二个持有者。
+    // 按 OAuth 2.0 安全最佳实践（RFC 9700 / BCP）作废整个令牌族 ——
+    // 攻击者与真实用户同时失效，重新登录即可恢复。
+    await this.revokeTokenFamily(stored.userId, stored.id);
+    throw new UnauthorizedException(
+      '刷新令牌已被使用过，出于安全考虑已吊销全部登录状态',
+    );
   }
 
   async logout(refreshToken: string, userId: string): Promise<void> {
@@ -364,13 +479,15 @@ export class AuthService {
   /**
    * 作废某个用户的整个刷新令牌族。
    *
-   * 触发者是「已被轮换过又被再次使用」的令牌：它说明这枚令牌在合法用户之外
-   * 还有第二个持有者，按 OAuth 2.0 安全最佳实践（RFC 9700 / BCP）应当
-   * 把整个令牌族作废——攻击者与真实用户同时失效，重新登录即可恢复。
+   * 触发者是「判定为真重放」的路径（`handleRevokedToken` 的第 ④ 档）：
+   * 宽限期已过、宽限密文解不开、或这枚令牌本身已被判成重放。
    *
-   * ⚠️ 只在**真正的重放**路径调用（即 refresh 里读到 revokedAt 已非空、
-   * 且原因是 ROTATED 的那次请求）。并发刷新里的 loser 不走这里：
-   * 毫秒级竞态不是泄露，动辄吊销全族会把用户自己的其它设备一起踢下线。
+   * ⚠️ **并发刷新里的 loser 不走这里**：它落进宽限期的第 ② 档
+   * （返回同一枚新令牌），毫秒级竞态不是泄露，动辄吊销全族会把
+   * 用户自己的其它设备一起踢下线。
+   *
+   * ⚠️ **where 必须覆盖 ROTATED 的行**（见下面的 OR）：那些行带着可兑换的
+   * 宽限密文，够不到它们就等于「吊销全族」名不副实。
    *
    * 两次写入必须原子：中途失败会留下「整族已作废、但触发者仍标 ROTATED」
    * 的记录，下次重放同一枚令牌会再次触发全族吊销。
@@ -382,10 +499,27 @@ export class AuthService {
     const now = new Date();
     await this.prisma.$transaction([
       this.prisma.refreshToken.updateMany({
-        where: { userId, revokedAt: null },
+        where: {
+          userId,
+          // ⚠️ 不能只写 { revokedAt: null }：那只会覆盖**还没被吊销**的行。
+          // 已经 ROTATED 的行带着**完整的宽限密文**活下来，
+          // 重放它照样能在宽限期内换回令牌 ——「吊销全族」名不副实。
+          //
+          // ⚠️ **LOGOUT 不纳入**：登出的令牌不该被重放路径改写成 REPLAY，
+          // 那会掩盖「用户主动登出」这个事实。
+          //
+          // ⚠️ 这个修改**不会牵连其它设备**：它只在「真重放被判定」时生效，
+          // 而那时整个令牌族本来就要死。
+          OR: [
+            { revokedAt: null },
+            { revokedReason: RefreshTokenRevokedReason.ROTATED },
+          ],
+        },
         data: {
           revokedAt: now,
           revokedReason: RefreshTokenRevokedReason.REPLAY,
+          // ⚠️ 全族吊销后，这些宽限密文不该再能被返回。
+          rotatedToToken: null,
         },
       }),
       this.prisma.refreshToken.updateMany({
@@ -393,6 +527,7 @@ export class AuthService {
         data: {
           revokedAt: now,
           revokedReason: RefreshTokenRevokedReason.REPLAY,
+          rotatedToToken: null,
         },
       }),
     ]);
@@ -425,25 +560,29 @@ export class AuthService {
       .replace(/^-+|-+$/g, '');
   }
 
-  private async issueTokens(user: {
-    id: string;
-    email: string;
-    displayName: string;
-    role: UserRole;
-    tenantId: string | null;
-  }): Promise<AuthResult> {
-    const accessToken = await this.jwt.signAsync({
+  /** 只签访问令牌（JWT 自包含，不需要落库） */
+  private async signAccessToken(user: AuthUser): Promise<string> {
+    return this.jwt.signAsync({
       sub: user.id,
       email: user.email,
       role: user.role,
       tenantId: user.tenantId,
     });
+  }
 
+  /** 生成一枚刷新令牌与它的过期时刻（**不落库**，由调用方决定写到哪） */
+  private createRefreshToken(): { refreshToken: string; expiresAt: Date } {
     const refreshToken = generateRefreshToken();
     const expiresAt = new Date();
     expiresAt.setDate(
       expiresAt.getDate() + Number(process.env.REFRESH_TOKEN_TTL_DAYS ?? 30),
     );
+    return { refreshToken, expiresAt };
+  }
+
+  private async issueTokens(user: AuthUser): Promise<AuthResult> {
+    const accessToken = await this.signAccessToken(user);
+    const { refreshToken, expiresAt } = this.createRefreshToken();
 
     // RefreshToken 不是租户作用域模型，这里不需要（也不应该）切换上下文
     await this.prisma.refreshToken.create({
@@ -455,15 +594,20 @@ export class AuthService {
     });
 
     return {
-      user: {
-        id: user.id,
-        email: user.email,
-        displayName: user.displayName,
-        role: user.role,
-        tenantId: user.tenantId,
-      },
+      user: this.toAuthUser(user),
       accessToken,
       refreshToken,
+    };
+  }
+
+  /** 把用户记录映射成对外的用户对象（三处返回都用它，避免漏改字段） */
+  private toAuthUser(user: AuthUser): AuthUser {
+    return {
+      id: user.id,
+      email: user.email,
+      displayName: user.displayName,
+      role: user.role,
+      tenantId: user.tenantId,
     };
   }
 }
