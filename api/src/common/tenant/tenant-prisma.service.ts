@@ -580,6 +580,12 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
     return this.client.plan;
   }
 
+  // ------- 抽佣流水（阶段 5e）模型 delegate 代理 -------
+
+  get commissionEntry() {
+    return this.client.commissionEntry;
+  }
+
   // ------- PrismaClient 实例级方法代理 -------
   // $connect / $disconnect 由生命周期钩子分别调用，
   // 这里仍然透传出来让服务消费者可以手动关闭连接（例如测试用例）。

@@ -3,7 +3,9 @@ import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { UserRole } from '@prisma/client';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { ReportService } from './report.service';
+import { CommissionService } from './commission.service';
 import { ReportQueryDto } from './dto/report-query.dto';
+import { CommissionQueryDto } from './dto/commission-query.dto';
 
 /**
  * 平台超管的订阅列表与收入报表。
@@ -20,7 +22,10 @@ import { ReportQueryDto } from './dto/report-query.dto';
 @Controller('platform')
 @Roles(UserRole.PLATFORM_ADMIN)
 export class PlatformReportController {
-  constructor(private readonly reports: ReportService) {}
+  constructor(
+    private readonly reports: ReportService,
+    private readonly commission: CommissionService,
+  ) {}
 
   @Get('subscriptions')
   @ApiOperation({ summary: '跨租户的订阅列表' })
@@ -44,5 +49,24 @@ export class PlatformReportController {
       from: query.from ? new Date(query.from) : undefined,
       to: query.to ? new Date(query.to) : undefined,
     });
+  }
+
+  /**
+   * 平台的抽佣明细。
+   *
+   * ⚠️ **区间缺省是「最近 30 天」** —— 与平台收入报表同款，
+   * 缺省窗口用**数据库的时钟**算（护栏 M15）。
+   *
+   * ⚠️ **区间用的是 `ReportService.resolveWindow`**：抽佣明细与收入报表
+   * 用的是同一套区间语义，复制一份迟早漂移。
+   */
+  @Get('commissions')
+  @ApiOperation({ summary: '平台的抽佣明细（缺省最近 30 天）' })
+  async commissions(@Query() query: CommissionQueryDto) {
+    const { from, to } = await this.reports.resolveWindow({
+      from: query.from ? new Date(query.from) : undefined,
+      to: query.to ? new Date(query.to) : undefined,
+    });
+    return this.commission.ledger({ from, to });
   }
 }

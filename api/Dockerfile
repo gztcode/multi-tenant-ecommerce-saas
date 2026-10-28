@@ -28,6 +28,13 @@ COPY . .
 # 光靠 npm install 不会生成，运行时 new PrismaClient() 会直接抛错。
 RUN npx prisma generate
 RUN npm run build
+# ⚠️ **产物路径必须是 dist/main.js**（不是 dist/src/main.js）——
+# 在 api/ 下新增顶层目录（如 scripts/）会改变 TypeScript 的公共根目录，
+# 产物就多出一层 src/，与运行阶段的 `node dist/main.js` 对不上，
+# 容器会起不来（Cannot find module '/app/dist/main.js'）。
+# ⚠️ 单测与 e2e 都从源码跑（ts-jest / ts-node），**发现不了产物路径变了** ——
+# 所以在这里断言一次，让镜像构建就失败，而不是让容器崩溃循环。
+RUN test -f /app/dist/main.js
 
 # ---------- 运行阶段 ----------
 FROM node:22-alpine AS runner

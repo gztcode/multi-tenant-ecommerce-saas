@@ -471,6 +471,19 @@ enum OrderStatus {
   CLOSED
 }
 
+/**
+ * 抽佣流水的类型。
+ *
+ * ⚠️ **冲回不是负的数字字段，是一行独立的流水** ——
+ * 这样「冲回了哪一笔」在表里查得到，且流水是 append-only 的审计凭证。
+ */
+enum CommissionEntryType {
+  /** 抽佣（支付成功时记） */
+  COMMISSION
+  /** 退款冲回（退款成功时记） */
+  REVERSAL
+}
+
 model Order {
   id         String      @id @default(uuid())
   tenantId   String
@@ -548,11 +561,65 @@ model Order {
   // 「跨租户挂载」由 service 层显式校验，而不是靠外键悄悄放行。
   items    OrderItem[]
   payments Payment[]
+  // 阶段 5e：抽佣流水（一笔抽佣一行、一笔冲回一行）
+  commissionEntries CommissionEntry[]
 
   // ⚠️ 幂等键的部分唯一索引由迁移手写，不在 schema 里声明。
   @@index([tenantId, customerId, status])
   @@index([tenantId, createdAt])
   @@map("orders")
+}
+
+/**
+ * 抽佣流水（阶段 5e）。
+ *
+ * ⚠️ **一笔抽佣一行、一笔冲回一行**，金额带符号：
+ * COMMISSION 的 amount > 0，REVERSAL 的 amount < 0。
+ * 单列求和即净额。
+ *
+ * ⚠️ **为什么要有这张表**：5b 的决策是「抽佣不建独立表，存成订单上的两个快照字段」，
+ * 遗留写的是「报表 SQL 要跨订单聚合；将来做结算单时再抽一层」。
+ * 本阶段把那层抽出来了 —— 不是因为分叉点变多了，而是
+ * **「按商家 × 区间出结算单」需要「这一笔属于哪个商家的哪一次成交」**，
+ * 从订单聚合算不出来。
+ */
+model CommissionEntry {
+  id       String @id @default(uuid())
+  tenantId String
+  orderId  String
+  /** 订单号快照（对外凭证） */
+  orderNo  String
+  type     CommissionEntryType
+  /**
+   * 金额（整数分，**带符号**）。
+   * COMMISSION > 0（抽佣）；REVERSAL < 0（冲回）。
+   */
+  amount Int
+  /** 抽佣费率快照（基点）。套餐费率会变 → 必须快照 */
+  rateBps Int
+  /** 计佣基数快照（= 实付 = `Order.totalAmount`） */
+  baseAmount Int
+  /**
+   * 业务发生时间。
+   * COMMISSION = 支付时间；REVERSAL = 退款时间。
+   * ⚠️ **与平台收入报表的归期口径逐字一致** ——
+   * 抽佣按 `paidAt`、冲回按 `refundedAt`。
+   */
+  occurredAt DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  /**
+   * ⚠️ **外键 Restrict**：流水是审计凭证，
+   * 有流水的订单不允许被物理删除（与 `InventoryMovement` 同款理由）。
+   */
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  // ⚠️ 一单一抽佣、一单一冲回 → 幂等的兜底
+  @@unique([orderId, type])
+  @@index([tenantId, occurredAt])
+  @@index([occurredAt])
+  @@map("commission_entries")
 }
 
 model OrderItem {

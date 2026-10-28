@@ -165,6 +165,16 @@ export class InvoiceService {
     invoiceId: string,
   ): Promise<boolean> {
     const now = await this.prisma.databaseNow();
+    // ⚠️ **`status` 条件是第二层防御，当前实现下测不到** ——
+    // 订阅期延长写的是**绝对值**（`currentPeriodStart: invoice.periodStart`、
+    // `currentPeriodEnd: invoice.periodEnd`），所以**同一个账单被重复处理也只会延长一次**。
+    // 那层 `status` 条件防的是「账单被重复处理」这个假设不成立时的意外，
+    // 当前实现下**无法从外部观测到它是否起作用**。
+    //
+    // ⚠️ **护栏 M11 的用例不能靠「同一个 eventId 重复投递」** ——
+    // 那会被事件表的唯一索引挡在 `markInvoicePaid` **之前**，
+    // 断言「订阅期只延长一次」**恒真**，测的不是这层防御。
+    // 真正的 M11 用例要投递**两个不同 eventId、但 providerTxnId 相同**的事件。
     const affected = await tx.invoice.updateMany({
       where: {
         id: invoiceId,

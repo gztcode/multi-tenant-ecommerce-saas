@@ -23,7 +23,8 @@
     "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "prisma db seed",
     "test:cov:e2e": "jest --config ./test/jest-e2e.json --coverage --collectCoverageFrom='src/**/*.ts' --collectCoverageFrom='!src/**/*.module.ts' --collectCoverageFrom='!src/main.ts'",
-    "db:test:deploy": "node test/deploy-test-db.mjs"
+    "db:test:deploy": "node test/deploy-test-db.mjs",
+    "backfill:commissions": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/backfill-commission-entries.ts"
   },
   "prisma": {
     "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"

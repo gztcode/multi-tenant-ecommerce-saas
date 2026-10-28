@@ -29,6 +29,7 @@ import { OrderService } from '../order/order.service';
 import { OrderInventoryService } from '../order/inventory.service';
 import { CouponRedemptionService } from '../coupon/coupon-redemption.service';
 import { InvoiceService } from '../billing/invoice.service';
+import { CommissionService } from '../billing/commission.service';
 import {
   NormalizedWebhookEvent,
   PaymentProvider,
@@ -137,6 +138,9 @@ export class PaymentService {
     // ⚠️ **`payment → billing` 是单向依赖** —— 与依赖图一致（不是环）。
     // 账单付清要延长订阅期，那件事由 billing 的 `InvoiceService` 做。
     private readonly billingInvoices: InvoiceService,
+    // ⚠️ **抽佣流水的写入也在 billing 模块**（`payment → billing`，单向，不成环）。
+    // 支付成功记一笔抽佣、退款成功记一笔冲回 —— 两者都必须与订单状态流转同事务。
+    private readonly commission: CommissionService,
     @Inject(PAYMENT_PROVIDERS)
     private readonly providers: Map<string, PaymentProvider>,
   ) {}
@@ -722,6 +726,9 @@ export class PaymentService {
       id: string;
       orderNo: string;
       totalAmount: number;
+      tenantId: string;
+      commissionRate: number;
+      commissionAmount: number;
       items: Array<{ skuId: string; quantity: number }>;
     },
   ): Promise<void> {
@@ -833,6 +840,18 @@ export class PaymentService {
     // 取消路径的条件更新会拦住它。两条路径都靠「核销状态的条件更新」
     // 保证只生效一次。
     await this.couponRedemption.markUsedInTx(tx, order.id);
+
+    // ---- 记一笔抽佣流水（阶段 5e）----
+    //
+    // ⚠️ **必须在同一个事务里**：订单转 PAID 与「这笔单赚到了抽佣」同生共死。
+    // 分成两个事务的话，订单已支付而抽佣没记上 → 平台少收钱、账对不上。
+    //
+    // ⚠️ **`occurredAt` 用 `paidAt`** —— 与平台收入报表的归期口径逐字一致
+    // （报表按 `Order.paidAt` 聚合抽佣）。
+    //
+    // ⚠️ **重复投递不会写第二行**：订单的状态条件更新在上面已经挡住了
+    // （`won` 为 false 时就 return 了），这里压根走不到。
+    await this.commission.recordCommissionInTx(tx, order, paidAt);
   }
 
   /** 标记事件已处理 */
@@ -1022,6 +1041,17 @@ export class PaymentService {
         if (!won) {
           throw new ConflictException('订单当前状态不允许退款');
         }
+
+        // ---- 记一笔冲回流水（阶段 5e）----
+        //
+        // ⚠️ **金额取负**（`recordReversalInTx` 内部处理）——
+        // 冲回是「平台要还回去的钱」，与抽佣行反向，单列求和即净额。
+        //
+        // ⚠️ **`occurredAt` 用 `refundedAt`** —— 与报表的冲回归期口径一致。
+        //
+        // ⚠️ **必须在同一个事务里**：订单转 REFUNDED 与「平台还回去了一笔抽佣」
+        // 同生共死。分成两个事务的话，退款成功而冲回没记上 → 平台多收钱。
+        await this.commission.recordReversalInTx(tx, order, refundedAt);
       },
       { maxWait: 10_000, timeout: 10_000 },
     );
@@ -1556,6 +1586,9 @@ export class PaymentService {
       orderNo: order.orderNo,
       status: order.status,
       totalAmount: order.totalAmount,
+      tenantId: order.tenantId,
+      commissionRate: order.commissionRate,
+      commissionAmount: order.commissionAmount,
       items: order.items.map((item) => ({
         skuId: item.skuId,
         quantity: item.quantity,
@@ -1600,6 +1633,22 @@ export interface ReadableOrder {
   orderNo: string;
   status: OrderStatus;
   totalAmount: number;
+  /**
+   * 订单所属租户。
+   *
+   * ⚠️ **记抽佣流水时要用**：流水的 `tenantId` 从订单来，
+   * 绝不从请求体或上下文猜。
+   */
+  tenantId: string;
+  /**
+   * 抽佣费率快照（基点）。
+   *
+   * ⚠️ **快照**：套餐费率将来会变，历史订单的抽佣额不能跟着变，
+   * 所以流水里存的费率也必须是这一单当时的那一档。
+   */
+  commissionRate: number;
+  /** 抽佣额快照（整数分） */
+  commissionAmount: number;
   items: Array<{ skuId: string; quantity: number; productName: string }>;
 }
 
