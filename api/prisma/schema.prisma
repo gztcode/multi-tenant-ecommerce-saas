@@ -704,6 +704,19 @@ model PaymentWebhookEvent {
   eventId       String
   providerTxnId String?
   payload       Json
+  /**
+   * 这笔是订单支付还是订阅支付（阶段 5f 加）。
+   *
+   * ⚠️ **由 webhook 端点写入**（端点自己知道是哪个端点），不是渠道适配器猜的、
+   *    也不是从请求体里取的 → **不可被渠道伪造**。
+   *
+   * ⚠️ **为什么需要它**：补偿扫描要重新入队「上次没处理完」的 webhook 事件，
+   *    而消费端靠 `kind` 决定反查订单还是反查账单。事件行原来没有这一列，
+   *    补偿扫描就分不清该反查哪张业务单。
+   *
+   * ⚠️ **不加 `tenantId`** —— 阶段 3 的 R14：租户从业务单反查，不采信事件里的租户。
+   */
+  kind          PaymentKind @default(ORDER)
   processedAt   DateTime?
   createdAt     DateTime  @default(now())
 

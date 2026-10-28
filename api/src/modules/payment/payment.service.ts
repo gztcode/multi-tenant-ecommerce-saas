@@ -619,16 +619,24 @@ export class PaymentService {
    * 攻击者抢先用 eventId 占位的话，真实回调会被当成重复事件忽略，
    * 钱付了订单永不流转。
    *
+   * ⚠️ **`kind` 由调用方给**（阶段 5f）：补偿扫描要靠事件行上的这一列
+   * 知道该反查订单还是反查账单。默认值是 `ORDER`，
+   * 既有调用方（阶段 3 的 e2e 直接调本方法）行为不变。
+   *
    * @returns true = 应当处理（首次到达，或上次到达时**没处理完**）；
    *          false = 重复投递且已处理过
    */
-  async insertEvent(event: NormalizedWebhookEvent): Promise<boolean> {
+  async insertEvent(
+    event: NormalizedWebhookEvent,
+    kind: PaymentKind = PaymentKind.ORDER,
+  ): Promise<boolean> {
     try {
       await this.prisma.paymentWebhookEvent.create({
         data: {
           provider: event.provider,
           eventId: event.eventId,
           providerTxnId: event.providerTxnId,
+          kind,
           payload: {
             channel: event.channel,
             referenceNo: event.referenceNo,
@@ -679,37 +687,46 @@ export class PaymentService {
    *
    * ⚠️ **jobId 用连字符**而不是冒号：BullMQ v6 拒绝含 `:` 的自定义 id
    * （`Custom Id cannot contain :`）。同一个 eventId 只排一个任务。
+   *
+   * ⚠️ **`jobIdSuffix` 是补偿扫描用的**（阶段 5f Task 3）：
+   * BullMQ 里 **failed job 的 hash 还在** → 用同一个 jobId 重新入队会被
+   * **静默忽略**（`addJob` 的 Lua 脚本按 jobId 查存在性）→ 补偿等于没做。
+   * 补偿扫描要能重复入队，就必须换个 jobId。
+   * 默认空串 → 既有调用点的行为**完全不变**。
+   *
+   * ⚠️ **入队失败必须抛出去**（阶段 5f 修的丢钱洞）：
+   * 此刻只落了**事件行**（`insertEvent` 已在验签之后插好），`Payment` 单与
+   * 订单流转**都还没发生**。若把失败吞掉、返回 200，渠道会认为收到了、
+   * **不再重投** → 事件行的 `processedAt` 永远是 null → 没人处理 →
+   * **用户付了钱，订单永不流转**（库存还永久卡在预占）。
+   * 抛出去 → 渠道收到 5xx → **重投**同一个 eventId → `insertEvent` 见
+   * `processedAt` 为 null → 返回 true（允许重试）→ 重新入队 → 处理。
+   *
+   * ⚠️ **与「订单超时释放」的投递语义不同**：那边的失败是**不抛**
+   * （订单已建成、用户可正常支付，报失败会诱发重复下单）。
    */
   async enqueueWebhookEvent(
     event: NormalizedWebhookEvent,
     tenantId: string,
     kind: PaymentKind = PaymentKind.ORDER,
+    jobIdSuffix = '',
   ): Promise<void> {
-    try {
-      await this.queue.add(
-        PAYMENT_WEBHOOK_QUEUE,
-        'payment',
-        {
-          tenantId,
-          kind,
-          eventId: event.eventId,
-          provider: event.provider,
-          channel: event.channel,
-          providerTxnId: event.providerTxnId,
-          referenceNo: event.referenceNo,
-          amount: event.amount,
-          success: event.success,
-        },
-        `webhook-${event.provider}-${event.eventId}`,
-      );
-    } catch (cause) {
-      // ⚠️ 支付已入库。报失败会诱导用户重复支付。
-      //    通知丢失的补偿机制不在本阶段范围（见设计文档 L1）。
-      this.logger.error(
-        `支付通知投递失败：provider=${event.provider} eventId=${event.eventId}`,
-        cause,
-      );
-    }
+    await this.queue.add(
+      PAYMENT_WEBHOOK_QUEUE,
+      'payment',
+      {
+        tenantId,
+        kind,
+        eventId: event.eventId,
+        provider: event.provider,
+        channel: event.channel,
+        providerTxnId: event.providerTxnId,
+        referenceNo: event.referenceNo,
+        amount: event.amount,
+        success: event.success,
+      },
+      `webhook-${event.provider}-${event.eventId}${jobIdSuffix}`,
+    );
   }
 
   /**
@@ -1119,7 +1136,7 @@ export class PaymentService {
     if (!check.accepted || !check.tenantId) {
       return;
     }
-    const inserted = await this.insertEvent(event);
+    const inserted = await this.insertEvent(event, PaymentKind.ORDER);
     if (!inserted) {
       return;
     }
@@ -1151,7 +1168,7 @@ export class PaymentService {
     if (!check.accepted || !check.tenantId) {
       return;
     }
-    const inserted = await this.insertEvent(event);
+    const inserted = await this.insertEvent(event, PaymentKind.SUBSCRIPTION);
     if (!inserted) {
       return;
     }

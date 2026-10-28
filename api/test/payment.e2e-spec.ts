@@ -11,6 +11,7 @@ import { tenantContext } from '../src/common/tenant/tenant-context';
 import { assertSecureConfig } from '../src/common/config/assert-secure-config';
 import { PAYMENT_WEBHOOK_QUEUE } from '../src/common/queue/queue.constants';
 import { getQueueToken } from '@nestjs/bullmq';
+import { SubscriptionStatus } from '@prisma/client';
 import type { Queue } from 'bullmq';
 import { http } from './helpers';
 import { createMerchant, unique } from './merchant-fixture';
@@ -1416,5 +1417,159 @@ describe('支付与 webhook (e2e)', () => {
     } finally {
       process.env.FAKE_PAYMENT_ENABLED = previous;
     }
+  });
+  // ============================================================
+  // 阶段 5f：webhook 入队失败要报失败（让渠道重投）
+  // ============================================================
+
+  it('⚠️ 入队失败时 webhook 接口要报失败（5xx），让渠道重投', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const skuId = await publishSku(merchant.token, '入队失败的商品', 1000);
+    await stockIn(merchant.token, skuId, 10);
+    const customer = await registerCustomer(merchant.subdomain);
+    const addressId = await createAddress(customer.token);
+
+    const { order, payment } = await placeAndPay(
+      merchant.token,
+      customer.token,
+      addressId,
+      skuId,
+      2,
+    );
+
+    // ⚠️ **让入队失败**：把队列的 add 打成抛错
+    const addSpy = jest
+      .spyOn(webhookQueue, 'add')
+      .mockRejectedValue(new Error('队列挂了'));
+
+    try {
+      const response = await postFakeWebhook({
+        eventId: `evt-${unique()}`,
+        providerTxnId: payment.paymentId,
+        orderNo: order.orderNo,
+        amount: order.totalAmount,
+        success: true,
+      });
+
+      // ⚠️ **必须是 5xx**：返回 200 的话渠道认为收到了、不会再重投，
+      //    而事件行已经在库里（processedAt=null）却没人处理 →
+      //    **这笔支付永远丢了**（用户付了钱，订单永不流转）。
+      expect(response.status).toBeGreaterThanOrEqual(500);
+    } finally {
+      addSpy.mockRestore();
+    }
+  });
+
+  it('⚠️ 渠道重投同一个 eventId → 事件被重新处理（订单转 PAID）', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const skuId = await publishSku(merchant.token, '重投的商品', 1000);
+    await stockIn(merchant.token, skuId, 10);
+    const customer = await registerCustomer(merchant.subdomain);
+    const addressId = await createAddress(customer.token);
+
+    const { order, payment } = await placeAndPay(
+      merchant.token,
+      customer.token,
+      addressId,
+      skuId,
+      2,
+    );
+
+    const eventId = `evt-${unique()}`;
+    const payload = {
+      eventId,
+      providerTxnId: payment.paymentId,
+      orderNo: order.orderNo,
+      amount: order.totalAmount,
+      success: true,
+    };
+
+    // ---- 第一次投递：队列挂了 → 接口 5xx ----
+    const addSpy = jest
+      .spyOn(webhookQueue, 'add')
+      .mockRejectedValue(new Error('队列挂了'));
+    try {
+      const first = await postFakeWebhook(payload);
+      expect(first.status).toBeGreaterThanOrEqual(500);
+    } finally {
+      addSpy.mockRestore();
+    }
+
+    // ⚠️ **事件行已经落了**（验签之后才插的）→ processedAt 仍是 null
+    const events = await prisma.paymentWebhookEvent.findMany({
+      where: { eventId },
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0].processedAt).toBeNull();
+
+    // ---- 渠道重投同一个 eventId ----
+    // insertEvent 见 processedAt=null → 返回 true（允许重试）→ 重新入队 → 处理
+    const second = await postFakeWebhook(payload);
+    expect(second.status).toBe(200);
+
+    // ⚠️ **订单最终转 PAID** —— 这才是「这笔钱没丢」的证明
+    const becamePaid = await waitFor(async () => {
+      const rows = await readOrder(merchant.tenantId, order.orderNo);
+      return rows.status === 'PAID';
+    });
+    expect(becamePaid).toBe(true);
+  });
+
+  it('⚠️ 订阅回调的事件行 kind = SUBSCRIPTION（由端点写入，不可被渠道伪造）', async () => {
+    const merchant = await createMerchant(app, prisma);
+
+    // ⚠️ **造一张账单**（订阅回调要反查账单）——直接落库，不走 HTTP
+    const invoiceNumber = `INV-${unique()}`;
+    const now = new Date();
+    const periodEnd = new Date(now.getTime() + 30 * 24 * 3600 * 1000);
+    const subscription = await asTenant(merchant.tenantId, () =>
+      prisma.subscription.create({
+        data: {
+          tenantId: merchant.tenantId,
+          planId: 'plan-compensation-test',
+          status: SubscriptionStatus.ACTIVE,
+          currentPeriodStart: now,
+          currentPeriodEnd: periodEnd,
+        },
+      }),
+    );
+    await asTenant(merchant.tenantId, () =>
+      prisma.invoice.create({
+        data: {
+          tenantId: merchant.tenantId,
+          subscriptionId: subscription.id,
+          planId: 'plan-compensation-test',
+          number: invoiceNumber,
+          amount: 9900,
+          periodStart: now,
+          periodEnd,
+          dueAt: now,
+        },
+      }),
+    );
+
+    const eventId = `evt-${unique()}`;
+    // ⚠️ 假网关的报文里键名恒为 `orderNo`，归一化后才是 `referenceNo`
+    const { body, signature } = signFakeWebhook({
+      eventId,
+      providerTxnId: `txn-${eventId}`,
+      orderNo: invoiceNumber,
+      amount: 9900,
+      success: true,
+    });
+
+    const response = await http(app)
+      .post(`/api/v1/webhooks/subscription/${FAKE_CHANNEL}`)
+      .set('content-type', 'application/json')
+      .set('x-fake-signature', signature)
+      .send(body);
+    expect(response.status).toBe(200);
+
+    const events = await prisma.paymentWebhookEvent.findMany({
+      where: { eventId },
+    });
+    expect(events).toHaveLength(1);
+    // ⚠️ **kind 由端点写入**（端点自己知道是哪个端点）→ 订阅回调就是 SUBSCRIPTION
+    expect(events[0].kind).toBe('SUBSCRIPTION');
   });
 });

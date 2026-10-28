@@ -26,8 +26,9 @@ describe('QueueService 的超时保护', () => {
       add: jest.fn(() => pending()),
       upsertJobScheduler: jest.fn(() => pending()),
     };
-    // 四个队列参数用同一个替身即可——本用例只关心「会不会超时」
+    // 五个队列参数用同一个替身即可——本用例只关心「会不会超时」
     return new QueueService(
+      queue as never,
       queue as never,
       queue as never,
       queue as never,
@@ -100,6 +101,7 @@ describe('QueueService 的超时保护', () => {
       queue as never,
       queue as never,
       queue as never,
+      queue as never,
     );
 
     await expect(
@@ -114,6 +116,7 @@ describe('QueueService 的超时保护', () => {
       upsertJobScheduler: jest.fn().mockRejectedValue(cause),
     };
     const service = new QueueService(
+      queue as never,
       queue as never,
       queue as never,
       queue as never,

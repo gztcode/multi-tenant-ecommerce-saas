@@ -1,0 +1,24 @@
+-- 阶段 5f：事件表加 `kind` 列
+--
+-- ⚠️ 本文件**不是** `prisma migrate dev` 的原样输出。
+-- 该命令在本项目会先提示「需要重置 public schema」（因为历史迁移文件
+-- 在应用后被改过，与 _prisma_migrations 里的校验和不一致），
+-- 而项目明令禁用 `prisma migrate reset`（阶段 2 已因此踩坑）。
+--
+-- ⚠️ 本次变更**只有一条 ADD COLUMN**，没有别的语句：
+-- 没有 DROP TABLE、没有数据删除、没有新增索引、没有改动既有表。
+--
+-- ⚠️ **为什么加它**：补偿扫描要重新入队「上次没处理完」的 webhook 事件，
+-- 而消费端靠 `kind` 决定反查订单还是反查账单。事件行原来没有这一列，
+-- 补偿扫描就分不清该反查哪张业务单。
+--
+-- ⚠️ **由 webhook 端点写入**（端点自己知道是哪个端点），不是渠道适配器猜的 →
+--    **不可被渠道伪造**。
+--
+-- ⚠️ **不加 `tenantId`** —— 阶段 3 的 R14：租户从业务单反查，不采信事件里的租户。
+--
+-- ⚠️ **默认值 `ORDER`**：历史行一律按订单处理。补偿扫描遇到「按订单找不到」
+--    的历史订阅事件会判成「找不到业务单」→ 不重投（保守，不会误处理）。
+
+-- AlterTable
+ALTER TABLE "payment_webhook_events" ADD COLUMN IF NOT EXISTS "kind" "PaymentKind" NOT NULL DEFAULT 'ORDER';

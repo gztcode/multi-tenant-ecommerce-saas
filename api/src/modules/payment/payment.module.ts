@@ -12,6 +12,8 @@ import { PaymentMethodService } from './payment-method.service';
 import { RenewalService } from './renewal.service';
 import { RenewalWorker } from './renewal.worker';
 import { WebhookWorker } from './webhook.worker';
+import { CompensationService } from './compensation.service';
+import { CompensationWorker } from './compensation.worker';
 import { FakePaymentProvider } from './fake-payment.provider';
 import { PaymentProvider } from './payment-provider.interface';
 import { PAYMENT_PROVIDERS } from './payment.constants';
@@ -72,6 +74,8 @@ import { PAYMENT_PROVIDERS } from './payment.constants';
     RenewalService,
     RenewalWorker,
     WebhookWorker,
+    CompensationService,
+    CompensationWorker,
     FakePaymentProvider,
     {
       provide: PAYMENT_PROVIDERS,

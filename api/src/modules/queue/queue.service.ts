@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import {
   AUTH_QUEUE,
   BILLING_QUEUE,
+  COMPENSATION_QUEUE,
   PAYMENT_TIMEOUT_QUEUE,
   PAYMENT_WEBHOOK_QUEUE,
 } from '../../common/queue/queue.constants';
@@ -13,7 +14,8 @@ export type QueueName =
   | typeof PAYMENT_TIMEOUT_QUEUE
   | typeof PAYMENT_WEBHOOK_QUEUE
   | typeof BILLING_QUEUE
-  | typeof AUTH_QUEUE;
+  | typeof AUTH_QUEUE
+  | typeof COMPENSATION_QUEUE;
 
 /**
  * 任务失败时的重试次数与退避策略。
@@ -60,11 +62,13 @@ export class QueueService {
     @InjectQueue(PAYMENT_WEBHOOK_QUEUE) webhookQueue: Queue,
     @InjectQueue(BILLING_QUEUE) billingQueue: Queue,
     @InjectQueue(AUTH_QUEUE) authQueue: Queue,
+    @InjectQueue(COMPENSATION_QUEUE) compensationQueue: Queue,
   ) {
     this.queues.set(PAYMENT_TIMEOUT_QUEUE, timeoutQueue);
     this.queues.set(PAYMENT_WEBHOOK_QUEUE, webhookQueue);
     this.queues.set(BILLING_QUEUE, billingQueue);
     this.queues.set(AUTH_QUEUE, authQueue);
+    this.queues.set(COMPENSATION_QUEUE, compensationQueue);
   }
 
   /**

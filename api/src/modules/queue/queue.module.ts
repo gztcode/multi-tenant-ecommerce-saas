@@ -3,6 +3,7 @@ import { Global, Module } from '@nestjs/common';
 import {
   AUTH_QUEUE,
   BILLING_QUEUE,
+  COMPENSATION_QUEUE,
   PAYMENT_TIMEOUT_QUEUE,
   PAYMENT_WEBHOOK_QUEUE,
 } from '../../common/queue/queue.constants';
@@ -57,6 +58,7 @@ import { QueueService } from './queue.service';
       { name: PAYMENT_WEBHOOK_QUEUE },
       { name: BILLING_QUEUE },
       { name: AUTH_QUEUE },
+      { name: COMPENSATION_QUEUE },
     ),
   ],
   providers: [QueueService],
