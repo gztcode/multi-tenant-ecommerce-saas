@@ -86,6 +86,8 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   'Subscription',
   'Invoice',
   'PaymentMethod',
+  // 抽佣流水（阶段 5e）
+  'CommissionEntry',
   // ⚠️ Plan 刻意**不在**这里：它不带 tenantId 字段，
   // 是「平台的数据」而不是「租户的数据」——先例是阶段 3 的 PaymentWebhookEvent。
   // ⚠️ PaymentWebhookEvent 刻意**不在**这里：它是渠道事件的数据，不是租户的数据，

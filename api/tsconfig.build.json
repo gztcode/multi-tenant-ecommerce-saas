@@ -1,5 +1,7 @@
 {
   "extends": "./tsconfig.json",
-  "//": "prisma/ 不参与编译：种子脚本由 ts-node 直接跑源码（package.json#prisma.seed）。把它纳入编译会把 TypeScript 的公共根目录抬到项目根，产物多出一层 src/（dist/src/main.js），与 start:prod 里的 node dist/main 对不上。",
-  "exclude": ["node_modules", "test", "dist", "prisma", "**/*spec.ts"]
+  "//": "prisma/ 与 scripts/ 不参与编译：它们由 ts-node 直接跑源码（package.json#prisma.seed、package.json#scripts.backfill:commissions）。把它们纳入编译会把 TypeScript 的公共根目录抬到项目根，产物多出一层 src/（dist/src/main.js），与 start:prod 里的 node dist/main 对不上 —— 镜像会起不来（Cannot find module '/app/dist/main.js'）。",
+  "//2": "⚠️ **在 api/ 下新增顶层目录时必须同步加进这个 exclude** —— 单测与 e2e 都从源码跑（ts-jest / ts-node），**发现不了产物路径变了**，只有构建镜像时才会炸。",
+  "//3": "coverage/ 是测试覆盖率输出目录，里面没有 .ts —— 但它**仍然在 tsconfig 的默认 include 范围内**，靠「里面没有 .ts」侥幸不改变公共根目录。显式排除掉，不留这个隐式依赖。",
+  "exclude": ["node_modules", "test", "dist", "prisma", "scripts", "coverage", "**/*spec.ts"]
 }

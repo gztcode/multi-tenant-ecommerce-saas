@@ -128,6 +128,53 @@ export interface ReportSummary {
   netRevenue: number;
 }
 
+/**
+ * 平台的抽佣明细。
+ *
+ * ⚠️ **金额一律整数分**：净额由后端算好，前端只做展示换算
+ * （与 `ReportSummary` 同款原则）。
+ */
+export interface CommissionLedger {
+  /** 区间起点。ISO 8601 */
+  from: string;
+  /** 区间终点（ISO 8601，**不含**） */
+  to: string;
+  /** 按商家汇总 */
+  byMerchant: Array<{
+    tenantId: string;
+    tenantName: string;
+    subdomain: string;
+    /** 净抽佣（整数分，可负） */
+    netAmount: number;
+    entryCount: number;
+    reversalCount: number;
+  }>;
+  /** 抽佣流水明细 */
+  entries: Array<{
+    id: string;
+    tenantId: string;
+    orderNo: string;
+    type: 'COMMISSION' | 'REVERSAL';
+    /** 带符号：抽佣为正、冲回为负 */
+    amount: number;
+    /** 费率（基点，万分之一） */
+    rateBps: number;
+    /** 计佣基数（整数分） */
+    baseAmount: number;
+    /** ISO 8601 */
+    occurredAt: string;
+  }>;
+}
+
+/** 抽佣流水类型的文案 */
+export const COMMISSION_ENTRY_TYPE_LABEL: Record<
+  'COMMISSION' | 'REVERSAL',
+  string
+> = {
+  COMMISSION: '抽佣',
+  REVERSAL: '退款冲回',
+};
+
 /** 套餐状态的文案 */
 const PLAN_STATUS_LABEL: Record<PlanStatus, string> = {
   ACTIVE: '在售',

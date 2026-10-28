@@ -264,8 +264,12 @@ export class ReportService {
    *
    * ⚠️ **缺省窗口在这里算，不在 DTO 里**：DTO 只负责解析，
    * 这样默认窗口与显式传入的窗口用**同一个时钟来源**。
+   *
+   * ⚠️ **是 public 的**：抽佣明细（`GET /platform/commissions`）与收入报表
+   * 用的是**同一套区间语义**（缺省最近 30 天、同一时钟来源）。
+   * 复制一份到别的 service 里，两边的缺省窗口迟早会漂移。
    */
-  private async resolveWindow(input: {
+  async resolveWindow(input: {
     from?: Date;
     to?: Date;
   }): Promise<{ from: Date; to: Date }> {

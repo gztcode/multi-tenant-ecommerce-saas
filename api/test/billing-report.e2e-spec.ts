@@ -2,10 +2,16 @@ import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { ValidationPipe } from '@nestjs/common';
 import cookieParser from 'cookie-parser';
-import { InvoiceStatus, OrderStatus, SubscriptionStatus } from '@prisma/client';
+import {
+  CommissionEntryType,
+  InvoiceStatus,
+  OrderStatus,
+  SubscriptionStatus,
+} from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.interceptor';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
+import { CommissionService } from '../src/modules/billing/commission.service';
 import {
   platformScope,
   tenantContext,
@@ -131,6 +137,7 @@ interface SubscriptionListBody {
 describe('平台侧的收入报表与订阅列表 (e2e)', () => {
   let app: INestApplication;
   let prisma: TenantPrismaService;
+  let commission: CommissionService;
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({
@@ -151,6 +158,9 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
     await app.init();
 
     prisma = app.get(TenantPrismaService);
+    // ⚠️ **对账用例要调回填**：回填是服务方法（D5），
+    // 迁移里的 SQL 测不到 —— 种子数据在迁移之后才灌进去。
+    commission = app.get(CommissionService);
   });
 
   afterAll(async () => {
@@ -173,6 +183,35 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
    */
   function asPlatform<T>(fn: () => Promise<T>): Promise<T> {
     return tenantContext.run(platformScope(), async () => fn());
+  }
+
+  /**
+   * 抽佣明细端点的响应体。
+   *
+   * ⚠️ **字段名与 `platform-admin/src/lib/billing.ts` 的 `CommissionLedger` 逐字一致** ——
+   * 前后端各写一份类型，对不上就是前端的 TS 报错（编译期能抓到）。
+   */
+  interface CommissionLedgerBody {
+    from: string;
+    to: string;
+    byMerchant: Array<{
+      tenantId: string;
+      tenantName: string;
+      subdomain: string;
+      netAmount: number;
+      entryCount: number;
+      reversalCount: number;
+    }>;
+    entries: Array<{
+      id: string;
+      tenantId: string;
+      orderNo: string;
+      type: string;
+      amount: number;
+      rateBps: number;
+      baseAmount: number;
+      occurredAt: string;
+    }>;
   }
 
   // ============================================================
@@ -288,7 +327,13 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
           periodStart,
           periodEnd: new Date(periodStart.getTime() + 30 * DAY_MS),
           dueAt: periodStart,
-          paidAt: options.paidAt ?? insideWindow(window, periodOffsetDays + 1),
+          // ⚠️ **不能用 `??`**：`null ?? x` 返回 `x`（只有 `undefined` 才回落），
+          // 那样「传 null 表示「没付过钱」」会被静默忽略 ——
+          // 夹具的类型签名写着 `Date | null`，调用方传 null 却拿不到 null。
+          paidAt:
+            options.paidAt === undefined
+              ? insideWindow(window, periodOffsetDays + 1)
+              : options.paidAt,
         },
       }),
     );
@@ -323,8 +368,15 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
           detail: '测试地址',
           commissionRate: options.commissionRate ?? 500,
           commissionAmount: options.commissionAmount ?? 0,
-          paidAt: options.paidAt ?? insideWindow(window, 10),
-          refundedAt: options.refundedAt ?? null,
+          // ⚠️ **不能用 `??`**：`null ?? x` 返回 `x`（只有 `undefined` 才回落），
+          // 那样「传 null 表示「没付过钱 / 没退过款」」会被静默忽略 ——
+          // 夹具的类型签名写着 `Date | null`，调用方传 null 却拿不到 null。
+          paidAt:
+            options.paidAt === undefined
+              ? insideWindow(window, 10)
+              : options.paidAt,
+          refundedAt:
+            options.refundedAt === undefined ? null : options.refundedAt,
         },
       }),
     );
@@ -573,6 +625,382 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
   });
 
   // ============================================================
+  // 对账：流水表 vs 报表
+  // ============================================================
+
+  it('⚠️ 对账：流水表按区间聚合 == 报表的「抽佣收入 − 冲回」', async () => {
+    // ⚠️ **这是「两套口径不许漂」的护栏** ——
+    //    报表（现状：从订单聚合）与流水（新增：从表聚合）必须给出同一个数。
+    //    不一致说明流水写入漏了某条路径，或回填规则漂了。
+    //
+    // ⚠️ **断言要具体**：期望什么、实到什么，不能只看红绿。
+    //
+    // ⚠️ **区间必须显式传**：报表的缺省窗口是「数据库时钟的最近 30 天」，
+    //    两边都用同一个显式区间，断言才能落在**绝对值**上。
+    const adminToken = await loginPlatformAdmin();
+    const merchant = await createMerchant(app, prisma);
+    const other = await createMerchant(app, prisma);
+    const window = nextWindow();
+
+    // ---- 造五类订单，覆盖回填的每一条判定分支 ----
+    //
+    // ⚠️ **订单 id 要留下来**：断言要落在「哪一单有几行」上，
+    // 只断言总数的话，「① 多了一行、③ 少了一行」也能凑出同一个总数。
+    //
+    // ① 已支付未退款 → 回填一条 COMMISSION 行（100）
+    const paidOrderId = await seedOrder(merchant.tenantId, window, {
+      status: OrderStatus.PAID,
+      totalAmount: 20000,
+      commissionRate: 500,
+      commissionAmount: 100,
+      paidAt: insideWindow(window, 10),
+    });
+
+    // ② 已支付已退款（退款时间也在窗口内）→ 回填一条 COMMISSION + 一条 REVERSAL
+    //    ⚠️ **抽佣 150 是毛额**：报表的 `commissionRevenue` 照记，
+    //    冲回由 `reversal`（150）单独抵掉。
+    const refundedOrderId = await seedOrder(merchant.tenantId, window, {
+      status: OrderStatus.REFUNDED,
+      totalAmount: 30000,
+      commissionRate: 500,
+      commissionAmount: 150,
+      paidAt: insideWindow(window, 11),
+      refundedAt: insideWindow(window, 20),
+    });
+
+    // ③ 已退款但 `refundedAt` 为 null（5b 之前退的款）→ 回填**跳过**冲回
+    //    ⚠️ **与报表口径一致**：报表的冲回是 `refundedAt ∈ [from, to)`，
+    //    对 null 不匹配 → 报表也不算它。两个口径不许在这里分叉。
+    //    ⚠️ **但它的抽佣行照记** —— 它收过钱（`paidAt` 非空）。
+    const undatedRefundOrderId = await seedOrder(merchant.tenantId, window, {
+      status: OrderStatus.REFUNDED,
+      totalAmount: 40000,
+      commissionRate: 500,
+      commissionAmount: 250,
+      paidAt: insideWindow(window, 12),
+      refundedAt: null,
+    });
+
+    // ④ 从未支付 → 报表与回填都不算它（`paidAt` 为空）
+    const unpaidOrderId = await seedOrder(merchant.tenantId, window, {
+      status: OrderStatus.PENDING_PAYMENT,
+      totalAmount: 50000,
+      commissionRate: 500,
+      commissionAmount: 250,
+      paidAt: null,
+      refundedAt: null,
+    });
+
+    // ⑤ 零额订单（免费套餐的费率是 0）→ **不产生流水行**
+    const zeroAmountOrderId = await seedOrder(merchant.tenantId, window, {
+      status: OrderStatus.PAID,
+      totalAmount: 60000,
+      commissionRate: 0,
+      commissionAmount: 0,
+      paidAt: insideWindow(window, 13),
+    });
+
+    // ---- 跑一遍回填 ----
+    //
+    // ⚠️ **回填跑在平台作用域下**（抽佣流水是跨租户的），
+    // `CommissionService.backfill()` 内部自己 `tenantContext.run(platformScope())`。
+    const firstRun = await commission.backfill();
+
+    // ⚠️ **回填是幂等的**（护栏 N6）：再跑一遍，行数不变。
+    const before = await asPlatform(() => prisma.commissionEntry.count());
+    const secondRun = await commission.backfill();
+    const after = await asPlatform(() => prisma.commissionEntry.count());
+    expect(after).toBe(before);
+    // ⚠️ **第二遍什么都不该新建**：第一遍建过的行原样保留。
+    expect(secondRun.commissionCreated).toBe(0);
+    expect(secondRun.reversalCreated).toBe(0);
+
+    // ---- 取报表（区间与流水用同一个） ----
+    const report = await fetchWindowReport(adminToken, window);
+
+    // ⚠️ **报表的期望值（绝对值）**：
+    //    - 抽佣收入（毛额）= 100（①）+ 150（②）+ 250（③）= 500
+    //      ⚠️ **④ 没付过钱 → 不算**；**⑤ 零额 → 算 0**。
+    //    - 冲回 = 150（只有 ② 有 `refundedAt`）
+    //      ⚠️ **③ 的 `refundedAt` 为 null → 报表同样跳过**（口径一致）。
+    expect(report.commissionRevenue).toBe(500);
+    expect(report.reversal).toBe(150);
+
+    // ---- 取流水的区间聚合 ----
+    //
+    // ⚠️ **流水表用「带符号的 amount 单列求和」** = 毛额 − 冲回。
+    const entries = await asPlatform(() =>
+      prisma.commissionEntry.findMany({
+        where: { occurredAt: { gte: window.from, lt: window.to } },
+        orderBy: { occurredAt: 'asc' },
+      }),
+    );
+
+    // ⚠️ **先断言条数**：条数不对时，求和的断言会给出误导性的期望值。
+    //    期望 4 行：① COMMISSION(100) + ② COMMISSION(150) + ③ COMMISSION(250)
+    //             + ② REVERSAL(-150)。
+    //    ⚠️ **③ 有抽佣行、没有冲回行** —— 它收过钱（`paidAt` 非空），
+    //    抽佣要记；但它的 `refundedAt` 为 null → 冲回无法归期 → 跳过。
+    //    ⚠️ **④ 不该有任何行**（没付过钱）；**⑤ 不该有行**（零额）。
+    expect(entries.length).toBe(4);
+
+    const ledgerSum = entries.reduce((sum, row) => sum + row.amount, 0);
+
+    // ⚠️ **流水里的每一行都要能被说清**（不是「凑出来等于」）：
+    //    抽佣 3 行共 500、冲回 1 行 -150。
+    const commissionRows = entries.filter((row) => row.type === 'COMMISSION');
+    const reversalRows = entries.filter((row) => row.type === 'REVERSAL');
+    expect(commissionRows.length).toBe(3);
+    expect(reversalRows.length).toBe(1);
+    // ⚠️ **抽佣行之和 == 报表的毛额抽佣**：500。
+    expect(commissionRows.reduce((sum, row) => sum + row.amount, 0)).toBe(500);
+    // ⚠️ **冲回金额必须是负数**（护栏 N2）—— 不取负的话净额会翻倍。
+    expect(reversalRows[0].amount).toBe(-150);
+
+    // ---- 逐单核对：哪一单有几行 ----
+    //
+    // ⚠️ **这一步是「总数断言」的加强版**：只断言「4 行、合计 350」的话，
+    // 「① 多了一行、③ 少了一行」也能凑出同一个数。
+    const rowsOf = (orderId: string) =>
+      entries.filter((row) => row.orderId === orderId);
+
+    // ① 一条 COMMISSION，100
+    expect(rowsOf(paidOrderId).length).toBe(1);
+    expect(rowsOf(paidOrderId)[0].type).toBe('COMMISSION');
+    expect(rowsOf(paidOrderId)[0].amount).toBe(100);
+
+    // ② 一条 COMMISSION(150) + 一条 REVERSAL(-150)
+    expect(rowsOf(refundedOrderId).length).toBe(2);
+    expect(
+      rowsOf(refundedOrderId).find((row) => row.type === 'COMMISSION')?.amount,
+    ).toBe(150);
+    expect(
+      rowsOf(refundedOrderId).find((row) => row.type === 'REVERSAL')?.amount,
+    ).toBe(-150);
+
+    // ③ **只有抽佣行、没有冲回行**（`refundedAt` 为 null → 冲回无法归期）
+    expect(rowsOf(undatedRefundOrderId).length).toBe(1);
+    expect(rowsOf(undatedRefundOrderId)[0].type).toBe('COMMISSION');
+    expect(rowsOf(undatedRefundOrderId)[0].amount).toBe(250);
+
+    // ④ **一行都没有**（护栏 N4：没付过钱 → 没有抽佣）
+    expect(rowsOf(unpaidOrderId).length).toBe(0);
+
+    // ⑤ **一行都没有**（护栏 N11：零额 → 不产生流水行）
+    expect(rowsOf(zeroAmountOrderId).length).toBe(0);
+
+    // ⚠️ **对账的核心断言**：流水净额 == 报表的「抽佣收入 − 冲回」。
+    expect(ledgerSum).toBe(report.commissionRevenue - report.reversal);
+    // ⚠️ **把期望值也写出来**（不只看红绿）：350。
+    expect(ledgerSum).toBe(350);
+
+    // ---- 归期口径也要对得上 ----
+    //
+    // ⚠️ **`occurredAt` 必须与报表的归期口径逐字一致**：
+    //    抽佣按 `paidAt`、冲回按 `refundedAt`。
+    for (const row of entries) {
+      expect(row.occurredAt.getTime()).toBeGreaterThanOrEqual(
+        window.from.getTime(),
+      );
+      expect(row.occurredAt.getTime()).toBeLessThan(window.to.getTime());
+    }
+    const reversalRow = reversalRows[0];
+    expect(reversalRow.occurredAt.getTime()).toBe(
+      insideWindow(window, 20).getTime(),
+    );
+
+    // ---- 租户隔离：别的租户查不到这家的流水 ----
+    //
+    // ⚠️ **护栏 N12 的隔离面**：`CommissionEntry` 登记在 `TENANT_SCOPED_MODELS` 里，
+    // 别的租户在租户作用域下查它，扩展会自动带上 `tenantId` 条件 → 查不到。
+    const seenByOther = await asTenant(other.tenantId, () =>
+      prisma.commissionEntry.findMany({
+        where: { occurredAt: { gte: window.from, lt: window.to } },
+      }),
+    );
+    expect(seenByOther.length).toBe(0);
+
+    // ⚠️ **平台作用域能看到全部**（跨租户聚合是台账的职责）。
+    const seenByPlatform = await asPlatform(() =>
+      prisma.commissionEntry.findMany({
+        where: { occurredAt: { gte: window.from, lt: window.to } },
+      }),
+    );
+    expect(seenByPlatform.length).toBe(4);
+
+    // ---- 回填的跳过计数也要报出来 ----
+    //
+    // ⚠️ **不静默**：运维要看到「有多少历史退款被跳过了」。
+    expect(firstRun.skippedUndatedRefund).toBeGreaterThanOrEqual(1);
+    expect(firstRun.skippedZeroAmount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('⚠️ 支付/退款的写入路径：一条抽佣行 + 一条负数冲回行', async () => {
+    // ⚠️ **为什么单独一条**：对账用例走的是**回填**路径 ——
+    //    回填会自己建行，所以「支付时不写流水」（F1）这类缺陷
+    //    在对账用例里**看不出来**（回填把行补上了）。
+    //    这一条直接走**运行时写入路径**（与 `payment.service.ts` 调的是同一个方法），
+    //    才能把「支付成功 → 一条 COMMISSION 行」这条护栏真的锁住。
+    const merchant = await createMerchant(app, prisma);
+    const window = nextWindow();
+
+    // ---- 支付成功 → 一条 COMMISSION 行 ----
+    const paidOrderId = await seedOrder(merchant.tenantId, window, {
+      status: OrderStatus.PAID,
+      totalAmount: 20000,
+      commissionRate: 500,
+      commissionAmount: 100,
+      paidAt: insideWindow(window, 10),
+    });
+    const paidAt = insideWindow(window, 10);
+
+    await asTenant(merchant.tenantId, () =>
+      prisma.$transaction(async (tx) => {
+        await commission.recordCommissionInTx(
+          tx,
+          {
+            id: paidOrderId,
+            tenantId: merchant.tenantId,
+            orderNo: 'ORD-支付成功',
+            totalAmount: 20000,
+            commissionRate: 500,
+            commissionAmount: 100,
+          },
+          paidAt,
+        );
+      }),
+    );
+
+    // ---- 退款成功 → 一条 REVERSAL 行（金额为负） ----
+    const refundedOrderId = await seedOrder(merchant.tenantId, window, {
+      status: OrderStatus.REFUNDED,
+      totalAmount: 30000,
+      commissionRate: 500,
+      commissionAmount: 150,
+      paidAt: insideWindow(window, 11),
+      refundedAt: insideWindow(window, 20),
+    });
+    const refundedAt = insideWindow(window, 20);
+
+    await asTenant(merchant.tenantId, () =>
+      prisma.$transaction(async (tx) => {
+        await commission.recordReversalInTx(
+          tx,
+          {
+            id: refundedOrderId,
+            tenantId: merchant.tenantId,
+            orderNo: 'ORD-退款成功',
+            totalAmount: 30000,
+            commissionRate: 500,
+            commissionAmount: 150,
+          },
+          refundedAt,
+        );
+      }),
+    );
+
+    // ---- 重复写入同一笔 → 不产生第二行（护栏 N3） ----
+    //
+    // ⚠️ **幂等**：靠 `@@unique([orderId, type])` + 「先查后插」。
+    // 这里重放同一个订单的抽佣写入 —— 行数必须不变。
+    await asTenant(merchant.tenantId, () =>
+      prisma.$transaction(async (tx) => {
+        await commission.recordCommissionInTx(
+          tx,
+          {
+            id: paidOrderId,
+            tenantId: merchant.tenantId,
+            orderNo: 'ORD-支付成功',
+            totalAmount: 20000,
+            commissionRate: 500,
+            commissionAmount: 100,
+          },
+          paidAt,
+        );
+      }),
+    );
+
+    // ---- 零额订单 → 不产生行（护栏 N11） ----
+    const zeroOrderId = await seedOrder(merchant.tenantId, window, {
+      status: OrderStatus.PAID,
+      totalAmount: 40000,
+      commissionRate: 0,
+      commissionAmount: 0,
+      paidAt: insideWindow(window, 12),
+    });
+
+    await asTenant(merchant.tenantId, () =>
+      prisma.$transaction(async (tx) => {
+        await commission.recordCommissionInTx(
+          tx,
+          {
+            id: zeroOrderId,
+            tenantId: merchant.tenantId,
+            orderNo: 'ORD-零额',
+            totalAmount: 40000,
+            commissionRate: 0,
+            commissionAmount: 0,
+          },
+          insideWindow(window, 12),
+        );
+      }),
+    );
+
+    const rows = await asPlatform(() =>
+      prisma.commissionEntry.findMany({
+        where: { occurredAt: { gte: window.from, lt: window.to } },
+        orderBy: { occurredAt: 'asc' },
+      }),
+    );
+
+    // ⚠️ **恰好两行**：支付成功一行、退款成功一行。
+    //    重复写入没多出第三行；零额订单没多出第四行。
+    expect(rows.length).toBe(2);
+
+    const commissionRow = rows.find((row) => row.type === 'COMMISSION');
+    const reversalRow = rows.find((row) => row.type === 'REVERSAL');
+    expect(commissionRow).toBeDefined();
+    expect(reversalRow).toBeDefined();
+
+    // ⚠️ **护栏 N1**：一条 COMMISSION 行，金额 = 抽佣快照，`occurredAt` = 支付时间。
+    expect(commissionRow!.orderId).toBe(paidOrderId);
+    expect(commissionRow!.amount).toBe(100);
+    expect(commissionRow!.occurredAt.getTime()).toBe(paidAt.getTime());
+    expect(commissionRow!.rateBps).toBe(500);
+    expect(commissionRow!.baseAmount).toBe(20000);
+
+    // ⚠️ **护栏 N2**：一条 REVERSAL 行，金额 = **负的**抽佣快照，
+    // `occurredAt` = 退款时间。
+    expect(reversalRow!.orderId).toBe(refundedOrderId);
+    expect(reversalRow!.amount).toBe(-150);
+    expect(reversalRow!.occurredAt.getTime()).toBe(refundedAt.getTime());
+
+    // ⚠️ **护栏 N3**：重复写入不产生第二条 —— 上面只查出了 1 行 COMMISSION。
+    expect(rows.filter((row) => row.type === 'COMMISSION').length).toBe(1);
+
+    // ⚠️ **护栏 N11**：零额订单没有任何行。
+    expect(rows.filter((row) => row.orderId === zeroOrderId).length).toBe(0);
+
+    // ⚠️ **护栏 N4**：没付过钱的订单不会有抽佣行 ——
+    //    写入方法只在「支付成功」那条路上被调用，这里显式验证一次。
+    const unpaidOrderId = await seedOrder(merchant.tenantId, window, {
+      status: OrderStatus.PENDING_PAYMENT,
+      totalAmount: 50000,
+      commissionRate: 500,
+      commissionAmount: 250,
+      paidAt: null,
+    });
+    const rowsAfter = await asPlatform(() =>
+      prisma.commissionEntry.findMany({
+        where: { occurredAt: { gte: window.from, lt: window.to } },
+      }),
+    );
+    expect(
+      rowsAfter.filter((row) => row.orderId === unpaidOrderId).length,
+    ).toBe(0);
+  });
+
+  // ============================================================
   // 区间
   // ============================================================
 
@@ -777,5 +1205,94 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
         }),
       );
     }
+  });
+  // ============================================================
+  // 抽佣明细端点
+  // ============================================================
+
+  it('GET /platform/commissions：平台超管 → 200，且按商家的净抽佣 == 该商家的明细之和', async () => {
+    const adminToken = await loginPlatformAdmin();
+    const merchant = await createMerchant(app, prisma);
+    const window = nextWindow();
+
+    const orderId = await seedOrder(merchant.tenantId, window, {
+      status: OrderStatus.PAID,
+      totalAmount: 10000,
+      commissionRate: 500,
+      commissionAmount: 500,
+      paidAt: insideWindow(window, 5),
+    });
+
+    // ⚠️ **直接造流水行**：这里要验的是**端点**（鉴权、聚合、区间校验），
+    //    写入路径由「对账 e2e」与 `payment.e2e-spec.ts` 的端到端用例负责。
+    //    直接造还避免了一个顺序耦合：本用例若先跑回填，
+    //    对账用例的 `firstRun` 计数就会变成 0。
+    await asPlatform(() =>
+      prisma.commissionEntry.create({
+        data: {
+          tenantId: merchant.tenantId,
+          orderId,
+          orderNo: `ORD-${unique()}`,
+          type: CommissionEntryType.COMMISSION,
+          amount: 500,
+          rateBps: 500,
+          baseAmount: 10000,
+          occurredAt: insideWindow(window, 5),
+        },
+      }),
+    );
+
+    const response = await http(app)
+      .get(
+        `/api/v1/platform/commissions?from=${window.from.toISOString()}&to=${window.to.toISOString()}`,
+      )
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(200);
+
+    const body = response.body as CommissionLedgerBody;
+
+    // ⚠️ **净额由后端算**：前端拿到 `netAmount` 直接展示。
+    //    这里的断言是「后端自己算的净额 == 明细行之和」——
+    //    端点自己加总一遍的话这里就会不一致。
+    expect(body.byMerchant).toHaveLength(1);
+    expect(body.byMerchant[0].tenantId).toBe(merchant.tenantId);
+    expect(body.byMerchant[0].netAmount).toBe(500);
+    expect(body.byMerchant[0].entryCount).toBe(1);
+    expect(body.byMerchant[0].reversalCount).toBe(0);
+    // ⚠️ **商家名不是 tenantId** —— 是另查 `Tenant` 拿到的名字与子域名
+    const tenant = await asPlatform(() =>
+      prisma.tenant.findUnique({ where: { id: merchant.tenantId } }),
+    );
+    expect(body.byMerchant[0].tenantName).toBe(tenant?.name);
+    expect(body.byMerchant[0].subdomain).toBe(merchant.subdomain);
+
+    const sum = body.entries.reduce((acc, e) => acc + e.amount, 0);
+    expect(sum).toBe(body.byMerchant[0].netAmount);
+  });
+
+  it('GET /platform/commissions：商家账号 → 403', async () => {
+    const merchant = await createMerchant(app, prisma);
+
+    await http(app)
+      .get('/api/v1/platform/commissions')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(403);
+  });
+
+  it('GET /platform/commissions：没登录 → 401', async () => {
+    await http(app).get('/api/v1/platform/commissions').expect(401);
+  });
+
+  it('GET /platform/commissions：区间非法（from >= to）→ 400', async () => {
+    const adminToken = await loginPlatformAdmin();
+
+    // ⚠️ 与 `GET /platform/reports` 的行为一致：区间不合法就响亮地报错，
+    // 而不是返回一串 0 让调用方以为「这段时间没抽佣」。
+    await http(app)
+      .get(
+        '/api/v1/platform/commissions?from=2026-02-01T00:00:00.000Z&to=2026-01-01T00:00:00.000Z',
+      )
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(400);
   });
 });

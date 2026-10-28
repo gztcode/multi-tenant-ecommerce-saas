@@ -320,6 +320,44 @@ describe('支付与 webhook (e2e)', () => {
   }
 
   /**
+   * 读某订单的抽佣流水（阶段 5e）。
+   *
+   * ⚠️ `commission_entries` **在租户作用域白名单里** → 租户作用域下
+   * `findMany` 会自动带上 `tenantId` 条件 ✅（别的租户的行查不到）。
+   */
+  async function readCommissionEntries(
+    tenantId: string,
+    orderId: string,
+  ): Promise<
+    Array<{
+      type: string;
+      amount: number;
+      rateBps: number;
+      baseAmount: number;
+      occurredAt: Date;
+    }>
+  > {
+    return asTenant(tenantId, () =>
+      prisma.commissionEntry.findMany({
+        where: { orderId },
+        orderBy: { type: 'asc' },
+      }),
+    );
+  }
+
+  /** 平台超管登录（种子里已有这个账号） */
+  async function loginPlatformAdmin(): Promise<string> {
+    const email =
+      process.env.SEED_PLATFORM_ADMIN_EMAIL ?? 'admin@platform.test';
+    const password = process.env.SEED_PLATFORM_ADMIN_PASSWORD ?? 'Admin12345!';
+    const response = await http(app)
+      .post('/api/v1/auth/login')
+      .send({ email, password, scope: 'PLATFORM' })
+      .expect(200);
+    return tokenBody(response).accessToken;
+  }
+
+  /**
    * 数队列里某个 eventId 排了多少个任务。
    *
    * ⚠️ 这是「幂等闸」的可观测面：重复投递若过了闸，就会多排一个任务。
@@ -1044,6 +1082,111 @@ describe('支付与 webhook (e2e)', () => {
     // 支付单转 SUCCESS
     const payments = await readPayments(merchant.tenantId, order.id);
     expect(payments[0].status).toBe('SUCCESS');
+  });
+
+  // ============================================================
+  // 抽佣流水（阶段 5e）
+  // ============================================================
+
+  it('⚠️ 支付成功 → 记一笔抽佣流水；退款 → 记一笔负数的冲回流水', async () => {
+    // ⚠️ **必须给商家订一个带费率的套餐**：没订阅套餐时
+    //    `order.service.ts` 的 `rateBps = plan?.commissionBps ?? 0` = 0
+    //    → `commissionAmount = 0` → 「零额不记」→ **一行都不写**。
+    //    那样的断言会恒真，测不到任何东西。
+    const adminToken = await loginPlatformAdmin();
+    const plan = await http(app)
+      .post('/api/v1/platform/plans')
+      .set('authorization', `Bearer ${adminToken}`)
+      .send({
+        code: `P-${unique()}`,
+        name: '抽佣测试套餐',
+        price: 9900,
+        periodDays: 30,
+        trialDays: 0,
+        commissionBps: 500,
+      })
+      .expect(201);
+    const planId = (plan.body as { id: string }).id;
+
+    const merchant = await createMerchant(app, prisma);
+    await http(app)
+      .post('/api/v1/billing/subscription')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ planId })
+      .expect(201);
+
+    const skuId = await publishSku(merchant.token, '抽佣的商品', 1000);
+    await stockIn(merchant.token, skuId, 10);
+    const customer = await registerCustomer(merchant.subdomain);
+    const addressId = await createAddress(customer.token);
+
+    const { order, payment } = await placeAndPay(
+      merchant.token,
+      customer.token,
+      addressId,
+      skuId,
+      2,
+    );
+    // ⚠️ **先把基数写死**：2 件 × 1000 分 = 2000 分，5% = 100 分。
+    expect(order.totalAmount).toBe(2000);
+
+    // ---- 支付成功 → 一行抽佣 ----
+    await postFakeWebhook({
+      eventId: `evt-${unique()}`,
+      providerTxnId: payment.paymentId,
+      orderNo: order.orderNo,
+      amount: order.totalAmount,
+      success: true,
+    });
+    const becamePaid = await waitFor(async () => {
+      const rows = await readOrder(merchant.tenantId, order.orderNo);
+      return rows.status === 'PAID';
+    });
+    expect(becamePaid).toBe(true);
+
+    const hasEntry = await waitFor(async () => {
+      const rows = await readCommissionEntries(merchant.tenantId, order.id);
+      return rows.length > 0;
+    });
+    expect(hasEntry).toBe(true);
+    const afterPay = await readCommissionEntries(merchant.tenantId, order.id);
+    expect(afterPay).toHaveLength(1);
+    expect(afterPay[0].type).toBe('COMMISSION');
+    // ⚠️ **金额写死**：2000 分 × 5% = 100 分
+    expect(afterPay[0].amount).toBe(100);
+    expect(afterPay[0].rateBps).toBe(500);
+    // ⚠️ **计佣基数是实付**，不是商品原价
+    expect(afterPay[0].baseAmount).toBe(2000);
+
+    // ---- 退款 → 一行负数的冲回 ----
+    await http(app)
+      .post(`/api/v1/merchant/orders/${order.orderNo}/ship`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ trackingNo: 'SF123456' })
+      .expect(201);
+
+    await http(app)
+      .post(`/api/v1/merchant/orders/${order.orderNo}/refund`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ reason: '客户不想要了' })
+      .expect(201);
+
+    const hasReversal = await waitFor(async () => {
+      const rows = await readCommissionEntries(merchant.tenantId, order.id);
+      return rows.length > 1;
+    });
+    expect(hasReversal).toBe(true);
+    const afterRefund = await readCommissionEntries(merchant.tenantId, order.id);
+    expect(afterRefund).toHaveLength(2);
+    const reversal = afterRefund.find((r) => r.type === 'REVERSAL');
+    expect(reversal).toBeDefined();
+    // ⚠️ **冲回是负数**：与抽佣行反向，单列求和即净额
+    expect(reversal!.amount).toBe(-100);
+    // ⚠️ **归期是退款时间**，不是支付时间
+    const refundedAt = (await readOrder(merchant.tenantId, order.orderNo))
+      .refundedAt;
+    expect(refundedAt).not.toBeNull();
+    expect(reversal!.occurredAt.getTime()).toBe(refundedAt!.getTime());
   });
 
   // ============================================================

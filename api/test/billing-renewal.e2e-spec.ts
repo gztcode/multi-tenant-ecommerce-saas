@@ -405,6 +405,13 @@ describe('账单、续费与订阅付款 (e2e)', () => {
 
   // ============================================================
   // 护栏 M11：同一个回调重复发两次 → 只延长一次
+  //
+  // ⚠️ **这条因事件表的 `(provider, eventId)` 唯一索引而恒真** ——
+  //    第二个事件压根进不了 `markInvoicePaidInTx`，所以它测的不是
+  //    那里的 `status` 防御。
+  //    ⚠️ **它验的仍然是一个真实的业务属性**（「同一枚事件重放不会重复处理」），
+  //    只是**不能**被当成 M11 的锁点。
+  //    真正有效的 M11 用例见下方「两个不同 eventId、但 providerTxnId 相同」那条。
   // ============================================================
 
   it('M11：同一个回调重复发两次 → 订阅期只延长一个周期', async () => {
@@ -462,6 +469,105 @@ describe('账单、续费与订阅付款 (e2e)', () => {
     );
 
     // 账单也只有一张、只付了一次
+    const all = await readInvoices(merchant.tenantId);
+    expect(all).toHaveLength(1);
+    expect(all[0].status).toBe('PAID');
+  });
+
+  // ============================================================
+  // 护栏 M11（真用例）：两个不同 eventId、但 providerTxnId 相同
+  // ============================================================
+
+  it('⚠️ M11：两个不同 eventId、但 providerTxnId 相同 → 订阅期只延长一次', async () => {
+    // ⚠️ **不能投递同一个 eventId** —— 事件表的唯一索引会挡在
+    //    `markInvoicePaid` 之前，断言恒真，测的不是那层防御。
+    //    这里的两个事件 **eventId 不同、providerTxnId 相同** ——
+    //    渠道重试换了事件 id 的恶劣形式。
+    //
+    // ⚠️ **断言要落在「订阅期的值」上**，不能落在「调用了几次」上 ——
+    //    后者可能被更上层的幂等（渠道侧 providerTxnId 唯一）挡掉，
+    //    测的就不是 `markInvoicePaidInTx` 了。
+    const merchant = await createMerchant(app, prisma);
+    const planId = await createPlan({ price: 9900, periodDays: 30 });
+
+    const subscription = await subscribe(merchant.token, planId);
+
+    const periodStart = new Date(subscription.currentPeriodEnd);
+    const periodEnd = new Date(periodStart.getTime() + 30 * DAY_MS);
+    const invoice = await asTenant(merchant.tenantId, () =>
+      invoices.generateInvoice({
+        subscriptionId: subscription.id,
+        tenantId: merchant.tenantId,
+        planId,
+        periodStart,
+        periodEnd,
+        dueAt: periodStart,
+      }),
+    );
+    expect(invoice).not.toBeNull();
+
+    const before = await readSubscription(merchant.tenantId);
+
+    // ⚠️ **同一个 providerTxnId、两个不同的 eventId**
+    const providerTxnId = `txn-${unique()}`;
+    const base = {
+      providerTxnId,
+      orderNo: invoice!.number,
+      amount: 9900,
+      success: true,
+    };
+
+    // ---- 事件 1 ----
+    const first = await postFakeSubscriptionWebhook({
+      ...base,
+      eventId: `evt-${unique()}`,
+    });
+    expect(first.status).toBe(200);
+
+    const becamePaid = await waitFor(async () => {
+      const row = await readInvoice(merchant.tenantId, invoice!.number);
+      return row?.status === 'PAID';
+    });
+    expect(becamePaid).toBe(true);
+
+    // ⚠️ **读订阅期的值**（第一次延长后的值）
+    const afterFirst = await readSubscription(merchant.tenantId);
+    expect(afterFirst!.currentPeriodEnd.getTime()).toBe(periodEnd.getTime());
+
+    // ---- 事件 2：**eventId 不同、providerTxnId 相同** ----
+    //
+    // ⚠️ 这一步必须真的走到 `markInvoicePaidInTx` —— 事件表的唯一索引是
+    // `(provider, eventId)`，`providerTxnId` 不参与唯一判定，所以第二个事件
+    // 能插进事件表；订阅那条路也不走 `attachProviderTxnId`
+    // （那是订单路径才有的），所以没有更上层的幂等把它挡掉。
+    const second = await postFakeSubscriptionWebhook({
+      ...base,
+      eventId: `evt-${unique()}`,
+    });
+    expect(second.status).toBe(200);
+
+    // ⚠️ **等第二个事件被消费完**（队列是异步的）
+    await waitFor(async () => {
+      const rows = await asTenant(merchant.tenantId, () =>
+        prisma.paymentWebhookEvent.findMany({
+          where: { providerTxnId },
+        }),
+      );
+      return rows.length >= 2 && rows.every((row) => row.processedAt !== null);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // ⚠️ **关键断言**：订阅期的值与第一次读到的一致（**没有第二次延长**）
+    const afterSecond = await readSubscription(merchant.tenantId);
+    expect(afterSecond!.currentPeriodEnd.getTime()).toBe(
+      afterFirst!.currentPeriodEnd.getTime(),
+    );
+    // 也没有被延长成「原来 + 2 个周期」
+    expect(afterSecond!.currentPeriodEnd.getTime()).not.toBe(
+      before!.currentPeriodEnd.getTime() + 2 * 30 * DAY_MS,
+    );
+
+    // 账单仍然只有一张、只付了一次
     const all = await readInvoices(merchant.tenantId);
     expect(all).toHaveLength(1);
     expect(all[0].status).toBe('PAID');
