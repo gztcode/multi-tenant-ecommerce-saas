@@ -30,6 +30,9 @@ import { MerchantOrderController } from './merchant-order.controller';
  * - `OrderService`：Task 5 的 payment 模块要调它把订单转 `PAID` / `REFUNDED`
  *   （依赖方向 `payment → order`，单向）
  * - `OrderInventoryService`：Task 5 的支付成功要调 `deductInTx` 确认售出
+ * - `OrderTimeoutService`：阶段 5f Task 3 的支付补偿扫描要调
+ *   `releaseExpiredOrder` 补释放「超时任务丢失」的订单（依赖方向仍是
+ *   `payment → order`，单向）
  */
 @Module({
   imports: [AuthModule, CouponModule, BillingModule],
@@ -40,6 +43,6 @@ import { MerchantOrderController } from './merchant-order.controller';
     OrderTimeoutService,
     OrderTimeoutWorker,
   ],
-  exports: [OrderService, OrderInventoryService],
+  exports: [OrderService, OrderInventoryService, OrderTimeoutService],
 })
 export class OrderModule {}

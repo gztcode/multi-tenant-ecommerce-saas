@@ -9,3 +9,6 @@ export const BILLING_QUEUE = 'billing';
 
 /** 刷新令牌宽限记录清理队列 */
 export const AUTH_QUEUE = 'auth';
+
+/** 支付补偿扫描队列（未处理完的 webhook 事件 + 丢失的超时释放） */
+export const COMPENSATION_QUEUE = 'compensation';

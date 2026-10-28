@@ -146,7 +146,10 @@ export class WebhookController {
     //
     // ⚠️ 唯一索引 `(provider, eventId)` 冲突 → 重复投递 → 直接返回成功，
     // 不再往下走。
-    const inserted = await this.paymentService.insertEvent(event);
+    //
+    // ⚠️ **`kind` 一起落库**（阶段 5f）：补偿扫描重新入队「上次没处理完」的
+    // 事件时，靠事件行上的这一列决定反查订单还是反查账单。
+    const inserted = await this.paymentService.insertEvent(event, kind);
     if (!inserted) {
       return { received: true, processed: false };
     }
