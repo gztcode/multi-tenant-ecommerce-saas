@@ -30,6 +30,7 @@ import { OrderInventoryService } from '../order/inventory.service';
 import { CouponRedemptionService } from '../coupon/coupon-redemption.service';
 import { InvoiceService } from '../billing/invoice.service';
 import { CommissionService } from '../billing/commission.service';
+import { ReceiptService } from '../billing/receipt.service';
 import {
   NormalizedWebhookEvent,
   PaymentProvider,
@@ -141,6 +142,9 @@ export class PaymentService {
     // ⚠️ **抽佣流水的写入也在 billing 模块**（`payment → billing`，单向，不成环）。
     // 支付成功记一笔抽佣、退款成功记一笔冲回 —— 两者都必须与订单状态流转同事务。
     private readonly commission: CommissionService,
+    // ⚠️ **货款流水的写入也在 billing 模块**（`payment → billing`，单向，不成环）。
+    // 支付成功记一笔货款、退款成功记一笔冲回 —— 两者都必须与订单状态流转同事务。
+    private readonly receipt: ReceiptService,
     @Inject(PAYMENT_PROVIDERS)
     private readonly providers: Map<string, PaymentProvider>,
   ) {}
@@ -869,6 +873,15 @@ export class PaymentService {
     // ⚠️ **重复投递不会写第二行**：订单的状态条件更新在上面已经挡住了
     // （`won` 为 false 时就 return 了），这里压根走不到。
     await this.commission.recordCommissionInTx(tx, order, paidAt);
+
+    // ---- 记一笔货款流水（阶段 5h-1）----
+    //
+    // ⚠️ **必须在同一个事务里，且紧跟在抽佣流水之后**：
+    // 两张流水表的口径必须同步 —— 「有货款 ⟺ 有抽佣」是出款计算的前提
+    // （唯一的例外是零额抽佣，那是有货款、无抽佣）。
+    //
+    // ⚠️ **`occurredAt` 用 `paidAt`** —— 与抽佣流水、与平台收入报表的归期口径逐字一致。
+    await this.receipt.recordReceiptInTx(tx, order, paidAt);
   }
 
   /** 标记事件已处理 */
@@ -1069,6 +1082,15 @@ export class PaymentService {
         // ⚠️ **必须在同一个事务里**：订单转 REFUNDED 与「平台还回去了一笔抽佣」
         // 同生共死。分成两个事务的话，退款成功而冲回没记上 → 平台多收钱。
         await this.commission.recordReversalInTx(tx, order, refundedAt);
+
+        // ---- 记一笔货款冲回流水（阶段 5h-1）----
+        //
+        // ⚠️ **金额取负**（`recordReceiptReversalInTx` 内部处理）——
+        // 与货款行反向，单列求和即净额。
+        //
+        // ⚠️ **必须在同一个事务里**：订单转 REFUNDED 与「商家该收的钱被冲回了」
+        // 同生共死。分成两个事务的话，退款成功而货款冲回没记上 → 商家多拿钱。
+        await this.receipt.recordReceiptReversalInTx(tx, order, refundedAt);
       },
       { maxWait: 10_000, timeout: 10_000 },
     );
