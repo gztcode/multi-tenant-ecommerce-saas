@@ -19,7 +19,15 @@ export default tseslint.config(
       },
       sourceType: 'commonjs',
       parserOptions: {
-        projectService: true,
+        // ⚠️ `projectService: true` 要求文件被某个 tsconfig 包含。
+        // `test/deploy-test-db.mjs` 是纯 Node 脚本（.mjs —— tsconfig 的 include
+        // 只覆盖 .ts），不在任何 tsconfig 里 → 解析报
+        // 「was not found by the project service」。
+        // `allowDefaultProject` 让它走默认项目（解析通过），
+        // 而不是把它加进 ignores —— 后者等于放弃对它的 lint。
+        projectService: {
+          allowDefaultProject: ['test/*.mjs'],
+        },
         tsconfigRootDir: import.meta.dirname,
       },
     },

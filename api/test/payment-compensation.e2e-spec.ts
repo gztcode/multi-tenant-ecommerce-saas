@@ -7,7 +7,10 @@ import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
 import { CompensationService } from '../src/modules/payment/compensation.service';
 import { PaymentService } from '../src/modules/payment/payment.service';
-import { platformScope, tenantContext } from '../src/common/tenant/tenant-context';
+import {
+  platformScope,
+  tenantContext,
+} from '../src/common/tenant/tenant-context';
 import { PAYMENT_WEBHOOK_QUEUE } from '../src/common/queue/queue.constants';
 import { getQueueToken } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';

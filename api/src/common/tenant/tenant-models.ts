@@ -88,6 +88,15 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   'PaymentMethod',
   // 抽佣流水（阶段 5e）
   'CommissionEntry',
+  // 结算单（阶段 5g）
+  'SettlementStatement',
+  // ⚠️ `SettlementStatementEntry` **刻意不在这里**：它没有 `tenantId` 字段，
+  // 是纯关联表，登记了也没有隔离效果。**它不受任何作用域约束** ——
+  // 将来做商家侧接口时，明细查询必须先校验 `statementId` 属于当前租户。
+  //
+  // 注意：它与「带 tenantId 却漏登记」是**两类不同的问题**。后者会被
+  // `assertTenantScopedModelsRegistered()` 在启动时扫出来硬失败；
+  // 前者没有 tenantId，扫都扫不到 —— 只能靠 service 层自觉校验。
   // ⚠️ Plan 刻意**不在**这里：它不带 tenantId 字段，
   // 是「平台的数据」而不是「租户的数据」——先例是阶段 3 的 PaymentWebhookEvent。
   // ⚠️ PaymentWebhookEvent 刻意**不在**这里：它是渠道事件的数据，不是租户的数据，

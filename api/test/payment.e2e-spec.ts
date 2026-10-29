@@ -1177,7 +1177,10 @@ describe('支付与 webhook (e2e)', () => {
       return rows.length > 1;
     });
     expect(hasReversal).toBe(true);
-    const afterRefund = await readCommissionEntries(merchant.tenantId, order.id);
+    const afterRefund = await readCommissionEntries(
+      merchant.tenantId,
+      order.id,
+    );
     expect(afterRefund).toHaveLength(2);
     const reversal = afterRefund.find((r) => r.type === 'REVERSAL');
     expect(reversal).toBeDefined();

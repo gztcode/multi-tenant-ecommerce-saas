@@ -9,6 +9,8 @@ import { InvoiceService } from './invoice.service';
 import { QuotaService } from './quota.service';
 import { ReportService } from './report.service';
 import { CommissionService } from './commission.service';
+import { PlatformSettlementController } from './platform-settlement.controller';
+import { SettlementService } from './settlement.service';
 
 /**
  * 计费模块（阶段 5b）。
@@ -23,6 +25,9 @@ import { CommissionService } from './commission.service';
  * ⚠️ **导出 `CommissionService`** —— 支付模块要靠它记抽佣流水
  *   （支付成功记抽佣、退款成功记冲回，两者都与订单状态流转同事务）。
  *   依赖方向同样是 `payment → billing`（单向）。
+ * ⚠️ **导出 `SettlementService`** —— 结算单（阶段 5g）目前**只有平台侧**在用，
+ *   导出是为了将来出款阶段（`PAID` 状态的流转）能复用它，
+ *   依赖方向是 `payment → billing`（单向），与上面几条同款，不构成环。
  */
 @Module({
   imports: [AuthModule],
@@ -30,6 +35,7 @@ import { CommissionService } from './commission.service';
     BillingController,
     PlatformBillingController,
     PlatformReportController,
+    PlatformSettlementController,
   ],
   providers: [
     PlanService,
@@ -38,6 +44,7 @@ import { CommissionService } from './commission.service';
     QuotaService,
     ReportService,
     CommissionService,
+    SettlementService,
   ],
   exports: [
     PlanService,
@@ -45,6 +52,7 @@ import { CommissionService } from './commission.service';
     InvoiceService,
     QuotaService,
     CommissionService,
+    SettlementService,
   ],
 })
 export class BillingModule {}

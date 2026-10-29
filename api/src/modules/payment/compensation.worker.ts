@@ -2,7 +2,10 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import type { Job } from 'bullmq';
 import { COMPENSATION_QUEUE } from '../../common/queue/queue.constants';
-import { platformScope, tenantContext } from '../../common/tenant/tenant-context';
+import {
+  platformScope,
+  tenantContext,
+} from '../../common/tenant/tenant-context';
 import { CompensationService } from './compensation.service';
 
 /**

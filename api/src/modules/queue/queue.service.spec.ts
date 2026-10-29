@@ -1,9 +1,6 @@
 import { ServiceUnavailableException } from '@nestjs/common';
 
-import {
-  QUEUE_OPERATION_TIMEOUT_MS,
-  QueueService,
-} from './queue.service';
+import { QUEUE_OPERATION_TIMEOUT_MS, QueueService } from './queue.service';
 
 /**
  * 队列投递的超时保护。

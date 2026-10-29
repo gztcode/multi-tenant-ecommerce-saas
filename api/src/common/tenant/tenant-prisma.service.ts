@@ -586,6 +586,18 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
     return this.client.commissionEntry;
   }
 
+  // ------- 结算单（阶段 5g）模型 delegate 代理 -------
+
+  get settlementStatement() {
+    return this.client.settlementStatement;
+  }
+
+  // 不在租户白名单里，但业务代码要读写它（结算单明细，无 tenantId 字段）
+  // ⚠️ 因此**不受租户作用域约束**——查询前必须自行校验 statementId 属于当前租户
+  get settlementStatementEntry() {
+    return this.client.settlementStatementEntry;
+  }
+
   // ------- PrismaClient 实例级方法代理 -------
   // $connect / $disconnect 由生命周期钩子分别调用，
   // 这里仍然透传出来让服务消费者可以手动关闭连接（例如测试用例）。

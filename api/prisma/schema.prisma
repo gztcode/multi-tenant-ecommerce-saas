@@ -615,6 +615,9 @@ model CommissionEntry {
    */
   order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
 
+  /** 阶段 5g：被哪些结算单纳入了 */
+  settlementEntries SettlementStatementEntry[]
+
   // ⚠️ 一单一抽佣、一单一冲回 → 幂等的兜底
   @@unique([orderId, type])
   @@index([tenantId, occurredAt])
@@ -1002,4 +1005,106 @@ model PaymentMethod {
 
   @@index([tenantId])
   @@map("payment_methods")
+}
+
+// ---------- 阶段 5g：结算单 ----------
+
+/**
+ * 结算单的状态。
+ *
+ * ⚠️ **`PAID` 本阶段不可达**：抽佣出款不做（5b 遗留 1 / 5e 的 L19）。
+ *    枚举值先留着 —— **加枚举值要改 schema + 迁移**，出款阶段必然要用，
+ *    预留比将来补省事。
+ */
+enum SettlementStatus {
+  /** 草稿：可重算、可取消确认 */
+  DRAFT
+  /** 已确认：金额与明细冻结 */
+  CONFIRMED
+  /** 已出款（阶段 5g 不做，出款阶段用） */
+  PAID
+}
+
+/**
+ * 结算单（平台开给商家的应收单据，阶段 5g）。
+ *
+ * ⚠️ **一张单 = 一个商家 × 一个自然月**（UTC，左闭右开）。
+ *
+ * ⚠️ **金额只从流水算**（`commission_entries`），**不从订单重新聚合** ——
+ *    报表那套口径抄一遍必然漂。三个金额是**生成时刻的快照**，
+ *    写死在这张单上；确认之后不再变。
+ */
+model SettlementStatement {
+  id       String @id @default(uuid())
+  tenantId String
+  /** 结算单号（对外凭证，服务端生成，客户端不能指定） */
+  statementNo String           @unique
+  /** 周期起点（含）。该月 1 日 00:00:00.000Z */
+  periodStart DateTime
+  /** 周期终点（不含）。次月 1 日 00:00:00.000Z */
+  periodEnd   DateTime
+  /**
+   * 抽佣毛额（整数分）：Σ COMMISSION.amount。
+   *
+   * ⚠️ **非负性由服务端聚合保证**，数据库层面**没有 CHECK 约束兜底**
+   * （`pg_constraint` 里这张表的 CHECK 约束数为 0）——直写负数不会被数据库拦下。
+   */
+  grossAmount Int
+  /**
+   * 退款冲回（整数分）：Σ REVERSAL.amount。
+   *
+   * ⚠️ **非正性由服务端聚合保证**，数据库层面**没有 CHECK 约束兜底**。
+   *
+   * ⚠️ **与平台收入报表的 `reversal` 符号相反** ——
+   *    报表那边是正数（`netRevenue = commissionRevenue − reversal`），
+   *    结算单这边是负数（`netAmount = grossAmount + reversalAmount`）。
+   */
+  reversalAmount Int
+  /** 净额 = grossAmount + reversalAmount。**可以是负数** */
+  netAmount Int
+  /** 纳入的流水笔数 */
+  entryCount Int @default(0)
+  status     SettlementStatus @default(DRAFT)
+  /** 确认时间。null = 未确认 */
+  confirmedAt DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  entries SettlementStatementEntry[]
+
+  // ⚠️ **同一商家同一周期只能有一张单**：重复生成走「先查后插」的幂等路径。
+  @@unique([tenantId, periodStart])
+  // 列表按周期倒序翻页
+  @@index([periodStart])
+  // 按状态筛选（「有多少张草稿待确认」）
+  @@index([status])
+  @@map("settlement_statements")
+}
+
+/**
+ * 结算单纳入了哪些抽佣流水。
+ *
+ * ⚠️ **`entryId` 是全局唯一**（不是 `(statementId, entryId)` 复合唯一）：
+ *   后者只能保证「同一张单里不重复」，前者才能保证
+ *   **「一笔流水只能被一期结算」**。复合唯一是后者的弱化版，
+ *   会放过「同一笔流水被两张单各结一次」。
+ *
+ * ⚠️ **本表没有 `tenantId`，DB 层不校验两端的租户一致性** —— 跨租户挂载在数据库
+ *   层面是允许的（实测把 B 租户的流水挂到 A 租户的结算单上能插进去），
+ *   **一致性由 service 层保证**。将来做商家侧接口时，明细查询必须先校验
+ *   `statementId` 属于当前租户。
+ */
+model SettlementStatementEntry {
+  id          String   @id @default(uuid())
+  statementId String
+  /** 被纳入的抽佣流水 id（`commission_entries.id`） */
+  entryId     String   @unique
+  createdAt   DateTime @default(now())
+
+  statement SettlementStatement @relation(fields: [statementId], references: [id], onDelete: Cascade)
+  // ⚠️ **外键 Restrict**：流水是审计凭证，被结算单纳入后不允许被物理删除
+  entry     CommissionEntry       @relation(fields: [entryId], references: [id], onDelete: Restrict)
+
+  @@index([statementId])
+  @@map("settlement_statement_entries")
 }
