@@ -49,6 +49,9 @@ const PERIODS: AvailablePeriod[] = [
     entryCount: 2,
     statementStatus: 'CONFIRMED',
     alreadyApplied: false,
+    appliedKind: null,
+    supplementAvailable: false,
+    supplementAmount: null,
   },
 ];
 

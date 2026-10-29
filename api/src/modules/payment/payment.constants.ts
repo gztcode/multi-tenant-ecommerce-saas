@@ -1,4 +1,5 @@
 import type { PaymentProvider } from './payment-provider.interface';
+import type { PayoutProvider } from './payout-provider.interface';
 
 /**
  * 渠道表的注入令牌。
@@ -11,3 +12,14 @@ export const PAYMENT_PROVIDERS = 'PAYMENT_PROVIDERS';
 
 /** 渠道表的类型别名 */
 export type PaymentProviderMap = Map<string, PaymentProvider>;
+
+/**
+ * 出款渠道表的注入令牌。
+ *
+ * ⚠️ 与 `PAYMENT_PROVIDERS` **分开**：收款渠道与打款渠道是两套表，
+ *    混在一张表里会出现「按渠道名找打款实现时匹配到收款实现」。
+ */
+export const PAYOUT_PROVIDERS = 'PAYOUT_PROVIDERS';
+
+/** 出款渠道表的类型别名 */
+export type PayoutProviderMap = Map<string, PayoutProvider>;

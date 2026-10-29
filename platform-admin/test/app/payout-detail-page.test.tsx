@@ -69,6 +69,13 @@ const DETAIL: PlatformPayoutDetail = {
   approvedAt: null,
   cancelledAt: null,
   rejectedReason: null,
+  kind: 'NORMAL',
+  attemptCount: 0,
+  failureReason: null,
+  payoutChannel: null,
+  processingAt: null,
+  paidAt: null,
+  failedAt: null,
   tenantId: 'tenant-1',
   tenantName: '示例店铺',
   subdomain: 'demo',
@@ -282,6 +289,135 @@ describe('出款单详情页：金额与状态', () => {
     const texts = await renderPage();
 
     expect(hasText(texts, '撤回时间')).toBe(true);
+  });
+});
+
+describe('出款单详情页：类型与执行状态（阶段 5h-2）', () => {
+  it('⚠️ 详情显示类型（补差出款是增量，超管要能一眼看出来）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      kind: 'SUPPLEMENT' as const,
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '类型')).toBe(true);
+    expect(hasText(texts, '补差出款')).toBe(true);
+    // ⚠️ **类型不能是裸枚举**。
+    expect(hasText(texts, 'SUPPLEMENT')).toBe(false);
+  });
+
+  it('⚠️ 正常出款显示「正常出款」', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '正常出款')).toBe(true);
+  });
+
+  it('⚠️ 详情显示失败原因与尝试次数', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'FAILED' as const,
+      failureReason: '收款账户校验不通过',
+      attemptCount: 3,
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '失败原因')).toBe(true);
+    expect(hasText(texts, '收款账户校验不通过')).toBe(true);
+    expect(hasText(texts, '已尝试 3 次')).toBe(true);
+    expect(hasText(texts, '出款失败')).toBe(true);
+  });
+
+  it('⚠️ 不是失败状态时不显示「失败原因」', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '失败原因')).toBe(false);
+  });
+
+  it('⚠️ 失败但后端没给原因时显示「未知原因」', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'FAILED' as const,
+      failureReason: null,
+      attemptCount: 1,
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '未知原因')).toBe(true);
+    expect(hasText(texts, '已尝试 1 次')).toBe(true);
+  });
+
+  it('⚠️ 显示打款渠道名（超管要知道钱打给哪个渠道了）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'PAID' as const,
+      payoutChannel: '招商银行代付',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '打款渠道')).toBe(true);
+    expect(hasText(texts, '招商银行代付')).toBe(true);
+  });
+
+  it('⚠️ 没有渠道名时不显示「打款渠道」', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '打款渠道')).toBe(false);
+  });
+
+  it('⚠️ 出款成功时显示打款时间', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'PAID' as const,
+      paidAt: '2026-02-10T08:30:00.000Z',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '打款时间')).toBe(true);
+    // ⚠️ **时间格式走 `lib/billing.ts` 的 `formatDateTime`**。
+    const { formatDateTime } = await vi.importActual<
+      typeof import('@/lib/billing')
+    >('@/lib/billing');
+    expect(hasText(texts, formatDateTime('2026-02-10T08:30:00.000Z'))).toBe(true);
+  });
+
+  it('⚠️ 不是已出款状态时不显示打款时间', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'APPROVED' as const,
+      paidAt: '2026-02-10T08:30:00.000Z',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '打款时间')).toBe(false);
+  });
+
+  it('⚠️ 出款失败时显示失败时间', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'FAILED' as const,
+      failureReason: '渠道超时',
+      failedAt: '2026-02-11T09:00:00.000Z',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '失败时间')).toBe(true);
+    const { formatDateTime } = await vi.importActual<
+      typeof import('@/lib/billing')
+    >('@/lib/billing');
+    expect(hasText(texts, formatDateTime('2026-02-11T09:00:00.000Z'))).toBe(true);
+  });
+
+  it('⚠️ 不是失败状态时不显示失败时间', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '失败时间')).toBe(false);
   });
 });
 

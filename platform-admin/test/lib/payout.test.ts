@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   describePayoutEntryType,
+  describePayoutKind,
   describePayoutStatus,
   describePayoutTimeline,
   formatCents,
@@ -26,8 +27,27 @@ describe('describePayoutStatus', () => {
     expect(describePayoutStatus('FAILED')).toBe('出款失败');
   });
 
+  it('describePayoutStatus：PROCESSING → 打款中', () => {
+    expect(describePayoutStatus('PROCESSING')).toBe('打款中');
+  });
+
+  it('describePayoutStatus：未知状态 → 未知状态', () => {
+    expect(describePayoutStatus('WHATEVER')).toBe('未知状态');
+  });
+
   it('⚠️ 未知状态回落到「未知状态」，不显示裸枚举', () => {
     expect(describePayoutStatus('WEIRD')).toBe('未知状态');
+  });
+});
+
+describe('describePayoutKind', () => {
+  it('describePayoutKind：NORMAL / SUPPLEMENT', () => {
+    expect(describePayoutKind('NORMAL')).toBe('正常出款');
+    expect(describePayoutKind('SUPPLEMENT')).toBe('补差出款');
+  });
+
+  it('describePayoutKind：未知类型回落到「正常出款」', () => {
+    expect(describePayoutKind('WHATEVER')).toBe('正常出款');
   });
 });
 

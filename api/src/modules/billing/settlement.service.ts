@@ -707,8 +707,9 @@ export class SettlementService {
       //    结算单被取消确认后重算，佣金会变 → 已批的出款单金额失真
       //    → 平台打出去的钱与账对不上。
       //
-      //    ⚠️ **只查非终态的出款单**：REJECTED / CANCELLED 的单没有打钱，
-      //    它们不构成「钱已经出去了」的事实 → 不该拦住修正漏结的路径。
+      //    ⚠️ **只查非终态的出款单**：REJECTED / CANCELLED / FAILED 的单
+      //    没有把钱打出去，它们不构成「钱已经出去了」的事实
+      //    → 不该拦住修正漏结的路径。
       //
       //    ⚠️ **查得到全局的出款单**：本方法跑在**平台作用域**下
       //    （`tenantContext.run(platformScope(), ...)`）→ 平台作用域下扩展
@@ -725,7 +726,16 @@ export class SettlementService {
       const referenced = await this.prisma.payout.findFirst({
         where: {
           statementId: statementId,
-          status: { notIn: [PayoutStatus.REJECTED, PayoutStatus.CANCELLED] },
+          // ⚠️ **FAILED 也要排除**（阶段 5h-2）：出款失败的单仍然挂着
+          //    statementId，但它**没有把钱打出去** → 不该拦住「取消确认」。
+          //    不排除的话，一次出款失败会让该结算单永远无法取消确认。
+          status: {
+            notIn: [
+              PayoutStatus.REJECTED,
+              PayoutStatus.CANCELLED,
+              PayoutStatus.FAILED,
+            ],
+          },
         },
         select: { id: true },
       });

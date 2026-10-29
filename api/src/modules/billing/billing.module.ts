@@ -14,6 +14,7 @@ import { PlatformSettlementController } from './platform-settlement.controller';
 import { SettlementService } from './settlement.service';
 import { PayoutService } from './payout.service';
 import { PayoutAccountService } from './payout-account.service';
+import { PayoutExecutionService } from './payout-execution.service';
 import { PlatformPayoutController } from './platform-payout.controller';
 import { MerchantPayoutController } from './merchant-payout.controller';
 import { MerchantPayoutAccountController } from './merchant-payout-account.controller';
@@ -62,6 +63,8 @@ import { MerchantPayoutAccountController } from './merchant-payout-account.contr
     // 出款（阶段 5h-1）
     PayoutService,
     PayoutAccountService,
+    // 出款执行（阶段 5h-2）
+    PayoutExecutionService,
   ],
   exports: [
     PlanService,
@@ -71,6 +74,10 @@ import { MerchantPayoutAccountController } from './merchant-payout-account.contr
     CommissionService,
     SettlementService,
     ReceiptService,
+    // ⚠️ **导出 `PayoutExecutionService`** —— `payment` 模块的
+    //    `PayoutWorker` 要靠它落状态（设计 §4.1）。
+    //    依赖方向是 `payment → billing`（单向），不构成环。
+    PayoutExecutionService,
   ],
 })
 export class BillingModule {}

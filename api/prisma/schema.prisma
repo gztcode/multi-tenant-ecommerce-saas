@@ -504,6 +504,8 @@ enum PayoutStatus {
   REQUESTED
   /// 已审批：金额已锁定
   APPROVED
+  /// 打款中（5h-2）：渠道调用中，尚未落终态
+  PROCESSING
   /// 已拒绝：商家可重新申请同一周期
   REJECTED
   /// 已撤回：商家主动撤销（仅 REQUESTED 可撤）
@@ -512,6 +514,14 @@ enum PayoutStatus {
   PAID
   /// 出款失败（5h-1 不可达，5h-2 用）
   FAILED
+}
+
+/// 出款单的类型（阶段 5h-2）
+enum PayoutKind {
+  /// 正常出款（某一期的完整应结）
+  NORMAL
+  /// 补差出款（该期已 PAID 后又回填进来的流水）
+  SUPPLEMENT
 }
 
 model Order {
@@ -1099,6 +1109,9 @@ model SettlementStatement {
   status     SettlementStatus @default(DRAFT)
   /** 确认时间。null = 未确认 */
   confirmedAt DateTime?
+  /// 打款完成时刻。null = 未打款（5h-2）
+  /// ⚠️ 与 status = PAID 同步写入，两者语义必须一致
+  paidAt DateTime?
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
 
@@ -1243,6 +1256,31 @@ model Payout {
   requestedAt DateTime @default(now())
   approvedAt DateTime?
   cancelledAt DateTime?
+  /// 出款类型：正常出款 / 补差出款（阶段 5h-2）
+  kind PayoutKind @default(NORMAL)
+  /// 打款渠道名（PAID / PROCESSING 时有值）
+  payoutChannel String?
+  /// 渠道交易号（幂等去重按它走）
+  payoutTxnId String?
+  /// 已尝试次数（含首次）。超过上限落 FAILED
+  attemptCount Int @default(0)
+  /// 最近一次失败的原因（给运营看）
+  failureReason String?
+  /// 开始执行的时刻（进 PROCESSING 时写）
+  processingAt DateTime?
+  /// 打款成功时刻
+  paidAt DateTime?
+  /// 失败落终态的时刻
+  failedAt DateTime?
+  /// 收款账户快照 —— 审批那一刻从 merchant_payout_accounts 抄下来
+  /// ⚠️ 三个字段都是快照，worker 只读它们，绝不在执行时重新查账户
+  snapshotAccountName String?
+  snapshotBankName    String?
+  snapshotAccountNo   String?
+  /// 卡死告警已发出的时刻（兜底扫描写）
+  /// ⚠️ 只为「告警去重」而存在：不写它的话兜底扫描每 5 分钟就把同一张单
+  ///    捞出来再打一遍日志 —— 一晚上几千行噪音
+  stuckLoggedAt DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1250,6 +1288,10 @@ model Payout {
   entries PayoutEntry[]
 
   @@index([status])
+  /// ⚠️ 阶段 5h-2：P6 闸按 statementId 查出款单，量大时全表扫
+  @@index([statementId])
+  /// ⚠️ 阶段 5h-2：执行侧按「状态 + 创建时刻」捞单
+  @@index([status, createdAt])
   @@map("payouts")
 }
 

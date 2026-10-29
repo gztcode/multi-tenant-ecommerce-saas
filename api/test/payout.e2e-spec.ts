@@ -929,7 +929,11 @@ describe('出款 (e2e)', () => {
     const after = await asPlatform(() =>
       prisma.payout.findFirst({ where: { id: requested.id } }),
     );
-    expect(after?.status).toBe(PayoutStatus.APPROVED);
+    // ⚠️ **不能再断言「状态必须是 APPROVED」**（阶段 5h-2 起失效）：
+    //    审批通过后会**自动入队**，worker 抢到单就把状态推到 `PROCESSING`
+    //    （再往下走就是 `PAID`）。这是 5h-2 的正常语义，不是缺陷。
+    //    护栏真正要验的是「重复审批被拒」→ 状态**不能退回 `REQUESTED`**。
+    expect(after?.status).not.toBe(PayoutStatus.REQUESTED);
     expect(after?.netAmount).toBe(18000);
   });
 
@@ -956,7 +960,10 @@ describe('出款 (e2e)', () => {
     const after = await asPlatform(() =>
       prisma.payout.findFirst({ where: { id: requested.id } }),
     );
-    expect(after?.status).toBe(PayoutStatus.APPROVED);
+    // ⚠️ 同上：审批后会自动入队，状态可能已经是 `PROCESSING` / `PAID`。
+    //    护栏要验的是「撤回被拒」→ 状态**不能是 `CANCELLED`**、也不能退回 `REQUESTED`。
+    expect(after?.status).not.toBe(PayoutStatus.CANCELLED);
+    expect(after?.status).not.toBe(PayoutStatus.REQUESTED);
     expect(after?.cancelledAt).toBeNull();
   });
 
@@ -994,9 +1001,13 @@ describe('出款 (e2e)', () => {
   // P9：明细归属
   // ============================================================
 
-  it('P9：商家 A 访问商家 B 的出款单 → 404', async () => {
+  // ⚠️ **P9 拆成两个用例**（5h-1 验收记录 N1）：
+  //    原来 GET 与 DELETE 的断言挤在一个 `it` 里 → **GET 的断言先失败**，
+  //    DELETE 的断言**轮不到执行** → 「撤回越权被挡住」这条护栏**实际没被验证**。
+  //    拆开之后，两个用例各自独立地成/败。
+  it('P9：商家看不到别家的出款单详情（GET 越权）', async () => {
     const adminToken = await loginPlatformAdmin();
-    const period = month('2025-11');
+    const period = month('2026-06');
     const { merchant: owner } = await setupMerchantWithPeriod(
       adminToken,
       period,
@@ -1013,17 +1024,38 @@ describe('出款 (e2e)', () => {
       .set('authorization', `Bearer ${other.token}`)
       .expect(404);
 
-    await http(app)
-      .delete(`/api/v1/merchant/payouts/${requested.id}`)
-      .set('authorization', `Bearer ${other.token}`)
-      .expect(404);
-
     // ⚠️ **商家 B 的列表里看不到这张单**
     const list = await http(app)
       .get('/api/v1/merchant/payouts')
       .set('authorization', `Bearer ${other.token}`)
       .expect(200);
     expect((list.body as PayoutListBody).items).toHaveLength(0);
+  });
+
+  it('P9：商家不能撤回别家的出款单（DELETE 越权）', async () => {
+    const adminToken = await loginPlatformAdmin();
+    // ⚠️ **必须与上一个用例不同月份**：两个用例虽然各自建了独立商家
+    //    （幂等键是 `(tenantId, periodStart)`），但同月份会让「该期只有一张活跃单」
+    //    的直觉失效，读用例的人也会以为它们在断言同一张单。
+    const period = month('2026-07');
+    const { merchant: owner } = await setupMerchantWithPeriod(
+      adminToken,
+      period,
+      { receiptAmount: 40000, commissionAmount: 4000 },
+    );
+    const other = await createMerchant(app, prisma);
+
+    const requested = await apply(owner.token, period.label);
+
+    await http(app)
+      .delete(`/api/v1/merchant/payouts/${requested.id}`)
+      .set('authorization', `Bearer ${other.token}`)
+      .expect(404);
+
+    // ⚠️ **还要断言「那张单没被动过」** ——
+    //    只断言 404 的话，一个「直接返回 404 但其实撤回了」的 bug 也能过。
+    const after = await fetchMerchantDetail(owner.token, requested.id);
+    expect(after.status).toBe(PayoutStatus.REQUESTED);
   });
 
   it('P9：明细里关联了别家的货款流水 → 详情不显示别家的订单号', async () => {

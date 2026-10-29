@@ -37,4 +37,17 @@ export function assertSecureConfig(): void {
       '生产环境禁止启用 FAKE_PAYMENT_ENABLED：假支付网关无需登录即可支付订单。',
     );
   }
+
+  // ⚠️ 假出款网关在生产环境开启 = 平台能让「打款失败」（阶段 5h-2）。
+  //
+  // 与假支付网关**分成两条**：用同一个开关的话，开着假支付就等于
+  // 同时开着假出款，两个环境的启停会互相牵连。
+  if (
+    process.env.NODE_ENV === 'production' &&
+    process.env.FAKE_PAYOUT_ENABLED === 'true'
+  ) {
+    throw new Error(
+      '生产环境禁止启用 FAKE_PAYOUT_ENABLED：假出款网关能让出款失败。',
+    );
+  }
 }

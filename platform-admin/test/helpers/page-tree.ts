@@ -113,6 +113,41 @@ export function collectComponentProps(
 }
 
 /**
+ * 把树里所有元素的 `className` 收集起来（字符串形式）。
+ *
+ * ⚠️ **为什么需要它**：有些护栏不是「页面上有没有这句话」，
+ *    而是「这句话**长得不一样**」—— 例如卡住 10 分钟以上的出款单
+ *    标红（`text-destructive`）。那种只能看样式类。
+ *
+ * ⚠️ **只收字符串的 `className`**：`clsx` 之类的组合可能给出数组或对象，
+ *    这里统一跳过（页面上的写法都是字符串）。
+ */
+export function collectClassNames(
+  node: unknown,
+  out: string[] = [],
+  seen = new Set<unknown>(),
+): string[] {
+  if (node === null || node === undefined || typeof node === 'boolean') return out;
+  if (typeof node === 'string' || typeof node === 'number') return out;
+  if (Array.isArray(node)) {
+    for (const child of node) collectClassNames(child, out, seen);
+    return out;
+  }
+  if (typeof node !== 'object') return out;
+  if (seen.has(node)) return out;
+  seen.add(node);
+
+  const element = node as ReactElement<Record<string, unknown>>;
+  const props = element.props;
+  if (props && typeof props === 'object') {
+    const className = props.className;
+    if (typeof className === 'string') out.push(className);
+    collectClassNames(props.children, out, seen);
+  }
+  return out;
+}
+
+/**
  * 找出树里所有**链接**的 href。
  *
  * ⚠️ **按 `href` 断言比按文字断言更准**：「编辑」与「取消」都是链接，

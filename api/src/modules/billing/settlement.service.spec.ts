@@ -438,7 +438,7 @@ describe('取消确认：已被出款单引用的结算单不能取消确认（�
     expect(call).toBeDefined();
     expect(call?.[0]?.where).toEqual({
       statementId: 'stmt-a',
-      status: { notIn: ['REJECTED', 'CANCELLED'] },
+      status: { notIn: ['REJECTED', 'CANCELLED', 'FAILED'] },
     });
   });
 

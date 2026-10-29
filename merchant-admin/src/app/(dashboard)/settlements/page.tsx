@@ -1,6 +1,10 @@
 import Link from 'next/link';
 import { ApiError, apiFetchAuthed } from '@/lib/api-client';
-import { describePayoutStatus, formatCents } from '@/lib/payout';
+import {
+  describePayoutKind,
+  describePayoutStatus,
+  formatCents,
+} from '@/lib/payout';
 import type { PayoutItem } from '@/lib/payout';
 
 /**
@@ -91,6 +95,7 @@ export default async function PayoutsPage() {
             <thead>
               <tr className="border-b text-left">
                 <th>周期</th>
+                <th>类型</th>
                 <th>状态</th>
                 <th>货款净额</th>
                 <th>平台佣金</th>
@@ -102,7 +107,7 @@ export default async function PayoutsPage() {
             <tbody>
               {items.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="py-4 text-muted-foreground">
+                  <td colSpan={8} className="py-4 text-muted-foreground">
                     暂无出款单。
                   </td>
                 </tr>
@@ -117,7 +122,20 @@ export default async function PayoutsPage() {
                         {payout.periodLabel}
                       </Link>
                     </td>
-                    <td>{describePayoutStatus(payout.status)}</td>
+                    {/* ⚠️ **用 `describePayoutKind` 而不是内联三元**：
+                        文案与平台端统一（「补差出款 / 正常出款」），
+                        且未知枚举值有回落 —— 内联三元会把新枚举误标成「正常」。 */}
+                    <td>{describePayoutKind(payout.kind)}</td>
+                    <td>
+                      {describePayoutStatus(payout.status)}
+                      {/* ⚠️ **失败的单可能真的已经打出去了**（渠道超时 / 网络中断）——
+                          必须让商家自己去核对是否已到账，否则商家会直接再申请一笔。 */}
+                      {payout.status === 'FAILED' && (
+                        <p className="text-xs text-destructive">
+                          出款失败，请联系平台确认是否已到账
+                        </p>
+                      )}
+                    </td>
                     <td>{formatCents(payout.receiptAmount)}</td>
                     <td>{formatCents(payout.commissionAmount)}</td>
                     <td>{formatCents(payout.netAmount)}</td>

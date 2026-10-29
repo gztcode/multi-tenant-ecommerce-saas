@@ -5,15 +5,23 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { PayoutStatus, SettlementStatus, type Payout } from '@prisma/client';
+import {
+  PayoutKind,
+  PayoutStatus,
+  SettlementStatus,
+  type Payout,
+} from '@prisma/client';
 import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import { clampPagination } from '../../common/http/pagination';
+import { PAYOUT_QUEUE } from '../../common/queue/queue.constants';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   getTenantContext,
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
+import { QueueService } from '../queue/queue.service';
+import { maskAccountNo } from './payout-account.service';
 import { formatPeriodLabel, resolveMonthlyPeriod } from './settlement';
 
 interface Paging {
@@ -37,6 +45,8 @@ interface Paging {
 export interface PayoutView {
   id: string;
   payoutNo: string;
+  /** 出款类型：正常 / 补差（阶段 5h-2） */
+  kind: PayoutKind;
   periodStart: string;
   periodEnd: string;
   periodLabel: string;
@@ -57,6 +67,31 @@ export interface PayoutView {
   requestedAt: string;
   approvedAt: string | null;
   cancelledAt: string | null;
+  /** 打款渠道名（`PAID` / `PROCESSING` 时有值） */
+  payoutChannel: string | null;
+  /** 渠道交易号 */
+  payoutTxnId: string | null;
+  /** 已尝试次数（含首次） */
+  attemptCount: number;
+  /** 最近一次失败的原因（给运营看） */
+  failureReason: string | null;
+  /** 开始执行的时刻 */
+  processingAt: string | null;
+  /** 打款成功时刻 */
+  paidAt: string | null;
+  /** 失败落终态的时刻 */
+  failedAt: string | null;
+  /** 收款账户快照（户名） */
+  snapshotAccountName: string | null;
+  /** 收款账户快照（开户行） */
+  snapshotBankName: string | null;
+  /**
+   * 收款账户快照（**账号脱敏**）。
+   *
+   * ⚠️ **`snapshotAccountNo` 是完整账号，绝不能原样进 API 响应**（护栏 X14）——
+   *    它是打款的依据，只给脱敏版。
+   */
+  maskedSnapshotAccountNo: string | null;
   createdAt: string;
 }
 
@@ -90,15 +125,40 @@ export interface AvailablePeriodView {
   entryCount: number;
   /** 该期结算单的状态；null = 该期没有结算单（零额抽佣） */
   statementStatus: SettlementStatus | null;
-  /** 该期是否已有活跃出款单 */
+  /** 该期是否已有活跃出款单（正常或补差都算） */
   alreadyApplied: boolean;
+  /**
+   * 该期活跃单的种类；null = 没有活跃单。
+   *
+   * ⚠️ **商家端靠它区分「点哪个按钮」**（设计 §6.4b）。
+   */
+  appliedKind: PayoutKind | null;
+  /**
+   * 该期还能不能申请补差（正常单已 `PAID` 且仍有未纳入流水）。
+   *
+   * ⚠️ **不能只看 `alreadyApplied` 就禁用按钮** —— 正常单 `PAID` 后
+   *    `alreadyApplied = true`，若直接禁用，**补差入口就此消失**。
+   */
+  supplementAvailable: boolean;
+  /** 补差金额（整数分）；`supplementAvailable = false` 时为 null */
+  supplementAmount: number | null;
 }
 
 @Injectable()
 export class PayoutService {
   private readonly logger = new Logger(PayoutService.name);
 
-  constructor(private readonly prisma: TenantPrismaService) {}
+  /**
+   * ⚠️ **注入 `QueueService`**（阶段 5h-2）：审批通过后要把出款单
+   *    **异步**投到 `PAYOUT_QUEUE`，由 worker 去调渠道打款。
+   *
+   * ⚠️ **`billing` import `queue` 是安全的** —— `QueueModule` 是 `@Global()`，
+   *    且 `queue.service.ts` 里没有任何渠道代码（不构成 `billing → payment` 的环）。
+   */
+  constructor(
+    private readonly prisma: TenantPrismaService,
+    private readonly queues: QueueService,
+  ) {}
 
   /**
    * 商家申请出款（指定自然月）。
@@ -106,6 +166,9 @@ export class PayoutService {
    * ⚠️ **幂等检查放最前**：该期已有活跃出款单 → **原样返回它**
    * （不报错、不重算金额 —— 金额已锁定）。
    * 商家重复提交是网络重试或手滑，报错会让商家以为申请失败。
+   *
+   * ⚠️ **阶段 5h-2：按 `kind` 分两条路** —— 正常单（第一次出款）与
+   *    补差单（该期已 `PAID` 之后又回填进来的货款）。
    */
   async apply(input: { period: string }): Promise<PayoutView> {
     const period = resolveMonthlyPeriod(input.period);
@@ -117,13 +180,36 @@ export class PayoutService {
       throw new BadRequestException('缺少租户或用户上下文');
     }
 
-    // ⚠️ **幂等分支在最前**：先查「该期有没有活跃单」。
-    // 查的时候**必须带上状态条件** —— REJECTED / CANCELLED 的单不占位，
-    // 商家要能重新申请（部分唯一索引也是这个条件）。
-    // ⚠️ **不手写 tenantId**：靠租户作用域扩展自动附加。
-    const existing = await this.findActivePayout(period.from);
-    if (existing) {
-      return this.toView(existing);
+    // ⚠️ **幂等分支在最前**（5h-1 的教训）：
+    //    商家重复提交是网络重试，报错会让商家以为申请失败。
+    //
+    // ⚠️ **正常单与补差单分开查** —— 索引是 `(tenantId, periodStart, kind)`
+    //    三元组，同期可以各有一张（设计 §5.2）。
+    const existingNormal = await this.findActivePayout(
+      period.from,
+      PayoutKind.NORMAL,
+    );
+    // ⚠️⚠️ **必须排除 `PAID`** —— `PAID` 的正常单**也是「活跃单」**
+    //    （它占着 `(tenantId, periodStart, kind)` 的索引位，
+    //    且 `findActivePayout` 的 `notIn` 与部分唯一索引的 `WHERE` 一致，
+    //    都不含 `PAID`）。
+    //
+    //    若这里把 `PAID` 的单也返回了，后面的「有 `PAID` 的正常单 →
+    //    走补差路径」就**永远到不了** → **补差路径不可达**，
+    //    商家在申请页看到「可申请补差」，点了却拿回那张已出款的旧单，
+    //    补差单从未被创建，钱永远没打。
+    //
+    // ⚠️ `PAID` 的正常单意味着「这一期已经结清了」——
+    //    此后再来申请，只能是**回填之后的补差**。
+    if (existingNormal && existingNormal.status !== PayoutStatus.PAID) {
+      return this.toView(existingNormal);
+    }
+    const existingSupplement = await this.findActivePayout(
+      period.from,
+      PayoutKind.SUPPLEMENT,
+    );
+    if (existingSupplement) {
+      return this.toView(existingSupplement);
     }
 
     // ⚠️ **周期必须已结束**：周期内的流水还会变（回填随时可能补进来），
@@ -144,21 +230,56 @@ export class PayoutService {
       throw new BadRequestException('请先在「出款」页设置收款账户');
     }
 
-    const amounts = await this.computeAmounts(tenantId, period);
+    // ⚠️⚠️ **决定走哪条路径**（设计 §6.4）：
+    // 「该期有没有已出款的正常单」决定这是**第一次**出款（正常单）
+    // 还是**回填之后**的补差（补差单）。
+    //
+    // ⚠️ **必须是「已 `PAID` 的正常单」而不是「任意正常单」**：
+    // `FAILED` 的正常单要走正常路径 —— 重新申请时重算会把回填流水
+    // 一起算进去，那才是商家真正要的「这一期总共该给我多少」。
+    // 误走补差路径 → 只打回填那部分的钱，**主体那部分永远打不出去**。
+    const paidNormal = await this.findPaidNormalPayout(period.from);
+    const isSupplement = paidNormal !== null;
 
-    // ⚠️ **结算单必须已确认**（护栏 P3）：不能拿一张草稿单当佣金依据。
-    this.assertStatementConfirmed(amounts, period.label);
+    let amounts: {
+      receiptAmount: number;
+      commissionAmount: number;
+      netAmount: number;
+      entryCount: number;
+      entryIds: string[];
+      statementId: string | null;
+      statementStatus: SettlementStatus | null;
+    };
+    let kind: PayoutKind;
 
-    if (amounts.entryCount === 0) {
-      throw new BadRequestException(
-        `该期（${period.label}）没有货款流水，无法申请出款`,
-      );
-    }
-    if (amounts.netAmount <= 0) {
-      throw new BadRequestException(
-        `该期（${period.label}）没有应结金额（货款净额 ${amounts.receiptAmount} 分、` +
-          `佣金 ${amounts.commissionAmount} 分），无法申请出款`,
-      );
+    if (isSupplement) {
+      kind = PayoutKind.SUPPLEMENT;
+      // ⚠️ **补差单的金额逻辑独立实现** —— 不复用 `computeAmounts`
+      //    （护栏 X13：复用会让同一笔佣金扣两遍）
+      amounts = await this.computeUnclaimedAmounts(tenantId, period);
+      if (amounts.netAmount <= 0) {
+        throw new BadRequestException(
+          `该期（${period.label}）没有可补差的货款，无法申请出款`,
+        );
+      }
+      // ⚠️ **补差单允许结算单是 `PAID`**（它不算佣金，结算单只作追溯凭证）
+      this.assertStatementConfirmed(amounts, period.label, { allowPaid: true });
+    } else {
+      kind = PayoutKind.NORMAL;
+      amounts = await this.computeAmounts(tenantId, period);
+      if (amounts.entryCount === 0) {
+        throw new BadRequestException(
+          `该期（${period.label}）没有货款流水，无法申请出款`,
+        );
+      }
+      if (amounts.netAmount <= 0) {
+        throw new BadRequestException(
+          `该期（${period.label}）没有应结金额（货款净额 ${amounts.receiptAmount} 分、` +
+            `佣金 ${amounts.commissionAmount} 分），无法申请出款`,
+        );
+      }
+      // ⚠️ **正常单的 P3 不放宽** —— 佣金要拿结算单的 `netAmount`
+      this.assertStatementConfirmed(amounts, period.label);
     }
 
     const payoutNo = generatePayoutNo(now);
@@ -170,6 +291,7 @@ export class PayoutService {
             data: {
               tenantId,
               payoutNo,
+              kind,
               periodStart: period.from,
               periodEnd: period.to,
               statementId: amounts.statementId,
@@ -180,6 +302,10 @@ export class PayoutService {
               status: PayoutStatus.REQUESTED,
               requestedAmount: amounts.netAmount,
               requestedBy: userId,
+              // ⚠️ **申请时也抄一份账户**（审批时会覆盖成审批那一刻的值）
+              snapshotAccountName: account.accountName,
+              snapshotBankName: account.bankName,
+              snapshotAccountNo: account.accountNo,
             },
           });
           // ⚠️ **申请时就固定纳入的流水**（设计 D7）：
@@ -206,7 +332,9 @@ export class PayoutService {
       if (!isUniqueViolation(error)) {
         throw error;
       }
-      const raced = await this.findActivePayout(period.from);
+      const raced =
+        (await this.findActivePayout(period.from, PayoutKind.NORMAL)) ??
+        (await this.findActivePayout(period.from, PayoutKind.SUPPLEMENT));
       if (!raced) {
         // ⚠️ **撞的不是活跃周期那条索引**（例如 `payoutNo` 撞了）
         //    → 原样抛出，**不伪装成「重复申请」**。
@@ -216,7 +344,8 @@ export class PayoutService {
     }
 
     this.logger.log(
-      `出款申请已创建：${payoutNo}（${period.label}，${amounts.netAmount} 分）`,
+      `出款申请已创建：${payoutNo}（${period.label}，${amounts.netAmount} 分，` +
+        `类型 ${kind}）`,
     );
     return this.toView(created);
   }
@@ -270,10 +399,13 @@ export class PayoutService {
   }
 
   /**
-   * 平台审批：**通过**（重算并锁定金额）。
+   * 平台审批：**通过**（重算并锁定金额 → 抄账户快照 → 事务后入队）。
    *
    * ⚠️ **重算金额**（护栏 P5）：不采信申请时的预估 —— 从申请到审批之间，
    * 流水可能补进来了、结算单可能被重算了。锁定的是**审批那一刻**的值。
+   *
+   * ⚠️ **按 `kind` 分支**（阶段 5h-2，护栏 X13）：补差单**绝不能**调
+   *    `computeAmounts` —— 那会把整期佣金再扣一遍。
    */
   async approve(payoutId: string): Promise<PlatformPayoutView> {
     const context = getTenantContext();
@@ -290,24 +422,21 @@ export class PayoutService {
         throw new NotFoundException('出款单不存在');
       }
 
-      // ⚠️ **重算**：用的是与申请时完全相同的两条数据源。
       const period = { from: payout.periodStart, to: payout.periodEnd };
-      const amounts = await this.computeAmounts(payout.tenantId, period);
+      const periodLabel = formatPeriodLabel(payout.periodStart);
 
-      // ⚠️ **结算单必须已确认**（护栏 P3）：审批那一刻它要是已经不是
-      //    CONFIRMED 了（被取消确认过、或被重算回草稿），
-      //    锁定的佣金就是拿草稿单算的 → 账不对。
-      //
-      //    ⚠️ **在 5h-1 内这条检查其实走不到**：结算单要从 CONFIRMED
-      //    回到 DRAFT 只有「取消确认」一条路，而 5g 的 `recalculate` 只接受
-      //    DRAFT 的单 → 必须先取消确认；而取消确认被护栏 P6 挡着
-      //    （这张单已被出款单引用）→ 回不到 DRAFT。
-      //    **保留它是防御性的**：P6 的语义若变化（5h-2 允许某些状态取消确认），
-      //    这道检查立刻生效，而那时没人会记得它曾经存在。
-      this.assertStatementConfirmed(
-        amounts,
-        formatPeriodLabel(payout.periodStart),
-      );
+      // ⚠️⚠️ **按 kind 分支重算** —— 补差单**绝不能**调 `computeAmounts`：
+      //    那会把整期佣金再扣一遍（护栏 X13）。
+      const isSupplement = payout.kind === PayoutKind.SUPPLEMENT;
+      const amounts = isSupplement
+        ? await this.computeSupplementAmounts(payout, period)
+        : await this.computeAmounts(payout.tenantId, period);
+
+      // ⚠️ **P3 校验**：补差单允许结算单是 `PAID`（它不算佣金，
+      //    结算单只作追溯凭证）；正常单**不放宽**（护栏 P5 / P6 不能失效）。
+      this.assertStatementConfirmed(amounts, periodLabel, {
+        allowPaid: isSupplement,
+      });
 
       // ⚠️ **重算后必须仍是正的应结金额**（与 `apply` 同款的两道闸）：
       //    申请与审批之间流水可能变了（订单退款冲回、回填补进一笔）。
@@ -317,42 +446,125 @@ export class PayoutService {
       //    那是调账的事，不该由出款这条路走。
       if (amounts.entryCount === 0) {
         throw new ConflictException(
-          `该期（${formatPeriodLabel(payout.periodStart)}）已无货款流水，不能审批出款`,
+          `该期（${periodLabel}）已无货款流水，不能审批出款`,
         );
       }
       if (amounts.netAmount <= 0) {
         throw new ConflictException(
-          `该期（${formatPeriodLabel(payout.periodStart)}）重算后的应结金额已非正数` +
+          `该期（${periodLabel}）重算后的应结金额已非正数` +
             `（货款净额 ${amounts.receiptAmount} 分、佣金 ${amounts.commissionAmount} 分），不能审批出款`,
         );
       }
 
-      const now = await this.prisma.databaseNow();
-      const affected = await this.prisma.payout.updateMany({
-        where: { id: payoutId, status: PayoutStatus.REQUESTED },
-        data: {
-          status: PayoutStatus.APPROVED,
-          approvedBy: userId,
-          approvedAt: now,
-          // ⚠️ **锁定的是重算后的值**：`requestedAmount` 保留申请时的预估，
-          // 两者的差异由审批人自己判断（不设阈值、不强制填原因）。
-          receiptAmount: amounts.receiptAmount,
-          commissionAmount: amounts.commissionAmount,
-          netAmount: amounts.netAmount,
-          entryCount: amounts.entryCount,
-          statementId: amounts.statementId,
-        },
+      // ⚠️ **重新查收款账户**（阶段 5h-2）：商家在 `REQUESTED` 期间可能删了账户。
+      //    查不到 → 409，**不要**带着空快照往下走 ——
+      //    worker 会因为「快照缺失」落 `FAILED`，那等于让商家白等一轮。
+      //
+      //    ⚠️ **必须显式带 `tenantId`**：`approve` 跑在**平台作用域**下 →
+      //    扩展**不附加** tenantId → 不带就是跨租户取数。
+      const account = await this.prisma.merchantPayoutAccount.findFirst({
+        where: { tenantId: payout.tenantId },
       });
-      if (affected.count === 0) {
-        throw new ConflictException('出款单已被审批或状态已变，不能重复审批');
+      if (!account) {
+        throw new ConflictException('该商家已删除收款账户，请让其重新申请');
       }
 
-      const updated = await this.prisma.payout.findFirst({
-        where: { id: payoutId },
+      const now = await this.prisma.databaseNow();
+      const updated = await this.prisma.$transaction(async (tx) => {
+        const affected = await tx.payout.updateMany({
+          where: { id: payoutId, status: PayoutStatus.REQUESTED },
+          data: {
+            status: PayoutStatus.APPROVED,
+            approvedBy: userId,
+            approvedAt: now,
+            // ⚠️ **锁定的是重算后的值**：`requestedAmount` 保留申请时的预估，
+            // 两者的差异由审批人自己判断（不设阈值、不强制填原因）。
+            receiptAmount: amounts.receiptAmount,
+            commissionAmount: amounts.commissionAmount,
+            netAmount: amounts.netAmount,
+            entryCount: amounts.entryCount,
+            // ⚠️ **补差单的 `statementId` 保持不变**（仍指那张结算单，
+            //    只作追溯凭证）；正常单按重算结果更新。
+            statementId: isSupplement
+              ? payout.statementId
+              : amounts.statementId,
+            // ⚠️⚠️ **账户快照必须在同一个事务里写** ——
+            //    分成「先改状态、再单独写快照」的话，会有
+            //    「状态已 APPROVED、job 已入队、快照还没写」的窗口，
+            //    worker 拿到的可能是 `apply` 时的旧账户
+            //    （正是快照要防的事）。
+            snapshotAccountName: account.accountName,
+            snapshotBankName: account.bankName,
+            snapshotAccountNo: account.accountNo,
+          },
+        });
+        if (affected.count === 0) {
+          throw new ConflictException('出款单已被审批或状态已变，不能重复审批');
+        }
+
+        // ⚠️⚠️ **明细必须与重算结果同步**（同一个事务里）：
+        //    审批锁定的范围 = 本单纳入的流水。申请到审批之间流水可能变，
+        //    而 `payout_entries` 还停留在申请时的旧集合 →
+        //    「重算金额包含的流水」与「明细里占用的流水」不一致 →
+        //    `computeUnclaimedAmounts` 认为多出来的那些仍「未纳入」→
+        //    商家能再申请一张补差单，**把同一笔流水再打一次钱**。
+        //
+        // ⚠️ **两种 kind 都要同步** —— 审批锁定的范围就是这张单纳入的流水；
+        //    审批**之后**才回填的流水不在锁定范围里，那些才该走补差单打。
+        //
+        // ⚠️ **`deleteMany` 必须在 `createMany` 之前** ——
+        //    `payout_entries.entryId` 是**全局唯一索引**，不先删就插会撞
+        //    → P2002 → 500。
+        await tx.payoutEntry.deleteMany({ where: { payoutId } });
+        if (amounts.entryIds.length > 0) {
+          await tx.payoutEntry.createMany({
+            data: amounts.entryIds.map((entryId) => ({
+              payoutId,
+              entryId,
+            })),
+          });
+        }
+
+        return tx.payout.findFirst({ where: { id: payoutId } });
       });
+
       if (!updated) {
         throw new NotFoundException('出款单不存在');
       }
+
+      // ⚠️⚠️ **入队必须在事务提交之后** —— 在事务里 `queue.add` 的话，
+      //    worker 可能在事务提交前就消费到 job → 查不到那张单（还是 REQUESTED）
+      //    → 抢不到 → 静默返回 → **这笔出款永远没人打**。
+      //
+      // ⚠️ **入队失败不抛错**：状态已经是 `APPROVED` 了（事务已提交），
+      //    抛错会让审批人以为「审批失败」而重试 → 409 → 更困惑。
+      //    正确做法是：记 `failureReason` + 记日志，
+      //    由 `scanStuck` 的「`APPROVED` 救援」重新入队（设计 §九·R3）。
+      try {
+        await this.queues.addWithOptions(
+          PAYOUT_QUEUE,
+          'execute',
+          { payoutId: updated.id },
+          `payout-${updated.id}-1`,
+          // ⚠️ **attempts 必须是 1** —— BullMQ 自己的重试要关掉，
+          //    重试由出款单自己的 `attemptCount` + 退避控制。
+          //
+          // ⚠️ **`removeOnComplete: true`** —— 否则完成的 job 留在队列里
+          //    一直涨，而且**同 jobId 永远不能再用**
+          //    （重试要用 `payout-{id}-2` 这类新轮次）。
+          { attempts: 1, removeOnComplete: true },
+        );
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        await this.prisma.payout.updateMany({
+          where: { id: updated.id, status: PayoutStatus.APPROVED },
+          data: { failureReason: `入队失败，等待自动救援：${reason}` },
+        });
+        this.logger.error(
+          `出款审批后入队失败：${updated.id} —— ${reason}（将由兜底扫描重新入队）`,
+        );
+      }
+
       return this.toPlatformView(updated);
     });
   }
@@ -497,6 +709,11 @@ export class PayoutService {
    *
    * ⚠️ **只列出真正能申请的周期**：周期已结束 + 有货款流水 + 应结 > 0。
    * 列出一堆不能申请的周期，商家挨个试才知道哪个能申请。
+   *
+   * ⚠️ **阶段 5h-2：按 `kind` 化** —— 一个 `alreadyApplied` 表达不了
+   *    「同一期同时有已 `PAID` 的正常单 + 还能再申请一张补差单」的形状。
+   *    `alreadyApplied = true` 会让商家以为「这期已经结清了」→
+   *    **补差入口就此消失**。
    */
   async availablePeriods(): Promise<AvailablePeriodView[]> {
     const context = getTenantContext();
@@ -530,17 +747,51 @@ export class PayoutService {
       if (resolved.to.getTime() > now.getTime()) {
         continue;
       }
+
+      // ⚠️ **整期金额无条件先算** —— 它的语义是「这一期总共应结多少」，
+      //    **与有没有活跃单无关**（设计 §6.4b）。
       const amounts = await this.computeAmounts(tenantId, resolved);
-      if (amounts.entryCount === 0 || amounts.netAmount <= 0) {
-        continue;
+
+      // ⚠️ **活跃单要按 kind 分别查** —— 索引是三元组，查询不带 kind 就会错位
+      const normalActive = await this.findActivePayout(
+        resolved.from,
+        PayoutKind.NORMAL,
+      );
+      const supplementActive = await this.findActivePayout(
+        resolved.from,
+        PayoutKind.SUPPLEMENT,
+      );
+
+      let appliedKind: PayoutKind | null = null;
+      let supplementAvailable = false;
+      let supplementAmount: number | null = null;
+
+      if (supplementActive) {
+        // ⚠️ **补差单不允许再叠**（护栏 X8）→ 即使还有新流水也不给入口
+        appliedKind = PayoutKind.SUPPLEMENT;
+      } else if (normalActive) {
+        appliedKind = PayoutKind.NORMAL;
+        // ⚠️ **只有正常单已 `PAID` 且还在飞之外的情况才给补差入口**：
+        //    正常单还在飞（REQUESTED / APPROVED / PROCESSING）时，
+        //    给补差入口会出现「两张单同时在飞」。
+        if (normalActive.status === PayoutStatus.PAID) {
+          const unclaimed = await this.computeUnclaimedAmounts(
+            tenantId,
+            resolved,
+          );
+          supplementAmount = unclaimed.receiptAmount;
+          supplementAvailable = unclaimed.receiptAmount > 0;
+        }
       }
-      const applied = await this.prisma.payout.findFirst({
-        where: {
-          periodStart: resolved.from,
-          status: { notIn: [PayoutStatus.REJECTED, PayoutStatus.CANCELLED] },
-        },
-        select: { id: true },
-      });
+
+      // ⚠️ **没有活跃单时按 5h-1 的规则跳过**（含「正常单是
+      //    REJECTED / CANCELLED / FAILED」的情况 → 走正常路径重新申请）
+      if (!normalActive && !supplementActive) {
+        if (amounts.entryCount === 0 || amounts.netAmount <= 0) {
+          continue;
+        }
+      }
+
       views.push({
         period,
         receiptAmount: amounts.receiptAmount,
@@ -548,7 +799,10 @@ export class PayoutService {
         netAmount: amounts.netAmount,
         entryCount: amounts.entryCount,
         statementStatus: amounts.statementStatus,
-        alreadyApplied: !!applied,
+        alreadyApplied: normalActive !== null || supplementActive !== null,
+        appliedKind,
+        supplementAvailable,
+        supplementAmount,
       });
     }
     return views;
@@ -560,19 +814,30 @@ export class PayoutService {
    * ⚠️ **只在「申请」与「审批」这两个动作上校验**，不在取数的地方校验：
    * 「可申请周期」列表要照常显示未确认的周期（带 `statementStatus`），
    * 在那里抛异常会把整个列表打成 409。
+   *
+   * ⚠️ **`allowPaid` 只给补差路径开**（阶段 5h-2）：
+   * 补差单不算佣金（佣金在结算单里一次性扣完），结算单只作追溯凭证 →
+   * 允许它对着已 `PAID` 的结算单。
+   *
+   * ⚠️ **绝不能改成「PAID 一律放行」** —— 那会让正常单也能对已 `PAID` 的
+   * 结算单重新算佣金，5h-1 的 P5（审批重算）与 P6（`PAID` 不可取消确认）
+   * 会一起失效。`DRAFT` 状态**任何路径都要 409**。
    */
   private assertStatementConfirmed(
     amounts: { statementStatus: SettlementStatus | null },
     periodLabel: string,
+    options: { allowPaid?: boolean } = {},
   ): void {
-    if (
-      amounts.statementStatus !== null &&
-      amounts.statementStatus !== SettlementStatus.CONFIRMED
-    ) {
-      throw new ConflictException(
-        `该期（${periodLabel}）的结算单尚未确认，不能申请出款`,
-      );
+    const status = amounts.statementStatus;
+    if (status === null || status === SettlementStatus.CONFIRMED) {
+      return;
     }
+    if (options.allowPaid && status === SettlementStatus.PAID) {
+      return;
+    }
+    throw new ConflictException(
+      `该期（${periodLabel}）的结算单尚未确认，不能申请出款`,
+    );
   }
 
   /**
@@ -628,6 +893,92 @@ export class PayoutService {
       netAmount: receiptAmount - commissionAmount,
       entryCount: receipts.length,
       entryIds: receipts.map((r) => r.id),
+      statementId: statement?.id ?? null,
+      statementStatus: statement?.status ?? null,
+    };
+  }
+
+  /**
+   * 算补差出款单的金额（**不复用 `computeAmounts`** —— 护栏 X13）。
+   *
+   * ## 为什么不能复用 `computeAmounts`
+   *
+   * 正常单的佣金取该期结算单的 `netAmount`（整期一次性扣完）。
+   * 补差单若也走这条路，佣金会被扣**第二遍** → 极端情况下净额变负。
+   *
+   * ## ⚠️⚠️ 重算范围必须是「本单口径」
+   *
+   * 补差单在 `apply` 时已经占用了自己那批流水。若这里用全局口径
+   * 「该期未被任何单占用的流水」，**本单纳入的流水会被当成未纳入**
+   * → 金额直接归零（护栏 X16）。
+   *
+   * 正确口径 = 「本单已占用的」 ∪ 「该期未被**其他**单占用的」。
+   *
+   * @param payout 待审批的补差单（要排除它自己占用的流水）
+   */
+  private async computeSupplementAmounts(
+    payout: { id: string; tenantId: string },
+    period: { from: Date; to: Date },
+  ): Promise<{
+    receiptAmount: number;
+    commissionAmount: number;
+    netAmount: number;
+    entryCount: number;
+    entryIds: string[];
+    statementId: string | null;
+    statementStatus: SettlementStatus | null;
+  }> {
+    const receipts = await this.prisma.merchantReceipt.findMany({
+      where: {
+        tenantId: payout.tenantId,
+        occurredAt: { gte: period.from, lt: period.to },
+      },
+      orderBy: { occurredAt: 'asc' },
+    });
+
+    // ---- ① 本单自己占用的 entryId ----
+    const ownLinks = await this.prisma.payoutEntry.findMany({
+      where: { payoutId: payout.id },
+      select: { entryId: true },
+    });
+    const ownIds = new Set(ownLinks.map((link) => link.entryId));
+
+    // ---- ② 被**其他**单占用的 entryId ----
+    // ⚠️ **`payout_entries` 不在租户白名单里** → 扩展不附加任何过滤，
+    //    这里查到的就是全局事实 → **必须显式带 `tenantId` 与 `periodStart`**。
+    const otherLinks = await this.prisma.payoutEntry.findMany({
+      where: {
+        payout: { tenantId: payout.tenantId, periodStart: period.from },
+        payoutId: { not: payout.id },
+      },
+      select: { entryId: true },
+    });
+    const otherIds = new Set(otherLinks.map((link) => link.entryId));
+
+    // ---- ③ 纳入范围 = 本单已占 ∪ 未被其他单占用的 ----
+    const scope = receipts.filter(
+      (receipt) => ownIds.has(receipt.id) || !otherIds.has(receipt.id),
+    );
+
+    const receiptAmount = scope.reduce(
+      (sum, receipt) => sum + receipt.amount,
+      0,
+    );
+
+    const statement = await this.prisma.settlementStatement.findFirst({
+      where: { tenantId: payout.tenantId, periodStart: period.from },
+    });
+
+    return {
+      receiptAmount,
+      // ⚠️ **佣金恒为 0** —— 这一期不再扣佣（设计 §6.4 的不变量：
+      //    同一期所有出款单的佣金之和 = 该期结算单的 netAmount）
+      commissionAmount: 0,
+      netAmount: receiptAmount,
+      // ⚠️ **entryCount 按补差那批重算** —— 不是整期的条数
+      //    （留着旧值会让商家在详情页看到「31 条」而明细只有 2 条）
+      entryCount: scope.length,
+      entryIds: scope.map((receipt) => receipt.id),
       statementId: statement?.id ?? null,
       statementStatus: statement?.status ?? null,
     };
@@ -690,14 +1041,118 @@ export class PayoutService {
    *
    * ⚠️ **只在商家侧（租户作用域）调用** —— 所以**不手写 tenantId**，
    *    靠扩展自动附加。
+   *
+   * ⚠️ **`kind` 是必传参数，不是可选的** —— 5h-2 把部分唯一索引改成了
+   *    `(tenantId, periodStart, kind)` 三元组，查询不带 kind 就会出现
+   *    「以为只查正常单、实际把补差单也捞进来了」的错位。
+   *
+   * ⚠️ **`notIn` 必须与索引的 WHERE 是同一个集合**
+   *    （REJECTED / CANCELLED / FAILED）—— 否则会出现
+   *    「查询认为不活跃、插入却被索引拦下」的错位。
    */
-  private async findActivePayout(periodStart: Date): Promise<Payout | null> {
+  private async findActivePayout(
+    periodStart: Date,
+    kind: PayoutKind,
+  ): Promise<Payout | null> {
     return this.prisma.payout.findFirst({
       where: {
         periodStart,
-        status: { notIn: [PayoutStatus.REJECTED, PayoutStatus.CANCELLED] },
+        kind,
+        status: {
+          notIn: [
+            PayoutStatus.REJECTED,
+            PayoutStatus.CANCELLED,
+            PayoutStatus.FAILED,
+          ],
+        },
       },
     });
+  }
+
+  /**
+   * 查该期有没有**已出款**的正常单（`status = PAID`）。
+   *
+   * ⚠️ **这是「走正常路径还是补差路径」的分水岭**（设计 §6.4）。
+   *    `PAID` 的正常单意味着「这一期已经结清了」，
+   *    之后回填进来的货款只能靠**补差单**再出一次。
+   *
+   * ⚠️ **绝不能改成「有任意正常单就算」** —— `FAILED` 的正常单要走
+   *    正常路径（重新申请时重算会把回填流水一起算进去）。
+   */
+  private async findPaidNormalPayout(
+    periodStart: Date,
+  ): Promise<Payout | null> {
+    return this.prisma.payout.findFirst({
+      where: {
+        periodStart,
+        kind: PayoutKind.NORMAL,
+        status: PayoutStatus.PAID,
+      },
+    });
+  }
+
+  /**
+   * 算「该期未被任何单纳入的流水」之和（**全局口径**）。
+   *
+   * ⚠️ **这里没有「本单」的概念** —— 单还没建，所以用全局口径：
+   *    该期全部流水 − 被**所有**单占用的 entryId。
+   *
+   * ⚠️ **与 `computeSupplementAmounts`（本单口径）是两回事**：
+   *    那是 `approve` 时的重算，那时单已经存在、自己占着那批流水。
+   *
+   * ⚠️ **「已被占用」按 `payout_entries` 的实际行算，不按 `entryCount` 求和** ——
+   *    被拒 / 撤回 / 失败的单已经释放了明细，但它们的 `entryCount` 列
+   *    **仍是旧数字**（历史快照，没清零）。拿 `entryCount` 求和会把
+   *    「已释放的流水」算成「已纳入」。
+   */
+  private async computeUnclaimedAmounts(
+    tenantId: string,
+    period: { from: Date; to: Date },
+  ): Promise<{
+    receiptAmount: number;
+    commissionAmount: number;
+    netAmount: number;
+    entryCount: number;
+    entryIds: string[];
+    statementId: string | null;
+    statementStatus: SettlementStatus | null;
+  }> {
+    const receipts = await this.prisma.merchantReceipt.findMany({
+      where: {
+        tenantId,
+        occurredAt: { gte: period.from, lt: period.to },
+      },
+      orderBy: { occurredAt: 'asc' },
+    });
+
+    // ⚠️ **`payout_entries` 不在租户白名单里** → 扩展不附加任何过滤
+    //    → 这里查到的就是全局事实 → **必须显式带 `tenantId` 与 `periodStart`**
+    const links = await this.prisma.payoutEntry.findMany({
+      where: { payout: { tenantId, periodStart: period.from } },
+      select: { entryId: true },
+    });
+    const claimed = new Set(links.map((link) => link.entryId));
+
+    const unclaimed = receipts.filter((receipt) => !claimed.has(receipt.id));
+    const receiptAmount = unclaimed.reduce(
+      (sum, receipt) => sum + receipt.amount,
+      0,
+    );
+
+    const statement = await this.prisma.settlementStatement.findFirst({
+      where: { tenantId, periodStart: period.from },
+    });
+
+    return {
+      receiptAmount,
+      // ⚠️ **佣金恒为 0** —— 这一期不再扣佣（设计 §6.4）
+      commissionAmount: 0,
+      netAmount: receiptAmount,
+      entryCount: unclaimed.length,
+      entryIds: unclaimed.map((receipt) => receipt.id),
+      statementId: statement?.id ?? null,
+      statementStatus: statement?.status ?? null,
+    };
   }
 
   /** 单据 → 对外字段（租户视角） */
@@ -705,6 +1160,7 @@ export class PayoutService {
     return {
       id: payout.id,
       payoutNo: payout.payoutNo,
+      kind: payout.kind,
       periodStart: payout.periodStart.toISOString(),
       periodEnd: payout.periodEnd.toISOString(),
       periodLabel: formatPeriodLabel(payout.periodStart),
@@ -721,6 +1177,20 @@ export class PayoutService {
       requestedAt: payout.requestedAt.toISOString(),
       approvedAt: payout.approvedAt?.toISOString() ?? null,
       cancelledAt: payout.cancelledAt?.toISOString() ?? null,
+      payoutChannel: payout.payoutChannel,
+      payoutTxnId: payout.payoutTxnId,
+      attemptCount: payout.attemptCount,
+      failureReason: payout.failureReason,
+      processingAt: payout.processingAt?.toISOString() ?? null,
+      paidAt: payout.paidAt?.toISOString() ?? null,
+      failedAt: payout.failedAt?.toISOString() ?? null,
+      snapshotAccountName: payout.snapshotAccountName,
+      snapshotBankName: payout.snapshotBankName,
+      // ⚠️ **脱敏** —— `snapshotAccountNo` 是完整账号，是打款的依据，
+      //    但**绝不能**出现在 API 响应里（护栏 X14）
+      maskedSnapshotAccountNo: payout.snapshotAccountNo
+        ? maskAccountNo(payout.snapshotAccountNo)
+        : null,
       createdAt: payout.createdAt.toISOString(),
     };
   }

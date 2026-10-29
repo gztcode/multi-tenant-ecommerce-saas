@@ -1,6 +1,11 @@
 import Link from 'next/link';
 import { ApiError, apiFetchAuthed } from '@/lib/api-client';
-import { describePayoutStatus, formatCents, type PayoutListResult } from '@/lib/payout';
+import {
+  describePayoutKind,
+  describePayoutStatus,
+  formatCents,
+  type PayoutListResult,
+} from '@/lib/payout';
 import {
   Table,
   TableBody,
@@ -114,6 +119,7 @@ export default async function PayoutsPage({
                   <TableRow>
                     <TableHead>商家</TableHead>
                     <TableHead>周期</TableHead>
+                    <TableHead>类型</TableHead>
                     <TableHead>状态</TableHead>
                     <TableHead>货款净额</TableHead>
                     <TableHead>佣金</TableHead>
@@ -135,7 +141,23 @@ export default async function PayoutsPage({
                         </Link>
                       </TableCell>
                       <TableCell>{payout.periodLabel}</TableCell>
-                      <TableCell>{describePayoutStatus(payout.status)}</TableCell>
+                      {/* ⚠️ **类型要单列出来**：补差出款是**增量**，
+                          混在正常出款里超管会按同一口径核账。 */}
+                      <TableCell>{describePayoutKind(payout.kind)}</TableCell>
+                      <TableCell>
+                        {/* ⚠️ **卡住标红**：钱可能已经打出去了，
+                            运营需要人工去查 —— 前端只提醒，不做任何自动处理。 */}
+                        <span className={isStuck(payout) ? 'text-destructive' : undefined}>
+                          {describePayoutStatus(payout.status)}
+                        </span>
+                        {/* ⚠️ **失败原因与尝试次数要显示出来**：
+                            运营需要知道「试了几次、为什么失败」才能决定怎么补。 */}
+                        {payout.status === 'FAILED' && payout.failureReason && (
+                          <p className="text-xs text-muted-foreground">
+                            {payout.failureReason}（已尝试 {payout.attemptCount} 次）
+                          </p>
+                        )}
+                      </TableCell>
                       {/* ⚠️ **金额直接用后端返回的三个数**，前端不加总。 */}
                       <TableCell>{formatCents(payout.receiptAmount)}</TableCell>
                       <TableCell>{formatCents(payout.commissionAmount)}</TableCell>
@@ -159,4 +181,25 @@ export default async function PayoutsPage({
       )}
     </div>
   );
+}
+
+/**
+ * 这张单是不是卡在「打款中」太久了。
+ *
+ * ⚠️ **阈值 10 分钟**，与后端兜底扫描的阈值一致。
+ *
+ * ⚠️ **前端只标红提醒，不做任何处理** ——
+ *    后端**绝不自动重试**卡在 `PROCESSING` 的单：
+ *    这个状态最可能的成因是「请求发出去了、回包丢了」，
+ *    钱**可能已经打到商家账上** —— 自动重试等于确定性地重复打款。
+ */
+function isStuck(payout: {
+  status: string;
+  processingAt: string | null;
+}): boolean {
+  if (payout.status !== 'PROCESSING' || !payout.processingAt) {
+    return false;
+  }
+  const elapsed = Date.now() - new Date(payout.processingAt).getTime();
+  return elapsed > 10 * 60 * 1000;
 }

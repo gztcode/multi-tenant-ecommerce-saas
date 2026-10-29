@@ -91,8 +91,36 @@ export default async function PayoutDetailPage({
             后端 `reject()` 也填 `approvedAt`（拒绝同样是一次审批动作），
             按字段非空显示就会出现「已拒绝 · 已审批」这种自相矛盾的说法。 */}
         <p className="text-muted-foreground">{describePayoutTimeline(payout)}</p>
+        {/* ⚠️ **打款时刻要显示**：商家最关心的是「钱什么时候打过来的」，
+            只显示「申请时间」商家无从判断钱到没到账。
+            时间格式复用 `lib/billing.ts` 的 `formatDateTime`，不自己造。 */}
+        {payout.status === 'PAID' && payout.paidAt && (
+          <p className="text-muted-foreground">
+            打款时间 {formatDateTime(payout.paidAt)}
+          </p>
+        )}
+        {/* ⚠️ **失败时刻同样要显示**：便于商家与平台对账是哪一次尝试失败的。 */}
+        {payout.status === 'FAILED' && payout.failedAt && (
+          <p className="text-destructive">
+            失败时间 {formatDateTime(payout.failedAt)}
+          </p>
+        )}
         {payout.rejectedReason && (
           <p className="text-destructive">拒绝原因：{payout.rejectedReason}</p>
+        )}
+        {/* ⚠️ **补差单的佣金是 0，这段话不能省**（设计 §6.4）：
+            商家一定会问「这 5000 块为什么不抽佣」，不说清楚就会反复申诉。 */}
+        {payout.kind === 'SUPPLEMENT' && (
+          <p className="text-sm text-muted-foreground">
+            这是补差出款单：该期结算单已结清，本期补差按零佣金结算。
+          </p>
+        )}
+        {/* ⚠️ **失败的单可能真的已经打出去了**（渠道超时 / 网络中断）——
+            必须让商家自己去核对是否已到账，否则商家会直接再申请一笔。 */}
+        {payout.status === 'FAILED' && (
+          <p className="text-sm text-destructive">
+            出款失败：{payout.failureReason ?? '未知原因'}。请联系平台确认是否已到账。
+          </p>
         )}
       </div>
 
