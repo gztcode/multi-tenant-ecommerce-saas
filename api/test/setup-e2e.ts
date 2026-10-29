@@ -1,8 +1,9 @@
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import Redis from 'ioredis';
 
-export default function globalSetup(): void {
+export default async function globalSetup(): Promise<void> {
   // jest 不加载 .env，Prisma CLI 才加载。globalSetup 与测试进程都要自己读。
   const envPath = resolve(__dirname, '..', '.env');
   if (existsSync(envPath)) {
@@ -47,6 +48,20 @@ export default function globalSetup(): void {
   // 清完再 seed，测试面对的永远是「只有种子数据」的干净库。
   truncateAllTables(url);
 
+  // ⚠️ **还要清 Redis 队列**（数据库清了，队列没清）。
+  //
+  // 之前只清库，Redis 里的 job 会**跨轮次累积**（实测一轮 e2e 留下
+  // 上万个 key）。而 `payment-compensation.e2e-spec.ts` 的
+  // 「扫描 A：未处理完的事件被重新入队」断言的是
+  // `webhookQueue.getJobs(['waiting','delayed'])` 里**属于本轮**的那个 job
+  // —— 上一轮留下的旧 job 也在那个队列里，filter 匹配到的是旧的，
+  // 表现为**随机的假失败**（实测：连跑两轮，第一轮挂第二轮过）。
+  //
+  // ⚠️ **只删 `bull-e2e` 前缀**：开发库（本机跑着的 api 容器）用的是
+  // 默认前缀 `bull`，两套独立的 key 空间 —— 删错了会把开发环境
+  // 正在等着的任务清掉。
+  await clearE2eQueues();
+
   // 测试库也要有种子数据：平台超管是登录接口的一个正式用例
   // （scope=PLATFORM 且 tenantId 为 null），缺了它该路径在 e2e 里根本无法执行。
   // seed.ts 自身幂等（先查重再插入），重复执行不会产生重复数据。
@@ -54,6 +69,37 @@ export default function globalSetup(): void {
     env: { ...process.env, DATABASE_URL: url },
     stdio: 'inherit',
   });
+}
+
+/**
+ * 清掉 e2e 自己的 Redis 队列残留。
+ *
+ * ⚠️ **只清 `bull-e2e:` 前缀** —— 开发库（本机跑着的 api 容器）用默认
+ * 前缀 `bull`，两套独立的 key 空间，删错了会把开发环境正在等着的任务清掉。
+ */
+async function clearE2eQueues(): Promise<void> {
+  const url = process.env.REDIS_URL ?? 'redis://localhost:16380';
+  const redis = new Redis(url);
+  try {
+    // ⚠️ **用 SCAN 不用 KEYS**：KEYS 会阻塞整个 Redis，而这里可能连着
+    //    本机开发环境正在跑的实例。
+    let cursor = '0';
+    do {
+      const [next, keys] = await redis.scan(
+        cursor,
+        'MATCH',
+        'bull-e2e:*',
+        'COUNT',
+        1000,
+      );
+      cursor = next;
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+    } while (cursor !== '0');
+  } finally {
+    await redis.quit();
+  }
 }
 
 /**

@@ -54,6 +54,9 @@ export default async function DashboardLayout({
             <Link href="/settlements" className="underline-offset-4 hover:underline">
               结算单
             </Link>
+            <Link href="/payouts" className="underline-offset-4 hover:underline">
+              出款
+            </Link>
           </nav>
         </div>
         <div className="flex items-center gap-4 text-sm">

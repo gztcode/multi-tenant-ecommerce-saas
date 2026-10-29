@@ -223,3 +223,17 @@ export function formatCommissionRate(bps: number): string {
   // ⚠️ 去掉多余的尾零：12.50% → 12.5%，12.00% → 12%。
   return `${Number(percent.toFixed(2))}%`;
 }
+
+/**
+ * 时间戳 → 本地时间字符串。
+ *
+ * ⚠️ **解析失败时原样回显**：后端某天返回了一个意外的时间串，
+ * 这里是表格里的一个单元格，炸掉它等于整张表都渲染不出来。
+ * 原样回显至少能让商家一眼看出「这个值不对」。
+ */
+export function formatDateTime(value: string | null | undefined): string {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('zh-CN', { hour12: false });
+}

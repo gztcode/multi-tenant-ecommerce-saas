@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import {
   CommissionEntryType,
+  PayoutStatus,
   SettlementStatus,
   type CommissionEntry,
   type SettlementStatement,
@@ -681,7 +682,11 @@ export class SettlementService {
    *    没有回退路径就永远修不好。退回来重算一次即可修正（设计 D6）。
    *
    * ⚠️ **`PAID` 不能取消**：已出款的单据退回来，改动的钱已经打给商家了。
-   *    （本阶段不出款，这条是给将来出款阶段留的闸。）
+   *
+   * ⚠️ **已被出款单引用的也不能取消**（阶段 5h-1，护栏 P6）：
+   *    出款单的佣金金额是**审批那一刻锁定的快照**。结算单退回来重算，
+   *    佣金就变了 → 已批的出款单金额失真 → 平台打出去的钱与账对不上。
+   *    详见下方方法体内的闸。
    */
   async unconfirm(statementId: string): Promise<SettlementView> {
     return tenantContext.run(platformScope(), async () => {
@@ -694,6 +699,39 @@ export class SettlementService {
       if (statement.status !== SettlementStatus.CONFIRMED) {
         throw new ConflictException(
           `结算单当前是「${statement.status}」状态，不能取消确认`,
+        );
+      }
+
+      // ⚠️ **已被出款单引用的结算单不能取消确认**（阶段 5h-1，护栏 P6）：
+      //    出款单的佣金金额是**审批那一刻锁定的快照**。
+      //    结算单被取消确认后重算，佣金会变 → 已批的出款单金额失真
+      //    → 平台打出去的钱与账对不上。
+      //
+      //    ⚠️ **只查非终态的出款单**：REJECTED / CANCELLED 的单没有打钱，
+      //    它们不构成「钱已经出去了」的事实 → 不该拦住修正漏结的路径。
+      //
+      //    ⚠️ **查得到全局的出款单**：本方法跑在**平台作用域**下
+      //    （`tenantContext.run(platformScope(), ...)`）→ 平台作用域下扩展
+      //    **不附加** tenantId 条件 → 查到的就是全局事实。
+      //
+      //    ⚠️ **这里有 TOCTOU 窗口**：闸是「读—判断—写」三步，
+      //    不是事务。闸通过之后、状态更新之前若**新建**了一张引用这张
+      //    结算单的出款单，这道闸挡不住它。
+      //    ⚠️ **本阶段这个窗口不致命**：出款单要走到「引用这张结算单」
+      //    必须先 `apply`，而 `apply` 要求该期结算单**已 CONFIRMED** ——
+      //    也就是说，能在这个窗口里插进来的单，它锁定的佣金来自
+      //    **确认状态**的结算单，与这里重算后的草稿值可能不同。
+      //    彻底堵住要靠 `approve` 侧回查（见 `PayoutService.approve`）。
+      const referenced = await this.prisma.payout.findFirst({
+        where: {
+          statementId: statementId,
+          status: { notIn: [PayoutStatus.REJECTED, PayoutStatus.CANCELLED] },
+        },
+        select: { id: true },
+      });
+      if (referenced) {
+        throw new ConflictException(
+          '该结算单已被出款单引用，不能取消确认。若出款已执行，请走调账流程。',
         );
       }
 

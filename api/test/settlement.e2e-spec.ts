@@ -5,6 +5,7 @@ import cookieParser from 'cookie-parser';
 import {
   CommissionEntryType,
   OrderStatus,
+  PayoutStatus,
   SettlementStatus,
 } from '@prisma/client';
 import { AppModule } from '../src/app.module';
@@ -34,6 +35,13 @@ import { createMerchant, unique } from './merchant-fixture';
  *    选 2024 年的理由：那块窗口要推进到 2024 年得 30 多次
  *    `nextWindow()` 调用，离当前的 13 次足够远 —— 报表文件以后加用例
  *    也不会轻易把窗口推到 2024。
+ *
+ *    ⚠️ **例外：阶段 5h-1 的两条出款引用用例用 2025-06 / 2025-07**。
+ *    理由：2024 年 1–12 月已被本文件的其他用例占满，而这两条用例
+ *    必须与已有的「取消确认」用例**错开月份**（结算单的幂等键是
+ *    `(tenantId, periodStart)`，同一期反复造数据会互相污染）。
+ *    2025 年同样在报表窗口之外 —— 那块窗口要推进到 2025 年得
+ *    40 多次 `nextWindow()` 调用。
  *
  * ⚠️ **自己造流水行，不跑回填**：`CommissionService.backfill()` 会扫全表
  * `paidAt` 非空的订单补流水，跨文件影响不可控。直接造行也不受用例顺序影响。
@@ -389,7 +397,6 @@ describe('平台侧的结算单 (e2e)', () => {
     const adminToken = await loginPlatformAdmin();
     const merchant = await createMerchant(app, prisma);
     const period = month('2025-05');
-    const next = month('2025-06');
 
     const orderA = await seedOrder(merchant.tenantId);
     await seedEntry(merchant.tenantId, orderA, {
@@ -1180,6 +1187,121 @@ describe('平台侧的结算单 (e2e)', () => {
       .expect(201);
     expect((unconfirmed.body as StatementBody).status).toBe('DRAFT');
     expect((unconfirmed.body as StatementBody).confirmedAt).toBeNull();
+  });
+
+  it('⚠️ 已被出款单引用的结算单 → 不能取消确认（护栏 P6）', async () => {
+    const adminToken = await loginPlatformAdmin();
+    const merchant = await createMerchant(app, prisma);
+    const period = month('2025-06');
+
+    const orderId = await seedOrder(merchant.tenantId);
+    await seedEntry(merchant.tenantId, orderId, {
+      type: CommissionEntryType.COMMISSION,
+      amount: 100,
+      occurredAt: inside(period, 10),
+    });
+
+    const body = await generate(adminToken, '2025-06', merchant.tenantId);
+    const id = body.items[0].id;
+
+    // 先确认
+    await http(app)
+      .post(`/api/v1/platform/settlements/${id}/confirm`)
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(201);
+
+    // ⚠️ **手工造一张引用了这张结算单的出款单**：
+    // 本阶段出款单的创建要走商家申请，而 e2e 里出款端点是 Task 7 才有的。
+    // 这里直接插库 —— 测的是「结算单被引用后取消确认被拒」这条闸本身。
+    //
+    // ⚠️ **平台作用域下写租户模型必须显式带 `tenantId`**：
+    //    `Payout` 在 `TENANT_SCOPED_MODELS` 白名单里，平台作用域写入
+    //    若不显式指定 `tenantId` 会直接抛 `TenantScopeError`。
+    await asPlatform(() =>
+      prisma.payout.create({
+        data: {
+          tenantId: merchant.tenantId,
+          payoutNo: `PAY-TEST-${unique()}`,
+          periodStart: period.from,
+          periodEnd: period.to,
+          statementId: id,
+          receiptAmount: 100,
+          commissionAmount: 100,
+          netAmount: 0,
+          entryCount: 0,
+          status: PayoutStatus.APPROVED,
+          requestedAmount: 0,
+          requestedBy: 'test-user',
+          approvedBy: 'test-admin',
+        },
+      }),
+    );
+
+    // ⚠️ **取消确认 → 409**，且结算单仍是 CONFIRMED
+    const response = await http(app)
+      .post(`/api/v1/platform/settlements/${id}/unconfirm`)
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(409);
+    expect(errorText(response.body)).toContain('出款单');
+
+    const after = await fetchDetail(adminToken, id);
+    expect(after.status).toBe('CONFIRMED');
+    expect(after.confirmedAt).toBeTruthy();
+    // ⚠️ **金额不能被顺手改掉**：被拒的取消确认只该拒绝，不该有任何副作用
+    expect(after.netAmount).toBe(100);
+    expect(after.entryCount).toBe(1);
+  });
+
+  it('⚠️ 只被已拒绝 / 已撤回的出款单引用的结算单 → 仍能取消确认', async () => {
+    // ⚠️ **反面用例**（这道闸不能挡过头）：
+    //    `REJECTED` / `CANCELLED` 的出款单**没有打钱**，
+    //    它们不构成「钱已经出去了」的事实 → 不该拦住修正漏结的路径。
+    //    若闸写成「只要有出款单引用就拦」，这条会挂。
+    const adminToken = await loginPlatformAdmin();
+    const merchant = await createMerchant(app, prisma);
+    const period = month('2025-07');
+
+    const orderId = await seedOrder(merchant.tenantId);
+    await seedEntry(merchant.tenantId, orderId, {
+      type: CommissionEntryType.COMMISSION,
+      amount: 100,
+      occurredAt: inside(period, 10),
+    });
+
+    const body = await generate(adminToken, '2025-07', merchant.tenantId);
+    const id = body.items[0].id;
+
+    await http(app)
+      .post(`/api/v1/platform/settlements/${id}/confirm`)
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(201);
+
+    await asPlatform(() =>
+      prisma.payout.create({
+        data: {
+          tenantId: merchant.tenantId,
+          payoutNo: `PAY-TEST-${unique()}`,
+          periodStart: period.from,
+          periodEnd: period.to,
+          statementId: id,
+          receiptAmount: 100,
+          commissionAmount: 100,
+          netAmount: 0,
+          entryCount: 0,
+          status: PayoutStatus.REJECTED,
+          requestedAmount: 0,
+          requestedBy: 'test-user',
+          approvedBy: 'test-admin',
+          rejectedReason: '测试用：已拒绝的出款单不构成出款事实',
+        },
+      }),
+    );
+
+    const unconfirmed = await http(app)
+      .post(`/api/v1/platform/settlements/${id}/unconfirm`)
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(201);
+    expect((unconfirmed.body as StatementBody).status).toBe('DRAFT');
   });
 
   it('重算：新的流水进来后重算，金额跟着变', async () => {

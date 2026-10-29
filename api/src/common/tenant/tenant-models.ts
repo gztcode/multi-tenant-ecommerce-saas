@@ -97,10 +97,23 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   // 注意：它与「带 tenantId 却漏登记」是**两类不同的问题**。后者会被
   // `assertTenantScopedModelsRegistered()` 在启动时扫出来硬失败；
   // 前者没有 tenantId，扫都扫不到 —— 只能靠 service 层自觉校验。
+  //
   // ⚠️ Plan 刻意**不在**这里：它不带 tenantId 字段，
   // 是「平台的数据」而不是「租户的数据」——先例是阶段 3 的 PaymentWebhookEvent。
+  //
   // ⚠️ PaymentWebhookEvent 刻意**不在**这里：它是渠道事件的数据，不是租户的数据，
   // 租户从订单反查。
+  //
+  // 出款（阶段 5h-1）
+  // ⚠️ `MerchantReceipt` / `MerchantPayoutAccount` / `Payout` 都是租户作用域模型 ——
+  // 不登记的话 `assertTenantScopedModelsRegistered()` **让应用启动直接失败**
+  // （阶段 1 的硬失败设计：宁可起不来，也不要静默地跨租户读写）。
+  'MerchantReceipt',
+  'MerchantPayoutAccount',
+  'Payout',
+  // ⚠️ `PayoutEntry` **刻意不在这里**：它没有 `tenantId` 字段，是纯关联表
+  // （与 5g 的 `SettlementStatementEntry` 同款）。**它不受任何作用域约束** ——
+  // 出款单明细的查询必须先校验 `payoutId` 属于当前租户。
 ]);
 
 /**

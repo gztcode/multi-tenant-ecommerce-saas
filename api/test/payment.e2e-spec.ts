@@ -346,6 +346,30 @@ describe('支付与 webhook (e2e)', () => {
     );
   }
 
+  /**
+   * 读某订单的货款流水（阶段 5h-1）。
+   *
+   * ⚠️ `merchant_receipts` **在租户作用域白名单里** → 租户作用域下
+   * `findMany` 会自动带上 `tenantId` 条件 ✅（别的租户的行查不到）。
+   */
+  async function readMerchantReceipts(
+    tenantId: string,
+    orderId: string,
+  ): Promise<
+    Array<{
+      type: string;
+      amount: number;
+      occurredAt: Date;
+    }>
+  > {
+    return asTenant(tenantId, () =>
+      prisma.merchantReceipt.findMany({
+        where: { orderId },
+        orderBy: { type: 'asc' },
+      }),
+    );
+  }
+
   /** 平台超管登录（种子里已有这个账号） */
   async function loginPlatformAdmin(): Promise<string> {
     const email =
@@ -1186,6 +1210,83 @@ describe('支付与 webhook (e2e)', () => {
     expect(reversal).toBeDefined();
     // ⚠️ **冲回是负数**：与抽佣行反向，单列求和即净额
     expect(reversal!.amount).toBe(-100);
+    // ⚠️ **归期是退款时间**，不是支付时间
+    const refundedAt = (await readOrder(merchant.tenantId, order.orderNo))
+      .refundedAt;
+    expect(refundedAt).not.toBeNull();
+    expect(reversal!.occurredAt.getTime()).toBe(refundedAt!.getTime());
+  });
+
+  it('⚠️ 支付成功 → 记一笔货款流水；退款 → 记一笔负数的货款冲回流水', async () => {
+    // ⚠️ **这条验的是「商家该收的货款」，不是平台抽的佣金**：
+    //    两张流水在**同一个事务**里写入 → 不可能出现「有货款、无抽佣」
+    //    的时序差。金额基数也不同：货款记 `totalAmount`（实付），
+    //    抽佣记 `totalAmount × 费率`。
+    const merchant = await createMerchant(app, prisma);
+    const skuId = await publishSku(merchant.token, '货款的商品', 1000);
+    await stockIn(merchant.token, skuId, 10);
+    const customer = await registerCustomer(merchant.subdomain);
+    const addressId = await createAddress(customer.token);
+
+    const { order, payment } = await placeAndPay(
+      merchant.token,
+      customer.token,
+      addressId,
+      skuId,
+      2,
+    );
+    // ⚠️ **基数写死**：2 件 × 1000 分 = 2000 分
+    expect(order.totalAmount).toBe(2000);
+
+    // ---- 支付成功 → 一行货款 ----
+    await postFakeWebhook({
+      eventId: `evt-${unique()}`,
+      providerTxnId: payment.paymentId,
+      orderNo: order.orderNo,
+      amount: order.totalAmount,
+      success: true,
+    });
+    const becamePaid = await waitFor(async () => {
+      const rows = await readOrder(merchant.tenantId, order.orderNo);
+      return rows.status === 'PAID';
+    });
+    expect(becamePaid).toBe(true);
+
+    const hasReceipt = await waitFor(async () => {
+      const rows = await readMerchantReceipts(merchant.tenantId, order.id);
+      return rows.length > 0;
+    });
+    expect(hasReceipt).toBe(true);
+    const afterPay = await readMerchantReceipts(merchant.tenantId, order.id);
+    expect(afterPay).toHaveLength(1);
+    expect(afterPay[0].type).toBe('SALE');
+    // ⚠️ **金额是商家该收的实付**，不是抽佣（没有费率也会记全额货款）
+    expect(afterPay[0].amount).toBe(2000);
+
+    // ---- 退款 → 一行负数的货款冲回 ----
+    await http(app)
+      .post(`/api/v1/merchant/orders/${order.orderNo}/ship`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ trackingNo: 'SF123456' })
+      .expect(201);
+
+    await http(app)
+      .post(`/api/v1/merchant/orders/${order.orderNo}/refund`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ reason: '客户不想要了' })
+      .expect(201);
+
+    const hasReversal = await waitFor(async () => {
+      const rows = await readMerchantReceipts(merchant.tenantId, order.id);
+      return rows.length > 1;
+    });
+    expect(hasReversal).toBe(true);
+    const afterRefund = await readMerchantReceipts(merchant.tenantId, order.id);
+    expect(afterRefund).toHaveLength(2);
+    const reversal = afterRefund.find((r) => r.type === 'SALE_REVERSAL');
+    expect(reversal).toBeDefined();
+    // ⚠️ **冲回是负数**：与货款行反向，单列求和即净额
+    expect(reversal!.amount).toBe(-2000);
     // ⚠️ **归期是退款时间**，不是支付时间
     const refundedAt = (await readOrder(merchant.tenantId, order.orderNo))
       .refundedAt;

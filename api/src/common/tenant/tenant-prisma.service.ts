@@ -598,6 +598,30 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
     return this.client.settlementStatementEntry;
   }
 
+  // ------- 商家应收货款流水（阶段 5h-1）模型 delegate 代理 -------
+
+  get merchantReceipt() {
+    return this.client.merchantReceipt;
+  }
+
+  // ------- 商家收款账户（阶段 5h-1）模型 delegate 代理 -------
+
+  get merchantPayoutAccount() {
+    return this.client.merchantPayoutAccount;
+  }
+
+  // ------- 出款单（阶段 5h-1）模型 delegate 代理 -------
+
+  get payout() {
+    return this.client.payout;
+  }
+
+  // 不在租户白名单里，但业务代码要读写它（出款单明细，无 tenantId 字段）
+  // ⚠️ 因此**不受租户作用域约束**——查询前必须自行校验 payoutId 属于当前租户
+  get payoutEntry() {
+    return this.client.payoutEntry;
+  }
+
   // ------- PrismaClient 实例级方法代理 -------
   // $connect / $disconnect 由生命周期钩子分别调用，
   // 这里仍然透传出来让服务消费者可以手动关闭连接（例如测试用例）。

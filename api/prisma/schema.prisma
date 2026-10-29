@@ -484,6 +484,36 @@ enum CommissionEntryType {
   REVERSAL
 }
 
+/// 商家应收货款的流水类型（阶段 5h-1）。
+///
+/// ⚠️ **与 `CommissionEntryType` 完全同款**：SALE 为正（货款入账）、
+/// SALE_REVERSAL 为负（货款冲回 = 全额退款）。单列求和即净额。
+enum ReceiptType {
+  /// 货款入账（正数）：订单支付成功
+  SALE
+  /// 货款冲回（负数）：订单全额退款
+  SALE_REVERSAL
+}
+
+/// 出款单的状态机（阶段 5h-1）。
+///
+/// ⚠️ **PAID / FAILED 在 5h-1 不可达** —— 本阶段不打钱，
+/// 渠道那一半在 5h-2（5g 的 D5 同样的「预留比将来补省事」：加枚举值要改 schema + 迁移）。
+enum PayoutStatus {
+  /// 待审批：商家已申请，金额是**预估**
+  REQUESTED
+  /// 已审批：金额已锁定
+  APPROVED
+  /// 已拒绝：商家可重新申请同一周期
+  REJECTED
+  /// 已撤回：商家主动撤销（仅 REQUESTED 可撤）
+  CANCELLED
+  /// 已出款（5h-1 不可达，5h-2 用）
+  PAID
+  /// 出款失败（5h-1 不可达，5h-2 用）
+  FAILED
+}
+
 model Order {
   id         String      @id @default(uuid())
   tenantId   String
@@ -563,6 +593,8 @@ model Order {
   payments Payment[]
   // 阶段 5e：抽佣流水（一笔抽佣一行、一笔冲回一行）
   commissionEntries CommissionEntry[]
+  // 阶段 5h-1：货款流水（商家应收，一笔货款一行、一笔冲回一行）
+  receipts MerchantReceipt[]
 
   // ⚠️ 幂等键的部分唯一索引由迁移手写，不在 schema 里声明。
   @@index([tenantId, customerId, status])
@@ -1071,6 +1103,8 @@ model SettlementStatement {
   updatedAt   DateTime         @updatedAt
 
   entries SettlementStatementEntry[]
+  // 阶段 5h-1：引用本结算单的出款单（零额抽佣的商家该期没有结算单 → 可空）
+  payouts Payout[]
 
   // ⚠️ **同一商家同一周期只能有一张单**：重复生成走「先查后插」的幂等路径。
   @@unique([tenantId, periodStart])
@@ -1107,4 +1141,133 @@ model SettlementStatementEntry {
 
   @@index([statementId])
   @@map("settlement_statement_entries")
+}
+
+// ---------- 阶段 5h-1：出款（把货款结算给商家） ----------
+
+/// 商家应收货款流水（阶段 5h-1）。
+///
+/// ⚠️ **与 `CommissionEntry` 同款**，只是金额基数不同：
+/// 抽佣流水记的是 `order.commissionAmount`（平台抽的），
+/// 货款流水记的是 `order.totalAmount`（商家该收的实付）。
+///
+/// ⚠️ **索引比它少一条**：`CommissionEntry` 上还有一条 `@@index([occurredAt])`，
+/// 是为平台侧的**跨租户**抽佣台账设的（那条查询没有 `tenantId` 条件，
+/// 走不了复合索引的前导列）。5h-1 没有跨租户货款台账这个场景 → 不加那条。
+///
+/// ⚠️ **写入点与抽佣流水在同一个事务里**（`payment.service.ts`）→
+/// 不可能出现「有货款、无抽佣」的时序差。唯一的口径例外是
+/// **零额抽佣**（费率 0 的订单有货款、无抽佣流水）。
+model MerchantReceipt {
+  id       String @id @default(uuid())
+  tenantId String
+  orderId  String
+  /// 订单号快照（商家核对时要看）
+  orderNo String
+  type     ReceiptType
+  /// 带符号整数分：SALE 为正、SALE_REVERSAL 为负
+  amount Int
+  /// 归期：支付取 `paidAt`、退款取 `refundedAt`（与抽佣流水逐字一致）
+  occurredAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  /// 阶段 5h-1：被哪张出款单出过一次（一笔货款只能出款一次 → `PayoutEntry.entryId` 全局唯一）
+  payoutEntries PayoutEntry[]
+
+  @@unique([orderId, type])
+  @@index([tenantId, occurredAt])
+  @@map("merchant_receipts")
+}
+
+/// 商家收款账户（阶段 5h-1）。
+///
+/// ⚠️ **一商家一账户**（`tenantId` 唯一）。
+///
+/// ⚠️ **`accountNo` 是明文存的** —— 本项目没有通用字段加密设施
+/// （只在 auth 模块有 JWT 相关的）。**接真实支付渠道前必须改成加密存储**
+/// （与 5b 对 `payment_methods` 的同一处理：设计写明，实现留到那一阶段）。
+/// 界面只展示脱敏（尾号 4 位）。
+model MerchantPayoutAccount {
+  id       String @id @default(uuid())
+  tenantId String @unique
+  /// 开户人姓名
+  accountName String
+  /// 开户行
+  bankName String
+  /// 银行账号（⚠️ 明文存，见上）
+  accountNo String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("merchant_payout_accounts")
+}
+
+/// 出款单（阶段 5h-1）。
+///
+/// ⚠️ **金额三件套站在「商家应收」角度**：
+/// `commissionAmount` 是**正数**（平台抽了多少，与结算单的 `netAmount` 同号），
+/// `netAmount = receiptAmount − commissionAmount` 是应结给商家的钱。
+/// ⚠️ **别把结算单的 `reversalAmount`（负数）那套符号搬过来** —— 这一类
+/// 已坑过两次（5g 的结算单 vs 平台收入报表）。
+model Payout {
+  id       String @id @default(uuid())
+  tenantId String
+  /// 出款单号（对外凭证，服务端生成；生成规则与撞号重试照抄 5g 的 `generateStatementNo`）
+  payoutNo String @unique
+  /// 周期起点（含）。该月 1 日 00:00:00.000Z
+  periodStart DateTime
+  /// 周期终点（不含）。次月 1 日 00:00:00.000Z
+  periodEnd DateTime
+  /// 引用的结算单。⚠️ **可空**：零额抽佣的商家该期没有结算单
+  statementId String?
+  /// 货款净额（正数）：该期 `merchant_receipts` 的金额之和
+  receiptAmount Int
+  /// 佣金净额（**正数** = 平台抽了多少）：结算单的 `netAmount`
+  commissionAmount Int
+  /// 应结给商家的金额 = `receiptAmount − commissionAmount`
+  netAmount Int
+  /// 纳入的货款流水笔数
+  entryCount Int
+  status PayoutStatus @default(REQUESTED)
+  /// 申请时的**预估**金额（与 `netAmount` 可能不同 —— 审批时会重算）
+  requestedAmount Int
+  /// 申请人的用户 ID
+  requestedBy String
+  /// 审批人的用户 ID
+  approvedBy String?
+  /// 拒绝原因（拒绝时必填）
+  rejectedReason String?
+  requestedAt DateTime @default(now())
+  approvedAt DateTime?
+  cancelledAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  statement SettlementStatement? @relation(fields: [statementId], references: [id], onDelete: Restrict)
+  entries PayoutEntry[]
+
+  @@index([status])
+  @@map("payouts")
+}
+
+/// 出款单明细关联（阶段 5h-1）。
+///
+/// ⚠️ **刻意不带 `tenantId`** → 不登记进 `TENANT_SCOPED_MODELS`
+/// （与 5g 的 `settlement_statement_entries` 同款）：
+/// 租户作用域扩展对它不附加任何过滤 → **service 层必须自己校验归属**。
+model PayoutEntry {
+  id       String @id @default(uuid())
+  payoutId String
+  /// 指向 `merchant_receipts.id` —— 一笔货款只能被出款一次
+  entryId String @unique
+  createdAt DateTime @default(now())
+
+  payout Payout @relation(fields: [payoutId], references: [id], onDelete: Cascade)
+  entry  MerchantReceipt @relation(fields: [entryId], references: [id], onDelete: Restrict)
+
+  @@index([payoutId])
+  @@map("payout_entries")
 }

@@ -113,6 +113,20 @@ function fakePrisma(options: {
    *    `groupBy` 返回这家，`findMany` 查不到它的流水。
    */
   groupByTenants?: string[];
+  /**
+   * 引用了这张结算单的出款单（阶段 5h-1，护栏 P6）。
+   *
+   * ⚠️ **非空 → 取消确认被拒**：出款单的佣金金额是审批那一刻的快照，
+   *    结算单被取消确认后重算 → 佣金变了 → 已批的出款单金额失真。
+   *
+   * ⚠️ **`statementId` 与 `status` 都要给**：假 Prisma 的 `payout.findFirst`
+   *    按 `where` 过滤（否则闸的查询条件就完全没被测试保护）。
+   */
+  referencedPayout?: {
+    id: string;
+    statementId: string;
+    status: string;
+  } | null;
 }) {
   const calls: string[] = [];
   let statementLookup = 0;
@@ -170,6 +184,37 @@ function fakePrisma(options: {
         }
         return Promise.resolve({ count: 1 });
       }),
+    },
+    // ⚠️ **出款单（阶段 5h-1）**：`unconfirm` 要先问一句
+    //    「这张结算单有没有被出款单引用」—— 没有它，闸根本走不到。
+    //
+    //    ⚠️ **这个桩要按 `where` 过滤**：闸的全部语义就是那两条条件
+    //    （`statementId` 匹配 + 状态不在终态里）。若桩无视 `where`，
+    //    把生产代码里的 `statementId` 或 `status` 删掉，单测照样绿 ——
+    //    闸的核心逻辑就完全没被测试保护。
+    payout: {
+      findFirst: jest.fn(
+        (args?: {
+          where?: { statementId?: string; status?: { notIn?: string[] } };
+        }) => {
+          const referenced = options.referencedPayout ?? null;
+          if (!referenced) {
+            return Promise.resolve(null);
+          }
+          const where = args?.where;
+          if (
+            where?.statementId !== undefined &&
+            where.statementId !== referenced.statementId
+          ) {
+            return Promise.resolve(null);
+          }
+          const notIn = where?.status?.notIn;
+          if (notIn && notIn.includes(referenced.status)) {
+            return Promise.resolve(null);
+          }
+          return Promise.resolve(referenced);
+        },
+      ),
     },
     tenant: {
       findFirst: jest.fn(() =>
@@ -338,6 +383,80 @@ describe('取消确认：必须检查 updateMany 的 affected.count', () => {
         statement({ status: SettlementStatus.DRAFT }),
       ],
       affectedCount: 1,
+    });
+
+    const service = makeService(prisma);
+    const view = await service.unconfirm('stmt-a');
+
+    expect(view.status).toBe(SettlementStatus.DRAFT);
+  });
+});
+
+describe('取消确认：已被出款单引用的结算单不能取消确认（护栏 P6）', () => {
+  it('有出款单引用 → 409，且不进入更新', async () => {
+    // ⚠️ **出款单的佣金金额是审批那一刻的快照**：
+    //    结算单被取消确认后重算 → 佣金变了 → 已批的出款单金额失真
+    //    → 平台打出去的钱与账对不上。
+    const prisma = fakePrisma({
+      statements: [statement({ status: SettlementStatus.CONFIRMED })],
+      referencedPayout: {
+        id: 'payout-a',
+        statementId: 'stmt-a',
+        status: 'APPROVED',
+      },
+    });
+
+    const service = makeService(prisma);
+
+    await expect(service.unconfirm('stmt-a')).rejects.toThrow('出款单');
+    await expect(service.unconfirm('stmt-a')).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+    // ⚠️ **状态不能变**：闸要拦在更新之前
+    expect(prisma.settlementStatement.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('⚠️ 闸的查询条件必须带 statementId 与状态过滤', async () => {
+    // ⚠️ **闸的全部语义就是那两条条件**：
+    //    「是不是这张结算单」+「这张单有没有打钱」。
+    //    少一条 → 别的结算单的出款单会拦住本单，或已拒绝的单也拦住。
+    const prisma = fakePrisma({
+      statements: [statement({ status: SettlementStatus.CONFIRMED })],
+      referencedPayout: {
+        id: 'payout-a',
+        statementId: 'stmt-a',
+        status: 'APPROVED',
+      },
+    });
+
+    const service = makeService(prisma);
+    await expect(service.unconfirm('stmt-a')).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+
+    const [call] = prisma.payout.findFirst.mock.calls;
+    expect(call).toBeDefined();
+    expect(call?.[0]?.where).toEqual({
+      statementId: 'stmt-a',
+      status: { notIn: ['REJECTED', 'CANCELLED'] },
+    });
+  });
+
+  it('⚠️ 已拒绝 / 已撤回的出款单不拦（闸不能挡过头）', async () => {
+    // ⚠️ **那两种状态没有打钱**，不构成「钱已经出去了」的事实
+    //    → 不该拦住修正漏结的路径。
+    const prisma = fakePrisma({
+      // ⚠️ **两次读**：第一次读「当前状态」（据此决定能不能取消确认），
+      //    第二次读「改完之后的状态」（据此返回视图）。
+      statements: [
+        statement({ status: SettlementStatus.CONFIRMED }),
+        statement({ status: SettlementStatus.DRAFT }),
+      ],
+      referencedPayout: {
+        id: 'payout-a',
+        statementId: 'stmt-a',
+        status: 'REJECTED',
+      },
     });
 
     const service = makeService(prisma);
