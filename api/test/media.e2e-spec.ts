@@ -598,15 +598,21 @@ describe('媒体上传 (e2e)', () => {
     const merchant = await createMerchant(app, prisma);
 
     // 按上限（5MB）申报，实际会传得更多
-    const signed = await http(app)
-      .post('/api/v1/media/upload-url')
-      .set('authorization', `Bearer ${merchant.token}`)
-      .send({ filename: 'huge.jpg', mime: 'image/jpeg', size: 1024 })
-      .expect(201);
+    //
+    // ⚠️ **用 `uploadBody()` 收敛类型**：supertest 的 `response.body` 是 `any`，
+    // 直接访问 `.uploadUrl` / `.media.id` 会触发
+    // `@typescript-eslint/no-unsafe-member-access`（值来自 `any`）。
+    const signed = uploadBody(
+      await http(app)
+        .post('/api/v1/media/upload-url')
+        .set('authorization', `Bearer ${merchant.token}`)
+        .send({ filename: 'huge.jpg', mime: 'image/jpeg', size: 1024 })
+        .expect(201),
+    );
 
     // 直传一个超过 MEDIA_MAX_SIZE 的对象
     const tooBig = Buffer.alloc(6 * 1024 * 1024, 7);
-    const put = await fetch(signed.body.uploadUrl as string, {
+    const put = await fetch(signed.uploadUrl, {
       method: 'PUT',
       headers: { 'content-type': 'image/jpeg' },
       body: tooBig,
@@ -615,7 +621,7 @@ describe('媒体上传 (e2e)', () => {
 
     // 确认时必须被拦下——不能因为「签发时申报的是 1KB」就放行
     const response = await http(app)
-      .post(`/api/v1/media/${signed.body.media.id}/confirm`)
+      .post(`/api/v1/media/${signed.media.id}/confirm`)
       .set('authorization', `Bearer ${merchant.token}`);
 
     expect(response.status).toBe(400);

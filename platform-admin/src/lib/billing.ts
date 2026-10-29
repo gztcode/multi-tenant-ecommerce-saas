@@ -427,3 +427,106 @@ function parseUtcDay(
 
   return { iso: check.toISOString(), time };
 }
+
+// ============================================================
+// 结算单（阶段 5g）
+// ============================================================
+
+/**
+ * 结算单的状态。
+ *
+ * ⚠️ **必须与后端 Prisma 的 `SettlementStatus` 逐字一致**：
+ * 写成 `CONFIRMED` 之外的拼法，界面上就是裸枚举。
+ */
+export type SettlementStatus = 'DRAFT' | 'CONFIRMED' | 'PAID';
+
+/** 结算单的一行 */
+export interface SettlementStatement {
+  id: string;
+  tenantId: string;
+  tenantName: string;
+  subdomain: string;
+  statementNo: string;
+  /** 周期起点（含）。ISO 8601 */
+  periodStart: string;
+  /** 周期终点（不含）。ISO 8601 */
+  periodEnd: string;
+  /** 周期标识（`YYYY-MM`） */
+  periodLabel: string;
+  /** 抽佣毛额（整数分） */
+  grossAmount: number;
+  /** 退款冲回（整数分，负数） */
+  reversalAmount: number;
+  /** 净额（整数分，**可以是负数**） */
+  netAmount: number;
+  /** 纳入的流水笔数 */
+  entryCount: number;
+  status: SettlementStatus;
+  /** 确认时间。ISO 8601。null = 未确认 */
+  confirmedAt: string | null;
+  /** ISO 8601 */
+  createdAt: string;
+}
+
+/** 结算单详情（含明细行） */
+export interface SettlementDetail extends SettlementStatement {
+  entries: Array<{
+    entryId: string;
+    orderNo: string;
+    type: 'COMMISSION' | 'REVERSAL';
+    amount: number;
+    rateBps: number;
+    baseAmount: number;
+    occurredAt: string;
+  }>;
+}
+
+/** 列表接口的信封 */
+export interface SettlementListResult {
+  items: SettlementStatement[];
+  total: number;
+}
+
+/** 生成接口的返回 */
+export interface SettlementGenerateResult {
+  items: SettlementStatement[];
+  created: number;
+  skipped: number;
+  /**
+   * 批量生成时**没能出单**的商家（其余商家已出单成功）。
+   *
+   * ⚠️ **后端在批量模式下不中断整批**：有冲突的商家没出单，
+   * 其他商家的单据照样建好了 —— 所以这**不是失败**，必须单独提示。
+   *
+   * ⚠️ **可选**：后端某些路径不返回它（且测试里的 mock 数据也没有）。
+   */
+  conflicts?: Array<{ tenantId: string; message: string }>;
+  /**
+   * 被**复用**但与当期流水对不上的商家（笔数不一致 → 可能缺笔）。
+   *
+   * ⚠️ **后端只标记不改单据**（已 CONFIRMED 的单是冻结的），
+   * 唯一的修正路径是用户手动「取消确认 → 重算」。
+   *
+   * ⚠️ **可选**：同上。
+   */
+  stale?: string[];
+}
+
+/** 结算单状态的中文文案 */
+const SETTLEMENT_STATUS_LABEL: Record<SettlementStatus, string> = {
+  DRAFT: '草稿',
+  CONFIRMED: '已确认',
+  PAID: '已出款',
+};
+
+/**
+ * 结算单状态 → 中文文案。
+ *
+ * ⚠️ **未知状态回落到「未知状态」**：后端加了新状态而前端还没跟上时，
+ * 显示笼统的兜底文案好过把裸枚举糊到界面上。
+ */
+export function describeSettlementStatus(
+  status: SettlementStatus | string,
+): string {
+  return SETTLEMENT_STATUS_LABEL[status as SettlementStatus] ?? '未知状态';
+}

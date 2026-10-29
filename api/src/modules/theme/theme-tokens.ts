@@ -153,11 +153,36 @@ export const FONT_TOKENS: ScalarTokenDefinition[] = [
 ];
 
 export const TEXT_SCALE_TOKENS: ScalarTokenDefinition[] = [
-  { key: 'xs', label: '最小', cssVar: '--brand-text-xs', defaultValue: '0.75rem' },
-  { key: 'sm', label: '小', cssVar: '--brand-text-sm', defaultValue: '0.875rem' },
-  { key: 'base', label: '正文', cssVar: '--brand-text-base', defaultValue: '1rem' },
-  { key: 'lg', label: '大', cssVar: '--brand-text-lg', defaultValue: '1.125rem' },
-  { key: 'xl', label: '特大', cssVar: '--brand-text-xl', defaultValue: '1.25rem' },
+  {
+    key: 'xs',
+    label: '最小',
+    cssVar: '--brand-text-xs',
+    defaultValue: '0.75rem',
+  },
+  {
+    key: 'sm',
+    label: '小',
+    cssVar: '--brand-text-sm',
+    defaultValue: '0.875rem',
+  },
+  {
+    key: 'base',
+    label: '正文',
+    cssVar: '--brand-text-base',
+    defaultValue: '1rem',
+  },
+  {
+    key: 'lg',
+    label: '大',
+    cssVar: '--brand-text-lg',
+    defaultValue: '1.125rem',
+  },
+  {
+    key: 'xl',
+    label: '特大',
+    cssVar: '--brand-text-xl',
+    defaultValue: '1.25rem',
+  },
 ];
 
 export const WEIGHT_TOKENS: ScalarTokenDefinition[] = [
