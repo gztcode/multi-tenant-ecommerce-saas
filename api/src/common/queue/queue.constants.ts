@@ -12,3 +12,6 @@ export const AUTH_QUEUE = 'auth';
 
 /** 支付补偿扫描队列（未处理完的 webhook 事件 + 丢失的超时释放） */
 export const COMPENSATION_QUEUE = 'compensation';
+
+/** 出款执行队列（审批后打款 + 卡死扫描） */
+export const PAYOUT_QUEUE = 'payout';

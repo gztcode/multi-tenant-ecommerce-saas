@@ -24,6 +24,7 @@ export type PayoutStatus =
   | 'APPROVED'
   | 'REJECTED'
   | 'CANCELLED'
+  | 'PROCESSING'
   | 'PAID'
   | 'FAILED';
 
@@ -33,9 +34,34 @@ export const PAYOUT_STATUS_LABEL: Record<PayoutStatus, string> = {
   APPROVED: '已审批',
   REJECTED: '已拒绝',
   CANCELLED: '已撤回',
+  // ⚠️ **阶段 5h-2 新增** —— 钱正在打出去
+  PROCESSING: '打款中',
   PAID: '已出款',
   FAILED: '出款失败',
 };
+
+/**
+ * 出款单的类型（阶段 5h-2）。
+ *
+ * ⚠️ **与后端 Prisma 的 `PayoutKind` 逐字一致**。
+ */
+export type PayoutKind = 'NORMAL' | 'SUPPLEMENT';
+
+/** 出款单类型的中文文案 */
+export const PAYOUT_KIND_LABEL: Record<PayoutKind, string> = {
+  NORMAL: '正常出款',
+  SUPPLEMENT: '补差出款',
+};
+
+/**
+ * 出款单类型 → 中文文案。
+ *
+ * ⚠️ **未知类型回落到「正常出款」**：补差是**增量**，回落到「正常」
+ *    不会让商家误以为钱要少发；回落到「未知类型」反而让人困惑。
+ */
+export function describePayoutKind(kind: PayoutKind | string): string {
+  return PAYOUT_KIND_LABEL[kind as PayoutKind] ?? PAYOUT_KIND_LABEL.NORMAL;
+}
 
 /**
  * 出款单状态 → 中文文案。
@@ -155,6 +181,20 @@ export interface PayoutItem {
   cancelledAt: string | null;
   /** 拒绝原因。null = 未拒绝 */
   rejectedReason: string | null;
+  /** 出款类型：正常 / 补差 */
+  kind: PayoutKind;
+  /** 已尝试次数（含首次）。3 = 试满仍失败 */
+  attemptCount: number;
+  /** 最近一次失败的原因。null = 没有失败过 */
+  failureReason: string | null;
+  /** 打款渠道名。null = 还没开始打 */
+  payoutChannel: string | null;
+  /** ISO 8601。null = 未开始执行 */
+  processingAt: string | null;
+  /** ISO 8601。null = 未打款成功 */
+  paidAt: string | null;
+  /** ISO 8601。null = 未失败 */
+  failedAt: string | null;
 }
 
 /** 出款单详情（含明细） */

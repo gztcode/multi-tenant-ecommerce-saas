@@ -6,6 +6,7 @@ import {
   COMPENSATION_QUEUE,
   PAYMENT_TIMEOUT_QUEUE,
   PAYMENT_WEBHOOK_QUEUE,
+  PAYOUT_QUEUE,
 } from '../../common/queue/queue.constants';
 import { QueueService } from './queue.service';
 
@@ -59,6 +60,7 @@ import { QueueService } from './queue.service';
       { name: BILLING_QUEUE },
       { name: AUTH_QUEUE },
       { name: COMPENSATION_QUEUE },
+      { name: PAYOUT_QUEUE },
     ),
   ],
   providers: [QueueService],

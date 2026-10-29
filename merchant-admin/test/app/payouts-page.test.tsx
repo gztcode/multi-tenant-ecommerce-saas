@@ -58,6 +58,13 @@ const ITEM: PayoutItem = {
   approvedAt: null,
   cancelledAt: null,
   rejectedReason: null,
+  kind: 'NORMAL',
+  attemptCount: 0,
+  failureReason: null,
+  payoutChannel: null,
+  processingAt: null,
+  paidAt: null,
+  failedAt: null,
 };
 
 const LIST = {
@@ -249,5 +256,61 @@ describe('出款单列表页：超过一页时的提示', () => {
     expect(hasText(texts, '共 1 张出款单')).toBe(true);
     expect(hasText(texts, '本页显示')).toBe(false);
     expect(hasText(texts, '更多出款单请联系平台')).toBe(false);
+  });
+});
+
+describe('出款单列表页：类型标记与失败提示（阶段 5h-2）', () => {
+  it('⚠️ 补差单显示「补差出款」标记', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      items: [{ ...ITEM, kind: 'SUPPLEMENT' as const }],
+    });
+
+    const texts = await renderPage();
+
+    // ⚠️ **文案要与平台端统一**（「补差出款」而不是「补差」）：
+    //    同一件事两种说法，商家与超管对不上账。
+    expect(hasText(texts, '补差出款')).toBe(true);
+    expect(hasText(texts, 'SUPPLEMENT')).toBe(false);
+  });
+
+  it('正常单显示「正常出款」标记', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '正常出款')).toBe(true);
+  });
+
+  it('⚠️ 未知类型回落成「正常出款」（不误标成别的类型）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      // ⚠️ **后端将来加新枚举时不能误标**：内联三元会把任何非补差的值
+      //    显示成「正常」，这里锁定「有兜底文案、且不是裸枚举」。
+      items: [{ ...ITEM, kind: 'SOMETHING_NEW' as never }],
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '正常出款')).toBe(true);
+    expect(hasText(texts, 'SOMETHING_NEW')).toBe(false);
+  });
+
+  it('⚠️ 出款失败时提示商家去核对是否已到账', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      items: [{ ...ITEM, status: 'FAILED' as const }],
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '出款失败')).toBe(true);
+    // ⚠️ **这句提示不能省**：失败的单可能真的已经打出去了，
+    //    商家不去核对就会直接再申请一笔。
+    expect(hasText(texts, '请联系平台确认是否已到账')).toBe(true);
+  });
+
+  it('⚠️ 不是失败状态时不显示那句核对提示', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '请联系平台确认是否已到账')).toBe(false);
   });
 });

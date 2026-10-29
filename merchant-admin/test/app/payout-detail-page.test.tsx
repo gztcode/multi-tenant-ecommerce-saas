@@ -56,6 +56,13 @@ const DETAIL: PayoutDetail = {
   approvedAt: null,
   cancelledAt: null,
   rejectedReason: null,
+  kind: 'NORMAL',
+  attemptCount: 0,
+  failureReason: null,
+  payoutChannel: null,
+  processingAt: null,
+  paidAt: null,
+  failedAt: null,
   entries: [
     {
       entryId: 'entry-1',
@@ -277,5 +284,114 @@ describe('出款单详情页：返回列表的入口', () => {
     const hrefs = await renderHrefs();
 
     expect(hrefs).toContain('/settlements');
+  });
+});
+
+describe('出款单详情页：补差单与失败提示（阶段 5h-2）', () => {
+  it('⚠️ 补差单显示「零佣金结算」说明', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      kind: 'SUPPLEMENT' as const,
+    });
+
+    const texts = await renderPage();
+
+    // ⚠️ **这段说明不能省**（设计 §6.4）：商家一定会问
+    //    「这 5000 块为什么不抽佣」，不说清楚就会反复申诉。
+    expect(hasText(texts, '补差按零佣金结算')).toBe(true);
+    expect(hasText(texts, '该期结算单已结清')).toBe(true);
+  });
+
+  it('正常单不显示补差说明', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '补差按零佣金结算')).toBe(false);
+  });
+
+  it('⚠️ 出款失败时显示失败原因并提示核对是否已到账', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'FAILED' as const,
+      failureReason: '渠道超时',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '出款失败：渠道超时')).toBe(true);
+    expect(hasText(texts, '请联系平台确认是否已到账')).toBe(true);
+  });
+
+  it('⚠️ 失败但没有原因时显示「未知原因」', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'FAILED' as const,
+      failureReason: null,
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '出款失败：未知原因')).toBe(true);
+  });
+
+  it('⚠️ 不是失败状态时不显示失败提示', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '请联系平台确认是否已到账')).toBe(false);
+  });
+});
+
+describe('出款单详情页：打款时刻与失败时刻（阶段 5h-2）', () => {
+  it('⚠️ 出款成功时显示打款时间（商家最关心「钱什么时候打过来的」）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'PAID' as const,
+      paidAt: '2026-02-10T08:30:00.000Z',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '打款时间')).toBe(true);
+    // ⚠️ **时间格式走 `lib/billing.ts` 的 `formatDateTime`**：
+    //    这里断言的是格式化后的结果（本地时区），
+    //    页面里自造一份格式化就会漂。
+    const { formatDateTime } = await vi.importActual<
+      typeof import('@/lib/billing')
+    >('@/lib/billing');
+    expect(hasText(texts, formatDateTime('2026-02-10T08:30:00.000Z'))).toBe(true);
+  });
+
+  it('⚠️ 不是已出款状态时不显示打款时间', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'APPROVED' as const,
+      paidAt: '2026-02-10T08:30:00.000Z',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '打款时间')).toBe(false);
+  });
+
+  it('⚠️ 出款失败时显示失败时间', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'FAILED' as const,
+      failureReason: '渠道超时',
+      failedAt: '2026-02-11T09:00:00.000Z',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '失败时间')).toBe(true);
+    const { formatDateTime } = await vi.importActual<
+      typeof import('@/lib/billing')
+    >('@/lib/billing');
+    expect(hasText(texts, formatDateTime('2026-02-11T09:00:00.000Z'))).toBe(true);
+  });
+
+  it('⚠️ 不是失败状态时不显示失败时间', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '失败时间')).toBe(false);
   });
 });

@@ -34,7 +34,12 @@ vi.mock('@/lib/api-client', async () => {
 import PayoutsPage from '@/app/(dashboard)/payouts/page';
 import type { PayoutListResult } from '@/lib/payout';
 
-import { collectHrefs, collectText, hasText } from '../helpers/page-tree';
+import {
+  collectClassNames,
+  collectHrefs,
+  collectText,
+  hasText,
+} from '../helpers/page-tree';
 
 /**
  * ⚠️ **故意对不上**：
@@ -58,6 +63,13 @@ const LIST: PayoutListResult = {
       approvedAt: null,
       cancelledAt: null,
       rejectedReason: null,
+      kind: 'NORMAL',
+      attemptCount: 0,
+      failureReason: null,
+      payoutChannel: null,
+      processingAt: null,
+      paidAt: null,
+      failedAt: null,
       tenantId: 'tenant-1',
       tenantName: '示例店铺',
       subdomain: 'demo',
@@ -240,6 +252,106 @@ describe('出款单列表页：空数据', () => {
 
     expect(hasText(texts, '共 1 张')).toBe(true);
     expect(hasText(texts, '本页显示')).toBe(false);
+  });
+});
+
+describe('出款单列表页：类型与执行状态（阶段 5h-2）', () => {
+  it('⚠️ 列表显示「补差出款」标记（补差是增量，不能混在正常出款里）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      items: [{ ...LIST.items[0], kind: 'SUPPLEMENT' as const }],
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '补差出款')).toBe(true);
+    // ⚠️ **类型不能是裸枚举**：页面上直接显示 `SUPPLEMENT` 就是把后端内部标识漏出去。
+    expect(hasText(texts, 'SUPPLEMENT')).toBe(false);
+  });
+
+  it('⚠️ 正常出款显示「正常出款」', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '正常出款')).toBe(true);
+  });
+
+  it('表头里有「类型」这一列', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '类型')).toBe(true);
+  });
+
+  it('⚠️ 出款失败时显示失败原因与尝试次数', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      items: [
+        {
+          ...LIST.items[0],
+          status: 'FAILED' as const,
+          failureReason: '收款账户校验不通过',
+          attemptCount: 3,
+        },
+      ],
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '出款失败')).toBe(true);
+    expect(hasText(texts, '收款账户校验不通过')).toBe(true);
+    expect(hasText(texts, '已尝试 3 次')).toBe(true);
+  });
+
+  it('⚠️ 不是失败状态时不显示失败原因', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '失败原因')).toBe(false);
+    expect(hasText(texts, '已尝试')).toBe(false);
+  });
+
+  it('⚠️ 「打款中」超过 10 分钟的单标红（卡住了，要人工去查）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      items: [
+        {
+          ...LIST.items[0],
+          status: 'PROCESSING' as const,
+          // ⚠️ **20 分钟前**开始的打款 —— 早过了 10 分钟的阈值。
+          processingAt: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+        },
+      ],
+    });
+
+    const element = await PayoutsPage({
+      searchParams: Promise.resolve({}),
+    });
+
+    // ⚠️ **标红是唯一的前端动作**：后端绝不自动重试卡住的单
+    //    （钱可能已经打出去，重试等于确定性地重复打款）。
+    expect(collectClassNames(element).some((name) => name.includes('text-destructive'))).toBe(
+      true,
+    );
+  });
+
+  it('⚠️ 「打款中」不到 10 分钟不标红', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      items: [
+        {
+          ...LIST.items[0],
+          status: 'PROCESSING' as const,
+          // ⚠️ **2 分钟前** —— 还在正常范围内。
+          processingAt: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+        },
+      ],
+    });
+
+    const element = await PayoutsPage({
+      searchParams: Promise.resolve({}),
+    });
+
+    expect(
+      collectClassNames(element).some((name) => name.includes('text-destructive')),
+    ).toBe(false);
   });
 });
 

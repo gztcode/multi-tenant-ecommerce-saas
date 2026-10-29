@@ -3,7 +3,12 @@ import {
   ConflictException,
   NotFoundException,
 } from '@nestjs/common';
-import { PayoutStatus, ReceiptType, SettlementStatus } from '@prisma/client';
+import {
+  PayoutKind,
+  PayoutStatus,
+  ReceiptType,
+  SettlementStatus,
+} from '@prisma/client';
 import { validate } from 'class-validator';
 
 import { tenantContext } from '../../common/tenant/tenant-context';
@@ -82,6 +87,7 @@ function payout(overrides: {
   id?: string;
   tenantId?: string;
   status?: PayoutStatus;
+  kind?: PayoutKind;
   receiptAmount?: number;
   commissionAmount?: number;
   netAmount?: number;
@@ -89,6 +95,12 @@ function payout(overrides: {
   entryCount?: number;
   periodStart?: Date;
   statementId?: string | null;
+  payoutChannel?: string | null;
+  attemptCount?: number;
+  failureReason?: string | null;
+  snapshotAccountName?: string | null;
+  snapshotBankName?: string | null;
+  snapshotAccountNo?: string | null;
 }) {
   const receiptAmount = overrides.receiptAmount ?? 10000;
   const commissionAmount = overrides.commissionAmount ?? 2000;
@@ -106,6 +118,8 @@ function payout(overrides: {
     netAmount,
     entryCount: overrides.entryCount ?? 1,
     status: overrides.status ?? PayoutStatus.REQUESTED,
+    // ⚠️ **出款类型**：正常单走 `computeAmounts`，补差单走独立口径
+    kind: overrides.kind ?? PayoutKind.NORMAL,
     requestedAmount: overrides.requestedAmount ?? netAmount,
     requestedBy: 'user-a',
     approvedBy: null,
@@ -113,6 +127,17 @@ function payout(overrides: {
     requestedAt: new Date('2025-08-01T00:00:00.000Z'),
     approvedAt: null,
     cancelledAt: null,
+    // ⚠️ **执行字段**（阶段 5h-2）
+    payoutChannel: overrides.payoutChannel ?? null,
+    payoutTxnId: null,
+    attemptCount: overrides.attemptCount ?? 0,
+    failureReason: overrides.failureReason ?? null,
+    processingAt: null,
+    paidAt: null,
+    failedAt: null,
+    snapshotAccountName: overrides.snapshotAccountName ?? null,
+    snapshotBankName: overrides.snapshotBankName ?? null,
+    snapshotAccountNo: overrides.snapshotAccountNo ?? null,
     createdAt: new Date('2025-08-01T00:00:00.000Z'),
     updatedAt: new Date('2025-08-01T00:00:00.000Z'),
   };
@@ -173,6 +198,14 @@ function fakePrisma(options: {
   statement?: ReturnType<typeof statement> | null;
   /** 已有的出款单（幂等检查） */
   payout?: ReturnType<typeof payout> | null;
+  /**
+   * **依次返回的出款单**（幂等检查要按 kind 查多次 → 需要不同的返回）。
+   *
+   * ⚠️ **顺序 = 服务层的查询顺序**：
+   *    ① NORMAL 活跃单 → ② SUPPLEMENT 活跃单 → ③ `PAID` 的 NORMAL 单。
+   *    配完之后 `options.payout` 不再生效。
+   */
+  payoutSequence?: Array<ReturnType<typeof payout> | null>;
   /** 出款单列表 */
   payouts?: ReturnType<typeof payout>[];
   /** 列表总数 */
@@ -183,6 +216,17 @@ function fakePrisma(options: {
   updateManyCount?: number;
   /** `payoutEntry.findMany` 的返回值 */
   linkedRows?: Array<{ entryId: string }>;
+  /**
+   * **本单自己占用的** `payout_entries`（补差单重算用）。
+   *
+   * ⚠️ **与 `linkedRows` 分开配**：补差单的「本单口径」要分两次查
+   *    （本单已占 / 其他单已占），两次的 `where` 形状不同 → 假 Prisma
+   *    必须能按 `where` 区分，否则两个集合会混成同一个。
+   *    未配置时**回落到 `linkedRows`**（保持 5h-1 的老行为）。
+   */
+  ownLinkedRows?: Array<{ entryId: string }>;
+  /** **其他单占用的** `payout_entries`（补差单重算用） */
+  otherLinkedRows?: Array<{ entryId: string }>;
   /** 收款账户（null = 没填） */
   account?: ReturnType<typeof payoutAccount> | null;
   /** 事务里的 `create` 要不要抛 P2002 */
@@ -240,9 +284,18 @@ function fakePrisma(options: {
       ),
     },
     payout: {
-      findFirst: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
-        Promise.resolve(options.payout ?? null),
-      ),
+      /**
+       * ⚠️ **按调用顺序返回**（阶段 5h-2）：`apply` 现在要按 `kind` 查三次
+       *    （NORMAL 活跃 → SUPPLEMENT 活跃 → `PAID` 的 NORMAL），
+       *    配一个固定返回值根本区分不了这三种情况。
+       */
+      findFirst: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() => {
+        const seq = options.payoutSequence;
+        if (seq && seq.length > 0) {
+          return Promise.resolve(seq.shift() ?? null);
+        }
+        return Promise.resolve(options.payout ?? null);
+      }),
       findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
         Promise.resolve(options.payouts ?? []),
       ),
@@ -257,9 +310,26 @@ function fakePrisma(options: {
       createMany: jest.fn<Promise<{ count: number }>, [args?: QueryArgs]>(() =>
         Promise.resolve({ count: 1 }),
       ),
-      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
-        Promise.resolve(options.linkedRows ?? []),
-      ),
+      /**
+       * ⚠️ **按 `where` 区分「本单已占」与「其他单已占」**：
+       *    补差单重算要查两次 `payout_entries`，两次的 `where` 形状不同
+       *    （一次 `payoutId: '<id>'`，一次 `payoutId: { not: '<id>' }`）。
+       *    不区分的话两个集合会混成同一个 → 测不出「本单口径」。
+       *    未配置对应的项时**回落到 `linkedRows`**（5h-1 的老行为）。
+       */
+      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>((args) => {
+        const where = args?.where as
+          { payoutId?: string | { not?: string } } | undefined;
+        if (where?.payoutId && typeof where.payoutId === 'object') {
+          return Promise.resolve(options.otherLinkedRows ?? []);
+        }
+        if (where?.payoutId && typeof where.payoutId === 'string') {
+          return Promise.resolve(
+            options.ownLinkedRows ?? options.linkedRows ?? [],
+          );
+        }
+        return Promise.resolve(options.linkedRows ?? []);
+      }),
     },
     tenant: {
       findFirst: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
@@ -274,11 +344,33 @@ function fakePrisma(options: {
       calls.push('$transaction');
       tx = {
         payout: {
-          create: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() => {
+          create: jest.fn<Promise<unknown>, [args?: QueryArgs]>((args) => {
             if (options.createThrows) {
               return Promise.reject(uniqueViolation());
             }
-            return Promise.resolve(options.createdPayout ?? payout({}));
+            if (options.createdPayout) {
+              return Promise.resolve(options.createdPayout);
+            }
+            // ⚠️ **回显建单时的 `kind` 与金额** —— 补差单建出来的单必须是
+            //    SUPPLEMENT 且佣金为 0，固定返回默认值会让断言看着像「建了正常单」。
+            const data = args?.data as
+              | {
+                  kind?: PayoutKind;
+                  receiptAmount?: number;
+                  commissionAmount?: number;
+                  netAmount?: number;
+                  entryCount?: number;
+                }
+              | undefined;
+            return Promise.resolve(
+              payout({
+                kind: data?.kind,
+                receiptAmount: data?.receiptAmount,
+                commissionAmount: data?.commissionAmount,
+                netAmount: data?.netAmount,
+                entryCount: data?.entryCount,
+              }),
+            );
           }),
           // ⚠️ **撤回与拒绝跑在事务里**（改状态 + 释放明细占用是两步，
           //    必须原子）→ 条件更新与回读都在事务客户端上。
@@ -310,9 +402,27 @@ function fakePrisma(options: {
   });
 }
 
+/**
+ * 假的队列服务（只实现 `approve` 用到的那一个方法）。
+ *
+ * ⚠️ **默认参数**：`makeService` 的第二个参数有默认值 → 现有调用点
+ *    不用改也能编译。
+ */
+function fakeQueues() {
+  return {
+    addWithOptions: jest.fn(() => Promise.resolve()),
+  };
+}
+
 /** 把假 Prisma 塞进服务（只用到 `as unknown as` 的一次性断言） */
-function makeService(prisma: ReturnType<typeof fakePrisma>): PayoutService {
-  return new PayoutService(prisma as unknown as never);
+function makeService(
+  prisma: ReturnType<typeof fakePrisma>,
+  queues: ReturnType<typeof fakeQueues> = fakeQueues(),
+): PayoutService {
+  return new PayoutService(
+    prisma as unknown as never,
+    queues as unknown as never,
+  );
 }
 
 /** 在租户上下文里调用（服务层靠 `getTenantContext()` 取租户与用户） */
@@ -351,7 +461,10 @@ describe('申请出款：周期与金额的前置校验', () => {
 
     // ⚠️ **没建任何单**：周期校验必须在建单之前
     expect(prisma.calls).not.toContain('$transaction');
-    expect(prisma.payout.findFirst).toHaveBeenCalledTimes(2);
+    // ⚠️ **阶段 5h-2：幂等前置查变成两次**（NORMAL 活跃 + SUPPLEMENT 活跃）
+    //    —— 周期校验在这两次之后，所以这里只查了两次。
+    //    （上面调了两次 `apply` → 2 × 2 = 4）
+    expect(prisma.payout.findFirst).toHaveBeenCalledTimes(4);
   });
 
   it('该期已有活跃出款单 → 幂等返回它，且不新建', async () => {
@@ -456,13 +569,42 @@ describe('申请出款：周期与金额的前置校验', () => {
     const service = makeService(prisma);
     await asTenant(() => service.apply({ period: '2025-07' }));
 
-    // ⚠️ **幂等前置查**：where 里只有周期与状态，没有 tenantId
+    // ⚠️ **幂等前置查**：where 里只有周期、类型与状态，没有 tenantId
     expect(argsOf(prisma.payout.findFirst).where).toEqual({
       periodStart: new Date('2025-07-01T00:00:00.000Z'),
-      status: { notIn: [PayoutStatus.REJECTED, PayoutStatus.CANCELLED] },
+      // ⚠️ **必须带 kind**：部分唯一索引已是 `(tenantId, periodStart, kind)`
+      //    三元组 → 查询不带 kind 就会把补差单也捞进来。
+      kind: PayoutKind.NORMAL,
+      status: {
+        notIn: [
+          PayoutStatus.REJECTED,
+          PayoutStatus.CANCELLED,
+          PayoutStatus.FAILED,
+        ],
+      },
     });
     // ⚠️ **收款账户查询**：没有 tenantId 条件
     expect(argsOf(prisma.merchantPayoutAccount.findFirst).where).toEqual({});
+  });
+});
+
+describe('活跃出款单的判定：notIn 必须与索引的 WHERE 是同一个集合', () => {
+  it('findActivePayout：排除 FAILED（失败的单不占位，该期能再来一次）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({ status: PayoutStatus.FAILED }),
+    });
+    const service = makeService(prisma);
+
+    await asTenant(async () => {
+      await service.apply({ period: '2025-07' });
+    });
+
+    // ⚠️ **断言传给 Prisma 的 where**（假 Prisma 不按 where 过滤）：
+    //    `status.notIn` 少了 FAILED → 索引认为不活跃、查询却认为活跃。
+    const where = argsOf(prisma.payout.findFirst).where as {
+      status: { notIn: string[] };
+    };
+    expect(where.status.notIn).toContain(PayoutStatus.FAILED);
   });
 });
 
@@ -584,7 +726,9 @@ describe('审批：必须重算金额（护栏 P5）', () => {
 
     await asPlatform(() => service.approve('payout-a'));
 
-    const updateCall = argsOf(prisma.payout.updateMany);
+    // ⚠️ **断言跑在事务客户端上**（阶段 5h-2）：状态更新与账户快照
+    //    必须原子 → 审批的落库也在事务里。
+    const updateCall = argsOf(prisma.tx()!.payout.updateMany);
     expect(updateCall.data).toMatchObject({
       netAmount: 9000,
       receiptAmount: 11000,
@@ -606,7 +750,7 @@ describe('审批：必须重算金额（护栏 P5）', () => {
     const service = makeService(prisma);
     await asPlatform(() => service.approve('payout-a'));
 
-    const updateCall = argsOf(prisma.payout.updateMany);
+    const updateCall = argsOf(prisma.tx()!.payout.updateMany);
     expect(updateCall.where).toEqual({
       id: 'payout-a',
       status: PayoutStatus.REQUESTED,
@@ -694,6 +838,571 @@ describe('审批：必须重算金额（护栏 P5）', () => {
       asPlatform(() => service.approve('payout-a')),
     ).rejects.toBeInstanceOf(ConflictException);
     expect(prisma.payout.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('approve（阶段 5h-2）', () => {
+  it('补差单审批时**不调 computeAmounts**：佣金恒为 0（护栏 X13）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({ kind: PayoutKind.SUPPLEMENT }),
+      // ⚠️ **结算单的 netAmount 是 2000** —— 若审批时误用 computeAmounts，
+      //    补差单的佣金会被算成 2000、净额被扣掉
+      statement: statement({ netAmount: 2000 }),
+      receipts: [receipt({ id: 'r-1', amount: 5000 })],
+    });
+    const service = makeService(prisma);
+
+    await asPlatform(async () => {
+      await service.approve('payout-a');
+    });
+
+    const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+      commissionAmount: number;
+      netAmount: number;
+      receiptAmount: number;
+    };
+    // ⚠️ **佣金恒为 0** —— 补差单不再扣佣（设计 §6.4 的不变量）
+    expect(data.commissionAmount).toBe(0);
+    expect(data.netAmount).toBe(data.receiptAmount);
+    expect(data.netAmount).toBe(5000);
+  });
+
+  it('补差单的重算范围是「本单已占 ∪ 未被其他单占用的」（护栏 X16）', async () => {
+    // ⚠️ **本单口径**：补差单在 `apply` 时已经占住了 r-1、r-2。
+    //    若审批时用全局口径「未被任何单占用」，这两笔会被当成未纳入
+    //    → 重算出的金额 ≈ 0 → 审批直接 409（或者更糟：金额错）。
+    //
+    //    r-3 被**别的单**占着 → 不该被算进补差单的金额。
+    const prisma = fakePrisma({
+      payout: payout({ kind: PayoutKind.SUPPLEMENT }),
+      statement: statement({ netAmount: 2000 }),
+      receipts: [
+        receipt({ id: 'r-1', amount: 3000 }),
+        receipt({ id: 'r-2', amount: 4000 }),
+        receipt({ id: 'r-3', amount: 9000 }),
+        receipt({ id: 'r-4', amount: 1000 }),
+      ],
+      ownLinkedRows: [{ entryId: 'r-1' }, { entryId: 'r-2' }],
+      otherLinkedRows: [{ entryId: 'r-3' }],
+    });
+    const service = makeService(prisma);
+
+    await asPlatform(async () => {
+      await service.approve('payout-a');
+    });
+
+    const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+      receiptAmount: number;
+      netAmount: number;
+      entryCount: number;
+    };
+    // ⚠️ **r-1 + r-2（本单已占）+ r-4（新进来的）**，不含 r-3
+    expect(data.receiptAmount).toBe(3000 + 4000 + 1000);
+    expect(data.netAmount).toBe(data.receiptAmount);
+    // ⚠️ **entryCount 按补差那批重算**（不是整期的 4 条）
+    expect(data.entryCount).toBe(3);
+  });
+
+  it('补差单查「其他单占用」时显式带了 tenantId 与 periodStart', async () => {
+    // ⚠️ **`payout_entries` 不在租户白名单里** → 扩展不附加任何过滤
+    //    → 这里查到的就是全局事实 → **必须自己带 tenantId 与 periodStart**。
+    const prisma = fakePrisma({
+      payout: payout({ kind: PayoutKind.SUPPLEMENT }),
+      statement: statement({ netAmount: 2000 }),
+      receipts: [receipt({ id: 'r-1', amount: 5000 })],
+    });
+    const service = makeService(prisma);
+
+    await asPlatform(async () => {
+      await service.approve('payout-a');
+    });
+
+    // ⚠️ **断言第二次 `payoutEntry.findMany`**（第一次是「本单已占」）
+    const calls = prisma.payoutEntry.findMany.mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    const otherWhere = (calls[1][0] as { where?: Record<string, unknown> })
+      .where;
+    expect(otherWhere?.payout).toEqual({
+      tenantId: 'tenant-a',
+      periodStart: new Date('2025-07-01T00:00:00.000Z'),
+    });
+    expect(otherWhere?.payoutId).toEqual({ not: 'payout-a' });
+  });
+
+  it('审批时把收款账户抄进快照三个字段', async () => {
+    const prisma = fakePrisma({
+      payout: payout({}),
+      receipts: [receipt({ id: 'r-1' })],
+    });
+    const service = makeService(prisma);
+
+    await asPlatform(async () => {
+      await service.approve('payout-a');
+    });
+
+    const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+      snapshotAccountName: string;
+      snapshotBankName: string;
+      snapshotAccountNo: string;
+    };
+    expect(data.snapshotAccountName).toBe('张三');
+    expect(data.snapshotBankName).toBe('测试银行');
+    expect(data.snapshotAccountNo).toBe('6222000000000000');
+  });
+
+  it('审批时查收款账户要显式带 tenantId（平台作用域下扩展不附加）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({}),
+      receipts: [receipt({ id: 'r-1' })],
+    });
+    const service = makeService(prisma);
+
+    await asPlatform(async () => {
+      await service.approve('payout-a');
+    });
+
+    expect(argsOf(prisma.merchantPayoutAccount.findFirst).where).toEqual({
+      tenantId: 'tenant-a',
+    });
+  });
+
+  it('审批时商家已删掉收款账户 → 409，不审批', async () => {
+    const prisma = fakePrisma({
+      payout: payout({}),
+      receipts: [receipt({ id: 'r-1' })],
+      account: null,
+    });
+    const service = makeService(prisma);
+
+    await expect(
+      asPlatform(async () => {
+        await service.approve('payout-a');
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // ⚠️ **没落库**：带着空快照往下走会让 worker 落 FAILED，
+    //    等于让商家白等一轮
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('审批成功后**入队**（事务提交之后）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({}),
+      receipts: [receipt({ id: 'r-1' })],
+    });
+    const queues = fakeQueues();
+    const service = makeService(prisma, queues);
+
+    await asPlatform(async () => {
+      await service.approve('payout-a');
+    });
+
+    expect(queues.addWithOptions).toHaveBeenCalled();
+    const [queueName, jobName, data, jobId, opts] = queues.addWithOptions.mock
+      .calls[0] as unknown as [
+      string,
+      string,
+      { payoutId: string },
+      string,
+      { attempts: number },
+    ];
+    expect(queueName).toBe('payout');
+    expect(jobName).toBe('execute');
+    expect(data.payoutId).toBe('payout-a');
+    expect(jobId).toContain('payout-a');
+    // ⚠️ **attempts 必须是 1** —— BullMQ 自己的重试要关掉
+    expect(opts.attempts).toBe(1);
+  });
+
+  it('⚠️ 入队失败不抛错：记 failureReason，审批照样成功', async () => {
+    // ⚠️ **状态已经是 APPROVED 了**（事务已提交）→ 抛错会让审批人
+    //    以为「审批失败」而重试 → 409 → 更困惑。
+    const prisma = fakePrisma({
+      payout: payout({}),
+      receipts: [receipt({ id: 'r-1' })],
+    });
+    const queues = fakeQueues();
+    queues.addWithOptions.mockRejectedValueOnce(new Error('Redis 连不上'));
+    const service = makeService(prisma, queues);
+
+    const view = await asPlatform(() => service.approve('payout-a'));
+
+    expect(view.id).toBe('payout-a');
+    // ⚠️ **记了失败原因** → 运营看得见；兜底扫描会重新入队
+    expect(prisma.payout.updateMany).toHaveBeenCalledTimes(1);
+    const data = argsOf(prisma.payout.updateMany).data as {
+      failureReason: string;
+    };
+    expect(data.failureReason).toContain('入队失败');
+  });
+
+  it('⚠️ 审批时同步明细：deleteMany 必须先于 createMany', async () => {
+    // ⚠️ **顺序错了会撞唯一索引** ——
+    //    `payout_entries.entryId` 是**全局唯一索引**，
+    //    不先删就插 → P2002 → 500。
+    const prisma = fakePrisma({
+      payout: payout({}),
+      receipts: [receipt({ id: 'r-1' }), receipt({ id: 'r-2' })],
+    });
+    const service = makeService(prisma);
+
+    await asPlatform(async () => {
+      await service.approve('payout-a');
+    });
+
+    const tx = prisma.tx();
+    expect(tx).not.toBeNull();
+    // ⚠️ **两次调用都要发生**（同步明细）
+    expect(tx!.payoutEntry.deleteMany).toHaveBeenCalledTimes(1);
+    expect(tx!.payoutEntry.createMany).toHaveBeenCalledTimes(1);
+
+    // ⚠️ **顺序断言** —— 用「mock 的调用序号」比较：
+    //    `jest.fn` 的 `mock.invocationCallOrder` 是全局递增的调用序号。
+    const deleteOrder = tx!.payoutEntry.deleteMany.mock.invocationCallOrder[0];
+    const createOrder = tx!.payoutEntry.createMany.mock.invocationCallOrder[0];
+    expect(deleteOrder).toBeLessThan(createOrder);
+  });
+
+  it('正常单也同步明细（不只是补差单）', async () => {
+    // ⚠️ **两种 kind 都要同步** —— 审批锁定的范围就是这张单纳入的流水；
+    //    审批**之后**才回填的流水不在锁定范围里，那些才该走补差单打。
+    const prisma = fakePrisma({
+      payout: payout({ kind: PayoutKind.NORMAL }),
+      receipts: [receipt({ id: 'r-1' }), receipt({ id: 'r-2' })],
+    });
+    const service = makeService(prisma);
+
+    await asPlatform(async () => {
+      await service.approve('payout-a');
+    });
+
+    const tx = prisma.tx();
+    expect(tx).not.toBeNull();
+    // ⚠️ **正常单也要删旧明细 + 插新明细**
+    expect(tx!.payoutEntry.deleteMany).toHaveBeenCalledWith({
+      where: { payoutId: 'payout-a' },
+    });
+    expect(tx!.payoutEntry.createMany).toHaveBeenCalledTimes(1);
+    const data = argsOf(tx!.payoutEntry.createMany).data as Array<{
+      payoutId: string;
+      entryId: string;
+    }>;
+    expect(data).toEqual([
+      { payoutId: 'payout-a', entryId: 'r-1' },
+      { payoutId: 'payout-a', entryId: 'r-2' },
+    ]);
+  });
+
+  it('正常单对已 PAID 的结算单仍然 409（不许放宽 P3）', async () => {
+    // ⚠️ **`allowPaid` 只给补差路径开** —— 放行正常单的话，
+    //    正常单也能对已 PAID 的结算单重新算佣金，
+    //    5h-1 的 P5 与 P6 会一起失效。
+    const prisma = fakePrisma({
+      payout: payout({ kind: PayoutKind.NORMAL }),
+      statement: statement({ status: SettlementStatus.PAID }),
+      receipts: [receipt({ id: 'r-1' })],
+    });
+    const service = makeService(prisma);
+
+    await expect(
+      asPlatform(() => service.approve('payout-a')),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('补差单对已 PAID 的结算单放行（结算单只作追溯凭证）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({ kind: PayoutKind.SUPPLEMENT }),
+      statement: statement({ status: SettlementStatus.PAID }),
+      receipts: [receipt({ id: 'r-1', amount: 5000 })],
+    });
+    const service = makeService(prisma);
+
+    await asPlatform(() => service.approve('payout-a'));
+
+    const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+      commissionAmount: number;
+    };
+    expect(data.commissionAmount).toBe(0);
+  });
+});
+
+describe('apply（阶段 5h-2：补差单）', () => {
+  it('findActivePayout：带 kind 条件（索引是三元组，查询也必须是）', async () => {
+    const prisma = fakePrisma({
+      receipts: [receipt({ id: 'r-1' })],
+      statement: statement({}),
+    });
+    const service = makeService(prisma);
+
+    await asTenant(async () => {
+      await service.apply({ period: '2025-07' });
+    });
+
+    // ⚠️ **断言传给 Prisma 的 where**（假 Prisma 不按 where 过滤）：
+    //    索引是 `(tenantId, periodStart, kind)` 三元组，
+    //    查询不带 kind → 「以为只查正常单、实际把补差单也捞进来」。
+    const where = argsOf(prisma.payout.findFirst).where as {
+      kind?: string;
+    };
+    expect(where.kind).toBe('NORMAL');
+    // ⚠️ **第二次查是补差单** —— 两次的 kind 必须不同
+    const secondWhere = (
+      prisma.payout.findFirst.mock.calls[1][0] as { where?: { kind?: string } }
+    ).where;
+    expect(secondWhere?.kind).toBe('SUPPLEMENT');
+  });
+
+  it('该期正常单已 PAID 且有未纳入流水 → 建 SUPPLEMENT 单，佣金为 0', async () => {
+    const prisma = fakePrisma({
+      // ⚠️ **查询顺序**：① NORMAL 活跃单 → ② SUPPLEMENT 活跃单
+      //    → ③ `PAID` 的 NORMAL 单
+      payoutSequence: [
+        null, // ① 没有活跃的正常单
+        null, // ② 没有活跃的补差单
+        payout({ status: PayoutStatus.PAID, kind: PayoutKind.NORMAL }),
+      ],
+      receipts: [receipt({ id: 'r-1', amount: 5000 })],
+      statement: statement({ status: SettlementStatus.PAID, netAmount: 2000 }),
+    });
+    const service = makeService(prisma);
+
+    const view = await asTenant(async () =>
+      service.apply({ period: '2025-07' }),
+    );
+
+    expect(view.kind).toBe(PayoutKind.SUPPLEMENT);
+    expect(view.commissionAmount).toBe(0);
+    expect(view.netAmount).toBe(view.receiptAmount);
+  });
+
+  it('⚠️ 该期有**已 PAID** 的正常单 → ① 的幂等分支必须跳过它（补差路径可达）', async () => {
+    const paidNormal = payout({
+      status: PayoutStatus.PAID,
+      kind: PayoutKind.NORMAL,
+    });
+    const prisma = fakePrisma({
+      // ⚠️ **第一次查询（NORMAL 活跃单）就该返回那张已 PAID 的单** ——
+      //    真实库里 `PAID` 的正常单**就是**活跃单（`notIn` 与部分唯一
+      //    索引的 WHERE 一致，都不含 `PAID`）。
+      //    ⚠️ 若 mock 成 `[null, ...]`，就造出了一个**数据库产生不了的
+      //    状态** → 绿灯掩盖了「补差路径不可达」这个 bug。
+      payoutSequence: [paidNormal, null, paidNormal],
+      receipts: [receipt({ id: 'r-1', amount: 5000 })],
+      statement: statement({ status: SettlementStatus.PAID, netAmount: 2000 }),
+    });
+    const service = makeService(prisma);
+
+    const view = await asTenant(async () =>
+      service.apply({ period: '2025-07' }),
+    );
+
+    // ⚠️ **必须是补差单** —— 若返回的是那张已 PAID 的正常单，
+    //    说明 ① 的幂等分支没有排除 PAID → 补差路径不可达。
+    expect(view.kind).toBe(PayoutKind.SUPPLEMENT);
+    expect(view.commissionAmount).toBe(0);
+  });
+
+  it('该期有活跃的 SUPPLEMENT 单 → 幂等返回它', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [
+        null, // ① 没有活跃的正常单
+        payout({ status: PayoutStatus.REQUESTED, kind: PayoutKind.SUPPLEMENT }),
+      ],
+    });
+    const service = makeService(prisma);
+
+    const view = await asTenant(async () =>
+      service.apply({ period: '2025-07' }),
+    );
+
+    expect(view.kind).toBe(PayoutKind.SUPPLEMENT);
+    expect(view.id).toBe('payout-a');
+  });
+
+  it('该期正常单是 FAILED → 走 NORMAL 路径（不误判成补差）', async () => {
+    const prisma = fakePrisma({
+      // ⚠️ **`FAILED` 的正常单不占位** → 前两次查询都查不到它
+      payoutSequence: [null, null, null],
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+      statement: statement({ netAmount: 2000 }),
+    });
+    const service = makeService(prisma);
+
+    const view = await asTenant(async () =>
+      service.apply({ period: '2025-07' }),
+    );
+
+    // ⚠️ **必须是 NORMAL** —— 误判成补差会让主体那部分永远打不出去
+    expect(view.kind).toBe(PayoutKind.NORMAL);
+    // ⚠️ **佣金照常扣**（结算单的 netAmount）
+    expect(view.commissionAmount).toBe(2000);
+  });
+
+  it('补差金额 ≤ 0 → 400「该期没有可补差的货款」', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [null, null, payout({ status: PayoutStatus.PAID })],
+      // ⚠️ **回填进来的是退款冲回流水**（负数）
+      receipts: [receipt({ id: 'r-1', amount: -500 })],
+    });
+    const service = makeService(prisma);
+
+    await expect(
+      asTenant(async () => service.apply({ period: '2025-07' })),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('补差单查「已被占用」时显式带了 tenantId 与 periodStart', async () => {
+    // ⚠️ **`payout_entries` 不在租户白名单里** → 扩展不附加任何过滤
+    //    → 查出来的就是全局事实 → **必须显式带 tenantId 与 periodStart**。
+    const prisma = fakePrisma({
+      payoutSequence: [null, null, payout({ status: PayoutStatus.PAID })],
+      receipts: [receipt({ id: 'r-1', amount: 5000 })],
+      statement: statement({ status: SettlementStatus.PAID }),
+    });
+    const service = makeService(prisma);
+
+    await asTenant(async () => {
+      await service.apply({ period: '2025-07' });
+    });
+
+    const call = argsOf(prisma.payoutEntry.findMany);
+    expect(call.where?.payout).toEqual({
+      tenantId: 'tenant-a',
+      periodStart: new Date('2025-07-01T00:00:00.000Z'),
+    });
+  });
+
+  it('补差单建单时 kind 落库为 SUPPLEMENT', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [null, null, payout({ status: PayoutStatus.PAID })],
+      receipts: [receipt({ id: 'r-1', amount: 5000 })],
+      statement: statement({ status: SettlementStatus.PAID }),
+    });
+    const service = makeService(prisma);
+
+    await asTenant(async () => {
+      await service.apply({ period: '2025-07' });
+    });
+
+    const data = argsOf(prisma.tx()!.payout.create).data as {
+      kind: PayoutKind;
+      commissionAmount: number;
+    };
+    expect(data.kind).toBe(PayoutKind.SUPPLEMENT);
+    // ⚠️ **佣金恒为 0** —— 补差单不再扣佣（护栏 X13）
+    expect(data.commissionAmount).toBe(0);
+  });
+});
+
+describe('PayoutView：执行字段与账号脱敏（护栏 X14）', () => {
+  it('完整账号绝不进 API 响应，只给脱敏版', async () => {
+    // ⚠️ **走「建单」这条路**（`payoutSequence` 三次都返回 null → 走正常单路径），
+    //    再用 `createdPayout` 指定建出来的那张单带执行字段与快照。
+    //    ⚠️ 不能靠「① 幂等返回一张已 PAID 的单」来短路 ——
+    //    `apply` 的 ① 现在会**跳过 `PAID` 的正常单**（否则补差路径不可达），
+    //    短路不了就会一路走到「没有货款流水」抛 400。
+    const created = payout({
+      status: PayoutStatus.PAID,
+      kind: PayoutKind.NORMAL,
+      snapshotAccountName: '张三',
+      snapshotBankName: '测试银行',
+      snapshotAccountNo: '6222000000000000',
+      payoutChannel: 'fake-bank',
+      attemptCount: 2,
+      failureReason: null,
+    });
+    const prisma = fakePrisma({
+      payoutSequence: [null, null, null],
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+      createdPayout: created,
+    });
+    const service = makeService(prisma);
+
+    const view = await asTenant(async () =>
+      service.apply({ period: '2025-07' }),
+    );
+
+    expect(view.kind).toBe(PayoutKind.NORMAL);
+    expect(view.payoutChannel).toBe('fake-bank');
+    expect(view.attemptCount).toBe(2);
+    expect(view.failureReason).toBeNull();
+    expect(view.snapshotAccountName).toBe('张三');
+    expect(view.snapshotBankName).toBe('测试银行');
+    expect(view.maskedSnapshotAccountNo).toBe('************0000');
+    // ⚠️ **完整账号一个字节都不能漏出去**
+    expect(JSON.stringify(view)).not.toContain('6222000000000000');
+    expect('snapshotAccountNo' in view).toBe(false);
+  });
+});
+
+describe('availablePeriods（阶段 5h-2）', () => {
+  it('正常单已 PAID 且有未纳入流水 → supplementAvailable = true', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({ status: PayoutStatus.PAID, kind: PayoutKind.NORMAL }),
+        null, // SUPPLEMENT 活跃单：没有
+      ],
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+      linkedRows: [{ entryId: 'r-taken' }],
+      statement: statement({ status: SettlementStatus.PAID, netAmount: 2000 }),
+    });
+    const service = makeService(prisma);
+
+    const views = await asTenant(async () => service.availablePeriods());
+
+    expect(views).toHaveLength(1);
+    expect(views[0].supplementAvailable).toBe(true);
+    expect(views[0].supplementAmount).toBe(10000);
+    // ⚠️ **整期金额的语义不变** —— 它是「这一期总共应结多少」
+    expect(views[0].netAmount).toBe(8000);
+  });
+
+  it('没有活跃单 → appliedKind = null，supplementAvailable = false', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [null, null],
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+    });
+    const service = makeService(prisma);
+
+    const views = await asTenant(async () => service.availablePeriods());
+
+    expect(views[0].appliedKind).toBeNull();
+    expect(views[0].alreadyApplied).toBe(false);
+    expect(views[0].supplementAvailable).toBe(false);
+    expect(views[0].supplementAmount).toBeNull();
+  });
+
+  it('有活跃的 SUPPLEMENT 单 → appliedKind = SUPPLEMENT', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({ status: PayoutStatus.PAID, kind: PayoutKind.NORMAL }),
+        payout({ status: PayoutStatus.REQUESTED, kind: PayoutKind.SUPPLEMENT }),
+      ],
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+    });
+    const service = makeService(prisma);
+
+    const views = await asTenant(async () => service.availablePeriods());
+
+    expect(views[0].appliedKind).toBe(PayoutKind.SUPPLEMENT);
+    // ⚠️ **补差单不允许再叠** → 不给补差入口
+    expect(views[0].supplementAvailable).toBe(false);
+  });
+
+  it('正常单还在飞（REQUESTED）→ 不给补差入口（不能两张单同时在飞）', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({ status: PayoutStatus.REQUESTED, kind: PayoutKind.NORMAL }),
+        null,
+      ],
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+    });
+    const service = makeService(prisma);
+
+    const views = await asTenant(async () => service.availablePeriods());
+
+    expect(views[0].appliedKind).toBe(PayoutKind.NORMAL);
+    expect(views[0].supplementAvailable).toBe(false);
+    expect(views[0].supplementAmount).toBeNull();
   });
 });
 

@@ -3,6 +3,7 @@ import { notFound } from 'next/navigation';
 import { ApiError, apiFetchAuthed } from '@/lib/api-client';
 import {
   describePayoutEntryType,
+  describePayoutKind,
   describePayoutStatus,
   describePayoutTimeline,
   formatCents,
@@ -124,6 +125,51 @@ export default async function PayoutDetailPage({
               <p className="text-sm text-destructive">
                 拒绝原因：{payout.rejectedReason}
               </p>
+            )}
+
+            {/* ⚠️ **类型要单独一行**：补差出款是**增量**，
+                混在正常出款里超管会按同一口径核账。 */}
+            <div className="flex justify-between py-2 text-sm">
+              <span className="text-muted-foreground">类型</span>
+              <span>{describePayoutKind(payout.kind)}</span>
+            </div>
+
+            {/* ⚠️ **失败原因与尝试次数**：运营需要知道「试了几次、为什么失败」
+                才能决定是补单还是让商家改收款信息。 */}
+            {payout.status === 'FAILED' && (
+              <div className="flex justify-between py-2 text-sm text-destructive">
+                <span>失败原因</span>
+                <span>
+                  {payout.failureReason ?? '未知原因'}（已尝试{' '}
+                  {payout.attemptCount} 次）
+                </span>
+              </div>
+            )}
+
+            {/* ⚠️ **打款渠道名**：超管要看到「钱是打给哪个渠道的」——
+                对账、排查重复打款都靠这条线索。渠道名**只给平台端**，
+                商家不关心（商家端页面不显示这一项）。 */}
+            {payout.payoutChannel && (
+              <div className="flex justify-between py-2 text-sm">
+                <span className="text-muted-foreground">打款渠道</span>
+                <span>{payout.payoutChannel}</span>
+              </div>
+            )}
+
+            {/* ⚠️ **打款时刻 / 失败时刻**：出款单到底什么时候打成功的、
+                什么时候失败的 —— 超管排查「卡住」与对账都要看这两个时刻。
+                时间格式复用 `lib/billing.ts` 的 `formatDateTime`。 */}
+            {payout.status === 'PAID' && payout.paidAt && (
+              <div className="flex justify-between py-2 text-sm">
+                <span className="text-muted-foreground">打款时间</span>
+                <span>{formatDateTime(payout.paidAt)}</span>
+              </div>
+            )}
+            {payout.status === 'FAILED' && payout.failedAt && (
+              <div className="flex justify-between py-2 text-sm text-destructive">
+                <span>失败时间</span>
+                <span>{formatDateTime(payout.failedAt)}</span>
+              </div>
             )}
 
             <PayoutActions

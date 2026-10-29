@@ -111,7 +111,16 @@ export function PayoutApplyForm({ periods }: { periods: AvailablePeriod[] }) {
                 {periods.map((item) => (
                   <option key={item.period} value={item.period}>
                     {item.period}（应结 {formatCents(item.netAmount)}）
-                    {item.alreadyApplied ? ' · 已申请' : ''}
+                    {/* ⚠️ **补差入口的优先级高于「已申请」**：正常单出款后
+                        `alreadyApplied = true`，先判 `alreadyApplied` 的话，
+                        补差入口就永远显示不出来。 */}
+                    {item.supplementAvailable
+                      ? ` · 可申请补差 ${formatCents(item.supplementAmount ?? 0)}`
+                      : item.alreadyApplied
+                        ? ` · 已${
+                            item.appliedKind === 'SUPPLEMENT' ? '补差出款' : '申请'
+                          }`
+                        : ''}
                   </option>
                 ))}
               </select>
@@ -125,6 +134,15 @@ export function PayoutApplyForm({ periods }: { periods: AvailablePeriod[] }) {
                   {formatCents(selected.netAmount)}
                 </p>
                 <p>共 {selected.entryCount} 笔货款</p>
+                {/* ⚠️ **补差金额必须单独显示**：上面的「应结」是
+                    「这一期总共应结多少」，补差金额是「还能再拿多少」——
+                    混在一起商家会以为重复了。 */}
+                {selected.supplementAvailable && (
+                  <p>
+                    可申请补差 {formatCents(selected.supplementAmount ?? 0)}
+                    （原结算单已结清，补差按零佣金结算）
+                  </p>
+                )}
               </div>
             )}
 
@@ -140,8 +158,22 @@ export function PayoutApplyForm({ periods }: { periods: AvailablePeriod[] }) {
             )}
 
             <div className="flex justify-end">
-              <Button type="submit" disabled={pending || !period}>
-                {pending ? '提交中…' : '提交申请'}
+              <Button
+                type="submit"
+                // ⚠️ **补差可申请时按钮可点** —— 其余情况按 `alreadyApplied` 禁用。
+                //    只看 `alreadyApplied` 就禁用的话，正常单出款后
+                //    补差入口就永远消失，商家再也申请不了补差。
+                disabled={
+                  pending ||
+                  !period ||
+                  (selected?.alreadyApplied && !selected?.supplementAvailable)
+                }
+              >
+                {pending
+                  ? '提交中…'
+                  : selected?.supplementAvailable
+                    ? '申请补差'
+                    : '提交申请'}
               </Button>
             </div>
           </form>

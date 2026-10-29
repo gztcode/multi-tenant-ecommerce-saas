@@ -7,6 +7,7 @@ import {
   COMPENSATION_QUEUE,
   PAYMENT_TIMEOUT_QUEUE,
   PAYMENT_WEBHOOK_QUEUE,
+  PAYOUT_QUEUE,
 } from '../../common/queue/queue.constants';
 import { TimeoutError, withTimeout } from '../../common/util/with-timeout';
 
@@ -15,7 +16,8 @@ export type QueueName =
   | typeof PAYMENT_WEBHOOK_QUEUE
   | typeof BILLING_QUEUE
   | typeof AUTH_QUEUE
-  | typeof COMPENSATION_QUEUE;
+  | typeof COMPENSATION_QUEUE
+  | typeof PAYOUT_QUEUE;
 
 /**
  * 任务失败时的重试次数与退避策略。
@@ -63,12 +65,14 @@ export class QueueService {
     @InjectQueue(BILLING_QUEUE) billingQueue: Queue,
     @InjectQueue(AUTH_QUEUE) authQueue: Queue,
     @InjectQueue(COMPENSATION_QUEUE) compensationQueue: Queue,
+    @InjectQueue(PAYOUT_QUEUE) payoutQueue: Queue,
   ) {
     this.queues.set(PAYMENT_TIMEOUT_QUEUE, timeoutQueue);
     this.queues.set(PAYMENT_WEBHOOK_QUEUE, webhookQueue);
     this.queues.set(BILLING_QUEUE, billingQueue);
     this.queues.set(AUTH_QUEUE, authQueue);
     this.queues.set(COMPENSATION_QUEUE, compensationQueue);
+    this.queues.set(PAYOUT_QUEUE, payoutQueue);
   }
 
   /**
@@ -103,6 +107,43 @@ export class QueueService {
       this.queueOf(queueName).add(jobName, data, {
         jobId,
         ...DEFAULT_JOB_OPTIONS,
+      }),
+      `${queueName}/${jobName}`,
+    );
+  }
+
+  /**
+   * 投递一个任务，**可覆盖默认的 job 选项**。
+   *
+   * ⚠️ **为什么要这个方法**：`add` 硬编码了
+   *    `DEFAULT_JOB_OPTIONS = { attempts: 3, backoff: exponential }`，
+   *    而出款入队要 **`attempts: 1`** —— 重试由出款单自己的
+   *    `attemptCount` + 退避控制。
+   *    两层重试叠在一起时，BullMQ 会在我们「退回 APPROVED 等下次」之后
+   *    **又立刻重跑一次同一个 job**，绕过退避 → 3 次尝试在 1 秒内烧完。
+   *
+   * @param opts.attempts BullMQ 自己的重试次数（默认 3；出款传 1）
+   * @param opts.delay 延迟毫秒数（用于「退避后重投」）
+   * @param opts.removeOnComplete 完成后立刻把 job 从队列里删掉
+   *   （BullMQ 默认把完成的 job 留在 `completed` 集合里 →
+   *   队列一直涨，且**同一个 jobId 永远不能再用** → 重新入队被静默忽略）
+   */
+  async addWithOptions(
+    queueName: QueueName,
+    jobName: string,
+    data: unknown,
+    jobId: string,
+    opts: { attempts?: number; delay?: number; removeOnComplete?: boolean },
+  ): Promise<void> {
+    await this.withQueueTimeout(
+      this.queueOf(queueName).add(jobName, data, {
+        jobId,
+        attempts: opts.attempts ?? DEFAULT_JOB_OPTIONS.attempts,
+        ...(opts.delay ? { delay: opts.delay } : {}),
+        ...(opts.removeOnComplete ? { removeOnComplete: true } : {}),
+        ...(opts.attempts === 1
+          ? {}
+          : { backoff: DEFAULT_JOB_OPTIONS.backoff }),
       }),
       `${queueName}/${jobName}`,
     );

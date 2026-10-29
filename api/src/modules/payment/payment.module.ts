@@ -15,8 +15,13 @@ import { WebhookWorker } from './webhook.worker';
 import { CompensationService } from './compensation.service';
 import { CompensationWorker } from './compensation.worker';
 import { FakePaymentProvider } from './fake-payment.provider';
+import { FakePayoutProvider } from './fake-payout.provider';
+import { PayoutWorker } from './payout.worker';
+import { PayoutScanScheduler } from './payout-scan.scheduler';
+import { FakePayoutController } from './fake-payout.controller';
 import { PaymentProvider } from './payment-provider.interface';
-import { PAYMENT_PROVIDERS } from './payment.constants';
+import { PayoutProvider } from './payout-provider.interface';
+import { PAYMENT_PROVIDERS, PAYOUT_PROVIDERS } from './payment.constants';
 
 /**
  * 支付模块（阶段 3 Task 5）。
@@ -67,6 +72,7 @@ import { PAYMENT_PROVIDERS } from './payment.constants';
     WebhookController,
     FakePaymentController,
     SubscriptionPaymentController,
+    FakePayoutController,
   ],
   providers: [
     PaymentService,
@@ -77,6 +83,14 @@ import { PAYMENT_PROVIDERS } from './payment.constants';
     CompensationService,
     CompensationWorker,
     FakePaymentProvider,
+    FakePayoutProvider,
+    // ⚠️ **出款执行消费端**（阶段 5h-2）：`PayoutExecutionService`
+    //    来自 `BillingModule`（已导出），依赖方向 `payment → billing` 单向。
+    PayoutWorker,
+    // ⚠️ **出款兜底扫描的周期任务注册器**（阶段 5h-2）：
+    //    `PayoutWorker` 只负责消费 `scan` job，没人往队列里投它的话
+    //    `APPROVED` 救援路径就是死代码（审批后入队失败 → 单子永远停在已审批）。
+    PayoutScanScheduler,
     {
       provide: PAYMENT_PROVIDERS,
       useFactory: (fake: FakePaymentProvider): Map<string, PaymentProvider> => {
@@ -85,6 +99,15 @@ import { PAYMENT_PROVIDERS } from './payment.constants';
         return providers;
       },
       inject: [FakePaymentProvider],
+    },
+    {
+      provide: PAYOUT_PROVIDERS,
+      useFactory: (fake: FakePayoutProvider): Map<string, PayoutProvider> => {
+        const providers = new Map<string, PayoutProvider>();
+        providers.set(fake.channel, fake);
+        return providers;
+      },
+      inject: [FakePayoutProvider],
     },
   ],
   exports: [PaymentService, PaymentMethodService, RenewalService],

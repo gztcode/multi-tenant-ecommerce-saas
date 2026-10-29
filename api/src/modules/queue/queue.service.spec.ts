@@ -23,8 +23,9 @@ describe('QueueService 的超时保护', () => {
       add: jest.fn(() => pending()),
       upsertJobScheduler: jest.fn(() => pending()),
     };
-    // 五个队列参数用同一个替身即可——本用例只关心「会不会超时」
+    // 六个队列参数用同一个替身即可——本用例只关心「会不会超时」
     return new QueueService(
+      queue as never,
       queue as never,
       queue as never,
       queue as never,
@@ -99,6 +100,7 @@ describe('QueueService 的超时保护', () => {
       queue as never,
       queue as never,
       queue as never,
+      queue as never,
     );
 
     await expect(
@@ -118,6 +120,7 @@ describe('QueueService 的超时保护', () => {
       queue as never,
       queue as never,
       queue as never,
+      queue as never,
     );
 
     const error = await service
@@ -127,5 +130,121 @@ describe('QueueService 的超时保护', () => {
     // 原样抛出：同一个错误对象，且不是 ServiceUnavailableException
     expect(error).toBe(cause);
     expect(error).not.toBeInstanceOf(ServiceUnavailableException);
+  });
+});
+
+/**
+ * `addWithOptions` 的 job 选项形状。
+ *
+ * ## 为什么这条用例必须存在
+ *
+ * 出款入队要 **`attempts: 1`**（BullMQ 自己的重试关掉，重试由出款单的
+ * `attemptCount` + 退避控制）。如果哪天有人把 `...DEFAULT_JOB_OPTIONS`
+ * 又 spread 回来 → `backoff` 跟着回来 → BullMQ 会在我们「退回 APPROVED
+ * 等下次」之后**又立刻重跑同一个 job** → 3 次尝试在 1 秒内烧完。
+ *
+ * ⚠️ **e2e 抓不到这个**：它只断言最终状态，看不见「中间是不是重跑了几次」。
+ * 所以这里直接断言 `queue.add` 的**第三个参数**（job options）的形状。
+ */
+describe('QueueService.addWithOptions 的 job 选项', () => {
+  /** 能返回结果的队列替身——本组用例要断言 add 的入参 */
+  function makeService() {
+    const queue = {
+      add: jest.fn(() => Promise.resolve({ id: '1' })),
+      upsertJobScheduler: jest.fn(() => Promise.resolve(undefined)),
+    };
+    const service = new QueueService(
+      queue as never,
+      queue as never,
+      queue as never,
+      queue as never,
+      queue as never,
+      queue as never,
+    );
+    return { service, queue };
+  }
+
+  /** 取 add 的第三个参数（job options） */
+  function optionsOf(queue: { add: jest.Mock }) {
+    const call = queue.add.mock.calls[0] as unknown[] | undefined;
+    expect(call).toBeDefined();
+    return call?.[2] as Record<string, unknown>;
+  }
+
+  it('attempts: 1 → 不带 backoff，attempts 就是 1', async () => {
+    const { service, queue } = makeService();
+
+    await service.addWithOptions('payout', 'execute', {}, 'payout-1', {
+      attempts: 1,
+    });
+
+    const options = optionsOf(queue);
+    expect(options.attempts).toBe(1);
+    // ⚠️ **核心断言**：有 backoff 就会绕过我们自己的退避，立刻重跑
+    expect(options).not.toHaveProperty('backoff');
+  });
+
+  it('attempts 未传（默认）→ 带 backoff，attempts 是 3', async () => {
+    const { service, queue } = makeService();
+
+    await service.addWithOptions('payout', 'execute', {}, 'payout-2', {});
+
+    const options = optionsOf(queue);
+    expect(options.attempts).toBe(3);
+    expect(options).toHaveProperty('backoff');
+  });
+
+  it('传了 delay → 带 delay 键；没传 → 不带 delay 键', async () => {
+    const withDelay = makeService();
+    await withDelay.service.addWithOptions(
+      'payout',
+      'execute',
+      {},
+      'payout-3',
+      { attempts: 1, delay: 5_000 },
+    );
+    const options = optionsOf(withDelay.queue);
+    expect(options).toHaveProperty('delay');
+    expect(options.delay).toBe(5_000);
+    // delay 不影响 attempts 的语义
+    expect(options.attempts).toBe(1);
+    expect(options).not.toHaveProperty('backoff');
+
+    const withoutDelay = makeService();
+    await withoutDelay.service.addWithOptions(
+      'payout',
+      'execute',
+      {},
+      'payout-4',
+      { attempts: 1 },
+    );
+    expect(optionsOf(withoutDelay.queue)).not.toHaveProperty('delay');
+  });
+
+  it('removeOnComplete: true → 完成即删（否则同 jobId 永远不能再用）', async () => {
+    // ⚠️ **BullMQ 默认把完成的 job 留在 `completed` 集合里** →
+    //    队列一直涨，且**同一个 jobId 永远不能再用** → 重新入队被静默忽略。
+    const withRemove = makeService();
+    await withRemove.service.addWithOptions(
+      'payout',
+      'execute',
+      {},
+      'payout-5',
+      { attempts: 1, removeOnComplete: true },
+    );
+    expect(optionsOf(withRemove.queue).removeOnComplete).toBe(true);
+
+    // ⚠️ **没传 → 不带这个键**（不改变现有调用点的行为）
+    const withoutRemove = makeService();
+    await withoutRemove.service.addWithOptions(
+      'payout',
+      'execute',
+      {},
+      'payout-6',
+      { attempts: 1 },
+    );
+    expect(optionsOf(withoutRemove.queue)).not.toHaveProperty(
+      'removeOnComplete',
+    );
   });
 });
