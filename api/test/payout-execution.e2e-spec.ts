@@ -749,7 +749,12 @@ describe('出款执行 (e2e)', () => {
     );
     expect(failed).not.toBeNull();
     // ⚠️ **金额非法 → 不调渠道，直接落 FAILED**
-    expect(failed!.failureReason).toContain('出款金额非法');
+    //
+    // ⚠️ **文案是业务口径「出款金额异常」**（阶段 5k 统一过）——
+    //    原来写的是「出款金额非法：0 分」，把内部金额数字暴露给了商家。
+    expect(failed!.failureReason).toContain('出款金额异常');
+    // ⚠️ **不许再退回内部术语** —— 「非法」「金额非法」这类词商家看不懂
+    expect(failed!.failureReason).not.toContain('出款金额非法');
     expect(failed!.attemptCount).toBe(1);
   });
 

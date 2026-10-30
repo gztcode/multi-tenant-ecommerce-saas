@@ -502,6 +502,68 @@ describe('出款单详情页：收款账户（阶段 5j 补强）', () => {
   });
 });
 
+describe('出款单详情页：备注（阶段 5k）', () => {
+  it('⚠️ 已审批且有失败原因时显示「备注」行', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'APPROVED' as const,
+      approvedAt: '2026-02-05T00:00:00.000Z',
+      failureReason: '打款任务提交失败，系统将自动重试',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '备注')).toBe(true);
+    expect(hasText(texts, '打款任务提交失败，系统将自动重试')).toBe(true);
+  });
+
+  it('⚠️ 已审批但没有失败原因时不显示「备注」行', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'APPROVED' as const,
+      approvedAt: '2026-02-05T00:00:00.000Z',
+      failureReason: null,
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '备注')).toBe(false);
+  });
+
+  it('⚠️ 失败状态显示的是「失败原因」而不是「备注」', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'FAILED' as const,
+      failureReason:
+        '收款账号信息异常，本次未打款，请更新收款账户后重新申请',
+      attemptCount: 1,
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '失败原因')).toBe(true);
+    // ⚠️ **两行不能并存** —— 同一份 `failureReason` 显示两遍会让超管困惑
+    expect(hasText(texts, '备注')).toBe(false);
+  });
+
+  it('⚠️ 备注行渲染的是 failureReason 原文（后端必须写业务口径）', async () => {
+    // ⚠️ **这条钉住后端口径** —— 「备注」行渲染的是 `failureReason` 的**原文**，
+    //    后端若把 Redis 的原始异常消息写进去，这里就会露出「Redis 连不上」
+    //    这类内部细节（5k 的口径统一就是为这个）。
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'APPROVED' as const,
+      approvedAt: '2026-02-05T00:00:00.000Z',
+      failureReason: '打款任务提交失败，系统将自动重试',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, 'Redis')).toBe(false);
+    expect(hasText(texts, 'ECONNREFUSED')).toBe(false);
+  });
+});
+
 describe('出款单详情页：明细', () => {
   it('每一行显示自己的金额、订单号与类型', async () => {
     const texts = await renderPage();

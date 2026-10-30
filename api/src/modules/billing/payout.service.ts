@@ -232,7 +232,9 @@ export class PayoutService {
       where: {},
     });
     if (!account) {
-      throw new BadRequestException('请先在「出款」页设置收款账户');
+      // ⚠️ **指引要指向准确的位置** —— 账户设置页在 `/settlements/account`，
+      //    「出款」页是申请出款的地方，商家在出款列表页找不到入口。
+      throw new BadRequestException('请先在「收款账户」页设置收款账户');
     }
     // ⚠️⚠️ **写路径也要查加密版本**（阶段 5j）：
     //    读路径（`payout-execution.service.ts` 的 `decryptVersioned`）遇到
@@ -598,7 +600,12 @@ export class PayoutService {
         const reason = error instanceof Error ? error.message : String(error);
         await this.prisma.payout.updateMany({
           where: { id: updated.id, status: PayoutStatus.APPROVED },
-          data: { failureReason: `入队失败，等待自动救援：${reason}` },
+          // ⚠️ **界面口径，不带原始异常消息** —— `reason` 可能是 Redis 的
+          //    连接细节（主机名、端口、连接错误）。内部原文只进日志。
+          //
+          // ⚠️ **文案要说清「会自动重试」** —— 超管看到这句就知道
+          //    兜底扫描会救它，不用手工干预。
+          data: { failureReason: '打款任务提交失败，系统将自动重试' },
         });
         this.logger.error(
           `出款审批后入队失败：${updated.id} —— ${reason}（将由兜底扫描重新入队）`,

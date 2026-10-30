@@ -98,7 +98,8 @@ export class PayoutWorker extends WorkerHost {
    * ## 三步
    *
    * 1. **抢单**：`APPROVED → PROCESSING`（护栏 X1）
-   * 2. **两道闸**：金额 ≤ 0 / 账户快照缺失 → 落 `FAILED`（护栏 X4、§5.1c）
+   * 2. **打之前的闸**：解密失败 / 金额 ≤ 0 / 账户快照缺失 → 落 `FAILED`
+   *    （护栏 X4、§5.1c；解密失败是阶段 5k 加的第三条）
    * 3. **调渠道** → 落终态（`PAID` / 退回 `APPROVED` / 落 `FAILED`）
    */
   private async runExecute(payoutId: string): Promise<void> {
@@ -114,7 +115,29 @@ export class PayoutWorker extends WorkerHost {
       return;
     }
 
-    // ---- STEP 1.5：两道「打之前」的闸 ----
+    // ---- STEP 1.5：打款前的闸 ----
+    //
+    // ⚠️ **解密失败必须在 `checkGates` 之前判** —— 否则 `account` 为 null
+    //    会让 `checkGates` 报「收款账户快照缺失」，把真实原因盖掉。
+    //
+    // ⚠️ **落 FAILED 是安全的**：解密发生在**调渠道之前** → 渠道从未被调用
+    //    → **确定没打钱**。这与「卡在 PROCESSING」（钱可能已打出去）语义相反，
+    //    不能套用同一套处置（设计 §二·2.2）。
+    if (claim.accountError) {
+      // ⚠️ **根因只进日志** —— `decryptVersioned` 的消息里有「密钥不匹配」
+      //    「密文已被篡改」「版本 0」这类内部术语，商家看到会恐慌
+      //    （界面口径见设计 §二·2.4）。
+      this.logger.error(
+        `出款 ${payoutId} 的收款账号快照不可用：${claim.accountError}`,
+      );
+      await this.execution.markFailed(payoutId, {
+        // ⚠️ **文案要自证「没打钱」**
+        reason: '收款账号信息异常，本次未打款，请更新收款账户后重新申请',
+        failedAt: await this.prisma.databaseNow(),
+      });
+      return;
+    }
+
     // ⚠️ **都不调渠道**：不满足条件就不该打钱。
     const gateFailure = this.checkGates(claim);
     if (gateFailure) {
@@ -175,6 +198,10 @@ export class PayoutWorker extends WorkerHost {
   /**
    * 打款之前的两道闸。
    *
+   * ⚠️ **理由一律用业务口径** —— 界面上的文案给商家看，
+   *    内部术语（「快照缺失」「出款金额非法：-1 分」）商家看不懂，
+   *    还会以为自己理解错了。
+   *
    * @returns 失败原因（`null` = 闸都过了，可以打款）
    */
   private checkGates(claim: {
@@ -182,10 +209,11 @@ export class PayoutWorker extends WorkerHost {
     account: { accountNo: string } | null;
   }): string | null {
     if (claim.netAmount <= 0) {
-      return `出款金额非法：${claim.netAmount} 分`;
+      // ⚠️ **不暴露内部金额数字** —— 只说「异常」
+      return '出款金额异常，本次未打款，请联系平台核对';
     }
     if (!claim.account) {
-      return '收款账户快照缺失';
+      return '收款账号信息异常，本次未打款，请更新收款账户后重新申请';
     }
     return null;
   }

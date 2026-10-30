@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import {
   PAYOUT_MAX_ATTEMPTS,
   PayoutWorker,
@@ -207,7 +208,73 @@ describe('PayoutWorker', () => {
     expect(execution.markFailed).toHaveBeenCalled();
   });
 
-  it('⚠️ 账户快照缺失 → 落 FAILED，不调渠道', async () => {
+  it('⚠️ 解密失败（accountError）→ 落 FAILED，不调渠道，理由是业务口径', async () => {
+    // ⚠️ **必须断言「根因进了日志」** —— 否则这个分支与 `checkGates`
+    //    的「账户缺失」闸**无法区分**：两条路径写的 `failureReason`
+    //    **完全相同**（设计 §二·2.3·②b 有意为之 —— 它们对商家是同一件事），
+    //    分支唯一的独有行为就是「把根因写进日志」。
+    //    没有这条断言，把整个分支删掉测试照样绿（失败注入 G2 实测过）。
+    const logSpy = jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined);
+
+    try {
+      const execution = fakeExecution({
+        ...claim,
+        account: null,
+        accountError:
+          '出款单的收款账号快照 尚未加密（版本 0），请先执行 `npm run migrate:payout-encryption` 再重试。',
+      });
+      const provider = fakeProvider({ status: 'SUCCESS' });
+      const worker = new PayoutWorker(
+        execution as unknown as never,
+        fakePrisma() as unknown as never,
+        fakeQueues() as unknown as never,
+        new Map([['fake-payout', provider]]),
+      );
+
+      await worker.process({
+        name: 'execute',
+        data: { payoutId: 'payout-a' },
+      } as never);
+
+      // ⚠️ **钱绝不能打出去** —— 解密失败发生在调渠道之前
+      expect(provider.execute).not.toHaveBeenCalled();
+      expect(execution.markPaid).not.toHaveBeenCalled();
+      expect(execution.markFailed).toHaveBeenCalled();
+
+      const call = execution.markFailed.mock.calls[0] as unknown as [
+        string,
+        { reason: string },
+      ];
+      const reason = call[1].reason;
+      // ⚠️ **界面文案必须是业务口径** —— 商家看到「密钥不匹配」会以为
+      //    自己的银行账号被篡改了
+      expect(reason).not.toContain('尚未加密');
+      expect(reason).not.toContain('密钥不匹配');
+      expect(reason).not.toContain('migrate:payout-encryption');
+      // ⚠️ **文案要自证「没打钱」** —— 商家端对所有 FAILED 都会接一句
+      //    「请联系平台确认出款情况」，不说清楚商家会以为钱可能已经打出去
+      expect(reason).toContain('本次未打款');
+
+      // ⚠️⚠️ **根因必须进日志** —— 这是「解密失败」与「快照为空」两条路径
+      //    **唯一**的可观察差异。运营靠它区分「是没迁移」「是密钥错了」
+      //    「是版本不匹配」—— 三者的处置方式完全不同。
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('收款账号快照不可用'),
+      );
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('尚未加密'),
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it('⚠️ 账户快照缺失 → 落 FAILED，不调渠道，理由是业务口径', async () => {
+    // ⚠️ **这条路径与「解密失败」对商家是同一件事**（账户不可用 → 没打钱
+    //    → 更新账户后重新申请），差异只在根因（日志里）。
+    //    所以 `failureReason` **完全相同**是有意的。
     const execution = fakeExecution({ ...claim, account: null });
     const provider = fakeProvider({ status: 'SUCCESS' });
     const worker = new PayoutWorker(
@@ -224,6 +291,14 @@ describe('PayoutWorker', () => {
 
     expect(provider.execute).not.toHaveBeenCalled();
     expect(execution.markFailed).toHaveBeenCalled();
+
+    const call = execution.markFailed.mock.calls[0] as unknown as [
+      string,
+      { reason: string },
+    ];
+    // ⚠️ **不能是「收款账户快照缺失」** —— 商家会问「什么叫快照缺失」
+    expect(call[1].reason).not.toContain('快照缺失');
+    expect(call[1].reason).toContain('本次未打款');
   });
 
   it('渠道失败且未超上限 → 退回 APPROVED 并延迟重新入队', async () => {

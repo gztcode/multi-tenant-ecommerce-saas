@@ -16,6 +16,7 @@ import { PayoutService } from './payout.service';
 import { PayoutAccountService } from './payout-account.service';
 import { PayoutCipherService } from './payout-cipher.service';
 import { PayoutExecutionService } from './payout-execution.service';
+import { PayoutEncryptionSelfCheck } from './payout-encryption-self-check.service';
 import { PlatformPayoutController } from './platform-payout.controller';
 import { MerchantPayoutController } from './merchant-payout.controller';
 import { MerchantPayoutAccountController } from './merchant-payout-account.controller';
@@ -75,6 +76,8 @@ import { MerchantStatementService } from './merchant-statement.service';
     PayoutCipherService,
     // 出款执行（阶段 5h-2）
     PayoutExecutionService,
+    // 账目加密自检（阶段 5k）
+    PayoutEncryptionSelfCheck,
     // 账目按期聚合（阶段 5i）
     LedgerService,
     // 商家对账单（阶段 5i）
@@ -95,6 +98,9 @@ import { MerchantStatementService } from './merchant-statement.service';
     // ⚠️ **导出 `LedgerService`** —— 商家侧对账单（阶段 5i Task 5）
     //    要注入它做按期聚合（出款页与对账单共用同一份聚合）。
     LedgerService,
+    // ⚠️ **导出 `PayoutEncryptionSelfCheck`** —— `main.ts` 要用
+    //    `app.get()` 拿到它，在 `app.listen()` 之前跑自检。
+    PayoutEncryptionSelfCheck,
   ],
 })
 export class BillingModule {}

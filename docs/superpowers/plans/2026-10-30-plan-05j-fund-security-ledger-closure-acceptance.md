@@ -255,7 +255,7 @@
 | 7 | **掩码串会泄露账号长度** | 掩码串按明文长度打星 → 长度可见。**现状 API 返回的就是掩码串**，不是新增泄露面。 |
 | 8 | **迁移脚本的备份表会留在库里** | `merchant_payout_accounts_backup_<时间戳>` / `payouts_backup_<时间戳>`。有意保留（迁移出问题可恢复），但会一直占空间，需要人工清理。 |
 | 9 | **开发库残留** | 迁移脚本跑完后，备份表里仍有明文账号（`6225880000001234`）。业务表已无明文。 |
-| 10 | **e2e 的读路径抛错会让出款单停在 `PROCESSING`** | 解密在 worker 的 try/catch **之外** → 抛错后单子既不 `PAID` 也不 `FAILED`。写路径闸已堵住「明文快照落库」这个触发源，但「版本不认识」等其它异常仍会卡住。属于卡死告警兜底的话题，不在本阶段范围。 |
+| 10 | **e2e 的读路径抛错会让出款单停在 `APPROVED`** | 解密在 `claimForExecution` 的**事务内** → 抛错后**整个事务回滚**（抢单的状态变更与 `attemptCount` 的自增一起被撤销）→ 单子既不 `PAID` 也不 `FAILED`，而是回到 `APPROVED` 且 `attemptCount = 0`。⚠️ **5k 实施期实测更正**：5j 当时写的是「停在 `PROCESSING`」，**那是错的** —— 5k 在 `api/test/payout-encryption.e2e-spec.ts` 的「未迁移的行」用例上加临时探针实测到的值是 `status= APPROVED  attemptCount= 0  processingAt= null`。这个差别很要紧：`APPROVED` + `attemptCount = 0` **正好命中兜底扫描的「`APPROVED` 救援」条件** → 每 5 分钟重新入队一次 → **无限循环**。5k 已把读路径的解密失败处置为落 `FAILED`（解密发生在调渠道之前 → 确定没打钱）。 |
 | 11 | 5h-1 遗留的两条概率性 flaky | `payment-compensation`「扫描 A…」/ `payout`「P7…」概率性挂（本进程 BullMQ worker 抢走测试自己入队的 job）。本次全量跑 608 条全过，未触发。 |
 | 12 | 平台端与商家端共用 `localhost` cookie | 两端 cookie 同名同域 → 交替登录会互顶。本次靠「分端登录、每端做完再换」解决。 |
 

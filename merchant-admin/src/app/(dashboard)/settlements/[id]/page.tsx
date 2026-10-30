@@ -2,6 +2,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { ApiError, apiFetchAuthed } from '@/lib/api-client';
 import {
+  describePayoutAccount,
   describePayoutEntryType,
   describePayoutStatus,
   describePayoutTimeline,
@@ -56,6 +57,10 @@ export default async function PayoutDetailPage({
     return null;
   }
 
+  // ⚠️ **先算一次再渲染**：条件与内容用同一个值，
+  //    免得两处各调一次函数（万一将来它不是纯函数就会不一致）。
+  const accountText = describePayoutAccount(payout);
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
@@ -87,6 +92,21 @@ export default async function PayoutDetailPage({
           申请时预估 {formatCents(payout.requestedAmount)}
           （审批通过时平台会重算一次并锁定，可能与上值不同）
         </p>
+        {/* ⚠️ **收款账户（申请时）要显示**：商家必须能看出「钱打给谁」。
+            阶段 5j 之后库里只有密文，**掩码串是唯一能核对的东西** ——
+            界面上不显示它，商家就只能打电话问。
+
+            ⚠️ **显示的是申请那一刻的快照**，不是当前账户 ——
+            商家申请后改过账户的话两者会不同，而**钱打给的是快照那份**。
+            所以文案要写明「申请时」。
+
+            ⚠️ **只显示掩码串，绝不显示完整账号** —— 完整账号压根不在响应里，
+            前端也不去解密。 */}
+        {accountText && (
+          <p className="text-sm">
+            收款账户（申请时）：{accountText}
+          </p>
+        )}
         {/* ⚠️ **时间说明按 `status` 走，不按「字段非空」走**：
             后端 `reject()` 也填 `approvedAt`（拒绝同样是一次审批动作），
             按字段非空显示就会出现「已拒绝 · 已审批」这种自相矛盾的说法。 */}
@@ -115,11 +135,15 @@ export default async function PayoutDetailPage({
             这是补差出款单：该期结算单已结清，本期补差按零佣金结算。
           </p>
         )}
-        {/* ⚠️ **失败的单可能真的已经打出去了**（渠道超时 / 网络中断）——
-            必须让商家自己去核对是否已到账，否则商家会直接再申请一笔。 */}
+        {/* ⚠️ **失败有两种，商家都需要联系平台**：
+            ① 渠道试满 3 次 —— 钱**可能已经打出去**（渠道超时 / 网络中断）
+            ② 账户不可用（解密失败 / 快照缺失）—— **确定没打**
+            一句「请联系平台确认出款情况」对两类都成立，
+            且不引入条件判断（前端不该按失败原因文案分支 ——
+            后续改措辞就失效，「哪些文案表明没打钱」的知识也会散落到前端）。 */}
         {payout.status === 'FAILED' && (
           <p className="text-sm text-destructive">
-            出款失败：{payout.failureReason ?? '未知原因'}。请联系平台确认是否已到账。
+            出款失败：{payout.failureReason ?? '未知原因'}。请联系平台确认出款情况。
           </p>
         )}
       </div>

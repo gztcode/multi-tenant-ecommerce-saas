@@ -15,6 +15,7 @@ import { AppModule } from '../src/app.module';
 import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.interceptor';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
 import { FakePayoutProvider } from '../src/modules/payment/fake-payout.provider';
+import { PayoutWorker } from '../src/modules/payment/payout.worker';
 import {
   platformScope,
   tenantContext,
@@ -97,6 +98,8 @@ interface PayoutBody {
   failedAt: string | null;
   payoutChannel: string | null;
   maskedSnapshotAccountNo: string | null;
+  snapshotAccountName: string | null;
+  snapshotBankName: string | null;
   statementId: string | null;
   createdAt: string;
 }
@@ -560,6 +563,11 @@ describe('收款账户与出款单快照的字段加密 (e2e)', () => {
     );
     expect(merchantDetail.maskedSnapshotAccountNo).toBe('************0000');
     expect(JSON.stringify(merchantDetail)).not.toContain(PLAIN_ACCOUNT_NO);
+    // ⚠️ **户名与开户行也要给商家** —— 阶段 5k 之前商家端压根看不到
+    //    「钱打给谁」，掩码串是唯一的核对线索（设计 §三·3.1）。
+    //    这条断言钉住「后端早就发了，别改回去」。
+    expect(merchantDetail.snapshotAccountName).toBe('张三');
+    expect(merchantDetail.snapshotBankName).toBe('招商银行');
   });
 
   // ============================================================
@@ -603,7 +611,7 @@ describe('收款账户与出款单快照的字段加密 (e2e)', () => {
   // 用例 6：未迁移的行 → 读路径抛错（绝不按明文兜底）
   // ============================================================
 
-  it('未迁移的行（版本号 0）→ 打款路径抛错，不按明文兜底', async () => {
+  it('未迁移的行（版本号 0）→ 抢单不抛错，accountError 带着根因，不按明文兜底', async () => {
     const adminToken = await loginPlatformAdmin();
     const period = month('2026-02');
     const { merchant } = await setupMerchantWithPeriod(adminToken, period, {
@@ -657,35 +665,26 @@ describe('收款账户与出款单快照的字段加密 (e2e)', () => {
 
       // ---- 直接调抢单这一步 —— 它就是解密发生的地方 ----
       //
-      // ⚠️ **为什么不走队列**：解密在 `claimForExecution` 里，
-      //    而 worker 的 try/catch 只包住「调渠道」那一段 →
-      //    解密抛错会让 job 变成 BullMQ 的 failed job，
-      //    **出款单停在 `PROCESSING`**（既没 PAID 也没 FAILED）。
-      //    那个「停在 PROCESSING」是**另一个话题**（卡死告警会兜住它），
-      //    这条用例要守的是「**解密失败绝不按明文兜底**」——
-      //    直接调这一步，异常会原样抛到测试手里。
+      // ⚠️ **为什么不走队列**：改写前这里期望「抛错」，抛错会让
+      //    job 变成 BullMQ 的 failed job。这条用例要守的是
+      //    「**解密失败绝不按明文兜底**」—— 直接调这一步最直白。
       const execution = app.get(PayoutExecutionService);
-      await expect(
-        execution.claimForExecution(applied.id, new Date()),
-      ).rejects.toThrow(/尚未加密/);
+      const claim = await execution.claimForExecution(applied.id, new Date());
 
-      // ⚠️⚠️ **错误消息必须指向「没加密」** ——
+      // ⚠️⚠️ **根因必须指向「没加密」** ——
       //    实现若按明文兜底（拿明文当密文去解），
       //    这里会是「密文解密失败（密钥不匹配，或密文已被篡改）」——
       //    消息长得像，但根因不同：按明文兜底等于把加密悄悄关掉，
       //    迁移脚本也永远不会提醒运维去补迁移。
       //    → 所以除了「尚未加密」，还要看到「迁移」这两个字。
-      let message = '';
-      try {
-        await execution.claimForExecution(applied.id, new Date());
-      } catch (error) {
-        message = error instanceof Error ? error.message : String(error);
-      }
-      expect(message).toContain('尚未加密');
+      expect(claim).not.toBeNull();
+      expect(claim!.accountError).toContain('尚未加密');
       // ⚠️ **必须点名迁移命令** —— 运维看到「尚未加密」还不够，
       //    他得知道**敲哪条命令**才能修好。
-      expect(message).toContain('migrate:payout-encryption');
-      expect(message).not.toContain('密钥不匹配');
+      expect(claim!.accountError).toContain('migrate:payout-encryption');
+      expect(claim!.accountError).not.toContain('密钥不匹配');
+      // ⚠️ **绝不按明文兜底**
+      expect(claim!.account).toBeNull();
 
       // ⚠️ **钱绝不能打出去** —— 解密失败就不能调渠道。
       //    这里直接调的是抢单这一步，压根没走到渠道，
@@ -712,15 +711,21 @@ describe('收款账户与出款单快照的字段加密 (e2e)', () => {
     expect(restored!.snapshotEncryptionVersion).toBe(originalVersion);
     expect(restored!.snapshotEncryptionVersion).toBe(1);
 
-    // ---- 还原后这张单能正常打款（证明抛错确实是版本号触发的）----
+    // ---- 还原后这张单能正常打款（证明失败确实是版本号触发的）----
     //
-    // ⚠️ **刚才的 `claimForExecution` 抛错前已经把单改成 `PROCESSING` 了**
-    //    （抢单是事务里的第一步更新），所以这里要先把它拨回 `APPROVED`，
-    //    否则 worker 抢不到单（护栏 X1 的条件更新）。
+    // ⚠️ **刚才的 `claimForExecution` 已经把单抢成 `PROCESSING` 了**
+    //    （抢单是事务里的第一步更新，且这次事务**提交了**），所以这里要
+    //    先把它拨回 `APPROVED`，否则 worker 抢不到单（护栏 X1 的条件更新）。
     await asPlatform(() =>
       prisma.payout.updateMany({
         where: { id: applied.id },
-        data: { status: PayoutStatus.APPROVED, processingAt: null },
+        data: {
+          status: PayoutStatus.APPROVED,
+          processingAt: null,
+          // ⚠️ **attemptCount 一起拨回 0** —— 改写后抢单成功过一次
+          //    （attemptCount = 1），这次打款应当是一次全新的执行
+          attemptCount: 0,
+        },
       }),
     );
     await payoutQueue.add(
@@ -853,5 +858,109 @@ describe('收款账户与出款单快照的字段加密 (e2e)', () => {
     // ---- 还原后申请出款能成功（证明闸确实是版本号触发的）----
     const applied = await apply(merchant.token, period.label);
     expect(applied.status).toBe(PayoutStatus.REQUESTED);
+  });
+
+  // ============================================================
+  // 用例 8：解密失败 → 落 FAILED（确定没打钱）+ 明细释放 + 无限循环断了
+  // ============================================================
+
+  it('解密失败 → 出款单落 FAILED，明细占用被释放，兜底扫描再也捞不到它', async () => {
+    const adminToken = await loginPlatformAdmin();
+    const period = month('2026-04');
+    const { merchant } = await setupMerchantWithPeriod(adminToken, period, {
+      receiptAmount: 10000,
+      commissionAmount: 1000,
+    });
+
+    const applied = await apply(merchant.token, period.label);
+
+    // ---- 手工把它拨成 APPROVED —— 绕过 approve 的入队路径 ----
+    //
+    // ⚠️ **为什么不用 `approve`**：审批会**重新抄一份账户行里的密文**
+    //    （覆盖快照），改在审批前的快照会被覆盖掉；改在审批后的话，
+    //    worker 可能已经抢到单打完了。手工置 `APPROVED` 既不覆盖快照，
+    //    也**不入队** → 没有竞态。
+    await asPlatform(() =>
+      prisma.payout.updateMany({
+        where: { id: applied.id },
+        data: {
+          status: PayoutStatus.APPROVED,
+          approvedAt: new Date(),
+          approvedBy: 'test-admin',
+        },
+      }),
+    );
+
+    // ---- 把快照的版本号改回 0 —— 模拟「这张单是在迁移前出的」 ----
+    const originalVersion = (await asPlatform(() =>
+      prisma.payout.findFirst({
+        where: { id: applied.id },
+        select: { snapshotEncryptionVersion: true },
+      }),
+    ))!.snapshotEncryptionVersion;
+
+    try {
+      await asPlatform(() =>
+        prisma.payout.updateMany({
+          where: { id: applied.id },
+          data: { snapshotEncryptionVersion: 0 },
+        }),
+      );
+
+      // ---- 直接调 worker 的 execute —— 走完整的「抢单 → 判闸 → 落终态」 ----
+      //
+      // ⚠️ **不靠队列**：BullMQ 的消费有延迟与竞态，直接调 `process()`
+      //    才是确定性的（这一步验的是 worker 的**逻辑**）。
+      const worker = app.get(PayoutWorker);
+      await worker.process({
+        name: 'execute',
+        data: { payoutId: applied.id },
+      } as never);
+
+      // ---- 断言 ①：单子落 FAILED，理由是业务口径 ----
+      const after = (await asPlatform(() =>
+        prisma.payout.findFirst({
+          where: { id: applied.id },
+          select: { status: true, failureReason: true },
+        }),
+      ))!;
+      expect(after.status).toBe(PayoutStatus.FAILED);
+      expect(after.failureReason).toContain('本次未打款');
+      // ⚠️ **界面文案不能带内部术语**
+      expect(after.failureReason).not.toContain('尚未加密');
+      expect(after.failureReason).not.toContain('密钥不匹配');
+
+      // ---- 断言 ②：渠道从未被调用（确定没打钱） ----
+      const fake = app.get(FakePayoutProvider);
+      expect(fake.receivedRequest(applied.id)).toBeUndefined();
+
+      // ---- 断言 ③：明细占用被释放（商家对同期重新申请不撞唯一索引） ----
+      const entries = await asPlatform(() =>
+        prisma.payoutEntry.count({ where: { payoutId: applied.id } }),
+      );
+      expect(entries).toBe(0);
+
+      // ---- 断言 ④：兜底扫描再也捞不到它（无限循环断了） ----
+      //
+      // ⚠️ **这是整条用例的关键断言** —— 改写前单子停在 `APPROVED`
+      //    且 `attemptCount = 0` → `scanStuck` 的分支 ② 全中 → 每 5 分钟
+      //    重新入队一次 → **无限循环**（设计 §二·2.1）。
+      //
+      // ⚠️ **时间要往后推一小时** —— 否则 `approvedAt` 刚设成 `now`，
+      //    还没到「卡住 10 分钟」的阈值，分支 ② 压根不会查它 →
+      //    断言恒真（没有牙齿）。
+      const execution = app.get(PayoutExecutionService);
+      const rescues = await execution.scanStuck(
+        new Date(Date.now() + 3600_000),
+      );
+      expect(rescues.find((r) => r.id === applied.id)).toBeUndefined();
+    } finally {
+      await asPlatform(() =>
+        prisma.payout.updateMany({
+          where: { id: applied.id },
+          data: { snapshotEncryptionVersion: originalVersion },
+        }),
+      );
+    }
   });
 });

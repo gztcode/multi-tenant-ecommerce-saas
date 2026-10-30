@@ -41,6 +41,15 @@ export interface ExecutionClaim {
   netAmount: number;
   /** 出款单号（渠道对账单上显示的） */
   payoutNo: string;
+  /**
+   * **解密失败**时的内部根因（给日志看）。
+   *
+   * ⚠️ **非 null = 解密失败**（根因在这里）。
+   * ⚠️ **null 且 `account` 也为 null = 快照本就没有账号**
+   *    （历史单压根没抄账户）—— 由 `checkGates` 报「收款账号信息异常」。
+   * ⚠️ **null 且 `account` 非 null = 解密成功，账户可用**。
+   */
+  accountError: string | null;
   /** 收款账户快照（**不是**实时查的） */
   account: {
     accountName: string;
@@ -119,24 +128,45 @@ export class PayoutExecutionService {
         if (!payout) {
           return null;
         }
+        // ⚠️ **解密失败不抛错** —— 抛错会让整个事务回滚，单子停在
+        //    `APPROVED` 且 `attemptCount` 一起被回滚 → 兜底扫描把它当成
+        //    「审批后入队失败」重新入队 → **每 5 分钟无限循环**
+        //    （设计 §二·2.1，有实测数据）。
+        //
+        // ⚠️ **底层照样响亮地失败**：`decryptVersioned` 抛带中文原因的错，
+        //    这里只是把**处置**从「抛给 BullMQ」改成「捕获 → 记日志 → 落 FAILED」。
+        let account: ExecutionClaim['account'] = null;
+        let accountError: string | null = null;
+
+        if (payout.snapshotAccountNoCipher) {
+          try {
+            account = {
+              accountName: payout.snapshotAccountName ?? '',
+              bankName: payout.snapshotBankName ?? '',
+              // ⚠️ **这里是全仓唯一给渠道明文账号的地方**。
+              accountNo: this.cipher.decryptVersioned(
+                payout.snapshotAccountNoCipher,
+                payout.snapshotEncryptionVersion,
+                '出款单的收款账号快照',
+              ),
+            };
+          } catch (error) {
+            // ⚠️ **捕获而不抛出**：让事务照常提交（单子进 PROCESSING），
+            //    由 worker 落 FAILED。
+            //
+            // ⚠️ **绝不按明文兜底**：`account` 保持 null ——
+            //    「忘了迁移」若被静默当成「就是明文」，等于把加密悄悄关掉。
+            accountError =
+              error instanceof Error ? error.message : String(error);
+          }
+        }
+
         return {
           attemptCount: payout.attemptCount,
           netAmount: payout.netAmount,
           payoutNo: payout.payoutNo,
-          account: payout.snapshotAccountNoCipher
-            ? {
-                accountName: payout.snapshotAccountName ?? '',
-                bankName: payout.snapshotBankName ?? '',
-                // ⚠️ **这里是全仓唯一给渠道明文账号的地方**。
-                //    快照的版本号不对（没迁移）→ 直接抛错，
-                //    不能拿明文兜底（那等于把加密悄悄关掉）。
-                accountNo: this.cipher.decryptVersioned(
-                  payout.snapshotAccountNoCipher,
-                  payout.snapshotEncryptionVersion,
-                  '出款单的收款账号快照',
-                ),
-              }
-            : null,
+          accountError,
+          account,
         };
       });
     });

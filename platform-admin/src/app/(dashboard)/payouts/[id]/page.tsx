@@ -148,6 +148,20 @@ export default async function PayoutDetailPage({
               </p>
             )}
 
+            {/* ⚠️ **只在 APPROVED 时显示备注**：入队失败的单停在 APPROVED，
+                而失败原因只在 FAILED 时渲染 → 这行是「这张单刚入队失败过、
+                正在等兜底扫描救援」的**唯一信号**。
+
+                ⚠️ **平台端加、商家端不加** —— 商家看到「已审批 + 系统将自动重试」
+                只会困惑（「重试什么？是不是要我做什么？」），超管看到它就知道
+                `scanStuck` 会救它。 */}
+            {payout.status === 'APPROVED' && payout.failureReason && (
+              <div className="flex justify-between py-2 text-sm text-muted-foreground">
+                <span>备注</span>
+                <span>{payout.failureReason}</span>
+              </div>
+            )}
+
             {/* ⚠️ **类型要单独一行**：补差出款是**增量**，
                 混在正常出款里超管会按同一口径核账。 */}
             <div className="flex justify-between py-2 text-sm">

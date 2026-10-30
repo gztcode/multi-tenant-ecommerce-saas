@@ -31,7 +31,7 @@ vi.mock('@/lib/api-client', async () => {
 
 import PayoutApplyPage from '@/app/(dashboard)/settlements/apply/page';
 import { PayoutApplyForm } from '@/app/(dashboard)/settlements/apply/apply-form';
-import type { AvailablePeriod } from '@/lib/payout';
+import type { AvailablePeriod, PayoutAccount } from '@/lib/payout';
 
 import { collectComponentProps, collectText, hasText } from '../helpers/page-tree';
 
@@ -55,6 +55,18 @@ const PERIODS: AvailablePeriod[] = [
   },
 ];
 
+/**
+ * 收款账户（阶段 5j 之后账号是密文，响应里只给掩码串）。
+ *
+ * ⚠️ **没有 `accountNo` 字段** —— 完整账号压根不进浏览器。
+ */
+const ACCOUNT: PayoutAccount = {
+  accountName: '示例商户',
+  bankName: '示例银行',
+  maskedAccountNo: '6222 **** **** 1234',
+  updatedAt: '2026-02-01T00:00:00.000Z',
+};
+
 /** 渲染页面并收集文字 */
 async function renderPage(): Promise<string[]> {
   const element = await PayoutApplyPage();
@@ -63,17 +75,51 @@ async function renderPage(): Promise<string[]> {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  apiFetchAuthedMock.mockResolvedValue(PERIODS);
+  // ⚠️ **按路径分别返回**：页面现在打两个接口
+  //    （可申请周期 + 收款账户）—— 都返回 `PERIODS` 的话，
+  //    账户那一路的字段全是 `undefined`，测不出东西。
+  apiFetchAuthedMock.mockImplementation(async (path: string) => {
+    if (path === '/merchant/payout-account') return ACCOUNT;
+    return PERIODS;
+  });
 });
 
 describe('申请出款页：取数', () => {
   it('打到商家侧的 /merchant/payouts/available-periods', async () => {
     await renderPage();
 
-    expect(apiFetchAuthedMock).toHaveBeenCalledTimes(1);
-    const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
+    const paths = apiFetchAuthedMock.mock.calls.map(
+      (call) => (call as [string])[0],
+    );
     // ⚠️ **精确匹配而不是 `toContain`**：路径写歪了照样绿的写法。
-    expect(path).toBe('/merchant/payouts/available-periods');
+    expect(paths).toContain('/merchant/payouts/available-periods');
+  });
+
+  it('⚠️ 也取当前收款账户（商家提交前得看出「钱会打到哪」）', async () => {
+    await renderPage();
+
+    const paths = apiFetchAuthedMock.mock.calls.map(
+      (call) => (call as [string])[0],
+    );
+    expect(paths).toContain('/merchant/payout-account');
+  });
+});
+
+describe('申请出款页：收款账户可见性（阶段 5j）', () => {
+  it('⚠️ 显示「本次出款将打到…」并带上开户行与掩码账号', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '本次出款将打到')).toBe(true);
+    expect(hasText(texts, '示例银行')).toBe(true);
+    expect(hasText(texts, '6222 **** **** 1234')).toBe(true);
+  });
+
+  it('⚠️ 只显示掩码账号，绝不显示完整账号', async () => {
+    const texts = await renderPage();
+
+    // ⚠️ **完整账号压根不在响应里** —— 界面上更不能凭空拼一个出来。
+    expect(hasText(texts, '完整账号')).toBe(false);
+    expect(hasText(texts, '6222123412341234')).toBe(false);
   });
 });
 

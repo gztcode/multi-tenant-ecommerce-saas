@@ -65,6 +65,9 @@ const ITEM: PayoutItem = {
   processingAt: null,
   paidAt: null,
   failedAt: null,
+  snapshotAccountName: '示例商户',
+  snapshotBankName: '示例银行',
+  maskedSnapshotAccountNo: '6222 **** **** 1234',
 };
 
 const LIST = {
@@ -294,7 +297,7 @@ describe('出款单列表页：类型标记与失败提示（阶段 5h-2）', ()
     expect(hasText(texts, 'SOMETHING_NEW')).toBe(false);
   });
 
-  it('⚠️ 出款失败时提示商家去核对是否已到账', async () => {
+  it('⚠️ 出款失败时提示商家去核对出款情况', async () => {
     apiFetchAuthedMock.mockResolvedValue({
       ...LIST,
       items: [{ ...ITEM, status: 'FAILED' as const }],
@@ -305,12 +308,19 @@ describe('出款单列表页：类型标记与失败提示（阶段 5h-2）', ()
     expect(hasText(texts, '出款失败')).toBe(true);
     // ⚠️ **这句提示不能省**：失败的单可能真的已经打出去了，
     //    商家不去核对就会直接再申请一笔。
-    expect(hasText(texts, '请联系平台确认是否已到账')).toBe(true);
+    //
+    // ⚠️ **措辞是「确认出款情况」而不是「确认是否已到账」** —— 失败有两种：
+    //    ① 渠道试满 3 次（钱**可能**已打出去）
+    //    ② 账户不可用（**确定没打**）
+    //    「是否已到账」对第 ② 类不成立，会让商家为一个确定没打钱的单
+    //    白打一个电话核对。
+    expect(hasText(texts, '请联系平台确认出款情况')).toBe(true);
+    expect(hasText(texts, '请联系平台确认是否已到账')).toBe(false);
   });
 
   it('⚠️ 不是失败状态时不显示那句核对提示', async () => {
     const texts = await renderPage();
 
-    expect(hasText(texts, '请联系平台确认是否已到账')).toBe(false);
+    expect(hasText(texts, '请联系平台确认出款情况')).toBe(false);
   });
 });
