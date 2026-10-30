@@ -1142,7 +1142,11 @@ describe('approve（阶段 5h-2）', () => {
     const data = argsOf(prisma.payout.updateMany).data as {
       failureReason: string;
     };
-    expect(data.failureReason).toContain('入队失败');
+    expect(data.failureReason).toContain('打款任务提交失败');
+    // ⚠️⚠️ **绝不能带原始异常消息** —— 那是 Redis 的连接细节
+    //    （主机名、端口、连接错误）。内部原文只进日志。
+    expect(data.failureReason).not.toContain('Redis 连不上');
+    expect(data.failureReason).not.toContain('Redis');
   });
 
   it('⚠️ 审批时同步明细：deleteMany 必须先于 createMany', async () => {

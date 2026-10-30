@@ -63,6 +63,9 @@ const DETAIL: PayoutDetail = {
   processingAt: null,
   paidAt: null,
   failedAt: null,
+  snapshotAccountName: '示例商户',
+  snapshotBankName: '示例银行',
+  maskedSnapshotAccountNo: '6222 **** **** 1234',
   entries: [
     {
       entryId: 'entry-1',
@@ -308,7 +311,7 @@ describe('出款单详情页：补差单与失败提示（阶段 5h-2）', () =>
     expect(hasText(texts, '补差按零佣金结算')).toBe(false);
   });
 
-  it('⚠️ 出款失败时显示失败原因并提示核对是否已到账', async () => {
+  it('⚠️ 出款失败时显示失败原因并提示联系平台确认出款情况', async () => {
     apiFetchAuthedMock.mockResolvedValue({
       ...DETAIL,
       status: 'FAILED' as const,
@@ -318,7 +321,10 @@ describe('出款单详情页：补差单与失败提示（阶段 5h-2）', () =>
     const texts = await renderPage();
 
     expect(hasText(texts, '出款失败：渠道超时')).toBe(true);
-    expect(hasText(texts, '请联系平台确认是否已到账')).toBe(true);
+    // ⚠️ **措辞是「确认出款情况」而不是「确认是否已到账」**（阶段 5k）：
+    //    `FAILED` 有两类 —— 渠道试满 3 次（钱**可能**已打出去）与
+    //    账户不可用（**确定没打**）。「是否已到账」对后者不成立。
+    expect(hasText(texts, '请联系平台确认出款情况')).toBe(true);
   });
 
   it('⚠️ 失败但没有原因时显示「未知原因」', async () => {
@@ -336,7 +342,7 @@ describe('出款单详情页：补差单与失败提示（阶段 5h-2）', () =>
   it('⚠️ 不是失败状态时不显示失败提示', async () => {
     const texts = await renderPage();
 
-    expect(hasText(texts, '请联系平台确认是否已到账')).toBe(false);
+    expect(hasText(texts, '请联系平台确认出款情况')).toBe(false);
   });
 });
 

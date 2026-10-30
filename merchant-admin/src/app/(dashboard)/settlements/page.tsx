@@ -128,11 +128,14 @@ export default async function PayoutsPage() {
                     <td>{describePayoutKind(payout.kind)}</td>
                     <td>
                       {describePayoutStatus(payout.status)}
-                      {/* ⚠️ **失败的单可能真的已经打出去了**（渠道超时 / 网络中断）——
-                          必须让商家自己去核对是否已到账，否则商家会直接再申请一笔。 */}
+                      {/* ⚠️ **失败有两种，商家都需要联系平台**：
+                          ① 渠道试满 3 次 —— 钱**可能已经打出去**（渠道超时 / 网络中断）
+                          ② 账户不可用（解密失败 / 快照缺失）—— **确定没打**
+                          一句「请联系平台确认出款情况」对两类都成立，
+                          且与详情页的措辞一致（同端不能两套说法）。 */}
                       {payout.status === 'FAILED' && (
                         <p className="text-xs text-destructive">
-                          出款失败，请联系平台确认是否已到账
+                          出款失败，请联系平台确认出款情况
                         </p>
                       )}
                     </td>

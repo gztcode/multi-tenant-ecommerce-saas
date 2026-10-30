@@ -188,9 +188,13 @@ describe('PayoutExecutionService', () => {
       expect(claim!.account).toBeNull();
     });
 
-    it('⚠️ 快照还没加密（版本 0）→ 抛错，绝不按明文兜底', async () => {
-      // ⚠️ **「忘了迁移」若被静默当成「就是明文」，等于把加密悄悄关掉了** ——
-      //    所以版本号不对必须响亮地失败。
+    it('⚠️ 快照还没加密（版本 0）→ 不抛错，accountError 带着根因', async () => {
+      // ⚠️ **原来这里是「抛错」** —— 抛错会让整个事务回滚，单子停在
+      //    `APPROVED` 且 `attemptCount` 一起被回滚 → 兜底扫描把它当成
+      //    「审批后入队失败」重新入队 → **每 5 分钟无限循环**（设计 §二·2.1）。
+      //
+      // ⚠️ **根因必须留在 `accountError` 里** —— 底层
+      //    `decryptVersioned` 照样抛带中文原因的错，worker 只把它记进日志。
       const prisma = fakePrisma({
         payout: {
           attemptCount: 1,
@@ -205,9 +209,41 @@ describe('PayoutExecutionService', () => {
       });
       const service = makeService(prisma);
 
-      await expect(
-        service.claimForExecution('payout-a', new Date()),
-      ).rejects.toThrow(/尚未加密/);
+      const claim = await service.claimForExecution('payout-a', new Date());
+
+      // ⚠️ **根因指向「没加密」** —— 运维要靠它知道该跑哪条命令
+      expect(claim!.accountError).toContain('尚未加密');
+      expect(claim!.accountError).toContain('migrate:payout-encryption');
+      // ⚠️ **绝不按明文兜底** —— 「忘了迁移」若被当成「就是明文」，
+      //    等于把加密悄悄关掉了
+      expect(claim!.account).toBeNull();
+    });
+
+    it('⚠️ 解密成功 → accountError 为 null，账户照常返回', async () => {
+      // ⚠️ **对照组** —— 防止「捕获异常」的改动把正常路径也弄坏
+      const plain = '6222000000000000';
+      const prisma = fakePrisma({
+        payout: {
+          attemptCount: 1,
+          netAmount: 8500,
+          payoutNo: 'PAY1',
+          snapshotAccountName: '张三',
+          snapshotBankName: '测试银行',
+          snapshotAccountNoCipher: new PayoutCipherService().encrypt(plain),
+          snapshotMaskedAccountNo: '************0000',
+          snapshotEncryptionVersion: 1,
+        },
+      });
+      const service = makeService(prisma);
+
+      const claim = await service.claimForExecution('payout-a', new Date());
+
+      expect(claim!.accountError).toBeNull();
+      expect(claim!.account).toEqual({
+        accountName: '张三',
+        bankName: '测试银行',
+        accountNo: plain,
+      });
     });
   });
 

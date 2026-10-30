@@ -7,6 +7,7 @@ import { TenantContextInterceptor } from './modules/tenancy/tenant-context.inter
 import { assertSecureConfig } from './common/config/assert-secure-config';
 import { assertPayoutEncryptionKey } from './common/config/assert-payout-encryption-key';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { PayoutEncryptionSelfCheck } from './modules/billing/payout-encryption-self-check.service';
 
 async function bootstrap() {
   // 在创建 Nest 应用之前校验 JWT_SECRET：
@@ -52,6 +53,12 @@ async function bootstrap() {
   SwaggerModule.setup('api/docs', app, document);
 
   const port = Number(process.env.PORT ?? 3000);
+
+  // ⚠️ **账目密钥自检必须在监听端口之前**：
+  //    带着解不开的密文启动，运营看到的全是失败的出款单，
+  //    没人知道根因是密钥配错了。
+  await app.get(PayoutEncryptionSelfCheck).check();
+
   await app.listen(port);
   console.log(`API 已启动：http://localhost:${port}/api/v1`);
 }
