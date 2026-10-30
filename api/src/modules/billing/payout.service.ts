@@ -21,6 +21,7 @@ import {
   tenantContext,
 } from '../../common/tenant/tenant-context';
 import { QueueService } from '../queue/queue.service';
+import { LedgerService } from './ledger.service';
 import { maskAccountNo } from './payout-account.service';
 import { formatPeriodLabel, resolveMonthlyPeriod } from './settlement';
 
@@ -154,10 +155,15 @@ export class PayoutService {
    *
    * ⚠️ **`billing` import `queue` 是安全的** —— `QueueModule` 是 `@Global()`，
    *    且 `queue.service.ts` 里没有任何渠道代码（不构成 `billing → payment` 的环）。
+   *
+   * ⚠️ **注入 `LedgerService`**（阶段 5i Task 6）：「可申请周期」列表
+   *    原本逐期循环调 `computeAmounts`（每期 3 次查询）→ 期数一多就是 N+1。
+   *    `LedgerService.aggregatePeriods` 把「N 期 × 3 次」压成**固定 6 次**。
    */
   constructor(
     private readonly prisma: TenantPrismaService,
     private readonly queues: QueueService,
+    private readonly ledger: LedgerService,
   ) {}
 
   /**
@@ -714,6 +720,12 @@ export class PayoutService {
    *    「同一期同时有已 `PAID` 的正常单 + 还能再申请一张补差单」的形状。
    *    `alreadyApplied = true` 会让商家以为「这期已经结清了」→
    *    **补差入口就此消失**。
+   *
+   * ⚠️ **阶段 5i Task 6：批量聚合** —— 原来是「逐期循环调 `computeAmounts`」
+   *    （每期 3 次查询：货款 / 结算单 / 出款单）→ 期数一多就线性放大（N+1）。
+   *    现在改成「先取周期清单 → `LedgerService.aggregatePeriods` 一次查齐
+   *    → 内存里按期取值」，**查询次数与期数无关**。
+   *    ⚠️ **口径必须与旧的 `computeAmounts` 逐字一致** —— 两处漂了账就错了。
    */
   async availablePeriods(): Promise<AvailablePeriodView[]> {
     const context = getTenantContext();
@@ -729,10 +741,11 @@ export class PayoutService {
     const receipts = await this.prisma.merchantReceipt.findMany({
       where: { occurredAt: { lt: now } },
       orderBy: { occurredAt: 'desc' },
+      select: { occurredAt: true },
     });
 
     // ⚠️ **按月分组**：流水是逐笔的，周期是月的。
-    //    这里只要**周期清单**（金额由 `computeAmounts` 重新算，
+    //    这里只要**周期清单**（金额由聚合统一算，
     //    不复用这里的求和 —— 两处口径漂了账就错了）。
     const periodLabels = new Set<string>();
     for (const receipt of receipts) {
@@ -741,53 +754,69 @@ export class PayoutService {
 
     const periods = [...periodLabels].sort((a, b) => b.localeCompare(a));
 
+    // ⚠️ **一次聚合所有期**（固定 6 次查询，与期数无关）——
+    //    这是本次改动的全部目的（阶段 5h-2 的遗留 L55）。
+    const aggregated = await this.ledger.aggregatePeriods(
+      tenantId,
+      periods.map((label) => resolveMonthlyPeriod(label)),
+    );
+
     const views: AvailablePeriodView[] = [];
     for (const period of periods) {
       const resolved = resolveMonthlyPeriod(period);
+      // ⚠️ **周期未结束的期要跳过** —— 周期内的流水还会变，
+      //    此时的数字不是凭证。
       if (resolved.to.getTime() > now.getTime()) {
         continue;
       }
 
-      // ⚠️ **整期金额无条件先算** —— 它的语义是「这一期总共应结多少」，
-      //    **与有没有活跃单无关**（设计 §6.4b）。
-      const amounts = await this.computeAmounts(tenantId, resolved);
-
-      // ⚠️ **活跃单要按 kind 分别查** —— 索引是三元组，查询不带 kind 就会错位
-      const normalActive = await this.findActivePayout(
-        resolved.from,
-        PayoutKind.NORMAL,
-      );
-      const supplementActive = await this.findActivePayout(
-        resolved.from,
-        PayoutKind.SUPPLEMENT,
-      );
-
-      let appliedKind: PayoutKind | null = null;
-      let supplementAvailable = false;
-      let supplementAmount: number | null = null;
-
-      if (supplementActive) {
-        // ⚠️ **补差单不允许再叠**（护栏 X8）→ 即使还有新流水也不给入口
-        appliedKind = PayoutKind.SUPPLEMENT;
-      } else if (normalActive) {
-        appliedKind = PayoutKind.NORMAL;
-        // ⚠️ **只有正常单已 `PAID` 且还在飞之外的情况才给补差入口**：
-        //    正常单还在飞（REQUESTED / APPROVED / PROCESSING）时，
-        //    给补差入口会出现「两张单同时在飞」。
-        if (normalActive.status === PayoutStatus.PAID) {
-          const unclaimed = await this.computeUnclaimedAmounts(
-            tenantId,
-            resolved,
-          );
-          supplementAmount = unclaimed.receiptAmount;
-          supplementAvailable = unclaimed.receiptAmount > 0;
-        }
+      const amounts = aggregated.get(period);
+      if (!amounts) {
+        continue;
       }
+
+      // ⚠️ **佣金可能是 `null`**（该期没有结算单）→ 展示成 0。
+      // ⚠️ **不要取绝对值** —— 结算单「只有冲回没有抽佣」时净额为**负**，
+      //    那是合法的账（平台要退商家钱），取绝对值会把方向搞反。
+      const commissionAmount = amounts.commissionAmount ?? 0;
+      // ⚠️ **没有结算单时佣金恒为 0** → 净额就是货款全额
+      //    （与旧 `computeAmounts` 的 `receiptAmount - commissionAmount` 逐字一致）。
+      const netAmount =
+        amounts.commissionAmount === null
+          ? amounts.receiptAmount
+          : amounts.receiptAmount - amounts.commissionAmount;
+
+      // ⚠️ **活跃单按 kind 区分**（索引是三元组，不带 kind 会错位）。
+      //    ⚠️ **「活跃」含 `PAID`** —— 已出款的正常单**也是活跃单**
+      //    （它占着索引位，也是「这一期已结清、只能走补差」的判据）。
+      const appliedKind: PayoutKind | null = amounts.hasActiveSupplement
+        ? PayoutKind.SUPPLEMENT
+        : amounts.hasActiveNormal
+          ? PayoutKind.NORMAL
+          : null;
+
+      // ⚠️ **补差入口的判据**：正常单已 `PAID`（这一期已结清过一次）
+      //    **且**仍有未被任何单纳入的货款。
+      //    ⚠️ **正常单还在飞（REQUESTED / APPROVED / PROCESSING）时不给入口** ——
+      //    否则会出现「两张单同时在飞」。
+      //    ⚠️⚠️ **已有活跃补差单时也不给入口**（护栏 X8，5h-2 的规则）：
+      //    补差单**不允许再叠** —— 即使这一期后来又回填了货款，
+      //    也不能在已有补差单在飞时再开一张（那会让商家拿到两张补差单）。
+      //    ⚠️ **这是「规格给的映射表」与「5h-2 既有行为」的一处冲突**：
+      //    规格表只写了 `normalPaid && supplementAmount > 0`，
+      //    那样写会让「已 `PAID` 的正常单 + 活跃补差单」这一期
+      //    **凭空多出一个补差入口** → 违反护栏 X8 → 已按 5h-2 的规则修正。
+      const supplementAmount =
+        !amounts.hasActiveSupplement &&
+        amounts.normalPaid &&
+        (amounts.supplementAmount ?? 0) > 0
+          ? amounts.supplementAmount
+          : null;
 
       // ⚠️ **没有活跃单时按 5h-1 的规则跳过**（含「正常单是
       //    REJECTED / CANCELLED / FAILED」的情况 → 走正常路径重新申请）
-      if (!normalActive && !supplementActive) {
-        if (amounts.entryCount === 0 || amounts.netAmount <= 0) {
+      if (!amounts.hasActiveNormal && !amounts.hasActiveSupplement) {
+        if (amounts.receiptCount === 0 || netAmount <= 0) {
           continue;
         }
       }
@@ -795,13 +824,13 @@ export class PayoutService {
       views.push({
         period,
         receiptAmount: amounts.receiptAmount,
-        commissionAmount: amounts.commissionAmount,
-        netAmount: amounts.netAmount,
-        entryCount: amounts.entryCount,
+        commissionAmount,
+        netAmount,
+        entryCount: amounts.receiptCount,
         statementStatus: amounts.statementStatus,
-        alreadyApplied: normalActive !== null || supplementActive !== null,
+        alreadyApplied: appliedKind !== null,
         appliedKind,
-        supplementAvailable,
+        supplementAvailable: supplementAmount !== null,
         supplementAmount,
       });
     }

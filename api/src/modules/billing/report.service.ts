@@ -1,10 +1,11 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
-import { InvoiceStatus, OrderStatus } from '@prisma/client';
+import { CommissionEntryType, InvoiceStatus } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
+import { toReportAmounts } from './ledger';
 
 /** 一天的毫秒数 */
 const DAY_MS = 24 * 3600 * 1000;
@@ -24,13 +25,13 @@ export interface ReportSummary {
   /** 订阅收入：区间内已付账单的金额之和 */
   subscriptionRevenue: number;
   /**
-   * 抽佣收入：**毛额** —— 区间内收过钱的订单的抽佣快照之和。
+   * 抽佣收入：**毛额** —— 区间内抽佣流水（`COMMISSION`）的合计。
    *
    * ⚠️ **包含后来退款的那些**：抽佣是支付时定下的快照，
    * 与后来退没退款无关。退款的部分由 `reversal` 抵掉。
    */
   commissionRevenue: number;
-  /** 退款冲回：区间内已退款订单当初抽了多少 */
+  /** 退款冲回：区间内冲回流水（`REVERSAL`）的绝对值 */
   reversal: number;
   /** 净收入 = 订阅收入 + 抽佣收入 − 冲回 */
   netRevenue: number;
@@ -58,8 +59,9 @@ export interface PlatformSubscriptionItem {
 /**
  * 平台收入报表与跨租户订阅列表。
  *
- * ⚠️ **抽佣不建独立表**（设计文档 §九的取舍）→ 抽佣的两个数要**跨订单聚合**。
- * 这正是那个取舍的代价：SQL 会长一点，但少一张表与一套生命周期。
+ * ⚠️ **抽佣的两个数从抽佣流水表（`commission_entries`）聚合**（阶段 5i）：
+ * 报表、结算单、出款单、对账单都读这一张事实源 —— 口径统一，
+ * 平台看到的收入就是商家账上真正被扣走的钱。
  *
  * ⚠️ **金额一律整数分**：不在这里换算成元 —— 换算散落在前端各处，
  * 各处的舍入规则迟早会漂移，账就对不上了。
@@ -102,52 +104,62 @@ export class ReportService {
         _sum: { amount: true },
       });
 
-      // ⚠️ **抽佣收入** = 区间内**已支付**订单的抽佣快照之和。
+      // ⚠️ **抽佣收入 = 区间内抽佣流水（COMMISSION）的合计**。
       //
-      // ⚠️ **只看 `paidAt`，不看 status**：抽佣是**支付时定下的快照**
-      // （`Order.commissionAmount`），钱收进来就赚到了这笔抽佣，
-      // 与后来退没退款**无关** —— 退款是另一个时点上的另一件事，
-      // 由下面的冲回行单独表达。
+      // ⚠️ **为什么不再读 `orders` 表**（阶段 5i 的口径收口）：
+      //    报表原先从 `orders` 聚合（按 `paidAt` 取 `commissionAmount`），
+      //    而结算单与出款单从 `commission_entries` 读 —— **两套口径、两套数据源**。
+      //    两边迟早漂移：流水是 append-only 的审计凭证（写进去就不改），
+      //    订单的 `commissionAmount` 是快照、可能被后续逻辑改动；
+      //    结算单的金额是从流水聚合出来的，报表却从订单聚合 ——
+      //    于是「平台报表的抽佣」与「结算单已结的抽佣」对不上，
+      //    平台超管看到的收入不是商家账上真正被扣走的钱。
+      //    现在四者（报表 / 结算单 / 出款单 / 对账单）都收敛到流水这一张事实源。
       //
-      // ⚠️ **按 status 筛会造出凭空的负收入**：订单在 P 支付、P+1 退款时，
-      // P 的抽佣行会因为 status 变成 REFUNDED 而漏掉它，
-      // P+1 的冲回行又照记 —— 两期合起来净额是 −500，而真相是 0。
-      // 同窗口支付且退款更糟：净贡献 −500（真相是 0）。
+      // ⚠️ **归期口径不变**：流水的 `occurredAt` 写入时取的就是 `order.paidAt`
+      //    （抽佣）/ `order.refundedAt`（冲回），与旧口径同源 —— 数字不变，
+      //    只是改从哪儿读。
       //
-      // `paidAt` 非空本身就等价于「这笔单收过钱」：
-      // PENDING_PAYMENT / CANCELLED / CLOSED 的订单 paidAt 都是 null，
-      // `gte`/`lt` 对 null 不匹配，天然被排除。
-      const commissionAggregate = await this.prisma.order.aggregate({
+      // ⚠️ **流水天然就是毛额**：流水表里抽佣与冲回是两类行，
+      //    冲回不在 `COMMISSION` 的合计里 → 抽佣收入保持「毛额」语义。
+      const commissionAggregate = await this.prisma.commissionEntry.aggregate({
         where: {
-          paidAt: { gte: from, lt: to },
+          type: CommissionEntryType.COMMISSION,
+          occurredAt: { gte: from, lt: to },
         },
-        _sum: { commissionAmount: true },
+        _sum: { amount: true },
       });
 
-      // ⚠️ **退款冲回** = 区间内**已退款**订单当初抽了多少。
+      // ⚠️ **退款冲回 = 区间内冲回流水的合计**（口径同上：读流水，不读订单）。
       //
-      // ⚠️ **抽佣收入是毛额（gross）**：区间内收过钱的订单的抽佣之和，
-      // **包含后来退款的那些**。冲回是区间内退款要还回去的部分。
-      // 净收入 = 订阅收入 + 抽佣收入 − 冲回。
+      // ⚠️ **冲回是毛额的对冲项**：净收入 = 订阅收入 + 抽佣收入 − 冲回。
       // 一笔单无论退没退款，全周期净贡献都是对的：
       // 退了就是 +抽佣（支付期）−抽佣（退款期）= 0。
       //
       // ⚠️ **按退款期间归期，不按支付期间**：一笔在 1 月支付、3 月退款的订单，
       // 3 月的账上要有那笔冲回 —— 否则 3 月的账会把「白拿的抽佣」算成收入。
-      const reversalAggregate = await this.prisma.order.aggregate({
+      const reversalAggregate = await this.prisma.commissionEntry.aggregate({
         where: {
-          status: OrderStatus.REFUNDED,
-          refundedAt: { gte: from, lt: to },
+          type: CommissionEntryType.REVERSAL,
+          occurredAt: { gte: from, lt: to },
         },
-        _sum: { commissionAmount: true },
+        _sum: { amount: true },
       });
 
-      // ⚠️ **`_sum` 的键必须与字段名逐字一致**：写 `_sum: { commissionAmount: true }`
-      // 就要读 `_sum.commissionAmount`。读成 `_sum.amount` 拿到的是 undefined，
+      // ⚠️ **`_sum` 的键必须与字段名逐字一致**：写 `_sum: { amount: true }`
+      // 就要读 `_sum.amount`。读成别的键拿到的是 undefined，
       // `?? 0` 之后永远是 0 —— **数字全错却不报错**，是最难查的那种错。
       const subscriptionRevenue = subscriptionAggregate._sum.amount ?? 0;
-      const commissionRevenue = commissionAggregate._sum.commissionAmount ?? 0;
-      const reversal = reversalAggregate._sum.commissionAmount ?? 0;
+
+      // ⚠️ **符号换算必须走 `toReportAmounts`**：
+      //    流水的 `REVERSAL.amount` 恒 ≤ 0，报表口径的 `reversal` 恒 ≥ 0
+      //    （`netRevenue = 订阅 + 抽佣 − 冲回`）。
+      //    符号写反 → 冲回被减两次 → 净收入翻倍。
+      //    `toReportAmounts` 还会在符号异常时抛错，并把 `-0` 归一成 `0`。
+      const { commissionRevenue, reversal } = toReportAmounts(
+        commissionAggregate._sum.amount ?? 0,
+        reversalAggregate._sum.amount ?? 0,
+      );
 
       return {
         from,

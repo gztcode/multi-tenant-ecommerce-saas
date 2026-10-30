@@ -383,6 +383,103 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
     return created.id;
   }
 
+  /**
+   * 造一条抽佣流水（阶段 5i 起，报表的抽佣数**从流水表读**）。
+   *
+   * ⚠️ **报表的两个数都来自 `commission_entries`**：
+   *    `commissionRevenue` = 区间内 `COMMISSION` 行之和（毛额），
+   *    `reversal` = 区间内 `REVERSAL` 行之和取绝对值。
+   *    所以只造订单不造流水 → 报表的抽佣是 0。
+   *
+   * ⚠️ **`occurredAt` 必须与订单的时间逐字一致**：
+   *    抽佣行取 `paidAt`、冲回行取 `refundedAt` —— 流水写入时就是这么记的，
+   *    报表按 `occurredAt` 归期，写成别的时刻就对不上区间了。
+   */
+  async function seedCommissionEntry(
+    tenantId: string,
+    orderId: string,
+    options: {
+      type?: CommissionEntryType;
+      amount: number;
+      rateBps: number;
+      baseAmount: number;
+      occurredAt: Date;
+    },
+  ): Promise<void> {
+    await asPlatform(() =>
+      prisma.commissionEntry.create({
+        data: {
+          tenantId,
+          orderId,
+          orderNo: `ORD-${unique()}`,
+          type: options.type ?? CommissionEntryType.COMMISSION,
+          amount: options.amount,
+          rateBps: options.rateBps,
+          baseAmount: options.baseAmount,
+          occurredAt: options.occurredAt,
+        },
+      }),
+    );
+  }
+
+  /**
+   * 给一笔订单补上抽佣流水（支付时记的 `COMMISSION` 行）。
+   *
+   * ⚠️ **`amount` = 订单的 `commissionAmount` 快照**，
+   *    `rateBps` / `baseAmount` 与订单对得上 —— 流水是审计凭证，
+   *    里面的费率与计佣基数不能与订单脱节。
+   */
+  async function seedCommissionForOrder(
+    tenantId: string,
+    order: {
+      id: string;
+      commissionAmount: number;
+      commissionRate: number;
+      totalAmount: number;
+      paidAt: Date | null;
+    },
+  ): Promise<void> {
+    if (!order.paidAt) {
+      throw new Error('造抽佣流水必须给一个已支付的订单（paidAt 不能为空）');
+    }
+    if (order.commissionAmount === 0) {
+      throw new Error('零额订单不产生抽佣流水（与回填口径一致）');
+    }
+    await seedCommissionEntry(tenantId, order.id, {
+      type: CommissionEntryType.COMMISSION,
+      amount: order.commissionAmount,
+      rateBps: order.commissionRate,
+      baseAmount: order.totalAmount,
+      occurredAt: order.paidAt,
+    });
+  }
+
+  /**
+   * 给一笔已退款的订单补上冲回流（`REVERSAL` 行，金额为负）。
+   */
+  async function seedReversalForOrder(
+    tenantId: string,
+    order: {
+      id: string;
+      commissionAmount: number;
+      commissionRate: number;
+      totalAmount: number;
+      refundedAt: Date | null;
+    },
+  ): Promise<void> {
+    if (!order.refundedAt) {
+      throw new Error('造冲回流水必须给一个已退款且有退款时间的订单');
+    }
+    await seedCommissionEntry(tenantId, order.id, {
+      type: CommissionEntryType.REVERSAL,
+      // ⚠️ **冲回取负**：与抽佣行反向，单列求和即净额。
+      amount: -order.commissionAmount,
+      rateBps: order.commissionRate,
+      baseAmount: order.totalAmount,
+      occurredAt: order.refundedAt,
+    });
+  }
+
   /** 拉报表 */
   async function fetchReport(
     token: string,
@@ -448,19 +545,42 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
     expect(body.subscriptionRevenue).toBe(3000);
   });
 
-  it('报表的抽佣收入 = 区间内已支付订单的抽佣之和', async () => {
+  it('报表的抽佣收入 = 区间内抽佣流水（COMMISSION）的合计', async () => {
+    // ⚠️ **口径**：阶段 5i 起，报表的抽佣数从**抽佣流水表**读 ——
+    //    区间内 `COMMISSION` 行（`occurredAt` 落在区间）的金额之和。
+    //    抽佣是支付时定下的快照，所以流水归期取的是订单的 `paidAt`。
     const adminToken = await loginPlatformAdmin();
     const merchant = await createMerchant(app, prisma);
     const window = nextWindow();
 
-    await seedOrder(merchant.tenantId, window, {
+    const orderA = await seedOrder(merchant.tenantId, window, {
       status: OrderStatus.PAID,
+      totalAmount: 20000,
+      commissionRate: 500,
       commissionAmount: 100,
       paidAt: insideWindow(window, 10),
     });
-    await seedOrder(merchant.tenantId, window, {
+    const orderB = await seedOrder(merchant.tenantId, window, {
       status: OrderStatus.PAID,
+      totalAmount: 40000,
+      commissionRate: 500,
       commissionAmount: 200,
+      paidAt: insideWindow(window, 11),
+    });
+
+    // ⚠️ **造流水**：报表读的是流水表，只造订单的话抽佣是 0。
+    await seedCommissionForOrder(merchant.tenantId, {
+      id: orderA,
+      commissionAmount: 100,
+      commissionRate: 500,
+      totalAmount: 20000,
+      paidAt: insideWindow(window, 10),
+    });
+    await seedCommissionForOrder(merchant.tenantId, {
+      id: orderB,
+      commissionAmount: 200,
+      commissionRate: 500,
+      totalAmount: 40000,
       paidAt: insideWindow(window, 11),
     });
 
@@ -474,19 +594,49 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
     const merchant = await createMerchant(app, prisma);
     const window = nextWindow();
 
-    await seedOrder(merchant.tenantId, window, {
+    const paidOrder = await seedOrder(merchant.tenantId, window, {
       status: OrderStatus.PAID,
+      totalAmount: 20000,
+      commissionRate: 500,
       commissionAmount: 100,
       paidAt: insideWindow(window, 10),
     });
-    await seedOrder(merchant.tenantId, window, {
+    const shippedOrder = await seedOrder(merchant.tenantId, window, {
       status: OrderStatus.SHIPPED,
+      totalAmount: 40000,
+      commissionRate: 500,
       commissionAmount: 200,
       paidAt: insideWindow(window, 11),
     });
-    await seedOrder(merchant.tenantId, window, {
+    const completedOrder = await seedOrder(merchant.tenantId, window, {
       status: OrderStatus.COMPLETED,
+      totalAmount: 80000,
+      commissionRate: 500,
       commissionAmount: 400,
+      paidAt: insideWindow(window, 12),
+    });
+
+    // ⚠️ **新口径下等价于「有没有 COMMISSION 流水」**：
+    //    流水是支付时记的，订单后来发货、完成都不影响它进报表。
+    await seedCommissionForOrder(merchant.tenantId, {
+      id: paidOrder,
+      commissionAmount: 100,
+      commissionRate: 500,
+      totalAmount: 20000,
+      paidAt: insideWindow(window, 10),
+    });
+    await seedCommissionForOrder(merchant.tenantId, {
+      id: shippedOrder,
+      commissionAmount: 200,
+      commissionRate: 500,
+      totalAmount: 40000,
+      paidAt: insideWindow(window, 11),
+    });
+    await seedCommissionForOrder(merchant.tenantId, {
+      id: completedOrder,
+      commissionAmount: 400,
+      commissionRate: 500,
+      totalAmount: 80000,
       paidAt: insideWindow(window, 12),
     });
 
@@ -502,15 +652,43 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
     const merchant = await createMerchant(app, prisma);
     const window = nextWindow();
 
-    await seedOrder(merchant.tenantId, window, {
+    const paidOrder = await seedOrder(merchant.tenantId, window, {
       status: OrderStatus.PAID,
+      totalAmount: 20000,
+      commissionRate: 500,
       commissionAmount: 100,
       paidAt: insideWindow(window, 10),
     });
-    await seedOrder(merchant.tenantId, window, {
+    const refundedOrder = await seedOrder(merchant.tenantId, window, {
       status: OrderStatus.REFUNDED,
+      totalAmount: 10000,
+      commissionRate: 500,
       commissionAmount: 50,
       paidAt: insideWindow(window, 11),
+      refundedAt: insideWindow(window, 20),
+    });
+
+    // ⚠️ **两条流水都要造**：抽佣行按 `paidAt` 归期、冲回行按 `refundedAt` 归期，
+    //    两行相抵才是真相。少了冲回行 → `reversal` 是 0。
+    await seedCommissionForOrder(merchant.tenantId, {
+      id: paidOrder,
+      commissionAmount: 100,
+      commissionRate: 500,
+      totalAmount: 20000,
+      paidAt: insideWindow(window, 10),
+    });
+    await seedCommissionForOrder(merchant.tenantId, {
+      id: refundedOrder,
+      commissionAmount: 50,
+      commissionRate: 500,
+      totalAmount: 10000,
+      paidAt: insideWindow(window, 11),
+    });
+    await seedReversalForOrder(merchant.tenantId, {
+      id: refundedOrder,
+      commissionAmount: 50,
+      commissionRate: 500,
+      totalAmount: 10000,
       refundedAt: insideWindow(window, 20),
     });
 
@@ -541,10 +719,30 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
     const refundWindow = nextWindow();
 
     // 支付落在窗口 A、退款落在窗口 B
-    await seedOrder(merchant.tenantId, payWindow, {
+    const orderId = await seedOrder(merchant.tenantId, payWindow, {
       status: OrderStatus.REFUNDED,
+      totalAmount: 100000,
+      commissionRate: 500,
       commissionAmount: 500,
       paidAt: insideWindow(payWindow, 10),
+      refundedAt: insideWindow(refundWindow, 5),
+    });
+
+    // ⚠️ **两条流水的归期分别落在两个窗口**：
+    //    抽佣行 `occurredAt` = `paidAt`（窗口 A）、冲回行 `occurredAt` = `refundedAt`（窗口 B）。
+    //    流水是唯一的事实源 —— 不造它，两个窗口都读不到抽佣。
+    await seedCommissionForOrder(merchant.tenantId, {
+      id: orderId,
+      commissionAmount: 500,
+      commissionRate: 500,
+      totalAmount: 100000,
+      paidAt: insideWindow(payWindow, 10),
+    });
+    await seedReversalForOrder(merchant.tenantId, {
+      id: orderId,
+      commissionAmount: 500,
+      commissionRate: 500,
+      totalAmount: 100000,
       refundedAt: insideWindow(refundWindow, 5),
     });
 
@@ -581,15 +779,42 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
       status: InvoiceStatus.PAID,
       paidAt: insideWindow(window, 4),
     });
-    await seedOrder(merchant.tenantId, window, {
+    const paidOrder = await seedOrder(merchant.tenantId, window, {
       status: OrderStatus.PAID,
+      totalAmount: 20000,
+      commissionRate: 500,
       commissionAmount: 100,
       paidAt: insideWindow(window, 10),
     });
-    await seedOrder(merchant.tenantId, window, {
+    const refundedOrder = await seedOrder(merchant.tenantId, window, {
       status: OrderStatus.REFUNDED,
+      totalAmount: 10000,
+      commissionRate: 500,
       commissionAmount: 50,
       paidAt: insideWindow(window, 11),
+      refundedAt: insideWindow(window, 20),
+    });
+
+    // ⚠️ **抽佣与冲回都要有流水**：净收入的两个构成项都从流水表读。
+    await seedCommissionForOrder(merchant.tenantId, {
+      id: paidOrder,
+      commissionAmount: 100,
+      commissionRate: 500,
+      totalAmount: 20000,
+      paidAt: insideWindow(window, 10),
+    });
+    await seedCommissionForOrder(merchant.tenantId, {
+      id: refundedOrder,
+      commissionAmount: 50,
+      commissionRate: 500,
+      totalAmount: 10000,
+      paidAt: insideWindow(window, 11),
+    });
+    await seedReversalForOrder(merchant.tenantId, {
+      id: refundedOrder,
+      commissionAmount: 50,
+      commissionRate: 500,
+      totalAmount: 10000,
       refundedAt: insideWindow(window, 20),
     });
 
@@ -608,14 +833,35 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
     const b = await createMerchant(app, prisma);
     const window = nextWindow();
 
-    await seedOrder(a.tenantId, window, {
+    const orderA = await seedOrder(a.tenantId, window, {
       status: OrderStatus.PAID,
+      totalAmount: 20000,
+      commissionRate: 500,
       commissionAmount: 100,
       paidAt: insideWindow(window, 10),
     });
-    await seedOrder(b.tenantId, window, {
+    const orderB = await seedOrder(b.tenantId, window, {
       status: OrderStatus.PAID,
+      totalAmount: 40000,
+      commissionRate: 500,
       commissionAmount: 200,
+      paidAt: insideWindow(window, 11),
+    });
+
+    // ⚠️ **两家商家的流水都要造**：报表是平台维度的聚合，
+    //    流水是跨租户的（每行自带 `tenantId`），两家都进同一份报表。
+    await seedCommissionForOrder(a.tenantId, {
+      id: orderA,
+      commissionAmount: 100,
+      commissionRate: 500,
+      totalAmount: 20000,
+      paidAt: insideWindow(window, 10),
+    });
+    await seedCommissionForOrder(b.tenantId, {
+      id: orderB,
+      commissionAmount: 200,
+      commissionRate: 500,
+      totalAmount: 40000,
       paidAt: insideWindow(window, 11),
     });
 
