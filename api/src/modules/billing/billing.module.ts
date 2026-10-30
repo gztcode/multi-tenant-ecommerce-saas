@@ -18,6 +18,9 @@ import { PayoutExecutionService } from './payout-execution.service';
 import { PlatformPayoutController } from './platform-payout.controller';
 import { MerchantPayoutController } from './merchant-payout.controller';
 import { MerchantPayoutAccountController } from './merchant-payout-account.controller';
+import { LedgerService } from './ledger.service';
+import { MerchantStatementController } from './merchant-statement.controller';
+import { MerchantStatementService } from './merchant-statement.service';
 
 /**
  * 计费模块（阶段 5b）。
@@ -50,6 +53,8 @@ import { MerchantPayoutAccountController } from './merchant-payout-account.contr
     PlatformPayoutController,
     MerchantPayoutController,
     MerchantPayoutAccountController,
+    // 商家对账单（阶段 5i）
+    MerchantStatementController,
   ],
   providers: [
     PlanService,
@@ -65,6 +70,10 @@ import { MerchantPayoutAccountController } from './merchant-payout-account.contr
     PayoutAccountService,
     // 出款执行（阶段 5h-2）
     PayoutExecutionService,
+    // 账目按期聚合（阶段 5i）
+    LedgerService,
+    // 商家对账单（阶段 5i）
+    MerchantStatementService,
   ],
   exports: [
     PlanService,
@@ -78,6 +87,9 @@ import { MerchantPayoutAccountController } from './merchant-payout-account.contr
     //    `PayoutWorker` 要靠它落状态（设计 §4.1）。
     //    依赖方向是 `payment → billing`（单向），不构成环。
     PayoutExecutionService,
+    // ⚠️ **导出 `LedgerService`** —— 商家侧对账单（阶段 5i Task 5）
+    //    要注入它做按期聚合（出款页与对账单共用同一份聚合）。
+    LedgerService,
   ],
 })
 export class BillingModule {}

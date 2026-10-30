@@ -13,6 +13,7 @@ import { validate } from 'class-validator';
 
 import { tenantContext } from '../../common/tenant/tenant-context';
 import { ApplyPayoutDto } from './dto/apply-payout.dto';
+import { LedgerService } from './ledger.service';
 import { PayoutService } from './payout.service';
 
 /**
@@ -282,6 +283,30 @@ function fakePrisma(options: {
           options.statement === undefined ? statement({}) : options.statement,
         ),
       ),
+      /**
+       * ⚠️ **阶段 5i Task 6：批量聚合用的是 `findMany`** ——
+       *    `LedgerService.aggregatePeriods` 一次查齐所有期的结算单。
+       *    ⚠️ **只返回一张**（假 Prisma 不按 `where` 过滤）→ 够单测用了。
+       */
+      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
+        Promise.resolve(
+          options.statement === undefined
+            ? [statement({})]
+            : [options.statement],
+        ),
+      ),
+    },
+    // ⚠️ **阶段 5i Task 6：聚合要查抽佣流水与其关联行** ——
+    //    这里恒返回空（单测不验「抽佣笔数」，那是 `LedgerService` 的单测职责）。
+    settlementStatementEntry: {
+      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
+        Promise.resolve([]),
+      ),
+    },
+    commissionEntry: {
+      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
+        Promise.resolve([]),
+      ),
     },
     payout: {
       /**
@@ -296,9 +321,23 @@ function fakePrisma(options: {
         }
         return Promise.resolve(options.payout ?? null);
       }),
-      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
-        Promise.resolve(options.payouts ?? []),
-      ),
+      /**
+       * ⚠️ **阶段 5i Task 6：批量聚合用的是 `findMany`** ——
+       *    `LedgerService.aggregatePeriods` 一次查齐所有期的出款单，
+       *    靠 `status` 与 `kind` 自己分桶，不需要服务层再按 kind 逐个查。
+       *    ⚠️ **不消费 `payoutSequence`**（那是 `findFirst` 的队列），
+       *    这里只**读**它 —— 否则两次查询会互相抢数据。
+       */
+      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() => {
+        if (options.payoutSequence) {
+          return Promise.resolve(
+            options.payoutSequence.filter(
+              (item): item is NonNullable<typeof item> => item !== null,
+            ),
+          );
+        }
+        return Promise.resolve(options.payouts ?? []);
+      }),
       count: jest.fn<Promise<number>, [args?: QueryArgs]>(() =>
         Promise.resolve(options.payoutCount ?? 0),
       ),
@@ -316,11 +355,19 @@ function fakePrisma(options: {
        *    （一次 `payoutId: '<id>'`，一次 `payoutId: { not: '<id>' }`）。
        *    不区分的话两个集合会混成同一个 → 测不出「本单口径」。
        *    未配置对应的项时**回落到 `linkedRows`**（5h-1 的老行为）。
+       *
+       * ⚠️ **阶段 5i Task 6：聚合用的是 `payoutId: { in: [...] }`** ——
+       *    那是「这些单占用了哪些流水」→ 与「其他单已占」同义但**不是同一集合**
+       *    （聚合问的是全部出款单，不是「除本单以外」）。
+       *    → 按 `in` / `not` 两个键区分。
        */
       findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>((args) => {
         const where = args?.where as
-          { payoutId?: string | { not?: string } } | undefined;
+          { payoutId?: string | { not?: string; in?: string[] } } | undefined;
         if (where?.payoutId && typeof where.payoutId === 'object') {
+          if (where.payoutId.in) {
+            return Promise.resolve(options.linkedRows ?? []);
+          }
           return Promise.resolve(options.otherLinkedRows ?? []);
         }
         if (where?.payoutId && typeof where.payoutId === 'string') {
@@ -414,7 +461,13 @@ function fakeQueues() {
   };
 }
 
-/** 把假 Prisma 塞进服务（只用到 `as unknown as` 的一次性断言） */
+/**
+ * 把假 Prisma 塞进服务（只用到 `as unknown as` 的一次性断言）。
+ *
+ * ⚠️ **阶段 5i Task 6：多注入一个 `LedgerService`** ——
+ *    「可申请周期」列表改成走 `LedgerService.aggregatePeriods`（批量聚合）。
+ *    这里**用同一只假 Prisma** 构造它 → 聚合看到的数据与老实现一致。
+ */
 function makeService(
   prisma: ReturnType<typeof fakePrisma>,
   queues: ReturnType<typeof fakeQueues> = fakeQueues(),
@@ -422,6 +475,7 @@ function makeService(
   return new PayoutService(
     prisma as unknown as never,
     queues as unknown as never,
+    new LedgerService(prisma as unknown as never),
   );
 }
 

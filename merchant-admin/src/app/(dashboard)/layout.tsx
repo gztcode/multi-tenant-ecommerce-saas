@@ -56,6 +56,11 @@ export default async function DashboardLayout({
             <Link href="/billing" className="underline-offset-4 hover:underline">
               订阅
             </Link>
+            {/* ⚠️ **「对账单」放在「出款」之前**：对账单是「看账」，
+                出款是「要钱」—— 看账在前更符合商家的使用顺序。 */}
+            <Link href="/statements" className="underline-offset-4 hover:underline">
+              对账单
+            </Link>
             <Link href="/settlements" className="underline-offset-4 hover:underline">
               出款
             </Link>

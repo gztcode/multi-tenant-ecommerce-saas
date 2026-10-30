@@ -25,7 +25,8 @@
     "test:cov:e2e": "jest --config ./test/jest-e2e.json --coverage --collectCoverageFrom='src/**/*.ts' --collectCoverageFrom='!src/**/*.module.ts' --collectCoverageFrom='!src/main.ts'",
     "db:test:deploy": "node test/deploy-test-db.mjs",
     "backfill:ledger": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/backfill-commission-entries.ts",
-    "backfill:commissions": "npm run backfill:ledger"
+    "backfill:commissions": "npm run backfill:ledger",
+    "check:ledger": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/check-ledger.ts"
   },
   "prisma": {
     "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"
