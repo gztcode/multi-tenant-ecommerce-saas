@@ -1,5 +1,6 @@
 import { PayoutStatus, SettlementStatus } from '@prisma/client';
 import { PayoutExecutionService } from './payout-execution.service';
+import { PayoutCipherService } from './payout-cipher.service';
 
 /**
  * 出款执行状态落库服务的单元测试。
@@ -105,12 +106,26 @@ function fakePrisma(
 function makeService(
   prisma: ReturnType<typeof fakePrisma>,
 ): PayoutExecutionService {
-  return new PayoutExecutionService(prisma as unknown as never);
+  return new PayoutExecutionService(
+    prisma as unknown as never,
+    new PayoutCipherService(),
+  );
 }
+
+/**
+ * ⚠️ **单元测试进程里没有 .env** —— `PayoutCipherService` 在构造时就要密钥，
+ *    拿不到就直接抛错。所以这里显式设一个**测试用**密钥。
+ */
+const TEST_ENCRYPTION_KEY = 'test-payout-encryption-key-at-least-32-chars';
+
+beforeAll(() => {
+  process.env.PAYOUT_ACCOUNT_ENCRYPTION_KEY = TEST_ENCRYPTION_KEY;
+});
 
 describe('PayoutExecutionService', () => {
   describe('claimForExecution', () => {
     it('APPROVED → PROCESSING，attemptCount + 1，返回金额与账户快照', async () => {
+      const plain = '6222000000000000';
       const prisma = fakePrisma({
         payout: {
           attemptCount: 1,
@@ -118,7 +133,9 @@ describe('PayoutExecutionService', () => {
           payoutNo: 'PAY202508010000000001',
           snapshotAccountName: '张三',
           snapshotBankName: '测试银行',
-          snapshotAccountNo: '6222000000000000',
+          snapshotAccountNoCipher: new PayoutCipherService().encrypt(plain),
+          snapshotMaskedAccountNo: '************0000',
+          snapshotEncryptionVersion: 1,
         },
       });
       const service = makeService(prisma);
@@ -133,10 +150,12 @@ describe('PayoutExecutionService', () => {
       // ⚠️ **金额是审批锁定的值**（护栏 X2：worker 不重算）
       expect(claim!.netAmount).toBe(8500);
       // ⚠️ **账户是快照**（护栏 X2b：不实时查账户表）
+      // ⚠️ **快照里的密文解出来 == 原文** —— 比「不等于原文」更强：
+      //    它证明 worker 拿到的是**正确的明文**，而不是随便一个非空串。
       expect(claim!.account).toEqual({
         accountName: '张三',
         bankName: '测试银行',
-        accountNo: '6222000000000000',
+        accountNo: plain,
       });
     });
 
@@ -157,7 +176,9 @@ describe('PayoutExecutionService', () => {
           payoutNo: 'PAY1',
           snapshotAccountName: null,
           snapshotBankName: null,
-          snapshotAccountNo: null,
+          snapshotAccountNoCipher: null,
+          snapshotMaskedAccountNo: null,
+          snapshotEncryptionVersion: 0,
         },
       });
       const service = makeService(prisma);
@@ -165,6 +186,28 @@ describe('PayoutExecutionService', () => {
       const claim = await service.claimForExecution('payout-a', new Date());
 
       expect(claim!.account).toBeNull();
+    });
+
+    it('⚠️ 快照还没加密（版本 0）→ 抛错，绝不按明文兜底', async () => {
+      // ⚠️ **「忘了迁移」若被静默当成「就是明文」，等于把加密悄悄关掉了** ——
+      //    所以版本号不对必须响亮地失败。
+      const prisma = fakePrisma({
+        payout: {
+          attemptCount: 1,
+          netAmount: 8500,
+          payoutNo: 'PAY1',
+          snapshotAccountName: '张三',
+          snapshotBankName: '测试银行',
+          snapshotAccountNoCipher: '6222000000000000',
+          snapshotMaskedAccountNo: '************0000',
+          snapshotEncryptionVersion: 0,
+        },
+      });
+      const service = makeService(prisma);
+
+      await expect(
+        service.claimForExecution('payout-a', new Date()),
+      ).rejects.toThrow(/尚未加密/);
     });
   });
 

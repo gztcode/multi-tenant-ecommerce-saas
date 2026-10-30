@@ -5,6 +5,7 @@ import {
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
+import { PayoutCipherService } from './payout-cipher.service';
 
 /** 打款的结果（worker 传给本服务） */
 export interface MarkPaidInput {
@@ -64,7 +65,10 @@ export interface ExecutionClaim {
 export class PayoutExecutionService {
   private readonly logger = new Logger(PayoutExecutionService.name);
 
-  constructor(private readonly prisma: TenantPrismaService) {}
+  constructor(
+    private readonly prisma: TenantPrismaService,
+    private readonly cipher: PayoutCipherService,
+  ) {}
 
   /**
    * 抢单：`APPROVED → PROCESSING`，`attemptCount + 1`。
@@ -107,7 +111,9 @@ export class PayoutExecutionService {
             payoutNo: true,
             snapshotAccountName: true,
             snapshotBankName: true,
-            snapshotAccountNo: true,
+            snapshotAccountNoCipher: true,
+            snapshotMaskedAccountNo: true,
+            snapshotEncryptionVersion: true,
           },
         });
         if (!payout) {
@@ -117,11 +123,18 @@ export class PayoutExecutionService {
           attemptCount: payout.attemptCount,
           netAmount: payout.netAmount,
           payoutNo: payout.payoutNo,
-          account: payout.snapshotAccountNo
+          account: payout.snapshotAccountNoCipher
             ? {
                 accountName: payout.snapshotAccountName ?? '',
                 bankName: payout.snapshotBankName ?? '',
-                accountNo: payout.snapshotAccountNo,
+                // ⚠️ **这里是全仓唯一给渠道明文账号的地方**。
+                //    快照的版本号不对（没迁移）→ 直接抛错，
+                //    不能拿明文兜底（那等于把加密悄悄关掉）。
+                accountNo: this.cipher.decryptVersioned(
+                  payout.snapshotAccountNoCipher,
+                  payout.snapshotEncryptionVersion,
+                  '出款单的收款账号快照',
+                ),
               }
             : null,
         };

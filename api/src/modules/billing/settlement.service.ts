@@ -54,6 +54,15 @@ export interface SettlementView {
   netAmount: number;
   /** 纳入的流水笔数 */
   entryCount: number;
+  /**
+   * 这一期「缺笔」的数量：当期真实流水笔数 − 结算单纳入的笔数。
+   *
+   * ⚠️ **0 = 不缺笔**。
+   * ⚠️ **只比笔数** —— 抽佣流水是 append-only（`commission_entries` 全仓没有
+   *    update / upsert），笔数没变 ⇒ 纳入的集合没变 ⇒ 金额也没变。
+   *    ⚠️ 若将来流水变得可变（可改金额 / 可改归期），这里必须改成比金额之和。
+   */
+  missingEntryCount: number;
   status: SettlementStatus;
   /** 确认时间。ISO 8601。null = 未确认 */
   confirmedAt: string | null;
@@ -102,6 +111,13 @@ export interface GenerateSettlementResult {
 
 /** 结算单详情（含明细行） */
 export interface SettlementDetailView extends SettlementView {
+  /**
+   * 本期能不能通过「取消确认 → 重算」修正。
+   *
+   * ⚠️ **取决于有没有出款单引用**（P6 闸）：
+   *    有出款单引用时 `unconfirm` 会被 409 拦下 → 只能走调账流程。
+   */
+  canRecalculate: boolean;
   entries: Array<{
     entryId: string;
     orderNo: string;
@@ -477,6 +493,22 @@ export class SettlementService {
   }
 
   /**
+   * 某一期当期真实的抽佣流水笔数。
+   *
+   * ⚠️ **按流水自己的 `occurredAt` 归期** —— 不能用账单的 `periodStart` 去筛流水：
+   *    流水的归期是 `occurredAt`，账单的周期是 `periodStart`，
+   *    两者不是一回事（跨期回填的流水归期在退款期，不在原期）。
+   */
+  private async actualEntryCount(
+    tenantId: string,
+    period: MonthlyPeriod,
+  ): Promise<number> {
+    return this.prisma.commissionEntry.count({
+      where: { tenantId, occurredAt: { gte: period.from, lt: period.to } },
+    });
+  }
+
+  /**
    * 把一行结算单变成对外的形状（含商家名与子域名）。
    *
    * ⚠️ **商家名要单独查**：`SettlementStatement.tenantId` 是纯标量、
@@ -490,19 +522,53 @@ export class SettlementService {
       where: { id: statement.tenantId },
       select: { name: true, subdomain: true },
     });
-    return this.toViewFields(statement, {
-      // ⚠️ **查不到商家名就回落到 id 本身**：商家被删了也要让超管看到这一行
-      //（「有个商家产生了抽佣但查不到它的信息」是超管必须知道的事实）。
-      name: tenant?.name ?? statement.tenantId,
-      // ⚠️ **子域名查不到时给「—」**：空串看不出是「商家不存在」还是「数据缺失」。
-      subdomain: tenant?.subdomain ?? '—',
-    });
+    // ⚠️ **缺笔数也要算** —— `SettlementView` 的字段是**每处返回都要有**的，
+    //    单张视图不能只为了少一次查询就把它填成 0。
+    const missingEntryCount = await this.missingEntryCountOf(statement);
+    return this.toViewFields(
+      statement,
+      {
+        // ⚠️ **查不到商家名就回落到 id 本身**：商家被删了也要让超管看到这一行
+        //（「有个商家产生了抽佣但查不到它的信息」是超管必须知道的事实）。
+        name: tenant?.name ?? statement.tenantId,
+        // ⚠️ **子域名查不到时给「—」**：空串看不出是「商家不存在」还是「数据缺失」。
+        subdomain: tenant?.subdomain ?? '—',
+      },
+      missingEntryCount,
+    );
+  }
+
+  /**
+   * 单张结算单的缺笔数：当期真实流水笔数 − 结算单纳入的笔数。
+   *
+   * ⚠️ **按流水自己的 `occurredAt` 归期** —— 不能用账单的 `periodStart` 去筛流水：
+   *    流水的归期是 `occurredAt`，账单的周期是 `periodStart`，
+   *    两者不是一回事（跨期回填的流水归期在退款期，不在原期）。
+   */
+  private async missingEntryCountOf(
+    statement: SettlementStatement,
+  ): Promise<number> {
+    // ⚠️ **上界用「周期标识反推出来的标准区间」，不用 `statement.periodEnd`** ——
+    //    `periodEnd` 是可以被人手工改宽的脏数据字段（`periodStart` 对应的
+    //    那个月的标准上界才是这一期真正的边界）。
+    //    批量路径（`missingEntryCounts`）是**逐条按 `occurredAt` 归期**的，
+    //    这里若改用 `periodEnd` 当上界 → 手工改宽后会把下个月的流水算进来
+    //    → **同一张单在列表页与详情页给出两个不同的缺笔数**。
+    //    两处口径必须同源，所以这里也走标准区间。
+    const period = resolveMonthlyPeriod(
+      formatPeriodLabel(statement.periodStart),
+    );
+    const actual = await this.actualEntryCount(statement.tenantId, period);
+    // ⚠️ **差值不能是负数**：结算单纳入的笔数不可能多于当期真实笔数
+    //    （流水是 append-only，不会被删）。
+    return Math.max(0, actual - statement.entryCount);
   }
 
   /** 单据本体 → 对外字段（不含商家信息） */
   private toViewFields(
     statement: SettlementStatement,
     tenant: { name: string; subdomain: string },
+    missingEntryCount: number,
   ): SettlementView {
     return {
       id: statement.id,
@@ -517,6 +583,7 @@ export class SettlementService {
       reversalAmount: statement.reversalAmount,
       netAmount: statement.netAmount,
       entryCount: statement.entryCount,
+      missingEntryCount,
       status: statement.status,
       confirmedAt: statement.confirmedAt?.toISOString() ?? null,
       createdAt: statement.createdAt.toISOString(),
@@ -675,6 +742,52 @@ export class SettlementService {
   }
 
   /**
+   * 这张结算单有没有被**活跃的**出款单引用（护栏 P6 的判定）。
+   *
+   * ⚠️ **只有非终态的出款单才算**：REJECTED / CANCELLED / FAILED 的单
+   *    没有把钱打出去，它们不构成「钱已经出去了」的事实
+   *    → 不该拦住修正漏结的路径。
+   *    ⚠️ **FAILED 也要排除**（阶段 5h-2）：出款失败的单仍然挂着
+   *    `statementId`，但不排除的话，一次出款失败会让该结算单
+   *    永远无法取消确认。
+   *
+   * ⚠️ **查得到全局的出款单**：调用方都跑在**平台作用域**下
+   *    （`tenantContext.run(platformScope(), ...)`）→ 平台作用域下扩展
+   *    **不附加** tenantId 条件 → 查到的就是全局事实。
+   *
+   * ⚠️ **这里有 TOCTOU 窗口**：闸是「读—判断—写」三步，不是事务。
+   *    闸通过之后、状态更新之前若**新建**了一张引用这张结算单的出款单，
+   *    这道闸挡不住它。
+   *    ⚠️ **本阶段这个窗口不致命**：出款单要走到「引用这张结算单」
+   *    必须先 `apply`，而 `apply` 要求该期结算单**已 CONFIRMED** ——
+   *    也就是说，能在这个窗口里插进来的单，它锁定的佣金来自
+   *    **确认状态**的结算单，与这里重算后的草稿值可能不同。
+   *    彻底堵住要靠 `approve` 侧回查（见 `PayoutService.approve`）。
+   *
+   * ⚠️ **`unconfirm` 与 `detail`（`canRecalculate`）共用这一个判定** ——
+   *    两处各写一份 → 口径漂了 → 前端说「可以重算」、
+   *    点下去却被 409 拦下。
+   */
+  private async hasActivePayoutReference(
+    statementId: string,
+  ): Promise<boolean> {
+    const referenced = await this.prisma.payout.findFirst({
+      where: {
+        statementId,
+        status: {
+          notIn: [
+            PayoutStatus.REJECTED,
+            PayoutStatus.CANCELLED,
+            PayoutStatus.FAILED,
+          ],
+        },
+      },
+      select: { id: true },
+    });
+    return referenced !== null;
+  }
+
+  /**
    * 取消确认：`CONFIRMED → DRAFT`。
    *
    * ⚠️ **为什么需要它**：漏结（已确认的单据之后又有该期的流水进来，
@@ -707,39 +820,11 @@ export class SettlementService {
       //    结算单被取消确认后重算，佣金会变 → 已批的出款单金额失真
       //    → 平台打出去的钱与账对不上。
       //
-      //    ⚠️ **只查非终态的出款单**：REJECTED / CANCELLED / FAILED 的单
-      //    没有把钱打出去，它们不构成「钱已经出去了」的事实
-      //    → 不该拦住修正漏结的路径。
-      //
-      //    ⚠️ **查得到全局的出款单**：本方法跑在**平台作用域**下
-      //    （`tenantContext.run(platformScope(), ...)`）→ 平台作用域下扩展
-      //    **不附加** tenantId 条件 → 查到的就是全局事实。
-      //
-      //    ⚠️ **这里有 TOCTOU 窗口**：闸是「读—判断—写」三步，
-      //    不是事务。闸通过之后、状态更新之前若**新建**了一张引用这张
-      //    结算单的出款单，这道闸挡不住它。
-      //    ⚠️ **本阶段这个窗口不致命**：出款单要走到「引用这张结算单」
-      //    必须先 `apply`，而 `apply` 要求该期结算单**已 CONFIRMED** ——
-      //    也就是说，能在这个窗口里插进来的单，它锁定的佣金来自
-      //    **确认状态**的结算单，与这里重算后的草稿值可能不同。
-      //    彻底堵住要靠 `approve` 侧回查（见 `PayoutService.approve`）。
-      const referenced = await this.prisma.payout.findFirst({
-        where: {
-          statementId: statementId,
-          // ⚠️ **FAILED 也要排除**（阶段 5h-2）：出款失败的单仍然挂着
-          //    statementId，但它**没有把钱打出去** → 不该拦住「取消确认」。
-          //    不排除的话，一次出款失败会让该结算单永远无法取消确认。
-          status: {
-            notIn: [
-              PayoutStatus.REJECTED,
-              PayoutStatus.CANCELLED,
-              PayoutStatus.FAILED,
-            ],
-          },
-        },
-        select: { id: true },
-      });
-      if (referenced) {
+      //    ⚠️ **判定与 `hasActivePayoutReference` 共用同一份实现** ——
+      //    `detail` 里的 `canRecalculate` 说的是同一件事，
+      //    两处各写一份 → 口径漂了 → 前端说「可以重算」、
+      //    点下去却被 409 拦下。
+      if (await this.hasActivePayoutReference(statementId)) {
         throw new ConflictException(
           '该结算单已被出款单引用，不能取消确认。若出款已执行，请走调账流程。',
         );
@@ -809,6 +894,8 @@ export class SettlementService {
         }),
         this.prisma.settlementStatement.count({ where }),
       ]);
+      // ⚠️ **缺笔数在 `toViews` 里批量算** —— 列表最多 200 行，
+      //    「每行查一次」就是 200 次额外查询（N+1）。
       return { items: await this.toViews(rows), total };
     });
   }
@@ -844,6 +931,11 @@ export class SettlementService {
 
       const view = (await this.toViews([statement]))[0];
 
+      // ⚠️ **能不能修正 = 有没有出款单引用**（P6 闸，与 `unconfirm` 同一份判定）。
+      const canRecalculate = !(await this.hasActivePayoutReference(
+        statement.id,
+      ));
+
       const detailEntries = links.flatMap((link) => {
         const entry = entryById.get(link.entryId);
         // ⚠️ **查不到就跳过而不是崩**：关联行有外键 Restrict，
@@ -864,6 +956,7 @@ export class SettlementService {
 
       return {
         ...view,
+        canRecalculate,
         // ⚠️ **按发生时间排序**：关联行是按 `statementId` 查出来的，
         //    顺序是任意的（数据库没有承诺）。明细要按业务时间读，
         //    否则超管看到的是一堆乱序的流水，对不上账。
@@ -879,7 +972,78 @@ export class SettlementService {
   }
 
   /**
+   * 批量算每张结算单的「缺笔数」（列表页用）。
+   *
+   * ⚠️ **只查一次流水** —— 列表最多 200 行，「每行查一次」就是 N+1。
+   *    做法：把本页所有结算单的 `(tenantId, periodStart)` 收集起来 →
+   *    取 `min(periodStart)` 到 `max(periodEnd)` 的**区间** →
+   *    **一次**查出该区间内所有相关租户的流水 →
+   *    在内存里按 `(tenantId, formatPeriodLabel(occurredAt))` 分组计数。
+   *
+   * ⚠️ **区间只是取数的粗筛**（平台端列表可跨多期，周期筛选是可选的），
+   *    **归期口径仍然是逐条按 `occurredAt` 算** —— 两者不矛盾：
+   *    区间负责「把相关的行都捞回来」，`occurredAt` 负责「每一笔算哪一期」。
+   *
+   * ⚠️ **返回值与入参 `rows` 一一对应（按下标）**：
+   *    同一租户同一期**只会有一张结算单**（`@@unique([tenantId, periodStart])`），
+   *    所以 `(tenantId, periodLabel)` 足以唯一定位一张单。
+   */
+  private async missingEntryCounts(
+    rows: SettlementStatement[],
+  ): Promise<Map<number, number>> {
+    const result = new Map<number, number>();
+    if (rows.length === 0) {
+      return result;
+    }
+
+    // ⚠️ **用 reduce 而不是 `Math.min(...arr)`**：`Math.min` 展开参数个数有上限，
+    //    行数多了会抛「Maximum call stack size exceeded」。
+    const from = new Date(
+      rows.reduce(
+        (min, row) => Math.min(min, row.periodStart.getTime()),
+        Infinity,
+      ),
+    );
+    const to = new Date(
+      rows.reduce(
+        (max, row) => Math.max(max, row.periodEnd.getTime()),
+        -Infinity,
+      ),
+    );
+    const tenantIds = [...new Set(rows.map((row) => row.tenantId))];
+
+    // ⚠️ **一次查出区间内所有相关租户的流水**（`select` 只要归期要用的字段）。
+    const entries = await this.prisma.commissionEntry.findMany({
+      where: {
+        tenantId: { in: tenantIds },
+        occurredAt: { gte: from, lt: to },
+      },
+      select: { tenantId: true, occurredAt: true },
+    });
+
+    // ⚠️ **按 `(tenantId, 周期标识)` 分组计数** —— 归期按流水自己的
+    //    `occurredAt` 算，不是按账单的 `periodStart`。
+    const countByKey = new Map<string, number>();
+    for (const entry of entries) {
+      const key = `${entry.tenantId}|${formatPeriodLabel(entry.occurredAt)}`;
+      countByKey.set(key, (countByKey.get(key) ?? 0) + 1);
+    }
+
+    rows.forEach((row, index) => {
+      const key = `${row.tenantId}|${formatPeriodLabel(row.periodStart)}`;
+      const actual = countByKey.get(key) ?? 0;
+      // ⚠️ **差值不能是负数**：结算单纳入的笔数不可能多于当期真实笔数
+      //    （流水是 append-only，不会被删）。
+      result.set(index, Math.max(0, actual - row.entryCount));
+    });
+    return result;
+  }
+
+  /**
    * 批量把结算单变成对外的形状（商家名批量查，避免 N+1）。
+   *
+   * ⚠️ **缺笔数也是批量算的**（`missingEntryCounts`）——
+   *    逐行查就是 N+1（列表最多 200 行）。
    */
   private async toViews(
     rows: SettlementStatement[],
@@ -888,18 +1052,25 @@ export class SettlementService {
       return [];
     }
     const tenantIds = [...new Set(rows.map((row) => row.tenantId))];
-    const tenants = await this.prisma.tenant.findMany({
-      where: { id: { in: tenantIds } },
-      select: { id: true, name: true, subdomain: true },
-    });
+    const [tenants, missingCounts] = await Promise.all([
+      this.prisma.tenant.findMany({
+        where: { id: { in: tenantIds } },
+        select: { id: true, name: true, subdomain: true },
+      }),
+      this.missingEntryCounts(rows),
+    ]);
     const tenantById = new Map(tenants.map((tenant) => [tenant.id, tenant]));
 
-    return rows.map((row) => {
+    return rows.map((row, index) => {
       const tenant = tenantById.get(row.tenantId);
-      return this.toViewFields(row, {
-        name: tenant?.name ?? row.tenantId,
-        subdomain: tenant?.subdomain ?? '—',
-      });
+      return this.toViewFields(
+        row,
+        {
+          name: tenant?.name ?? row.tenantId,
+          subdomain: tenant?.subdomain ?? '—',
+        },
+        missingCounts.get(index) ?? 0,
+      );
     });
   }
 }

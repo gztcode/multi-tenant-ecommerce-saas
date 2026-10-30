@@ -461,6 +461,17 @@ export interface SettlementStatement {
   netAmount: number;
   /** 纳入的流水笔数 */
   entryCount: number;
+  /**
+   * 缺笔数：当期真实流水笔数 − 结算单纳入的笔数（0 = 不缺笔）。
+   *
+   * ⚠️ **缺笔 = 这一期的佣金与当期真实流水对不上**：
+   *    该落库的抽佣流水没落库，或已落库却没被结算单纳入。
+   *    缺 COMMISSION 流水 → 平台少收了钱；缺 REVERSAL 流水 → 商家少拿了钱。
+   *
+   * ⚠️ **数值由后端算好，前端不自己比**：两处口径一旦漂移，
+   *    同一个单子在列表页与详情页会给出两个不同的缺笔数。
+   */
+  missingEntryCount: number;
   status: SettlementStatus;
   /** 确认时间。ISO 8601。null = 未确认 */
   confirmedAt: string | null;
@@ -470,6 +481,13 @@ export interface SettlementStatement {
 
 /** 结算单详情（含明细行） */
 export interface SettlementDetail extends SettlementStatement {
+  /**
+   * 本期能不能通过「取消确认 → 重算」修正。
+   *
+   * ⚠️ **取决于有没有出款单引用**（P6 闸）：有的话 `unconfirm` 会被 409 拦下，
+   *    缺笔只能走调账流程。
+   */
+  canRecalculate: boolean;
   entries: Array<{
     entryId: string;
     orderNo: string;
@@ -529,4 +547,35 @@ export function describeSettlementStatus(
   status: SettlementStatus | string,
 ): string {
   return SETTLEMENT_STATUS_LABEL[status as SettlementStatus] ?? '未知状态';
+}
+
+/**
+ * 缺笔时给出的修账指引。
+ *
+ * ⚠️ **指引必须按「实际能走哪条路」写，不能只看 `canRecalculate`**：
+ *    后端的 `canRecalculate` 只回答「有没有出款单引用」，
+ *    **不含结算单自身的状态**。而实际的操作路径有两个闸：
+ *    - `DRAFT` 才有「重算」（后端 `recalculate` 拒掉非 DRAFT 的单）；
+ *    - `CONFIRMED` 才有「取消确认」（后端 `unconfirm` 拒掉非 CONFIRMED 的单）。
+ *    所以 `DRAFT` + 无出款单引用时，说「可先取消确认再重算」是**走不通的**
+ *    —— 那张单压根没有「取消确认」按钮。
+ *
+ * @param status        结算单状态
+ * @param canRecalculate 有没有活跃出款单引用（后端 P6 闸的同一份判定）
+ */
+export function describeRecalculateHint(
+  status: SettlementStatus | string,
+  canRecalculate: boolean,
+): string {
+  if (!canRecalculate) {
+    return '本期已被出款单引用，不能取消确认；缺笔部分需走调账流程。';
+  }
+  if (status === 'DRAFT') {
+    return '本期是草稿，可直接「重算」，重算会把当期的流水重新纳入。';
+  }
+  if (status === 'CONFIRMED') {
+    return '本期尚无出款单引用，可先「取消确认」再「重算」，重算会把当期的流水重新纳入。';
+  }
+  // ⚠️ **已出款（PAID）的单两条路都走不通** —— 兜底说清楚，别给假指引。
+  return '本期已出款，不能取消确认也不能重算；缺笔部分需走调账流程。';
 }

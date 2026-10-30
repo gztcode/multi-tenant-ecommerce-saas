@@ -55,6 +55,7 @@ const PERIOD: StatementPeriod = {
   overpaidAmount: 0,
   applicableKind: 'NORMAL',
   blockedReason: null,
+  missingEntryCount: 0,
 };
 
 const LIST: StatementPeriod[] = [PERIOD];
@@ -256,6 +257,55 @@ describe('对账单列表页：状态列', () => {
     const texts = await renderPage();
 
     expect(hasText(texts, '—')).toBe(true);
+  });
+});
+
+describe('对账单列表页：缺笔提示', () => {
+  it('⚠️ 缺笔时在「结算单状态」那一格下面显示提示', async () => {
+    apiFetchAuthedMock.mockResolvedValue([
+      { ...PERIOD, missingEntryCount: 2 },
+    ]);
+
+    const rows = await renderRows();
+
+    // ⚠️ **只看「结算单状态」那一格**（第 2 格）：
+    //    整页断言会被别处的文字顶成假阳性。
+    expect(rows[0][1]).toContain('本期结算单缺 2 笔抽佣流水');
+    expect(rows[0][1]).toContain('佣金以结算单为准');
+  });
+
+  it('⚠️ 不缺笔时不显示缺笔提示', async () => {
+    const rows = await renderRows();
+
+    expect(rows[0][1]).not.toContain('缺');
+    expect(rows[0][1]).toBe('已结算');
+  });
+
+  it('⚠️ 没有结算单的期不显示缺笔提示（缺笔恒为 0）', async () => {
+    apiFetchAuthedMock.mockResolvedValue([
+      {
+        ...PERIOD,
+        statementId: null,
+        statementStatus: null,
+        missingEntryCount: 0,
+      },
+    ]);
+
+    const rows = await renderRows();
+
+    expect(rows[0][1]).not.toContain('缺');
+  });
+
+  it('⚠️ 文案中立：不指责平台、不承诺补钱', async () => {
+    apiFetchAuthedMock.mockResolvedValue([
+      { ...PERIOD, missingEntryCount: 2 },
+    ]);
+
+    const rows = await renderRows();
+
+    expect(rows[0][1]).not.toContain('少扣');
+    expect(rows[0][1]).not.toContain('待补记');
+    expect(rows[0][1]).not.toContain('补记');
   });
 });
 

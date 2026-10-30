@@ -2,6 +2,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { ApiError, apiFetchAuthed } from '@/lib/api-client';
 import {
+  describePayoutAccount,
   describePayoutEntryType,
   describePayoutKind,
   describePayoutStatus,
@@ -72,6 +73,10 @@ export default async function PayoutDetailPage({
     );
   }
 
+  // ⚠️ **先算一次再渲染**：条件与内容用同一个值，
+  //    免得两处各调一次函数（万一将来它不是纯函数就会不一致）。
+  const accountText = describePayoutAccount(payout);
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
@@ -113,6 +118,22 @@ export default async function PayoutDetailPage({
               申请时预估 {formatCents(payout.requestedAmount)}
               （审批通过时平台会重算一次并锁定，可能与上值不同）
             </p>
+
+            {/* ⚠️ **收款账户要显示出来**：超管必须能看出「这笔钱打给谁」。
+                阶段 5j 之后库里只有密文，**掩码串是唯一能核对的东西** ——
+                界面上不显示它，运营就彻底没法核对打给谁了。
+
+                ⚠️ **这不是 5j 引入的缺口**，是 5h-2 交付时就没有渲染过；
+                    5j 只是让它变得更要紧（明文也没了，掩码串成了唯一线索）。
+
+                ⚠️ **只显示掩码串，绝不显示完整账号** —— 完整账号压根不在响应里，
+                    前端也不去解密。 */}
+            {accountText && (
+              <div className="flex justify-between py-2 text-sm">
+                <span className="text-muted-foreground">收款账户</span>
+                <span>{accountText}</span>
+              </div>
+            )}
 
             {/* ⚠️ **时间说明按 `status` 走，不按「字段非空」走**：
                 后端 `reject()` 也填 `approvedAt`（拒绝同样是一次审批动作），

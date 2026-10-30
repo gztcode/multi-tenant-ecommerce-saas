@@ -6,6 +6,7 @@ import { ApiError, apiFetchAuthed } from '@/lib/api-client';
 import { formatDateTime } from '@/lib/billing';
 import {
   describeCommissionEntryType,
+  describeMissingEntries,
   describeReceiptPayoutStatus,
   describeReceiptType,
   describeStatementStatus,
@@ -63,6 +64,10 @@ export default async function StatementDetailPage({
     return null;
   }
 
+  // ⚠️ **先算一次再渲染**：条件与内容用同一个值，
+  //    免得两处各调一次函数（万一将来它不是纯函数就会不一致）。
+  const missingHint = describeMissingEntries(data.missingEntryCount);
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
@@ -100,6 +105,15 @@ export default async function StatementDetailPage({
         <p className="text-muted-foreground">
           货款按流水实时统计，平台佣金以已确认的结算单为准。
         </p>
+        {/* ⚠️ **缺笔提示放在佣金那一行旁边**：结算单少纳了几笔抽佣流水，
+            商家看明细时会对不上账，得当场看见提示。
+            ⚠️ **文案只陈述事实**：缺哪一类、该谁补钱由平台判断，
+            商家端不替平台承诺补钱。 */}
+        {missingHint && (
+          <p className="text-muted-foreground">
+            {missingHint}
+          </p>
+        )}
         {/* ⚠️ **超付要显眼**：平台多付了钱，等着调账 ——
             商家看到「待出款 0」却不知道原因时会以为漏付。 */}
         {data.overpaidAmount > 0 && (

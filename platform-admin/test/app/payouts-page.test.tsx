@@ -73,6 +73,11 @@ const LIST: PayoutListResult = {
       tenantId: 'tenant-1',
       tenantName: '示例店铺',
       subdomain: 'demo',
+      // ⚠️ **收款账户快照（阶段 5j 补强）**：后端每条视图都带这三个字段，
+      //    列表页不渲染它们，但类型上它们是必填的。
+      snapshotAccountName: '张三',
+      snapshotBankName: '招商银行',
+      maskedSnapshotAccountNo: '************1234',
     },
   ],
   total: 1,

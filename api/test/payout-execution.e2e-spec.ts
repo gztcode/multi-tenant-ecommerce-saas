@@ -486,6 +486,16 @@ describe('出款执行 (e2e)', () => {
 
     const applied = await apply(merchant.token, period.label);
     await approve(adminToken, applied.id);
+
+    // ⚠️⚠️ **先记下「审批那一刻」的账户密文** ——
+    //    下面会把账户改掉，账户行里的密文就变了。
+    //    这份密文正是快照该复制的那一份。
+    const accountAtApproval = await asPlatform(() =>
+      prisma.merchantPayoutAccount.findFirst({
+        where: { tenantId: merchant.tenantId },
+      }),
+    );
+
     // ⚠️ **审批后立刻换账户**
     await http(app)
       .put('/api/v1/merchant/payout-account')
@@ -512,11 +522,49 @@ describe('出款执行 (e2e)', () => {
     //    验不了「**传给渠道的**是快照」——worker 若传实时账户，
     //    钱会打到错的账户，而库里的快照字段纹丝不动 → 断言照样通过。
     //    （失败注入 Y14 实测：只去掉这一层时，挂 0 条。）
+    //
+    // ⚠️ **阶段 5j 之后，这一行仍然是明文账号** ——
+    //    渠道拿到的是**解密后的明文**（打款必须如此），
+    //    这条断言恰恰是「解密链路通了」的证据。
     const fake = app.get(FakePayoutProvider);
     const received = fake.receivedRequest(applied.id);
     expect(received).toBeDefined();
     expect(received!.account.accountNo).toBe('6225880000000000');
     expect(received!.amount).toBe(paid!.netAmount);
+
+    // ⚠️⚠️ **但库里存的是密文**（阶段 5j）——
+    //    「渠道收到明文」与「库里存密文」必须**同时**成立：
+    //    前者证明加密没把打款打断，后者证明加密真的生效了。
+    //    只断言其中一条，两种坏实现都盖得住：
+    //    库里存明文（没加密）/ 库里存密文但渠道收到掩码（打不出钱）。
+    expect(accountAtApproval!.accountNoCipher).not.toBe('6225880000000000');
+    expect(accountAtApproval!.accountNoCipher).not.toContain('62258800');
+    expect(accountAtApproval!.encryptionVersion).toBe(1);
+
+    const payout = await asPlatform(() =>
+      prisma.payout.findFirst({ where: { id: applied.id } }),
+    );
+    expect(payout!.snapshotAccountNoCipher).not.toBe('6225880000000000');
+    expect(payout!.snapshotAccountNoCipher).not.toContain('62258800');
+    expect(payout!.snapshotEncryptionVersion).toBe(1);
+    // ⚠️⚠️ **快照的密文就是「审批那一刻」账户行里那份** ——
+    //    审批时**复制**（不是重新加密：重新加密会得到不同的密文，
+    //    而「快照 = 审批那一刻的那一份」要求复制同一份密文），
+    //    版本号也跟着一起复制。
+    expect(payout!.snapshotAccountNoCipher).toBe(
+      accountAtApproval!.accountNoCipher,
+    );
+    // ⚠️ **快照与「换后的账户」不一样** ——
+    //    账户改了 → 重新加密 → 密文变了。
+    //    这条断言保证快照没被「审批后又被覆盖」过。
+    const accountAfterChange = await asPlatform(() =>
+      prisma.merchantPayoutAccount.findFirst({
+        where: { tenantId: merchant.tenantId },
+      }),
+    );
+    expect(payout!.snapshotAccountNoCipher).not.toBe(
+      accountAfterChange!.accountNoCipher,
+    );
   });
 
   it('X14：API 响应里的账号是脱敏的（不是完整账号）', async () => {
@@ -534,6 +582,35 @@ describe('出款执行 (e2e)', () => {
     // ⚠️ **完整账号绝不能出现在响应里**（护栏 X14）
     expect(JSON.stringify(detail)).not.toContain('6225880000000000');
     expect(detail.maskedSnapshotAccountNo).toMatch(/\*+0000$/);
+
+    // ⚠️⚠️ **阶段 5j 之后，X14 得更硬一层** ——
+    //    以前库里存的是明文，响应里给掩码就已经是全部防线；
+    //    现在库里存的是密文 → **响应里连密文都不能给**
+    //    （把密文端出去等于换个地方存账号，攻击者拿到密钥就能解开）。
+    const account = await asPlatform(() =>
+      prisma.merchantPayoutAccount.findFirst({
+        where: { tenantId: merchant.tenantId },
+      }),
+    );
+    expect(JSON.stringify(detail)).not.toContain(account!.accountNoCipher);
+    const payout = await asPlatform(() =>
+      prisma.payout.findFirst({ where: { id: applied.id } }),
+    );
+    expect(JSON.stringify(detail)).not.toContain(
+      payout!.snapshotAccountNoCipher!,
+    );
+
+    // ⚠️ **平台端也一样** —— 超管看到的响应同样不能带账号。
+    const platformDetail = await http(app)
+      .get(`/api/v1/platform/payouts/${applied.id}`)
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    expect(JSON.stringify(platformDetail.body)).not.toContain(
+      '6225880000000000',
+    );
+    expect(JSON.stringify(platformDetail.body)).not.toContain(
+      account!.accountNoCipher,
+    );
   });
 
   // ============================================================

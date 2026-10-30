@@ -1,6 +1,10 @@
 import Link from 'next/link';
 import { ApiError, apiFetchAuthed } from '@/lib/api-client';
-import { describeStatementStatus, formatCents } from '@/lib/statement';
+import {
+  describeMissingEntries,
+  describeStatementStatus,
+  formatCents,
+} from '@/lib/statement';
 import type { StatementPeriod } from '@/lib/statement';
 
 /**
@@ -70,7 +74,11 @@ export default async function StatementsPage() {
                 </td>
               </tr>
             ) : (
-              periods.map((row) => (
+              periods.map((row) => {
+                // ⚠️ **先算一次再渲染**：条件与内容用同一个值，
+                //    免得两处各调一次函数（万一将来它不是纯函数就会不一致）。
+                const missingHint = describeMissingEntries(row.missingEntryCount);
+                return (
                 <tr key={row.period} className="border-b">
                   <td>
                     {/* ⚠️ **周期链到详情页**：商家要在这一期里逐笔核对。 */}
@@ -78,7 +86,18 @@ export default async function StatementsPage() {
                       {row.period}
                     </Link>
                   </td>
-                  <td>{describeStatementStatus(row.statementStatus)}</td>
+                  <td>
+                    {describeStatementStatus(row.statementStatus)}
+                    {/* ⚠️ **缺笔提示要显眼**：结算单少纳了几笔抽佣流水，
+                        商家对账时看到明细与金额对不上，得知道去问谁。
+                        ⚠️ **文案只陈述事实**：缺哪一类、该谁补钱，
+                        得平台自己判断，商家端不替平台下结论。 */}
+                    {missingHint && (
+                      <p className="text-xs text-muted-foreground">
+                        {missingHint}
+                      </p>
+                    )}
+                  </td>
                   <td>{formatCents(row.receiptAmount)}</td>
                   {/* ⚠️ **佣金是带符号的**（正数 = 平台抽了，负数 = 平台退了）：
                       直接展示，不要自己加负号 —— 符号已经是数据的一部分。 */}
@@ -124,7 +143,8 @@ export default async function StatementsPage() {
                     )}
                   </td>
                 </tr>
-              ))
+                );
+              })
             )}
           </tbody>
         </table>

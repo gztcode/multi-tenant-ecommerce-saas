@@ -5,12 +5,17 @@ import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 import { TenantContextInterceptor } from './modules/tenancy/tenant-context.interceptor';
 import { assertSecureConfig } from './common/config/assert-secure-config';
+import { assertPayoutEncryptionKey } from './common/config/assert-payout-encryption-key';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 
 async function bootstrap() {
   // 在创建 Nest 应用之前校验 JWT_SECRET：
   // 配置不安全时进程必须立刻退出，不能先监听端口再失败。
   assertSecureConfig();
+
+  // ⚠️ **账目加密密钥同样要在建应用前校验**：
+  //    缺了它，出款执行时会解不开快照 → 钱打不出去。
+  assertPayoutEncryptionKey();
 
   // ⚠️ `rawBody: true`：让 Nest 把请求的**原始字节**挂在 `req.rawBody` 上。
   //

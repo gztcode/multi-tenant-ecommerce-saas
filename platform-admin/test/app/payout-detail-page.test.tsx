@@ -79,6 +79,11 @@ const DETAIL: PlatformPayoutDetail = {
   tenantId: 'tenant-1',
   tenantName: '示例店铺',
   subdomain: 'demo',
+  // ⚠️ **收款账户快照（阶段 5j 补强）**：库里存的是密文，
+  //    响应里只给**掩码串** —— 完整账号绝不在响应里。
+  snapshotAccountName: '张三',
+  snapshotBankName: '招商银行',
+  maskedSnapshotAccountNo: '************1234',
   entries: [
     {
       entryId: 'entry-1',
@@ -418,6 +423,82 @@ describe('出款单详情页：类型与执行状态（阶段 5h-2）', () => {
     const texts = await renderPage();
 
     expect(hasText(texts, '失败时间')).toBe(false);
+  });
+});
+
+describe('出款单详情页：收款账户（阶段 5j 补强）', () => {
+  it('⚠️ 显示收款账户：开户行 + 掩码账号 + （户名）', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '收款账户')).toBe(true);
+    expect(hasText(texts, '招商银行')).toBe(true);
+    expect(hasText(texts, '************1234')).toBe(true);
+    expect(hasText(texts, '（张三）')).toBe(true);
+  });
+
+  it('⚠️ 只显示掩码账号，绝不显示完整账号', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      // ⚠️ **模拟「后端把完整账号给了前端」这个不该发生的情况**：
+      //    响应里压根不该有这个字段，页面也不能把它显示出来。
+      maskedSnapshotAccountNo: '************1234',
+      snapshotAccountNo: '6222000000001234',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '************1234')).toBe(true);
+    // ⚠️ **完整账号一个字都不能漏**。
+    expect(hasText(texts, '6222000000001234')).toBe(false);
+  });
+
+  it('⚠️ 快照为 null → 不显示「收款账户」这一行，也不渲染出字面量 "null"', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      snapshotAccountName: null,
+      snapshotBankName: null,
+      maskedSnapshotAccountNo: null,
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '收款账户')).toBe(false);
+    // ⚠️ **不能渲染出字面量 "null"** —— 那会让超管以为系统出错了。
+    expect(hasText(texts, 'null')).toBe(false);
+  });
+
+  it('⚠️ 只有掩码串（缺开户行与户名）时仍显示掩码串', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      snapshotAccountName: null,
+      snapshotBankName: null,
+      maskedSnapshotAccountNo: '************1234',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '收款账户')).toBe(true);
+    expect(hasText(texts, '************1234')).toBe(true);
+    expect(hasText(texts, 'null')).toBe(false);
+  });
+
+  it('⚠️ 收款账户这一行在金额区附近，不在页脚', async () => {
+    const texts = await renderPage();
+
+    // ⚠️ **按文本节点的下标比位置**，不按拼起来的整串：
+    //    整串里夹着大量别的内容，距离会随排版变化而漂。
+    const amountIndex = texts.findIndex((t) => t.includes('应结金额'));
+    const accountIndex = texts.findIndex((t) => t.includes('收款账户'));
+    const typeIndex = texts.findIndex((t) => t.includes('类型'));
+
+    // ⚠️ **收款账户要跟在金额后面**：超管核对金额时顺带核对收款账户，
+    //    塞到页脚就等于没有。
+    expect(amountIndex).toBeGreaterThan(-1);
+    expect(accountIndex).toBeGreaterThan(amountIndex);
+    expect(typeIndex).toBeGreaterThan(-1);
+    // ⚠️ **还在「类型」那一行之前** —— 说明它落在信息卡片的上半段，
+    //    而不是被挤到末尾。
+    expect(accountIndex).toBeLessThan(typeIndex);
   });
 });
 

@@ -33,6 +33,12 @@ export interface PeriodAmounts {
   statementStatus: SettlementStatus | null;
   /** 抽佣流水笔数（结算单纳入的） */
   commissionEntryCount: number;
+  /**
+   * 当期**真实**的抽佣流水笔数（全部流水，不是结算单纳入的那些）。
+   *
+   * ⚠️ 与 `commissionEntryCount`（结算单纳入的笔数）的差值 = 缺笔数。
+   */
+  actualCommissionEntryCount: number;
   /** 已出款金额（`PAID` 的出款单之和） */
   paidAmount: number;
   /** 在途金额（`REQUESTED` / `APPROVED` / `PROCESSING` 的出款单之和） */
@@ -84,7 +90,7 @@ export class LedgerService {
   /**
    * 一次查齐所有期的货款 / 佣金 / 出款，内存里按期分组。
    *
-   * ⚠️ **查询次数与期数无关** —— 不论 1 期还是 100 期，都是 6 次查询
+   * ⚠️ **查询次数与期数无关** —— 不论 1 期还是 100 期，都是 7 次查询
    *    （每张表各 1 次）。这是本服务存在的全部意义（L55 的解药）。
    *
    * ⚠️ **两张关联表要靠 id 列表限定**：
@@ -215,7 +221,22 @@ export class LedgerService {
     //    「已释放的流水」算成「已纳入」→ 补差金额被凭空抹掉。
     const claimedEntryIds = new Set(payoutLinks.map((link) => link.entryId));
 
-    // ---- ⑦ 分期汇总（纯内存）----
+    // ---- ⑦ 当期全部抽佣流水（用于算缺笔）----
+    // ⚠️ **按流水自己的 `occurredAt` 取，再按期分组** ——
+    //    不能用账单的 periodStart 筛流水（跨期回填的流水归期在退款期）。
+    // ⚠️ 第 ④ 步查的是「已被结算单纳入的那些」，这里查的是「当期全部」，
+    //    两者相减才是缺笔数。
+    const allCommissionEntries = await this.prisma.commissionEntry.findMany({
+      where: { tenantId, occurredAt: { gte: from, lt: to } },
+      select: { occurredAt: true },
+    });
+    const actualCountByPeriod = new Map<string, number>();
+    for (const entry of allCommissionEntries) {
+      const label = formatPeriodLabel(entry.occurredAt);
+      actualCountByPeriod.set(label, (actualCountByPeriod.get(label) ?? 0) + 1);
+    }
+
+    // ---- ⑧ 分期汇总（纯内存）----
     for (const period of periods) {
       const label = formatPeriodLabel(period.from);
       const amounts: PeriodAmounts = {
@@ -225,6 +246,7 @@ export class LedgerService {
         commissionAmount: null,
         statementStatus: null,
         commissionEntryCount: 0,
+        actualCommissionEntryCount: 0,
         paidAmount: 0,
         inFlightAmount: 0,
         hasActiveNormal: false,
@@ -239,6 +261,11 @@ export class LedgerService {
       const receiptSum = receiptByPeriod.get(label);
       amounts.receiptAmount = receiptSum?.amount ?? 0;
       amounts.receiptCount = receiptSum?.count ?? 0;
+
+      // ---- 当期全部抽佣流水笔数（缺笔数的分母）----
+      // ⚠️ **按流水自己的 `occurredAt` 归期** —— 不能用账单的 `periodStart`：
+      //    跨期回填的流水归期在退款期，不在原期。
+      amounts.actualCommissionEntryCount = actualCountByPeriod.get(label) ?? 0;
 
       // ---- 佣金（取结算单的冻结值）----
       const statement = statementByPeriod.get(label);
