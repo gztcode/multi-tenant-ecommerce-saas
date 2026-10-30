@@ -39,6 +39,8 @@ export interface StatementPeriodView {
   commissionAmount: number | null;
   /** 抽佣流水笔数（结算单纳入的） */
   commissionEntryCount: number;
+  /** 缺笔数：当期真实抽佣流水笔数 − 结算单纳入的笔数。0 = 不缺笔 */
+  missingEntryCount: number;
   /** 货款净额 − 佣金净额；null = 佣金未知 */
   payableAmount: number | null;
   /** 已出款 */
@@ -281,6 +283,17 @@ export class MerchantStatementService {
         ? 0
         : Math.max(0, amounts.paidAmount - payableAmount);
 
+    // ⚠️ **「还没生成结算单」不是「缺笔」** ——
+    //    没有结算单时 commissionEntryCount 恒为 0，
+    //    直接相减会把「这一期还没结算」误标成「结算单缺笔」。
+    //    （与 5i 的口径一致：没有结算单 → commissionAmount 恒为 null，不是 0。）
+    const missingEntryCount = amounts.statementId
+      ? Math.max(
+          0,
+          amounts.actualCommissionEntryCount - amounts.commissionEntryCount,
+        )
+      : 0;
+
     // ⚠️ **周期是否结束按「这个月过完了没有」判** ——
     //    当月的流水还会变（回填随时可能补进来），此时的数字不是凭证。
     const periodEnded =
@@ -306,6 +319,7 @@ export class MerchantStatementService {
       receiptCount: amounts.receiptCount,
       commissionAmount: amounts.commissionAmount,
       commissionEntryCount: amounts.commissionEntryCount,
+      missingEntryCount,
       payableAmount,
       paidAmount: amounts.paidAmount,
       inFlightAmount: amounts.inFlightAmount,

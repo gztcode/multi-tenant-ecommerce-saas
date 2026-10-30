@@ -14,6 +14,7 @@ import { PlatformSettlementController } from './platform-settlement.controller';
 import { SettlementService } from './settlement.service';
 import { PayoutService } from './payout.service';
 import { PayoutAccountService } from './payout-account.service';
+import { PayoutCipherService } from './payout-cipher.service';
 import { PayoutExecutionService } from './payout-execution.service';
 import { PlatformPayoutController } from './platform-payout.controller';
 import { MerchantPayoutController } from './merchant-payout.controller';
@@ -68,6 +69,10 @@ import { MerchantStatementService } from './merchant-statement.service';
     // 出款（阶段 5h-1）
     PayoutService,
     PayoutAccountService,
+    // 收款账户字段加密（阶段 5j）
+    // ⚠️ **刻意不导出** —— 本阶段只有本模块用，保持最小面。
+    //    worker 在 payment 模块是通过 `PayoutExecutionService` 间接拿到账号的。
+    PayoutCipherService,
     // 出款执行（阶段 5h-2）
     PayoutExecutionService,
     // 账目按期聚合（阶段 5i）

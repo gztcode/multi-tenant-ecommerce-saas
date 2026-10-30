@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { getTenantContext } from '../../common/tenant/tenant-context';
+import { PayoutCipherService } from './payout-cipher.service';
 
 /** 收款账户的对外形状（**账号脱敏**） */
 export interface PayoutAccountView {
@@ -22,9 +23,18 @@ export interface PayoutAccountView {
  */
 @Injectable()
 export class PayoutAccountService {
-  constructor(private readonly prisma: TenantPrismaService) {}
+  constructor(
+    private readonly prisma: TenantPrismaService,
+    private readonly cipher: PayoutCipherService,
+  ) {}
 
-  /** 读当前商家的收款账户（没有就是 null） */
+  /**
+   * 读当前商家的收款账户（没有就是 null）。
+   *
+   * ⚠️ **未迁移的行掩码串是空串** —— 迁移 SQL 用 `DEFAULT ''` 加的列，
+   *    迁移脚本跑完才有值。**这是预期的**。
+   * ⚠️ **不要在这里解密兜底** —— 那等于把加密悄悄关掉。
+   */
   async get(): Promise<PayoutAccountView | null> {
     const context = getTenantContext();
     const tenantId = context.tenantId;
@@ -82,7 +92,13 @@ export class PayoutAccountService {
           // ⚠️ **`accountNo` 为空时不带这个键**：
           //    Prisma 的 `undefined` = 不更新该字段 → 保留原账号。
           //    写成空串会把账号**清掉** —— 钱就不知道打给谁了。
-          ...(accountNo ? { accountNo } : {}),
+          ...(accountNo
+            ? {
+                accountNoCipher: this.cipher.encrypt(accountNo),
+                maskedAccountNo: maskAccountNo(accountNo),
+                encryptionVersion: 1,
+              }
+            : {}),
         },
       });
       if (updated.count === 0) {
@@ -106,7 +122,12 @@ export class PayoutAccountService {
         tenantId,
         accountName: input.accountName,
         bankName: input.bankName,
-        accountNo,
+        // ⚠️ **账号落库即密文** —— 库里不该再有完整账号的明文副本。
+        accountNoCipher: this.cipher.encrypt(accountNo),
+        // ⚠️ **掩码串单独存**：密文长度 ≠ 明文长度，
+        //    而掩码要按明文长度打星 → 不解密就还原不出掩码。
+        maskedAccountNo: maskAccountNo(accountNo),
+        encryptionVersion: 1,
       },
     });
     return this.toView(created);
@@ -116,13 +137,15 @@ export class PayoutAccountService {
   private toView(account: {
     accountName: string;
     bankName: string;
-    accountNo: string;
+    maskedAccountNo: string;
     updatedAt: Date;
   }): PayoutAccountView {
     return {
       accountName: account.accountName,
       bankName: account.bankName,
-      maskedAccountNo: maskAccountNo(account.accountNo),
+      // ⚠️ **直接用库里存的掩码串，不解密** ——
+      //    展示路径一旦解密，X14（响应永不含完整账号）就有洞了。
+      maskedAccountNo: account.maskedAccountNo,
       updatedAt: account.updatedAt.toISOString(),
     };
   }

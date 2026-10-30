@@ -1199,19 +1199,33 @@ model MerchantReceipt {
 ///
 /// ⚠️ **一商家一账户**（`tenantId` 唯一）。
 ///
-/// ⚠️ **`accountNo` 是明文存的** —— 本项目没有通用字段加密设施
-/// （只在 auth 模块有 JWT 相关的）。**接真实支付渠道前必须改成加密存储**
-/// （与 5b 对 `payment_methods` 的同一处理：设计写明，实现留到那一阶段）。
-/// 界面只展示脱敏（尾号 4 位）。
+/// ⚠️ **账号是密文存的**（阶段 5j）—— 本项目已有通用字段加密设施
+/// （`common/crypto/field-cipher.ts`）。界面只展示脱敏（尾号 4 位）。
 model MerchantPayoutAccount {
-  id       String @id @default(uuid())
+  id     String @id @default(uuid())
   tenantId String @unique
   /// 开户人姓名
   accountName String
   /// 开户行
   bankName String
-  /// 银行账号（⚠️ 明文存，见上）
-  accountNo String
+  /// 银行账号的**密文**（AES-256-GCM，base64url）。
+  /// ⚠️ 列名带 Cipher 后缀是为了自解释 —— 保留 `accountNo` 却让它存密文，
+  ///    只靠注释说明，下一个读代码的人容易误解。
+  /// ⚠️ 展示用的掩码串在 `maskedAccountNo`；展示路径**不解密**。
+  accountNoCipher String
+  /// 脱敏后的账号（只留尾 4 位）。
+  /// ⚠️ 必须单独存：密文长度 ≠ 明文长度，而掩码要按明文长度打星
+  ///    → 不解密就还原不出掩码。
+  /// ⚠️ 会泄露账号长度，但**现状 API 返回的就是掩码串**，不是新增泄露面。
+  /// ⚠️ **默认值是空串** —— 存量行在迁移后还没被 Task 3 加密，
+  ///    它们的掩码串就是空的（迁移脚本用 `DEFAULT ''` 加列，
+  ///    库里已有行不能直接加 `NOT NULL` 而不带默认值）。
+  maskedAccountNo String @default("")
+  /// 加密版本：0 = 尚未加密，1 = 已加密。
+  /// ⚠️ 这是「这行加密过没有」的**权威依据** —— 不能靠「能不能解密」猜：
+  ///    密钥配错时「解不开」会被误判成「没加密」，
+  ///    迁移脚本就会用错密钥把原文覆盖掉，且不可恢复。
+  encryptionVersion Int @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1274,9 +1288,18 @@ model Payout {
   failedAt DateTime?
   /// 收款账户快照 —— 审批那一刻从 merchant_payout_accounts 抄下来
   /// ⚠️ 三个字段都是快照，worker 只读它们，绝不在执行时重新查账户
+  ///
+  /// ⚠️ **账号是密文**（`...Cipher`）；户名与开户行**有意保持明文** ——
+  ///    账号是唯一能直接用于资金转移的字段，户名与开户行是卡面上就印着的公开信息。
+  ///    理由见 5j 设计 §2.7。
   snapshotAccountName String?
-  snapshotBankName    String?
-  snapshotAccountNo   String?
+  snapshotBankName String?
+  /// 银行账号的**密文**（打款时由 worker 解密）。
+  snapshotAccountNoCipher String?
+  /// 脱敏后的账号（展示用，不解密）。
+  snapshotMaskedAccountNo String?
+  /// 快照的加密版本（0 = 尚未加密，1 = 已加密）。
+  snapshotEncryptionVersion Int @default(0)
   /// 卡死告警已发出的时刻（兜底扫描写）
   /// ⚠️ 只为「告警去重」而存在：不写它的话兜底扫描每 5 分钟就把同一张单
   ///    捞出来再打一遍日志 —— 一晚上几千行噪音

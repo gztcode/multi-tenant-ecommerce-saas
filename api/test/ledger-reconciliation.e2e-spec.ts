@@ -59,6 +59,11 @@ import { createMerchant, unique } from './merchant-fixture';
  *   `created === 1` —— 往那两个月造流水会带偏它。
  *   ⚠️ **三态那条用例用 2023-04** —— 整个 `test/` 目录都没用过这个月份
  *   （2023-04 ~ 2023-07 / 2023-10 全库无人用）→ 不撞任何别的文件。
+ *   ⚠️ **缺笔那几条用例用 2023-06** —— 同样是全库无人用的月份，
+ *   且**每个用例用自己独立的商家**（出款单的幂等键是
+ *   `(tenantId, periodStart, kind)`，同商家同月反复造数据会互相污染）。
+ *   ⚠️ 2023-06 被本文件占掉后，剩下没人用的月份只有 2023-05 / 2023-07 /
+ *   2023-10 —— 再往后加用例请从这三个里挑。
  */
 
 /** 一天的毫秒数 */
@@ -107,6 +112,12 @@ interface StatementPeriodView {
   /** 佣金净额（取结算单的冻结值）；null = 没有结算单 */
   commissionAmount: number | null;
   commissionEntryCount: number;
+  /**
+   * 缺笔数：当期真实抽佣流水笔数 − 结算单纳入的笔数。0 = 不缺笔。
+   *
+   * ⚠️ **没有结算单时恒为 0** —— 「还没结算」≠「缺笔」。
+   */
+  missingEntryCount: number;
   /** 应结 = 货款净额 − 佣金净额；null = 佣金未知 */
   payableAmount: number | null;
   /** 已出款（`PAID` 的出款单之和） */
@@ -406,6 +417,45 @@ describe('账目口径收口：报表切到流水口径 (e2e)', () => {
       .post(`/api/v1/platform/settlements/${statementId}/confirm`)
       .set('authorization', `Bearer ${adminToken}`)
       .expect(201);
+  }
+
+  /** 平台端结算单列表的一行 */
+  interface PlatformStatementRow {
+    id: string;
+    tenantId: string;
+    periodLabel: string;
+    entryCount: number;
+    /** 缺笔数：当期真实抽佣流水笔数 − 结算单纳入的笔数。0 = 不缺笔 */
+    missingEntryCount: number;
+  }
+
+  /** 拉平台端结算单列表（可按周期筛） */
+  async function fetchPlatformStatements(
+    adminToken: string,
+    period?: string,
+  ): Promise<PlatformStatementRow[]> {
+    const response = await http(app)
+      .get('/api/v1/platform/settlements')
+      .query(period ? { period } : {})
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    const body = response.body as { items: PlatformStatementRow[] };
+    return body.items;
+  }
+
+  /** 拉平台端结算单详情 */
+  async function fetchPlatformStatementDetail(
+    adminToken: string,
+    statementId: string,
+  ): Promise<{ missingEntryCount: number; canRecalculate: boolean }> {
+    const response = await http(app)
+      .get(`/api/v1/platform/settlements/${statementId}`)
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    return response.body as {
+      missingEntryCount: number;
+      canRecalculate: boolean;
+    };
   }
 
   /** 商家填收款账户（申请出款的前置条件） */
@@ -1582,8 +1632,8 @@ describe('账目口径收口：报表切到流水口径 (e2e)', () => {
 
   it('三态：在途的出款单 → 货款明细标「出款中」而不是「已出款」', async () => {
     // ⚠️ **2023-04**：**整个 test/ 目录都没用过这个月份**
-    //   （2023-01 / 02 / 03 / 08 / 09 / 11 被本文件的报表用例占着，
-    //    2023-04 ~ 2023-07 / 2023-10 全库无人用）
+    //   （2023-01 / 02 / 03 / 06 / 08 / 09 / 11 被本文件占着，
+    //    2023-05 / 07 / 10 全库无人用）
     //   → 不撞本文件，也不撞别的 e2e 文件的月份。
     //
     // ⚠️ **必须是「已结束的月份」**：`settlement.service.ts` 的
@@ -1631,5 +1681,219 @@ describe('账目口径收口：报表切到流水口径 (e2e)', () => {
     expect(detail.inFlightAmount).toBe(9000);
     expect(detail.paidAmount).toBe(0);
     expect(detail.payableAmount).toBe(9000);
+  });
+
+  // ============================================================
+  // 缺笔可见性（阶段 5j Task 4）：护栏 R8
+  //
+  // ⚠️ **月份用 2023-06**：**整个 test/ 目录都没用过这个月份**
+  //   （2023-01 / 02 / 03 / 04 / 08 / 09 / 11 被本文件占着，
+  //    2023-05 / 07 / 10 全库无人用）
+  //   → 不撞本文件，也不撞别的 e2e 文件的月份。
+  // ============================================================
+
+  it('⚠️ 当期又进了新流水 → 结算单缺笔，平台端与商家端都看得见', async () => {
+    // ⚠️ **必须是「已结束的月份」**：`settlement.service.ts` 的
+    //   「周期尚未结束，不能出结算单」闸会把**当月**挡掉 → 400。
+    const period = month('2023-06');
+    const merchant = await setupMerchantWithPeriod(period, {
+      receiptAmount: 10000,
+      commissionAmount: 500,
+    });
+    expect(merchant.statementId).not.toBeNull();
+
+    // ---- 先钉死「此刻不缺笔」----
+    //
+    // ⚠️ **为什么要有这一步**：只断言「缺笔数 = 1」的话，
+    //   实现恒返回 1 也能过 → 测不出「它真的在数差额」。
+    //   先量出「不缺笔时是 0」，后面那个 1 才有意义。
+    const before = await fetchStatementDetail(merchant.token, period.label);
+    expect(before.missingEntryCount).toBe(0);
+
+    // ---- 再补一笔抽佣流水到同一期 ----
+    //
+    // ⚠️ **这笔流水是「后补」的**：结算单已经在它之前出好并确认了，
+    //   所以它没被纳入 → 这一期「真实 2 笔、纳入 1 笔」→ 缺 1 笔。
+    //
+    // ⚠️ **归期按流水自己的 `occurredAt` 算** —— 所以这笔记在
+    //   2023-06 内（`inside(period, 20)`），不能记到别的月份去。
+    const lateOrderId = await seedOrder(merchant.tenantId, {
+      totalAmount: 10000,
+      commissionAmount: 300,
+      paidAt: inside(period, 20),
+    });
+    await seedEntry(merchant.tenantId, lateOrderId, {
+      type: CommissionEntryType.COMMISSION,
+      amount: 300,
+      occurredAt: inside(period, 20),
+    });
+
+    // ---- 平台端：缺笔数 = 1 ----
+    //
+    // ⚠️ **平台端是「列表」上的缺笔数** —— 超管扫一眼列表就该知道
+    //    哪张单少了笔，而不是必须点进详情才发现。
+    const statements = await fetchPlatformStatements(
+      platformAdminToken,
+      period.label,
+    );
+    const statement = statements.find(
+      (item) =>
+        item.tenantId === merchant.tenantId &&
+        item.periodLabel === period.label,
+    );
+    expect(statement).toBeDefined();
+    expect(statement!.missingEntryCount).toBe(1);
+
+    // ---- 平台端：详情页也要有缺笔数 ----
+    //
+    // ⚠️ **详情与列表必须同源** —— 两处各写一份就会漂：
+    //   列表说缺 1 笔、详情说 0 笔，超管会以为是自己看错了。
+    const platformDetail = await fetchPlatformStatementDetail(
+      platformAdminToken,
+      merchant.statementId!,
+    );
+    expect(platformDetail.missingEntryCount).toBe(1);
+
+    // ⚠️⚠️ **缺笔时必须还能修** ——
+    //    这张单**没有出款单引用**（本用例没申请过出款）→
+    //    超管应该能走「取消确认 → 重算」把它补上。
+    //    前端说「不能修」而按钮还在、或反过来，都是误导。
+    expect(platformDetail.canRecalculate).toBe(true);
+
+    // ---- 商家端：对账单也提示 ----
+    //
+    // ⚠️ **这一段必须在「重算」之前** —— 重算会把那笔补进去，
+    //    缺笔数就变成 0 了。顺序反了的话，这里量到的就是重算后的值。
+    const detail = await fetchStatementDetail(merchant.token, period.label);
+    expect(detail.missingEntryCount).toBe(1);
+
+    // ⚠️ **商家端列表也要提示** —— 商家在列表页就该看到，
+    //    不必点进详情才发现。
+    const merchantList = await fetchStatementList(merchant.token);
+    const merchantView = merchantList.find(
+      (item) => item.period === period.label,
+    );
+    expect(merchantView).toBeDefined();
+    expect(merchantView!.missingEntryCount).toBe(1);
+
+    // ---- 实打实地修一次 ----
+    //
+    // ⚠️ **「canRecalculate = true」不能只是装饰性的布尔值** ——
+    //    得确认重算真的能把那笔补进去，缺笔数真的归零。
+    //
+    // ⚠️ **重算要求 `DRAFT`**（`CONFIRMED` 的单是冻结的）→
+    //   先取消确认再重算。
+    await http(app)
+      .post(`/api/v1/platform/settlements/${merchant.statementId}/unconfirm`)
+      .set('authorization', `Bearer ${platformAdminToken}`)
+      .expect(201);
+    const recalculated = await http(app)
+      .post(`/api/v1/platform/settlements/${merchant.statementId}/recalculate`)
+      .set('authorization', `Bearer ${platformAdminToken}`)
+      .expect(201);
+    expect(
+      (recalculated.body as { missingEntryCount: number }).missingEntryCount,
+    ).toBe(0);
+    // ⚠️ **补进去的那笔也要在明细里** —— 光看缺笔数变 0 不够，
+    //   得确认它真的纳入了（笔数从 1 变成 2）。
+    expect((recalculated.body as { entryCount: number }).entryCount).toBe(2);
+  });
+
+  it('缺笔的归期按流水自己的 occurredAt 算：别的月份补的流水不算这一期缺笔', async () => {
+    const period = month('2023-06');
+    const merchant = await setupMerchantWithPeriod(period, {
+      receiptAmount: 10000,
+      commissionAmount: 500,
+    });
+    expect(merchant.statementId).not.toBeNull();
+
+    // ---- 补一笔流水，但**归期在别的月份** ----
+    //
+    // ⚠️ **这一条与上一条是一对**：上一条验「同月补的算缺笔」，
+    //   这一条验「异月补的不算」——
+    //   实现若忽略 `occurredAt`、只按「这个商家有没有新流水」来算，
+    //   两条都会过 → 那就没有「归期」这回事了。
+    //
+    // ⚠️ **归期落在 2023-05**（`inside(period, -10)` = 6 月 1 日往前 10 天
+    //   → 落在 5 月）。这一期（2023-06）不该因此缺笔。
+    const otherMonthOrderId = await seedOrder(merchant.tenantId, {
+      totalAmount: 10000,
+      commissionAmount: 300,
+      paidAt: inside(period, -10),
+    });
+    await seedEntry(merchant.tenantId, otherMonthOrderId, {
+      type: CommissionEntryType.COMMISSION,
+      amount: 300,
+      occurredAt: inside(period, -10),
+    });
+
+    const detail = await fetchStatementDetail(merchant.token, period.label);
+    // ⚠️ **缺笔数仍是 0** —— 那笔流水的归期不在 2023-06
+    expect(detail.missingEntryCount).toBe(0);
+  });
+
+  it('没有结算单的期 → 缺笔数恒为 0（「还没结算」≠「缺笔」）', async () => {
+    // ⚠️ **这一条是上一条的必要对照**：
+    //   实现若写成 `max(0, 真实笔数 − 纳入笔数)` 而没有「有没有结算单」
+    //   的判断 → 这一期（真实 1 笔、纳入 0 笔）会被算成「缺 1 笔」。
+    //   但这一期压根还没结算 → 说它「缺笔」是误导。
+    const period = month('2023-06');
+    const merchant = await setupMerchantWithPeriod(period, {
+      receiptAmount: 10000,
+      commissionAmount: 0,
+      withStatement: false,
+    });
+    expect(merchant.statementId).toBeNull();
+
+    // ---- 造一笔抽佣流水（这一期有真实流水，但没有结算单）----
+    const orderId = await seedOrder(merchant.tenantId, {
+      totalAmount: 10000,
+      commissionAmount: 500,
+      paidAt: inside(period, 10),
+    });
+    await seedEntry(merchant.tenantId, orderId, {
+      type: CommissionEntryType.COMMISSION,
+      amount: 500,
+      occurredAt: inside(period, 10),
+    });
+
+    const detail = await fetchStatementDetail(merchant.token, period.label);
+    // ⚠️ **缺笔数恒为 0**
+    expect(detail.missingEntryCount).toBe(0);
+    // ⚠️ **佣金是 null（不是 0）** —— 「这一期还没结算」的口径
+    expect(detail.commissionAmount).toBeNull();
+  });
+
+  it('结算单被出款单引用（且出款单还活着）→ 不能重算（canRecalculate = false）', async () => {
+    const period = month('2023-06');
+    const merchant = await setupMerchantWithPeriod(period, {
+      receiptAmount: 10000,
+      commissionAmount: 500,
+    });
+    expect(merchant.statementId).not.toBeNull();
+
+    // ---- 申请一张出款单，但**不审批**（`REQUESTED` = 还活着）----
+    //
+    // ⚠️ **必须「不审批」**：`PAID` 的单也是「活着」的，
+    //   但我们想要的是**最简单**的形状 —— 一张 `REQUESTED` 的单。
+    const applied = await applyPayout(merchant.token, period.label);
+    expect(applied.status).toBe(PayoutStatus.REQUESTED);
+
+    const detail = await fetchPlatformStatementDetail(
+      platformAdminToken,
+      merchant.statementId!,
+    );
+
+    // ⚠️⚠️ **不能重算** —— 出款单的佣金金额是**审批那一刻锁定的快照**。
+    //    结算单被取消确认后重算，佣金会变 → 已批的出款单金额失真
+    //    → 平台打出去的钱与账对不上（护栏 P6）。
+    expect(detail.canRecalculate).toBe(false);
+
+    // ⚠️ **实打实地拦一下** —— `canRecalculate = false` 不能只是
+    //   一个装饰性的布尔值：得确认「取消确认」真的会被 409 拦下。
+    const response = await http(app)
+      .post(`/api/v1/platform/settlements/${merchant.statementId}/unconfirm`)
+      .set('authorization', `Bearer ${platformAdminToken}`);
+    expect(response.status).toBe(409);
   });
 });

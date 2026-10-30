@@ -22,7 +22,6 @@ import {
 } from '../../common/tenant/tenant-context';
 import { QueueService } from '../queue/queue.service';
 import { LedgerService } from './ledger.service';
-import { maskAccountNo } from './payout-account.service';
 import { formatPeriodLabel, resolveMonthlyPeriod } from './settlement';
 
 interface Paging {
@@ -89,8 +88,8 @@ export interface PayoutView {
   /**
    * 收款账户快照（**账号脱敏**）。
    *
-   * ⚠️ **`snapshotAccountNo` 是完整账号，绝不能原样进 API 响应**（护栏 X14）——
-   *    它是打款的依据，只给脱敏版。
+   * ⚠️ **快照里的账号是密文，但即便解开了也绝不能原样进 API 响应**
+   *    （护栏 X14）—— 它是打款的依据，只给脱敏版。
    */
   maskedSnapshotAccountNo: string | null;
   createdAt: string;
@@ -235,6 +234,18 @@ export class PayoutService {
     if (!account) {
       throw new BadRequestException('请先在「出款」页设置收款账户');
     }
+    // ⚠️⚠️ **写路径也要查加密版本**（阶段 5j）：
+    //    读路径（`payout-execution.service.ts` 的 `decryptVersioned`）遇到
+    //    未迁移的行会抛错 —— 但**写路径漏掉这道闸**的话，
+    //    快照里就会装进**明文账号**（`accountNoCipher` 列装的是明文），
+    //    等于在新表里第一次出现明文副本，
+    //    而且打款时必然抛错 → 出款单卡在 `PROCESSING` 反复重试。
+    //    宁可在建单前就拒掉，也不要造出一张注定打不出钱的单。
+    if (account.encryptionVersion !== 1) {
+      throw new BadRequestException(
+        '收款账户尚未完成加密迁移，请先执行 `npm run migrate:payout-encryption`',
+      );
+    }
 
     // ⚠️⚠️ **决定走哪条路径**（设计 §6.4）：
     // 「该期有没有已出款的正常单」决定这是**第一次**出款（正常单）
@@ -311,7 +322,14 @@ export class PayoutService {
               // ⚠️ **申请时也抄一份账户**（审批时会覆盖成审批那一刻的值）
               snapshotAccountName: account.accountName,
               snapshotBankName: account.bankName,
-              snapshotAccountNo: account.accountNo,
+              // ⚠️ **复制的是账户行里那份密文本身，不是重新加密**：
+              //    重新加密会得到不同的密文（随机 iv），
+              //    而「快照 = 审批那一刻的那一份」要求复制同一份密文。
+              snapshotAccountNoCipher: account.accountNoCipher,
+              snapshotMaskedAccountNo: account.maskedAccountNo,
+              // ⚠️ **版本号必须跟着密文一起复制** ——
+              //    否则会出现「密文是新的、版本号是 0」的错配。
+              snapshotEncryptionVersion: account.encryptionVersion,
             },
           });
           // ⚠️ **申请时就固定纳入的流水**（设计 D7）：
@@ -474,6 +492,15 @@ export class PayoutService {
       if (!account) {
         throw new ConflictException('该商家已删除收款账户，请让其重新申请');
       }
+      // ⚠️⚠️ **写路径也要查加密版本**（阶段 5j）—— 与 `apply` 里那道闸同款理由：
+      //    未迁移的账户行里装的是**明文**，快照一抄过去就是明文落库，
+      //    而打款时必然抛错 → 单卡在 `PROCESSING` 反复重试。
+      if (account.encryptionVersion !== 1) {
+        throw new ConflictException(
+          '该商家的收款账户尚未完成加密迁移，' +
+            '请先执行 `npm run migrate:payout-encryption`',
+        );
+      }
 
       const now = await this.prisma.databaseNow();
       const updated = await this.prisma.$transaction(async (tx) => {
@@ -501,7 +528,14 @@ export class PayoutService {
             //    （正是快照要防的事）。
             snapshotAccountName: account.accountName,
             snapshotBankName: account.bankName,
-            snapshotAccountNo: account.accountNo,
+            // ⚠️ **复制的是账户行里那份密文本身，不是重新加密**：
+            //    重新加密会得到不同的密文（随机 iv），
+            //    而「快照 = 审批那一刻的那一份」要求复制同一份密文。
+            snapshotAccountNoCipher: account.accountNoCipher,
+            snapshotMaskedAccountNo: account.maskedAccountNo,
+            // ⚠️ **版本号必须跟着密文一起复制** ——
+            //    否则会出现「密文是新的、版本号是 0」的错配。
+            snapshotEncryptionVersion: account.encryptionVersion,
           },
         });
         if (affected.count === 0) {
@@ -1215,11 +1249,10 @@ export class PayoutService {
       failedAt: payout.failedAt?.toISOString() ?? null,
       snapshotAccountName: payout.snapshotAccountName,
       snapshotBankName: payout.snapshotBankName,
-      // ⚠️ **脱敏** —— `snapshotAccountNo` 是完整账号，是打款的依据，
-      //    但**绝不能**出现在 API 响应里（护栏 X14）
-      maskedSnapshotAccountNo: payout.snapshotAccountNo
-        ? maskAccountNo(payout.snapshotAccountNo)
-        : null,
+      // ⚠️ **脱敏** —— 快照里的账号是打款的依据（存的是密文），
+      //    但**即便解密也绝不能**出现在 API 响应里（护栏 X14）。
+      //    这里读的是**预存的掩码串**，不解密。
+      maskedSnapshotAccountNo: payout.snapshotMaskedAccountNo ?? null,
       createdAt: payout.createdAt.toISOString(),
     };
   }

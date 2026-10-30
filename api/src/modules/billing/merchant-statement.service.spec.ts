@@ -48,6 +48,7 @@ function periodAmounts(overrides?: Partial<PeriodAmounts>): PeriodAmounts {
     commissionAmount: null,
     statementStatus: null,
     commissionEntryCount: 0,
+    actualCommissionEntryCount: 0,
     paidAmount: 0,
     inFlightAmount: 0,
     hasActiveNormal: false,
@@ -341,6 +342,81 @@ describe('商家对账单：汇总口径', () => {
     const views = await asTenant(() => service.list());
 
     expect(views.map((v) => v.period)).toEqual(['2026-08', '2026-07']);
+  });
+});
+
+describe('商家对账单：缺笔（阶段 5j）', () => {
+  it('缺笔数 = 当期真实流水笔数 − 结算单纳入的笔数', async () => {
+    // ⚠️ **商家少拿了钱，要看得见** —— 当期真实 3 笔、结算单只纳入 2 笔
+    //    → 缺 1 笔。
+    const prisma = fakePrisma({
+      periodReceipts: [{ occurredAt: new Date('2026-08-10T00:00:00.000Z') }],
+    });
+    const ledger = fakeLedger({
+      '2026-08': periodAmounts({
+        receiptAmount: 100000,
+        receiptCount: 3,
+        statementId: 'stmt-a',
+        statementStatus: SettlementStatus.CONFIRMED,
+        commissionAmount: 5000,
+        commissionEntryCount: 2,
+        actualCommissionEntryCount: 3,
+      }),
+    });
+    const service = makeService(prisma, ledger);
+
+    const views = await asTenant(() => service.list());
+
+    expect(views[0].missingEntryCount).toBe(1);
+  });
+
+  it('⚠️ 没有结算单 → 不是「缺笔」，是「还没结算」', async () => {
+    // ⚠️ **「还没生成结算单」不是「缺笔」** ——
+    //    没有结算单时 `commissionEntryCount` 恒为 0，直接相减会把
+    //    「这一期还没结算」误标成「结算单缺笔」。
+    const prisma = fakePrisma({
+      periodReceipts: [{ occurredAt: new Date('2026-08-10T00:00:00.000Z') }],
+    });
+    const ledger = fakeLedger({
+      '2026-08': periodAmounts({
+        receiptAmount: 100000,
+        receiptCount: 3,
+        statementId: null,
+        statementStatus: null,
+        commissionAmount: null,
+        commissionEntryCount: 0,
+        actualCommissionEntryCount: 3,
+      }),
+    });
+    const service = makeService(prisma, ledger);
+
+    const views = await asTenant(() => service.list());
+
+    expect(views[0].missingEntryCount).toBe(0);
+  });
+
+  it('⚠️ 缺笔数不能是负数', async () => {
+    // ⚠️ **脏数据下 `commissionEntryCount` 可能大于真实笔数**
+    //    （关联行指向了已不存在的流水）→ 差值取负会让前端显示「缺 −2 笔」。
+    const prisma = fakePrisma({
+      periodReceipts: [{ occurredAt: new Date('2026-08-10T00:00:00.000Z') }],
+    });
+    const ledger = fakeLedger({
+      '2026-08': periodAmounts({
+        receiptAmount: 100000,
+        receiptCount: 3,
+        statementId: 'stmt-a',
+        statementStatus: SettlementStatus.CONFIRMED,
+        commissionAmount: 5000,
+        commissionEntryCount: 5,
+        actualCommissionEntryCount: 3,
+      }),
+    });
+    const service = makeService(prisma, ledger);
+
+    const views = await asTenant(() => service.list());
+
+    expect(views[0].missingEntryCount).toBe(0);
   });
 });
 

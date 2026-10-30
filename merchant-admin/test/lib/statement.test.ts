@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   describeCommissionEntryType,
+  describeMissingEntries,
   describeReceiptPayoutStatus,
   describeReceiptType,
   describeStatementStatus,
@@ -114,5 +115,15 @@ describe('describeReceiptPayoutStatus', () => {
   it('⚠️ 未知状态 → 未知状态（不显示裸枚举）', () => {
     expect(describeReceiptPayoutStatus('WHATEVER')).toBe('未知状态');
     expect(describeReceiptPayoutStatus('WHATEVER')).not.toContain('WHATEVER');
+  });
+});
+
+describe('describeMissingEntries', () => {
+  it('⚠️ 缺笔 → 给出提示文案', () => {
+    expect(describeMissingEntries(2)).toContain('缺 2 笔');
+  });
+
+  it('⚠️ 不缺笔 → 不给提示', () => {
+    expect(describeMissingEntries(0)).toBeNull();
   });
 });

@@ -151,6 +151,40 @@ export function describePayoutTimeline(payout: {
 }
 
 /**
+ * 收款账户的展示串：`开户行 掩码账号（户名）`。
+ *
+ * ⚠️ **账号是密文，界面只给掩码**（阶段 5j）：库里存的是密文，
+ *    响应里只有预存的掩码串（`maskedSnapshotAccountNo`）——
+ *    **完整账号绝不在响应里，前端也不去解密**。
+ *
+ * ⚠️ **三个字段都可能为 null**（老数据没有快照）：这时返回 `null`，
+ *    让调用方**整行不显示** —— 不能渲染出字面量 "null"，
+ *    也不该用「—」占位（那一行本来就没有信息）。
+ *
+ * ⚠️ **只拼已有的部分**：户名可能缺、可能只有掩码串。
+ *    用「—」占位缺失的部分会让超管以为「开户行不知道」，
+ *    而实际情况是「这张单没有快照」。
+ */
+export function describePayoutAccount(payout: {
+  snapshotBankName?: string | null;
+  maskedSnapshotAccountNo?: string | null;
+  snapshotAccountName?: string | null;
+}): string | null {
+  const parts: string[] = [];
+
+  if (payout.snapshotBankName) parts.push(payout.snapshotBankName);
+  if (payout.maskedSnapshotAccountNo) {
+    parts.push(payout.maskedSnapshotAccountNo);
+  }
+  if (payout.snapshotAccountName) {
+    parts.push(`（${payout.snapshotAccountName}）`);
+  }
+
+  // ⚠️ **三个字段全空 → 返回 null**（这张单没有收款账户快照）。
+  return parts.length === 0 ? null : parts.join(' ');
+}
+
+/**
  * 出款单的一行（商家侧与平台侧共用的字段）。
  *
  * ⚠️ **`receiptAmount` 与 `commissionAmount` 都是正数**：
@@ -195,6 +229,22 @@ export interface PayoutItem {
   paidAt: string | null;
   /** ISO 8601。null = 未失败 */
   failedAt: string | null;
+  /**
+   * 收款账户快照（户名）。null = 老数据没有快照
+   *
+   * ⚠️ **账号本身是密文，界面只给掩码**（见 `maskedSnapshotAccountNo`）。
+   */
+  snapshotAccountName: string | null;
+  /** 收款账户快照（开户行）。null = 老数据没有快照 */
+  snapshotBankName: string | null;
+  /**
+   * 收款账户快照（**账号脱敏**）。null = 老数据没有快照
+   *
+   * ⚠️ **库里存的是密文，响应里只给预存的掩码串** ——
+   *    即便解开也绝不能原样进响应（护栏 X14）。
+   *    掩码串是超管核对「钱打给谁」的**唯一**依据。
+   */
+  maskedSnapshotAccountNo: string | null;
 }
 
 /** 出款单详情（含明细） */

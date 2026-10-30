@@ -5,7 +5,7 @@
  * 页面上有 `next/link`，在 Next 运行时之外渲染它可能抛错。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ComponentType } from 'react';
+import { isValidElement, type ComponentType, type ReactElement, type ReactNode } from 'react';
 
 // ⚠️ **`@/auth` 必须 mock 掉**：理由同列表页。
 vi.mock('@/auth', () => ({ auth: vi.fn() }));
@@ -46,7 +46,12 @@ import SettlementDetailPage from '@/app/(dashboard)/settlements/[id]/page';
 import { SettlementRowActions } from '@/app/(dashboard)/settlements/settlement-actions';
 import type { SettlementDetail } from '@/lib/billing';
 
-import { collectComponentProps, collectText, hasText } from '../helpers/page-tree';
+import {
+  collectClassNames,
+  collectComponentProps,
+  collectText,
+  hasText,
+} from '../helpers/page-tree';
 
 /**
  * ⚠️ **净额故意与明细对不上**：后端给的净额是 99999 分 = ¥999.99，
@@ -66,6 +71,8 @@ const DETAIL: SettlementDetail = {
   reversalAmount: -300,
   netAmount: 99999,
   entryCount: 2,
+  missingEntryCount: 0,
+  canRecalculate: true,
   status: 'CONFIRMED',
   confirmedAt: '2026-02-01T10:00:00.000Z',
   createdAt: '2026-02-01T00:00:00.000Z',
@@ -110,6 +117,68 @@ async function renderRowActionProps(
     element,
     SettlementRowActions as unknown as ComponentType<unknown>,
   );
+}
+
+/**
+ * 取出**缺笔修账指引**那一句（不含「本期结算单缺 N 笔」的坏消息）。
+ *
+ * ⚠️ **为什么要单独定位，而不是整页断言**：
+ *    页面上还有 `SettlementRowActions`（客户端组件），
+ *    它的按钮文字（「确认」「重算」「取消确认」）与指引文案里
+ *    的「重算」「取消确认」**是同一批字**。
+ *    整页断言分不清「这句指引说了重算」与「页面上有个重算按钮」。
+ *
+ * ⚠️ **定位方式**：缺笔块是个 `div`，里面有两个并列的 `<p>` ——
+ *    第一个是 `text-destructive` 的坏消息，第二个（`text-muted-foreground`）
+ *    才是指引。这里按「`text-destructive` 的 `<p>` 的下一个兄弟 `<p>`」取。
+ *
+ * ⚠️ **返回 null 而不是空串**：取不到说明缺笔块根本没渲染，
+ *    调用方据此断言「没出提示」，而不是拿到空串去 `toContain` 蒙混过关。
+ */
+async function renderHint(id = 'statement-1'): Promise<string | null> {
+  const element = await SettlementDetailPage({
+    params: Promise.resolve({ id }),
+  });
+
+  const visit = (node: unknown): string | null => {
+    if (node === null || node === undefined || typeof node === 'boolean') return null;
+    if (typeof node === 'string' || typeof node === 'number') return null;
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const found = visit(child);
+        if (found !== null) return found;
+      }
+      return null;
+    }
+    if (!isValidElement(node)) return null;
+
+    const el = node as ReactElement<Record<string, unknown>>;
+    const children = el.props?.children as ReactNode;
+    const list = (Array.isArray(children) ? children : [children]).filter(
+      (child): child is ReactElement<Record<string, unknown>> =>
+        isValidElement(child),
+    );
+
+    // 找到「坏消息」那个 `<p>`（className 带 text-destructive），
+    // 取它的下一个兄弟 `<p>` —— 那就是指引。
+    for (let index = 0; index < list.length; index += 1) {
+      const child = list[index];
+      const className = child.props?.className;
+      const text = collectText(child.props?.children).join('');
+      if (
+        typeof className === 'string' &&
+        className.includes('text-destructive') &&
+        text.includes('本期结算单缺')
+      ) {
+        const next = list[index + 1];
+        if (next) return collectText(next.props?.children).join('');
+      }
+    }
+
+    return visit(children);
+  };
+
+  return visit(element);
 }
 
 beforeEach(() => {
@@ -270,6 +339,112 @@ describe('结算单详情页：明细', () => {
     const texts = await renderPage();
 
     expect(hasText(texts, '暂无明细。')).toBe(true);
+  });
+});
+
+describe('结算单详情页：缺笔可见（阶段 5j）', () => {
+  it('⚠️ 缺笔时详情页给出修账指引', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      missingEntryCount: 2,
+      canRecalculate: true,
+    });
+
+    const texts = await renderPage();
+
+    // ⚠️ **缺笔数要出现在页面上**：只说「本期缺笔」不说缺几笔，
+    //    超管还是得回列表去数。
+    expect(hasText(texts, '缺 2 笔')).toBe(true);
+    // ⚠️ **要给得出下一步怎么做**，而不是只报一个坏消息。
+    expect(hasText(texts, '重算')).toBe(true);
+  });
+
+  it('⚠️ 能重算时指引说「取消确认 → 重算」', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      missingEntryCount: 2,
+      canRecalculate: true,
+    });
+
+    const texts = await renderPage();
+
+    // ⚠️ **能修的路径必须写出来**：超管看到「缺笔」却不知道能做什么，
+    //    就会去调账（多绕一圈流程，还可能算错）。
+    expect(hasText(texts, '取消确认')).toBe(true);
+    expect(hasText(texts, '重算')).toBe(true);
+    // ⚠️ **不能提调账**：这一期能重算，调账是另一条路。
+    expect(hasText(texts, '调账')).toBe(false);
+  });
+
+  it('⚠️ 不能重算时（被出款单引用）改指引为调账', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      missingEntryCount: 2,
+      canRecalculate: false,
+    });
+
+    const texts = await renderPage();
+
+    // ⚠️ **有出款单引用时 `unconfirm` 会被 409 拦下** ——
+    //    这时候还说「可先取消确认再重算」是在指一条走不通的路。
+    expect(hasText(texts, '调账')).toBe(true);
+    expect(hasText(texts, '不能取消确认')).toBe(true);
+    // ⚠️ **不能出现「重算」**：走不通的路不能出现在指引里。
+    expect(hasText(texts, '重算')).toBe(false);
+  });
+
+  it('⚠️ 草稿单直接说「重算」，不说「先取消确认再重算」', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'DRAFT' as const,
+      confirmedAt: null,
+      missingEntryCount: 2,
+      canRecalculate: true,
+    });
+
+    const texts = await renderPage();
+    const hint = await renderHint();
+
+    // ⚠️ **缺笔数要出现在页面上**（这条护栏与状态无关）。
+    expect(hasText(texts, '缺 2 笔')).toBe(true);
+
+    // ⚠️ **只断言「指引那一句」**：页面上还有 `SettlementRowActions`
+    //    的按钮文字（「确认」「重算」），整页断言分不清
+    //    「这句指引说了重算」与「页面上有个重算按钮」。
+    expect(hint).not.toBeNull();
+    expect(hint).toContain('可直接「重算」');
+
+    // ⚠️ **草稿单压根没有「取消确认」按钮**（`SettlementRowActions` 里
+    //    「取消确认」只在 `status === 'CONFIRMED'` 时渲染）：
+    //    给草稿单指「先取消确认再重算」是指了一条走不通的路。
+    expect(hint).not.toContain('先「取消确认」再「重算」');
+    expect(hint).not.toContain('取消确认');
+  });
+
+  it('⚠️ 不缺笔时不出任何缺笔提示', async () => {
+    const texts = await renderPage();
+
+    // ⚠️ **不缺笔就不该有缺笔提示**：每次都提醒一遍，
+    //    真缺笔的那次就被淹没了。
+    expect(hasText(texts, '缺笔')).toBe(false);
+    expect(hasText(texts, '缺 0 笔')).toBe(false);
+  });
+
+  it('⚠️ 缺笔的提示要标红', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      missingEntryCount: 2,
+      canRecalculate: true,
+    });
+
+    const element = await SettlementDetailPage({
+      params: Promise.resolve({ id: 'statement-1' }),
+    });
+    const classNames = collectClassNames(element);
+
+    expect(
+      classNames.some((name) => name.includes('text-destructive')),
+    ).toBe(true);
   });
 });
 

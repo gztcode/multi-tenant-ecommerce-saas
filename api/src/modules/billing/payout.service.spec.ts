@@ -15,6 +15,7 @@ import { tenantContext } from '../../common/tenant/tenant-context';
 import { ApplyPayoutDto } from './dto/apply-payout.dto';
 import { LedgerService } from './ledger.service';
 import { PayoutService } from './payout.service';
+import { PayoutCipherService } from './payout-cipher.service';
 
 /**
  * 出款单服务的**分支级**单元测试。
@@ -101,7 +102,9 @@ function payout(overrides: {
   failureReason?: string | null;
   snapshotAccountName?: string | null;
   snapshotBankName?: string | null;
-  snapshotAccountNo?: string | null;
+  snapshotAccountNoCipher?: string | null;
+  snapshotMaskedAccountNo?: string | null;
+  snapshotEncryptionVersion?: number;
 }) {
   const receiptAmount = overrides.receiptAmount ?? 10000;
   const commissionAmount = overrides.commissionAmount ?? 2000;
@@ -138,20 +141,49 @@ function payout(overrides: {
     failedAt: null,
     snapshotAccountName: overrides.snapshotAccountName ?? null,
     snapshotBankName: overrides.snapshotBankName ?? null,
-    snapshotAccountNo: overrides.snapshotAccountNo ?? null,
+    // ⚠️ **阶段 5j：快照里的账号是密文** —— 展示路径读的是预存的掩码串
+    snapshotAccountNoCipher: overrides.snapshotAccountNoCipher ?? null,
+    snapshotMaskedAccountNo: overrides.snapshotMaskedAccountNo ?? null,
+    snapshotEncryptionVersion: overrides.snapshotEncryptionVersion ?? 0,
     createdAt: new Date('2025-08-01T00:00:00.000Z'),
     updatedAt: new Date('2025-08-01T00:00:00.000Z'),
   };
 }
 
-/** 收款账户的形状 */
-function payoutAccount() {
+/**
+ * 收款账户的形状（阶段 5j：账号是密文）。
+ *
+ * ⚠️ **版本 0 的行不是「已加密但版本号写 0」，而是「压根还没加密」**：
+ *    迁移脚本是把旧列 `accountNo` **原地改名**成 `accountNoCipher` ——
+ *    所以未迁移的行里，那一列装的是**明文账号**；
+ *    而 `maskedAccountNo` 是迁移时新增的列，存量行全是**空串**。
+ *    → 夹具必须照这个形状造，否则「版本 0」会被画成「已加密但版本号是 0」，
+ *    将来加断言会被骗过去。
+ */
+function payoutAccount(
+  overrides: {
+    /** 加密版本（0 = 这行还没迁移加密，1 = 已加密） */
+    encryptionVersion?: number;
+    /** 账号明文（版本 1 时会被加密成密文存进夹具） */
+    accountNo?: string;
+  } = {},
+) {
+  const accountNo = overrides.accountNo ?? '6222000000000000';
+  const encryptionVersion = overrides.encryptionVersion ?? 1;
   return {
     id: 'acct-a',
     tenantId: 'tenant-a',
     accountName: '张三',
     bankName: '测试银行',
-    accountNo: '6222000000000000',
+    // ⚠️ **版本 0 → 那一列里是明文**（迁移是改名，不是加密）；
+    //    版本 1 → 才是真密文。
+    accountNoCipher:
+      encryptionVersion === 0
+        ? accountNo
+        : new PayoutCipherService().encrypt(accountNo),
+    // ⚠️ **掩码串是迁移时新加的列** → 存量行（版本 0）没有掩码，是空串。
+    maskedAccountNo: encryptionVersion === 0 ? '' : '************0000',
+    encryptionVersion,
     createdAt: new Date('2025-08-01T00:00:00.000Z'),
     updatedAt: new Date('2025-08-01T00:00:00.000Z'),
   };
@@ -486,6 +518,16 @@ function asTenant<T>(fn: () => Promise<T>): Promise<T> {
     async () => fn(),
   );
 }
+
+/**
+ * ⚠️ **单元测试进程里没有 .env** —— `PayoutCipherService` 在构造时就要密钥，
+ *    拿不到就直接抛错。所以这里显式设一个**测试用**密钥。
+ */
+const TEST_ENCRYPTION_KEY = 'test-payout-encryption-key-at-least-32-chars';
+
+beforeAll(() => {
+  process.env.PAYOUT_ACCOUNT_ENCRYPTION_KEY = TEST_ENCRYPTION_KEY;
+});
 
 /** 在平台上下文里调用 */
 function asPlatform<T>(fn: () => Promise<T>): Promise<T> {
@@ -983,7 +1025,7 @@ describe('approve（阶段 5h-2）', () => {
     expect(otherWhere?.payoutId).toEqual({ not: 'payout-a' });
   });
 
-  it('审批时把收款账户抄进快照三个字段', async () => {
+  it('审批时把收款账户抄进快照（账号是密文，版本号跟着一起抄）', async () => {
     const prisma = fakePrisma({
       payout: payout({}),
       receipts: [receipt({ id: 'r-1' })],
@@ -997,11 +1039,25 @@ describe('approve（阶段 5h-2）', () => {
     const data = argsOf(prisma.tx()!.payout.updateMany).data as {
       snapshotAccountName: string;
       snapshotBankName: string;
-      snapshotAccountNo: string;
+      snapshotAccountNoCipher: string;
+      snapshotMaskedAccountNo: string;
+      snapshotEncryptionVersion: number;
     };
     expect(data.snapshotAccountName).toBe('张三');
     expect(data.snapshotBankName).toBe('测试银行');
-    expect(data.snapshotAccountNo).toBe('6222000000000000');
+    // ⚠️ **快照里的是密文，不是明文**
+    expect(data.snapshotAccountNoCipher).toBeDefined();
+    expect(data.snapshotAccountNoCipher).not.toBe('6222000000000000');
+    // ⚠️ **更强的断言**：密文解出来就是原文
+    expect(
+      new PayoutCipherService().decrypt(data.snapshotAccountNoCipher),
+    ).toBe('6222000000000000');
+    // ⚠️ **掩码串一起抄** —— 展示路径不解密，靠的就是它
+    expect(data.snapshotMaskedAccountNo).toBe('************0000');
+    // ⚠️ **版本号必须跟着密文一起抄** ——
+    //    否则会出现「密文是新的、版本号是 0」的错配，
+    //    worker 解密时会因为版本号不对而抛错。
+    expect(data.snapshotEncryptionVersion).toBe(1);
   });
 
   it('审批时查收款账户要显式带 tenantId（平台作用域下扩展不附加）', async () => {
@@ -1176,6 +1232,247 @@ describe('approve（阶段 5h-2）', () => {
       commissionAmount: number;
     };
     expect(data.commissionAmount).toBe(0);
+  });
+});
+
+/**
+ * 阶段 5j：快照抄的是「账户行里那份密文本身」。
+ *
+ * ⚠️ **为什么不能用「解出来 == 原文」代替「同一个字符串」**：
+ *    重新加密（`encrypt(密文)`）会得到**另一串**密文，
+ *    而把它解一次，拿到的是**原来那串密文**、不是账号明文 ——
+ *    所以「解出来是原文」这条断言在「重新加密」的变异下**照样会挂**，
+ *    但**换一种写法就蒙混过关**（例如把密文当明文再加密再解一次）。
+ *    → 唯一能区分「复制」与「重新加密」的，是**字符串本身一模一样**。
+ */
+describe('账户快照：抄的是同一份密文（阶段 5j）', () => {
+  it('apply 建单时抄的是账户行里那份密文本身（不是重新加密）', async () => {
+    const account = payoutAccount();
+    const prisma = fakePrisma({
+      receipts: [receipt({ id: 'r-1' })],
+      statement: statement({}),
+      payout: null,
+      account,
+    });
+    const service = makeService(prisma);
+
+    await asTenant(async () => {
+      await service.apply({ period: '2025-07' });
+    });
+
+    const data = argsOf(prisma.tx()!.payout.create).data as {
+      snapshotAccountNoCipher: string;
+    };
+    // ⚠️ **同一个字符串**（不是「内容对得上」）——
+    //    重新加密会因随机 iv 得到**完全不同的密文**。
+    expect(data.snapshotAccountNoCipher).toBe(account.accountNoCipher);
+  });
+
+  it('approve 快照抄的也是账户行里那份密文本身（不是重新加密）', async () => {
+    const account = payoutAccount();
+    const prisma = fakePrisma({
+      payout: payout({}),
+      receipts: [receipt({ id: 'r-1' })],
+      account,
+    });
+    const service = makeService(prisma);
+
+    await asPlatform(async () => {
+      await service.approve('payout-a');
+    });
+
+    const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+      snapshotAccountNoCipher: string;
+    };
+    // ⚠️ **同一个字符串** —— 「快照 = 审批那一刻的那一份」
+    expect(data.snapshotAccountNoCipher).toBe(account.accountNoCipher);
+  });
+
+  it('apply 建单时版本号跟着账户行走（账户已迁移 → 快照也是 1）', async () => {
+    // ⚠️ **版本号必须跟着密文一起抄** ——
+    //    写死 0 会骗过后续的版本检查，
+    //    造成「密文是新的、版本号说它是旧的」的错配。
+    const account = payoutAccount({ encryptionVersion: 1 });
+    const prisma = fakePrisma({
+      receipts: [receipt({ id: 'r-1' })],
+      statement: statement({}),
+      payout: null,
+      account,
+    });
+    const service = makeService(prisma);
+
+    await asTenant(async () => {
+      await service.apply({ period: '2025-07' });
+    });
+
+    const data = argsOf(prisma.tx()!.payout.create).data as {
+      snapshotEncryptionVersion: number;
+    };
+    expect(data.snapshotEncryptionVersion).toBe(1);
+  });
+
+  it('approve 快照的版本号跟着账户行走（账户已迁移 → 快照也是 1）', async () => {
+    const account = payoutAccount({ encryptionVersion: 1 });
+    const prisma = fakePrisma({
+      payout: payout({}),
+      receipts: [receipt({ id: 'r-1' })],
+      account,
+    });
+    const service = makeService(prisma);
+
+    await asPlatform(async () => {
+      await service.approve('payout-a');
+    });
+
+    const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+      snapshotEncryptionVersion: number;
+    };
+    expect(data.snapshotEncryptionVersion).toBe(1);
+  });
+});
+
+/**
+ * 阶段 5j：**写路径也要查加密版本**。
+ *
+ * ⚠️ **为什么这道闸是必须的**：账户行未迁移时（`encryptionVersion = 0`），
+ *    `accountNoCipher` 列里装的是**明文账号**（迁移是给旧列改名，不是加密）。
+ *    而快照是**复制**账户行里那一份 → 抄过去就是把明文抄进 `payouts` 表，
+ *    等于在新表里第一次出现明文副本；
+ *    而且打款时 `decryptVersioned` 必然抛错 → 出款单卡在 `PROCESSING` 反复重试。
+ *    → 宁可在**建单/审批前**就拒掉，也不要造出一张注定打不出钱的单。
+ */
+describe('写路径闸：账户未完成加密迁移时不允许建单/审批（阶段 5j）', () => {
+  it('apply 遇到未迁移的账户 → 400，且**没建任何单**', async () => {
+    // ⚠️ **账户行里装的是明文**（版本 0 的真实形状）——
+    //    如果这道闸漏了，这串明文就会被抄进 `payouts`。
+    const account = payoutAccount({
+      encryptionVersion: 0,
+      accountNo: '6225880000000000',
+    });
+    const prisma = fakePrisma({
+      receipts: [receipt({ id: 'r-1' })],
+      statement: statement({}),
+      payout: null,
+      account,
+    });
+    const service = makeService(prisma);
+
+    await expect(
+      asTenant(() => service.apply({ period: '2025-07' })),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    await expect(
+      asTenant(() => service.apply({ period: '2025-07' })),
+    ).rejects.toThrow('migrate:payout-encryption');
+
+    // ⚠️ **没建单**：闸必须在建单**之前** ——
+    //    建完再拒等于明文已经落库了。
+    expect(prisma.calls).not.toContain('$transaction');
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('apply 遇到未迁移的账户 → 明文账号**没有**写进 payouts', async () => {
+    const account = payoutAccount({
+      encryptionVersion: 0,
+      accountNo: '6225880000000000',
+    });
+    const prisma = fakePrisma({
+      receipts: [receipt({ id: 'r-1' })],
+      statement: statement({}),
+      payout: null,
+      account,
+    });
+    const service = makeService(prisma);
+
+    await expect(
+      asTenant(() => service.apply({ period: '2025-07' })),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    // ⚠️ **建单根本没发生** → 不可能有明文落库。
+    //    （`payout.create` 跑在事务客户端上，事务没开 → 客户端是 null）
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('approve 遇到未迁移的账户 → 409，且**状态没变**', async () => {
+    const account = payoutAccount({
+      encryptionVersion: 0,
+      accountNo: '6225880000000000',
+    });
+    const prisma = fakePrisma({
+      payout: payout({ status: PayoutStatus.REQUESTED }),
+      receipts: [receipt({ id: 'r-1' })],
+      account,
+    });
+    const service = makeService(prisma);
+
+    await expect(
+      asPlatform(() => service.approve('payout-a')),
+    ).rejects.toBeInstanceOf(ConflictException);
+    await expect(asPlatform(() => service.approve('payout-a'))).rejects.toThrow(
+      'migrate:payout-encryption',
+    );
+
+    // ⚠️ **没落库**：状态还停在 `REQUESTED`，
+    //    没被改成 `APPROVED`（审批事务根本没开）。
+    expect(prisma.tx()).toBeNull();
+    expect(prisma.payout.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('对照组：账户已迁移（版本 1）→ apply 正常建单', async () => {
+    // ⚠️ **对照组**：证明上一条不是因为「别的什么原因失败」——
+    //    同样的数据，只把版本号改成 1，就必须能建单。
+    const account = payoutAccount({
+      encryptionVersion: 1,
+      accountNo: '6225880000000000',
+    });
+    const prisma = fakePrisma({
+      receipts: [receipt({ id: 'r-1' })],
+      statement: statement({}),
+      payout: null,
+      account,
+    });
+    const service = makeService(prisma);
+
+    const view = await asTenant(() => service.apply({ period: '2025-07' }));
+
+    expect(view.id).toBe('payout-a');
+    expect(prisma.calls).toContain('$transaction');
+    const data = argsOf(prisma.tx()!.payout.create).data as {
+      snapshotAccountNoCipher: string;
+      snapshotEncryptionVersion: number;
+    };
+    expect(data.snapshotEncryptionVersion).toBe(1);
+    // ⚠️ **快照里是密文，不是明文**
+    expect(data.snapshotAccountNoCipher).not.toBe('6225880000000000');
+    expect(
+      new PayoutCipherService().decrypt(data.snapshotAccountNoCipher),
+    ).toBe('6225880000000000');
+  });
+
+  it('对照组：账户已迁移（版本 1）→ approve 正常审批', async () => {
+    const account = payoutAccount({
+      encryptionVersion: 1,
+      accountNo: '6225880000000000',
+    });
+    const prisma = fakePrisma({
+      payout: payout({ status: PayoutStatus.REQUESTED }),
+      receipts: [receipt({ id: 'r-1' })],
+      account,
+    });
+    const service = makeService(prisma);
+
+    const view = await asPlatform(() => service.approve('payout-a'));
+
+    expect(view.id).toBe('payout-a');
+    const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+      status: string;
+      snapshotEncryptionVersion: number;
+    };
+    // ⚠️ **状态确实被改成 `APPROVED`** ——
+    //    ⚠️ `view.status` 不能用来断言这一点：假 Prisma 的
+    //    `tx.payout.findFirst` 回读的是**配置里那张旧行**（还是 `REQUESTED`），
+    //    所以只能看 `updateMany` 落库的 `data`。
+    expect(data.status).toBe(PayoutStatus.APPROVED);
+    expect(data.snapshotEncryptionVersion).toBe(1);
   });
 });
 
@@ -1359,7 +1656,11 @@ describe('PayoutView：执行字段与账号脱敏（护栏 X14）', () => {
       kind: PayoutKind.NORMAL,
       snapshotAccountName: '张三',
       snapshotBankName: '测试银行',
-      snapshotAccountNo: '6222000000000000',
+      snapshotAccountNoCipher: new PayoutCipherService().encrypt(
+        '6222000000000000',
+      ),
+      snapshotMaskedAccountNo: '************0000',
+      snapshotEncryptionVersion: 1,
       payoutChannel: 'fake-bank',
       attemptCount: 2,
       failureReason: null,
@@ -1385,6 +1686,12 @@ describe('PayoutView：执行字段与账号脱敏（护栏 X14）', () => {
     // ⚠️ **完整账号一个字节都不能漏出去**
     expect(JSON.stringify(view)).not.toContain('6222000000000000');
     expect('snapshotAccountNo' in view).toBe(false);
+    // ⚠️ **密文也不能漏出去** —— 密文虽然解不开，但它是「打款依据」的载体，
+    //    泄出去等于把解密材料交出去（密钥轮换后旧密文依然可解）。
+    expect('snapshotAccountNoCipher' in view).toBe(false);
+    expect(JSON.stringify(view)).not.toContain(
+      created.snapshotAccountNoCipher as string,
+    );
   });
 });
 

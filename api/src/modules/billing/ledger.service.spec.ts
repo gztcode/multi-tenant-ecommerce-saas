@@ -55,7 +55,13 @@ function fakePrisma(
       status: SettlementStatus;
     }>;
     statementLinks?: Array<{ statementId: string; entryId: string }>;
-    commissionEntries?: Array<{ id: string }>;
+    /**
+     * 抽佣流水。
+     *
+     * ⚠️ **`occurredAt` 是阶段 5j 加的** —— 缺笔检测要按流水自己的
+     *    `occurredAt` 归期（不能用账单的 `periodStart`）。
+     */
+    commissionEntries?: Array<{ id: string; occurredAt?: Date }>;
     payouts?: Array<{
       id: string;
       periodStart: Date;
@@ -83,8 +89,44 @@ function fakePrisma(
       ),
     },
     commissionEntry: {
-      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
-        Promise.resolve(options.commissionEntries ?? []),
+      /**
+       * ⚠️ **阶段 5j：这张表现在被查两次**，靠 `where` 的形状区分：
+       * - ④ 「结算单纳入的那些」→ `where.id.in`
+       * - ⑧ 「当期全部」→ `where.occurredAt`
+       *
+       * ⚠️ **两个 `where` 都要真的过滤** —— 否则「查当期全部」会拿到
+       *    「结算单纳入的那些」，缺笔数永远是 0，测试就白写了。
+       */
+      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(
+        (args?: QueryArgs) => {
+          const rows = options.commissionEntries ?? [];
+          const where = args?.where as
+            | {
+                id?: { in?: string[] };
+                occurredAt?: { gte?: Date; lt?: Date };
+              }
+            | undefined;
+          if (where?.id?.in) {
+            return Promise.resolve(
+              rows.filter((row) => where.id?.in?.includes(row.id)),
+            );
+          }
+          if (where?.occurredAt) {
+            const { gte, lt } = where.occurredAt;
+            return Promise.resolve(
+              rows.filter((row) => {
+                // ⚠️ **没有 `occurredAt` 的行不算数** —— 归期算不出来。
+                if (!row.occurredAt) return false;
+                if (gte && row.occurredAt.getTime() < gte.getTime())
+                  return false;
+                if (lt && row.occurredAt.getTime() >= lt.getTime())
+                  return false;
+                return true;
+              }),
+            );
+          }
+          return Promise.resolve(rows);
+        },
       ),
     },
     payout: {
@@ -106,14 +148,15 @@ function makeService(prisma: ReturnType<typeof fakePrisma>): LedgerService {
   return new LedgerService(prisma as unknown as never);
 }
 
-/** 断言「每张表恰好查了一次」 */
+/** 断言「每张表恰好查了一次」（抽佣流水查两次：④ 纳入的那些 + ⑧ 当期全部） */
 function expectEachTableQueriedOnce(
   prisma: ReturnType<typeof fakePrisma>,
 ): void {
   expect(prisma.merchantReceipt.findMany).toHaveBeenCalledTimes(1);
   expect(prisma.settlementStatement.findMany).toHaveBeenCalledTimes(1);
   expect(prisma.settlementStatementEntry.findMany).toHaveBeenCalledTimes(1);
-  expect(prisma.commissionEntry.findMany).toHaveBeenCalledTimes(1);
+  // ⚠️ **抽佣流水查两次**（阶段 5j 加的第 ⑧ 步：算缺笔要用「当期全部」）
+  expect(prisma.commissionEntry.findMany).toHaveBeenCalledTimes(2);
   expect(prisma.payout.findMany).toHaveBeenCalledTimes(1);
   expect(prisma.payoutEntry.findMany).toHaveBeenCalledTimes(1);
 }
@@ -137,7 +180,8 @@ describe('LedgerService（阶段 5i）', () => {
     expect(prisma.merchantReceipt.findMany).toHaveBeenCalledTimes(2);
     expect(prisma.settlementStatement.findMany).toHaveBeenCalledTimes(2);
     expect(prisma.settlementStatementEntry.findMany).toHaveBeenCalledTimes(2);
-    expect(prisma.commissionEntry.findMany).toHaveBeenCalledTimes(2);
+    // ⚠️ **抽佣流水每次调用查 2 次**（④ 纳入的那些 + ⑧ 当期全部）
+    expect(prisma.commissionEntry.findMany).toHaveBeenCalledTimes(4);
     expect(prisma.payout.findMany).toHaveBeenCalledTimes(2);
     expect(prisma.payoutEntry.findMany).toHaveBeenCalledTimes(2);
 
@@ -146,7 +190,7 @@ describe('LedgerService（阶段 5i）', () => {
     expect(prisma.merchantReceipt.findMany).toHaveBeenCalledTimes(2);
   });
 
-  it('⚠️ 一次调用内部：每张表恰好查一次（6 次，与期数无关）', async () => {
+  it('⚠️ 一次调用内部：每张表恰好查一次（7 次，与期数无关）', async () => {
     const prisma = fakePrisma();
     const service = makeService(prisma);
 
@@ -237,7 +281,9 @@ describe('LedgerService（阶段 5i）', () => {
         },
       ],
       statementLinks: [{ statementId: 'stmt-a', entryId: 'e-1' }],
-      commissionEntries: [{ id: 'e-1' }],
+      commissionEntries: [
+        { id: 'e-1', occurredAt: new Date('2026-08-10T00:00:00.000Z') },
+      ],
     });
     const service = makeService(prisma);
 
@@ -249,6 +295,66 @@ describe('LedgerService（阶段 5i）', () => {
     expect(amounts?.commissionAmount).toBe(1500);
     // ⚠️ **笔数按真实存在的流水行算**
     expect(amounts?.commissionEntryCount).toBe(1);
+    // ⚠️ **当期全部流水也是 1 笔** → 不缺笔
+    expect(amounts?.actualCommissionEntryCount).toBe(1);
+  });
+
+  it('⚠️ 缺笔：当期真实流水比结算单纳入的多 → 差值可见', async () => {
+    // ⚠️ **这一期的流水后来又进了一笔**（回填补录）→
+    //    结算单只纳入了 1 笔 → 平台少收了 / 商家少拿了钱。
+    const prisma = fakePrisma({
+      statements: [
+        {
+          id: 'stmt-a',
+          periodStart: PERIOD_2026_08.from,
+          netAmount: 1500,
+          status: SettlementStatus.CONFIRMED,
+        },
+      ],
+      statementLinks: [{ statementId: 'stmt-a', entryId: 'e-1' }],
+      commissionEntries: [
+        { id: 'e-1', occurredAt: new Date('2026-08-10T00:00:00.000Z') },
+        { id: 'e-2', occurredAt: new Date('2026-08-20T00:00:00.000Z') },
+      ],
+    });
+    const service = makeService(prisma);
+
+    const result = await service.aggregatePeriods('tenant-1', [PERIOD_2026_08]);
+
+    const amounts = result.get('2026-08');
+    expect(amounts?.commissionEntryCount).toBe(1);
+    expect(amounts?.actualCommissionEntryCount).toBe(2);
+  });
+
+  it('⚠️ 缺笔按流水自己的 occurredAt 归期（不按账单的 periodStart）', async () => {
+    // ⚠️ **归期是流水自己的 `occurredAt` 说了算** —— 不是账单周期说了算。
+    //
+    // ⚠️ **样本必须「在查询区间内、但归期属于别的期」**：
+    //    如果样本落在查询区间之外，它在进入分组逻辑**之前**就被区间查询
+    //    过滤掉了 → 归期用哪种口径都测不出差别 → 这条用例没有牙齿。
+    //    （规格原文点名了这个陷阱：跨期回填的流水归期在退款期，不在原期。）
+    const prisma = fakePrisma({
+      commissionEntries: [
+        { id: 'e-1', occurredAt: new Date('2026-08-10T00:00:00.000Z') },
+        // ⚠️ **落在查询区间内**（[2026-07-01, 2026-09-01)），
+        //    **但归期在 2026-07** —— 若错按账单的 `periodStart` 归期，
+        //    它会被算进 2026-08 那一期。
+        { id: 'e-2', occurredAt: new Date('2026-07-05T00:00:00.000Z') },
+        // ⚠️ **落在查询区间外**（2026-09）→ 被区间查询过滤掉 → 两期都不算
+        { id: 'e-3', occurredAt: new Date('2026-09-05T00:00:00.000Z') },
+      ],
+    });
+    const service = makeService(prisma);
+
+    const result = await service.aggregatePeriods('tenant-1', [
+      PERIOD_2026_08,
+      PERIOD_2026_07,
+    ]);
+
+    // ⚠️ **2026-08 只有 e-1**：e-2 归期在 07，不该算进 08
+    expect(result.get('2026-08')?.actualCommissionEntryCount).toBe(1);
+    // ⚠️ **2026-07 有 e-2**：它落在查询区间内，必须按自己的 `occurredAt` 归期
+    expect(result.get('2026-07')?.actualCommissionEntryCount).toBe(1);
   });
 
   it('出款单按状态分桶：PAID 算已出款，REQUESTED 算在途', async () => {

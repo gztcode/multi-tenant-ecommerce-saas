@@ -157,6 +157,21 @@ export function describeReceiptPayoutStatus(
 }
 
 /**
+ * 缺笔提示的文案。
+ *
+ * ⚠️ **只陈述事实，不替平台判断谁该补钱** ——
+ *    缺 `COMMISSION` 是平台少收，缺 `REVERSAL` 是商家少拿，
+ *    方向取决于缺失流水的类型与正负，平台自己也要判断。
+ *    所以商家端只说「缺 N 笔，佣金以结算单为准」。
+ *
+ * @returns 有缺笔时返回提示文案；不缺笔时返回 `null`（不显示）
+ */
+export function describeMissingEntries(count: number): string | null {
+  if (count <= 0) return null;
+  return `本期结算单缺 ${count} 笔抽佣流水，佣金以结算单为准`;
+}
+
+/**
  * 这一期能申请的出款类型。
  *
  * ⚠️ **与后端 `deriveApplicableKind` 的返回一致**：
@@ -199,6 +214,13 @@ export interface StatementPeriod {
   applicableKind: ApplicableKind | null;
   /** 不能申请的原因；null = 能申请 */
   blockedReason: string | null;
+  /**
+   * 这一期结算单缺了多少笔抽佣流水（阶段 5j）。
+   *
+   * ⚠️ **没有结算单的期恒为 0**：「这一期还没结算」与「结算单缺笔」
+   *    是两回事 —— 后者才需要提示商家。
+   */
+  missingEntryCount: number;
 }
 
 /** 一期对账单的详情（含两段明细） */

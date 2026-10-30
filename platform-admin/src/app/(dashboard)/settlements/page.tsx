@@ -133,6 +133,7 @@ export default async function SettlementsPage({
                     <TableHead>冲回</TableHead>
                     <TableHead>净额</TableHead>
                     <TableHead>笔数</TableHead>
+                    <TableHead>缺笔</TableHead>
                     <TableHead>单号</TableHead>
                     <TableHead>操作</TableHead>
                   </TableRow>
@@ -159,6 +160,18 @@ export default async function SettlementsPage({
                       </TableCell>
                       <TableCell>{formatRevenueLabel(statement.netAmount)}</TableCell>
                       <TableCell>{statement.entryCount}</TableCell>
+                      {/* ⚠️ **缺笔数是后端给的，前端不自己比**：
+                          缺笔 = 当期真实流水笔数 − 结算单纳入的笔数。
+                          0 时显示「—」——「缺 0 笔」是自相矛盾的说法。 */}
+                      <TableCell>
+                        {statement.missingEntryCount > 0 ? (
+                          <span className="text-destructive">
+                            缺 {statement.missingEntryCount} 笔
+                          </span>
+                        ) : (
+                          '—'
+                        )}
+                      </TableCell>
                       <TableCell>
                         <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
                           {statement.statementNo}

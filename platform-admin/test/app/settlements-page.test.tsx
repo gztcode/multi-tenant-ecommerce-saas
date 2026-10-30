@@ -11,7 +11,7 @@
  * 所以这里构造**故意对不上**的数据来锁住它。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ComponentType } from 'react';
+import { isValidElement, type ComponentType, type ReactElement, type ReactNode } from 'react';
 
 // ⚠️ **`@/auth` 必须 mock 掉**：`@/lib/api-client` 会 import 它，
 // 而 `next-auth` 会间接 import `next/server` —— 那是 ESM 下的路径别名，
@@ -37,9 +37,11 @@ import {
   SettlementGenerateForm,
   SettlementRowActions,
 } from '@/app/(dashboard)/settlements/settlement-actions';
+import { TableBody, TableCell, TableRow } from '@/components/ui/table';
 import type { SettlementListResult } from '@/lib/billing';
 
 import {
+  collectClassNames,
   collectComponentProps,
   collectHrefs,
   collectText,
@@ -67,6 +69,7 @@ const LIST: SettlementListResult = {
       reversalAmount: -300,
       netAmount: 99999,
       entryCount: 2,
+      missingEntryCount: 0,
       status: 'DRAFT',
       confirmedAt: null,
       createdAt: '2026-02-01T00:00:00.000Z',
@@ -115,6 +118,63 @@ async function renderRowActionProps(
     element,
     SettlementRowActions as unknown as ComponentType<unknown>,
   );
+}
+
+/**
+ * 取出表格里**数据行**（`<tbody>` 里的 `<tr>`）的每一格文字。
+ *
+ * ⚠️ **为什么需要它**：表头里有一列就叫「缺笔」——
+ *    断言「页面出现『缺笔』」时，表头会把它顶出来（**恒真的假阳性**）。
+ *    真正要盯的是**缺笔那一格**（第 8 格，索引 7）。
+ *
+ * ⚠️ **表头的 `<tr>` 在 `<thead>` 里，不算数** —— 只在 `TableBody` 里找 `TableRow`。
+ *
+ * ⚠️ **必须按组件引用比对，不能按 `'tbody'` 字符串**：
+ *    `TableBody` / `TableRow` / `TableCell` 都是**组件函数**，
+ *    元素树里它们的 `type` 是函数本身而不是 `'tbody'`。
+ *    （商家端那套用原生 `<tbody>`，所以那边能比字符串。）
+ */
+async function renderRows(
+  params: { period?: string } = {},
+): Promise<string[][]> {
+  const element = await SettlementsPage({
+    searchParams: Promise.resolve(params),
+  });
+  const rows: string[][] = [];
+
+  const visit = (node: unknown): void => {
+    if (node === null || node === undefined || typeof node === 'boolean') return;
+    if (typeof node === 'string' || typeof node === 'number') return;
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child);
+      return;
+    }
+    if (!isValidElement(node)) return;
+    const el = node as ReactElement<Record<string, unknown>>;
+    const children = el.props?.children as ReactNode;
+    if (el.type === TableBody) {
+      const trs = (Array.isArray(children) ? children : [children]).filter(
+        (child): child is ReactElement<Record<string, unknown>> =>
+          isValidElement(child),
+      );
+      for (const tr of trs) {
+        if (tr.type !== TableRow) continue;
+        const tds = tr.props?.children as ReactNode;
+        const cells = (Array.isArray(tds) ? tds : [tds]).filter(
+          (cell): cell is ReactElement<Record<string, unknown>> =>
+            isValidElement(cell) && cell.type === TableCell,
+        );
+        rows.push(
+          cells.map((cell) => collectText(cell.props?.children).join('')),
+        );
+      }
+      return;
+    }
+    visit(children);
+  };
+
+  visit(element);
+  return rows;
 }
 
 beforeEach(() => {
@@ -274,6 +334,69 @@ describe('结算单列表页：取数失败', () => {
     const texts = await renderPage();
 
     expect(hasText(texts, '网络断了')).toBe(true);
+  });
+});
+
+describe('结算单列表页：缺笔可见（阶段 5j）', () => {
+  it('⚠️ 缺笔的期在列表里标出来', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      items: [{ ...LIST.items[0], missingEntryCount: 3 }],
+    });
+
+    const rows = await renderRows();
+
+    // ⚠️ **缺笔必须在列表页就看得见**：超管是按月扫列表找问题的，
+    //    只在详情页提示等于让超管一张张点进去才知道哪期对不上账。
+    //
+    // ⚠️ **只看「缺笔」那一格**（索引 7）：
+    //    整页断言 `hasText(texts, '缺笔')` **恒真** —— 表头里本来就有一列
+    //    叫「缺笔」，`hasText` 会把所有文本节点拼起来匹配，
+    //    这条断言从写下来那天起就没有区分力。
+    expect(rows).toHaveLength(1);
+    expect(rows[0][7]).toBe('缺 3 笔');
+  });
+
+  it('⚠️ 不缺笔时这一列显示「—」（不写「缺 0 笔」）', async () => {
+    const rows = await renderRows();
+
+    // ⚠️ **「缺 0 笔」是自相矛盾的说法**：0 就是不缺笔，
+    //    写出来会让超管以为每张单都有问题。
+    expect(rows[0][7]).toBe('—');
+    expect(rows[0][7]).not.toContain('缺');
+  });
+
+  it('⚠️ 缺笔列的内容跟着后端给的缺笔数走（前端不自己比）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      items: [{ ...LIST.items[0], missingEntryCount: 7 }],
+    });
+
+    const rows = await renderRows();
+
+    // ⚠️ **前端不自己算缺笔数**：缺笔 = 当期真实流水笔数 − 结算单纳入的笔数，
+    //    两处口径一旦漂移，同一张单在列表页与详情页会给出两个不同的数。
+    expect(rows[0][7]).toBe('缺 7 笔');
+  });
+
+  it('⚠️ 缺笔的提示要标红（className 是 text-destructive）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      items: [{ ...LIST.items[0], missingEntryCount: 3 }],
+    });
+
+    const element = await SettlementsPage({
+      searchParams: Promise.resolve({}),
+    });
+    const classNames = collectClassNames(element);
+
+    // ⚠️ **光有文字不够**：不标红的话，超管在几十行表格里扫过去
+    //    根本不会注意到那一格 —— 「看得见」包括「一眼能看见」。
+    expect(
+      classNames.some((name) =>
+        name.includes('text-destructive'),
+      ),
+    ).toBe(true);
   });
 });
 

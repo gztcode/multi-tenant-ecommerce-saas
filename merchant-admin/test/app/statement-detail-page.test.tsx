@@ -58,6 +58,7 @@ const DETAIL: StatementPeriodDetail = {
   overpaidAmount: 0,
   applicableKind: 'NORMAL',
   blockedReason: null,
+  missingEntryCount: 0,
   commissionEntries: [
     {
       entryId: 'ce-1',
@@ -252,6 +253,41 @@ describe('对账单详情页：超付', () => {
     const texts = await renderPage();
 
     expect(hasText(texts, '本期已超付')).toBe(false);
+  });
+});
+
+describe('对账单详情页：缺笔提示', () => {
+  it('⚠️ 缺笔时显示缺笔提示', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      missingEntryCount: 2,
+    });
+
+    const texts = await renderPage();
+
+    // ⚠️ **断言精确到那一句**：整页包含会把别处的相似文案顶成假阳性。
+    expect(hasText(texts, '本期结算单缺 2 笔抽佣流水')).toBe(true);
+    expect(hasText(texts, '佣金以结算单为准')).toBe(true);
+  });
+
+  it('⚠️ 不缺笔时不显示缺笔提示', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '本期结算单缺')).toBe(false);
+    expect(hasText(texts, '缺 0 笔')).toBe(false);
+  });
+
+  it('⚠️ 文案中立：不指责平台、不承诺补钱', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      missingEntryCount: 2,
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '少扣')).toBe(false);
+    expect(hasText(texts, '待补记')).toBe(false);
+    expect(hasText(texts, '补记')).toBe(false);
   });
 });
 

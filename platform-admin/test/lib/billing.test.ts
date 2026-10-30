@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   describePlanStatus,
+  describeRecalculateHint,
   describeSubscriptionStatus,
   formatCommissionRate,
   formatDateTime,
@@ -347,5 +348,76 @@ describe('toIsoRange：自然日 → 带时区的 ISO 区间', () => {
     const range = toIsoRange('2026-01-01', '2026-1-2');
 
     expect('error' in range).toBe(true);
+  });
+});
+
+describe('describeRecalculateHint：缺笔时的修账指引', () => {
+  /**
+   * ⚠️ **为什么不能只看 `canRecalculate`**：
+   *    后端的 `canRecalculate` 只回答「有没有**活跃的**出款单引用」，
+   *    **不含结算单自身的状态**。而实际的操作路径有两个闸：
+   *    - `DRAFT` 才有「重算」（后端 `recalculate` 拒掉非 DRAFT 的单）；
+   *    - `CONFIRMED` 才有「取消确认」（后端 `unconfirm` 拒掉非 CONFIRMED 的单）。
+   *    所以草稿单压根没有「取消确认」按钮 ——
+   *    给它指「先取消确认再重算」是指了一条走不通的路。
+   */
+
+  it('⚠️ 草稿 + 无出款单引用 → 直接「重算」，不说「取消确认」', () => {
+    const hint = describeRecalculateHint('DRAFT', true);
+
+    // ⚠️ **草稿单没有「取消确认」按钮**（见 `SettlementRowActions`）：
+    //    文案里提「取消确认」就是指了一条走不通的路。
+    expect(hint).toContain('可直接「重算」');
+    expect(hint).not.toContain('取消确认');
+  });
+
+  it('⚠️ 已确认 + 无出款单引用 → 先「取消确认」再「重算」', () => {
+    const hint = describeRecalculateHint('CONFIRMED', true);
+
+    // ⚠️ **已确认的单没有「重算」按钮**（只有「取消确认」），
+    //    所以顺序必须是「先取消确认」。
+    expect(hint).toContain('先「取消确认」再「重算」');
+  });
+
+  it('⚠️ 已确认 + 被出款单引用 → 走调账流程', () => {
+    const hint = describeRecalculateHint('CONFIRMED', false);
+
+    // ⚠️ **有出款单引用时 `unconfirm` 会被 409 拦下** ——
+    //    这时候还说「可先取消确认再重算」是给一条走不通的路。
+    expect(hint).toContain('调账');
+    expect(hint).not.toContain('「重算」');
+  });
+
+  it('⚠️ 草稿 + 被出款单引用 → 也走调账流程', () => {
+    const hint = describeRecalculateHint('DRAFT', false);
+
+    expect(hint).toContain('调账');
+    expect(hint).not.toContain('「重算」');
+  });
+
+  it('⚠️ 已出款 → 两条路都不给', () => {
+    const hint = describeRecalculateHint('PAID', true);
+
+    // ⚠️ **已出款（PAID）的单既不能取消确认也不能重算** ——
+    //    给哪一条都是在指一条走不通的路。
+    //
+    // ⚠️ **不能拿「文案里没有『重算』两个字」当判据**：
+    //    兜底文案写的是「不能取消确认也不能重算」，
+    //    字面上就带着这两个词，但它是在**否定**这条路。
+    //    真正要断言的是「没有把这条路**指给**用户」。
+    expect(hint).not.toContain('可直接「重算」');
+    expect(hint).not.toContain('先「取消确认」再「重算」');
+    // ⚠️ **要明确说走不通**：否则用户会以为漏渲染了。
+    expect(hint).toContain('不能取消确认也不能重算');
+    expect(hint).toContain('调账');
+  });
+
+  it('⚠️ 未知状态 → 兜底走调账流程，不崩', () => {
+    const hint = describeRecalculateHint('WEIRD', true);
+
+    // ⚠️ **未知状态不能猜**：猜成「可直接重算」就是在指一条走不通的路。
+    expect(hint).toContain('调账');
+    expect(hint).not.toContain('可直接「重算」');
+    expect(hint).not.toContain('先「取消确认」再「重算」');
   });
 });

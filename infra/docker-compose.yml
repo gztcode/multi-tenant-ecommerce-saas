@@ -106,6 +106,10 @@ services:
       # （api/src/common/config/assert-secure-config.ts 会在启动时拒绝）。
       # 这里的值只服务于本机开发，真实部署必须换成随机密钥。
       JWT_SECRET: local-dev-only-jwt-secret-at-least-32-chars-long
+      # 收款账户与出款单快照的字段加密密钥。
+      # ⚠️ 必须是**固定值**：每次 up 都换密钥的话，
+      # 之前签发的出款单快照就全解不开了（与 JWT_SECRET 同款理由）。
+      PAYOUT_ACCOUNT_ENCRYPTION_KEY: local-dev-only-payout-encryption-key-at-least-32-chars
       JWT_EXPIRES_IN: 2h
       REFRESH_TOKEN_TTL_DAYS: '30'
       # MinIO（媒体上传）。三个 endpoint 各管各的，含义见 api/.env.example。

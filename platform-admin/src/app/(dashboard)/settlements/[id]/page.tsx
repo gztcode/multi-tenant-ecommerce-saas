@@ -7,6 +7,7 @@ import {
   formatCommissionRate,
   formatDateTime,
   formatRevenueLabel,
+  describeRecalculateHint,
   type SettlementDetail,
 } from '@/lib/billing';
 import {
@@ -110,6 +111,26 @@ export default async function SettlementDetailPage({
               statementId={statement.id}
               status={statement.status}
             />
+            {/* ⚠️ **缺笔要在这里说清楚，并给出能走的下一步**：
+                只报一个坏消息，超管还是不知道该做什么。
+                ⚠️ **指引按「实际能走哪条路」写**（`describeRecalculateHint`）：
+                `DRAFT` 直接「重算」、`CONFIRMED` 先「取消确认」再「重算」、
+                有出款单引用（`canRecalculate` 为假）只能走调账流程。
+                只看 `canRecalculate` 会给草稿单指一条走不通的路。 */}
+            {statement.missingEntryCount > 0 && (
+              <div className="flex flex-col gap-1 text-sm">
+                <p className="text-destructive">
+                  本期结算单缺 {statement.missingEntryCount}{' '}
+                  笔抽佣流水，佣金与当期真实流水对不上。
+                </p>
+                <p className="text-muted-foreground">
+                  {describeRecalculateHint(
+                    statement.status,
+                    statement.canRecalculate,
+                  )}
+                </p>
+              </div>
+            )}
           </div>
         </CardContent>
       </Card>
