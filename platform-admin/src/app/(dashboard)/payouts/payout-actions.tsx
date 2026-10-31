@@ -51,11 +51,19 @@ export function PayoutActions({
   payoutId,
   status,
   requestedAmount,
+  failedBeforePayout,
 }: {
   payoutId: string;
   status: PayoutStatus;
   /** 申请时的预估金额（审批时会重算 → 两者可能不同） */
   requestedAmount: number;
+  /**
+   * 这次失败是否发生在打款之前（钱确定没打出去）。
+   *
+   * ⚠️ **只有它为 true 才给「重试」按钮** —— 钱可能已经打出去的单
+   *    重试 = **重复打款**。
+   */
+  failedBeforePayout?: boolean;
 }) {
   const router = useRouter();
   const [reason, setReason] = useState('');
@@ -122,6 +130,147 @@ export function PayoutActions({
       busyRef.current = false;
       setBusy(false);
     }
+  }
+
+  /**
+   * 平台端的人工处置（重试 / 解卡，阶段 5l）。
+   *
+   * ⚠️ **顺序是「先确认 → 再收原因 → 最后才发请求」**：
+   *    取消确认就一步都不该往下走；原因留空也**不该发请求**
+   *    （涉及钱的操作没有理由就等于没有留痕）。
+   */
+  async function runManual(
+    action: 'retry' | 'unstick-failed' | 'unstick-redo',
+  ) {
+    // ⚠️ **闸门读的是 ref 不是 state**（与现有 `run` 同款）——
+    //    连点两次会一起通过检查发出两次请求。
+    if (busyRef.current) return;
+
+    const confirms: Record<typeof action, string> = {
+      retry:
+        '确定重试这张出款单？\n钱确定没有打出去，重试后会重新打款。',
+      'unstick-failed':
+        '确定把这张单标记为失败？\n' +
+        '请先核对渠道是否已打款 —— 标记失败后商家可以对该期重新申请。',
+      'unstick-redo':
+        '⚠️ 这张单可能已经打款！\n' +
+        '重新打款会重复打款。请先核对渠道是否已到账。确认继续？',
+    };
+    if (!confirm(confirms[action])) {
+      return;
+    }
+
+    // ⚠️ **原因必填** —— 涉及钱的操作不能没有理由（会记进操作留痕）
+    const answer = prompt('请填写操作原因（会记进操作留痕）');
+    const trimmed = (answer ?? '').trim();
+    if (!trimmed) {
+      setFailure('必须填写操作原因');
+      return;
+    }
+
+    busyRef.current = true;
+    setBusy(true);
+    setFailure(null);
+
+    try {
+      const url =
+        action === 'retry'
+          ? `/api/billing/payouts/${payoutId}/retry`
+          : `/api/billing/payouts/${payoutId}/unstick`;
+      const body =
+        action === 'retry'
+          ? { reason: trimmed }
+          : {
+              to: action === 'unstick-failed' ? 'FAILED' : 'APPROVED',
+              reason: trimmed,
+            };
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const problem = await readFailure(response, FAILURE_TEXT);
+      if (problem) throw new Error(problem);
+
+      // ⚠️ **成功后必须 router.refresh()**（与现有 `run` 同款）
+      router.refresh();
+    } catch (cause) {
+      setFailure(
+        `${FAILURE_TEXT}：${cause instanceof Error ? cause.message : '未知错误'}`,
+      );
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
+  // ⚠️ **出款失败的人工处置（阶段 5l）**：只有「钱确定没打出去」的单
+  //    才给「重试」—— 渠道调过了只是没成功回包的单，钱可能已经打出去，
+  //    重试 = **重复打款**。那种单只能人工核对渠道。
+  if (status === 'FAILED') {
+    return (
+      <div className="flex flex-col gap-2">
+        {failedBeforePayout ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={busy}
+            onClick={() => runManual('retry')}
+          >
+            {busy ? '处理中…' : '重试'}
+          </Button>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            该单可能已打款（渠道调过了，只是没成功回包），不能直接重试。
+            请先核对渠道是否已到账。
+          </p>
+        )}
+        {failure && (
+          <p role="alert" className="text-sm text-destructive">
+            {failure}
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  // ⚠️ **卡在「打款中」的人工解卡（阶段 5l）**：钱可能已经打出去 ——
+  //    「重新打款」是重复打款的高危操作，必须在按钮旁用红字警示。
+  if (status === 'PROCESSING') {
+    return (
+      <div className="flex flex-col gap-2">
+        <p className="text-sm text-destructive">
+          ⚠️ 这张单可能已打款（卡在「打款中」超过 10 分钟）。
+          重新打款会重复打款，请先核对渠道。
+        </p>
+        <div className="flex gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={busy}
+            onClick={() => runManual('unstick-failed')}
+          >
+            {busy ? '处理中…' : '标记为失败'}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={busy}
+            onClick={() => runManual('unstick-redo')}
+          >
+            {busy ? '处理中…' : '重新打款'}
+          </Button>
+        </div>
+        {failure && (
+          <p role="alert" className="text-sm text-destructive">
+            {failure}
+          </p>
+        )}
+      </div>
+    );
   }
 
   // ⚠️ **非「待审批」一律不给按钮**：已审批的不能再批、已拒绝的不能改主意。

@@ -23,6 +23,17 @@ export interface MarkFailedInput {
   reason: string;
   /** 落 FAILED 的时刻（数据库时钟） */
   failedAt: Date;
+  /**
+   * 这次失败是否发生在**打款之前**。
+   *
+   * ⚠️ **true = 钱确定没打出去**（渠道从未被调用）→ 该单**可安全重试**。
+   * ⚠️ **false = 钱可能已经打出去**（渠道调过了，只是没成功回包）
+   *    → **不能重试**，只能人工核对渠道。
+   *
+   * ⚠️ **默认 false** —— 宁可保守。新增调用点若忘了传，
+   *    会落成「不可重试」（安全方向）。
+   */
+  failedBeforePayout?: boolean;
 }
 
 /** 退回 APPROVED 等下一次重试的结果 */
@@ -246,6 +257,9 @@ export class PayoutExecutionService {
             status: PayoutStatus.FAILED,
             failedAt: input.failedAt,
             failureReason: input.reason,
+            // ⚠️ **「钱确定没打出去」的标记**（阶段 5l）——
+            //    平台端的「重试」按钮只对 true 的单出现。
+            failedBeforePayout: input.failedBeforePayout ?? false,
           },
         });
         if (affected.count === 0) {

@@ -19,6 +19,7 @@ import {
   tenantContext,
 } from '../../common/tenant/tenant-context';
 import { isUniqueViolation } from '../../common/errors/unique-constraint';
+import { clampPagination } from '../../common/http/pagination';
 import {
   formatPeriodLabel,
   resolveMonthlyPeriod,
@@ -968,6 +969,91 @@ export class SettlementService {
               : 0,
         ),
       };
+    });
+  }
+
+  /**
+   * 结算单明细的分页查询（阶段 5l）。
+   *
+   * ⚠️ **与详情接口分开** —— 详情接口的 `entries` 是**无上限全量返回**，
+   *    改它会破坏现有消费者（平台端页面 + 相关 e2e），且**语义变了**
+   *    （从「全部」变成「一页」）。
+   *
+   * ⚠️ **只返回条目本身** —— `missingEntryCount`（缺笔数）与
+   *    `canRecalculate`（有没有出款单引用）是**整单级**判定，
+   *    留在详情接口（放一页明细里会让人误以为是「这一页的缺笔数」）。
+   */
+  async listEntries(
+    statementId: string,
+    query: { page?: number; pageSize?: number },
+  ): Promise<{
+    items: Array<{
+      entryId: string;
+      orderNo: string;
+      type: CommissionEntryType;
+      amount: number;
+      rateBps: number;
+      baseAmount: number;
+      occurredAt: string;
+    }>;
+    total: number;
+    page: number;
+    pageSize: number;
+  }> {
+    const { page, pageSize } = clampPagination(query.page, query.pageSize);
+
+    return tenantContext.run(platformScope(), async () => {
+      // ⚠️ **结算单不存在要 404** —— 与 `detail` 同一份判定，
+      //    否则「明细页 404」和「明细为空」在调用方看来是一样的。
+      const statement = await this.prisma.settlementStatement.findFirst({
+        where: { id: statementId },
+      });
+      if (!statement) {
+        throw new NotFoundException('结算单不存在');
+      }
+
+      // ⚠️⚠️ **必须「全量查 → 排序 → 内存切片」，不能 `skip`/`take`** ——
+      //    排序键 `occurredAt` 在 `commission_entries` 上，而关联行
+      //    `settlement_statement_entries` 上没有它 → 数据库层排不了。
+      //    若先 `skip/take` 再排序，拿到的是「关联表顺序里的前 N 条」，
+      //    **不是**「按发生时间的前 N 条」→ 翻页时会漏行/重复。
+      //
+      //    ⚠️ 详情接口本来就是全量返回（`detail` 的 `entries` 没有上限），
+      //    所以这里不会比它更差 —— 省下的是**前端的渲染量**。
+      const links = await this.prisma.settlementStatementEntry.findMany({
+        where: { statementId },
+      });
+      const entryIds = links.map((link) => link.entryId);
+      const entries =
+        entryIds.length > 0
+          ? await this.prisma.commissionEntry.findMany({
+              where: { id: { in: entryIds } },
+            })
+          : [];
+      const entryById = new Map(entries.map((entry) => [entry.id, entry]));
+
+      const all = links.flatMap((link) => {
+        const entry = entryById.get(link.entryId);
+        // ⚠️ **查不到就跳过而不是崩**（与 `detail` 同款）
+        if (!entry) return [];
+        return [
+          {
+            entryId: entry.id,
+            orderNo: entry.orderNo,
+            type: entry.type,
+            amount: entry.amount,
+            rateBps: entry.rateBps,
+            baseAmount: entry.baseAmount,
+            occurredAt: entry.occurredAt.toISOString(),
+          },
+        ];
+      });
+      // ⚠️ **按发生时间排序** —— 与 `detail` 逐字一致（关联行的顺序是任意的）
+      all.sort((a, b) =>
+        a.occurredAt < b.occurredAt ? -1 : a.occurredAt > b.occurredAt ? 1 : 0,
+      );
+      const items = all.slice((page - 1) * pageSize, page * pageSize);
+      return { items, total: all.length, page, pageSize };
     });
   }
 

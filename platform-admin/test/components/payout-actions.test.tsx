@@ -364,6 +364,50 @@ describe('PayoutActions：并发闸门', () => {
   });
 });
 
+describe('平台端出款的人工处置（阶段 5l）', () => {
+  it('⚠️ FAILED 且确定没打 → 显示「重试」按钮', () => {
+    render(
+      <PayoutActions
+        payoutId="payout-1"
+        status="FAILED"
+        requestedAmount={95000}
+        failedBeforePayout
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /重试/ })).toBeTruthy();
+  });
+
+  it('⚠️ FAILED 但可能已打 → **不显示**「重试」按钮', () => {
+    // ⚠️ **这条是护栏** —— 钱可能已经打出去，重试 = 重复打款
+    render(
+      <PayoutActions
+        payoutId="payout-1"
+        status="FAILED"
+        requestedAmount={95000}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /重试/ })).toBeNull();
+  });
+
+  it('⚠️ 卡在 PROCESSING → 显示两个解卡按钮，且「重新打款」带警示', () => {
+    render(
+      <PayoutActions
+        payoutId="payout-1"
+        status="PROCESSING"
+        requestedAmount={95000}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /标记为失败/ })).toBeTruthy();
+    const redo = screen.getByRole('button', { name: /重新打款/ });
+    expect(redo).toBeTruthy();
+    // ⚠️ **警示必须出现在按钮附近** —— 运营点之前要看到这句话
+    expect(screen.getByText(/可能已打款/)).toBeTruthy();
+  });
+});
+
 describe('PayoutActions：失败处理', () => {
   it('⚠️ 失败时显示错误提示，且不刷新', async () => {
     const user = userEvent.setup();

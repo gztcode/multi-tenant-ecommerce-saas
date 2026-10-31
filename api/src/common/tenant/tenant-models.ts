@@ -114,6 +114,13 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   // ⚠️ `PayoutEntry` **刻意不在这里**：它没有 `tenantId` 字段，是纯关联表
   // （与 5g 的 `SettlementStatementEntry` 同款）。**它不受任何作用域约束** ——
   // 出款单明细的查询必须先校验 `payoutId` 属于当前租户。
+  //
+  // ⚠️ **`PayoutOperation` 刻意排除**（阶段 5l）——
+  //    它是「出款单的人工操作留痕」，**没有 `tenantId`**（租户从出款单反查）。
+  //    ⚠️ **不要把它登记进白名单** —— 登记了扩展会给它附加 tenantId 条件，
+  //    而它**没有 `tenantId` 列** → Prisma 直接报错。
+  //    ⚠️ 它**不受作用域约束** → 任何忘了带 `payoutId` 的查询都会返回全平台数据。
+  //    它只在**平台作用域**下读写（只有平台超管能操作出款单）。
 ]);
 
 /**

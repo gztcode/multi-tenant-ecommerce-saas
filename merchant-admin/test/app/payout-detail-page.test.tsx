@@ -311,23 +311,44 @@ describe('出款单详情页：补差单与失败提示（阶段 5h-2）', () =>
     expect(hasText(texts, '补差按零佣金结算')).toBe(false);
   });
 
-  it('⚠️ 出款失败时显示失败原因并提示联系平台确认出款情况', async () => {
+  it('⚠️ 出款失败时显示后端给的业务口径（可能已打 → 去核对）', async () => {
     apiFetchAuthedMock.mockResolvedValue({
       ...DETAIL,
       status: 'FAILED' as const,
-      failureReason: '渠道超时',
+      // ⚠️ **后端已经按「钱打没打」分流**（阶段 5l）——
+      //    前端原样显示，不再自己包「出款失败：」与「请联系平台…」。
+      failureReason: '出款未完成，请联系平台确认出款情况',
     });
 
     const texts = await renderPage();
 
-    expect(hasText(texts, '出款失败：渠道超时')).toBe(true);
+    expect(hasText(texts, '出款未完成，请联系平台确认出款情况')).toBe(true);
+    // ⚠️ **不能自己再加一遍后缀** —— 那会变成
+    //    「出款未完成，请联系平台确认出款情况。请联系平台确认出款情况。」
+    expect(hasText(texts, '出款失败：')).toBe(false);
     // ⚠️ **措辞是「确认出款情况」而不是「确认是否已到账」**（阶段 5k）：
     //    `FAILED` 有两类 —— 渠道试满 3 次（钱**可能**已打出去）与
     //    账户不可用（**确定没打**）。「是否已到账」对后者不成立。
-    expect(hasText(texts, '请联系平台确认出款情况')).toBe(true);
+    expect(hasText(texts, '请联系平台确认是否已到账')).toBe(false);
   });
 
-  it('⚠️ 失败但没有原因时显示「未知原因」', async () => {
+  it('⚠️ 确定没打时只显示「本次未打款」那一句（不自相矛盾）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      status: 'FAILED' as const,
+      failureReason:
+        '收款账号信息异常，本次未打款，请更新收款账户后重新申请',
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '本次未打款')).toBe(true);
+    // ⚠️ **不能同时说「请联系平台确认出款情况」** —— 钱确定没打，
+    //    让商家去核对「钱到没到」是白跑一趟。
+    expect(hasText(texts, '请联系平台确认出款情况')).toBe(false);
+  });
+
+  it('⚠️ 失败但没有原因时不显示失败原因那一行', async () => {
     apiFetchAuthedMock.mockResolvedValue({
       ...DETAIL,
       status: 'FAILED' as const,
@@ -336,7 +357,9 @@ describe('出款单详情页：补差单与失败提示（阶段 5h-2）', () =>
 
     const texts = await renderPage();
 
-    expect(hasText(texts, '出款失败：未知原因')).toBe(true);
+    // ⚠️ **状态本身仍显示「出款失败」** —— 商家至少知道出款没成功
+    expect(hasText(texts, '出款失败')).toBe(true);
+    expect(hasText(texts, '未知原因')).toBe(false);
   });
 
   it('⚠️ 不是失败状态时不显示失败提示', async () => {

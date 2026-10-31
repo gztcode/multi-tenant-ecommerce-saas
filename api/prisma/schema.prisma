@@ -1300,6 +1300,15 @@ model Payout {
   snapshotMaskedAccountNo String?
   /// 快照的加密版本（0 = 尚未加密，1 = 已加密）。
   snapshotEncryptionVersion Int @default(0)
+  /// 这次失败发生在**打款之前** —— 钱确定没打出去。
+  ///
+  /// ⚠️ **true = 可安全重试**（渠道从未被调用）；
+  ///    **false = 钱可能已经打出去**（渠道调过了，只是没成功回包）
+  ///    —— 这种情况**只能人工核对渠道**，不能重试。
+  ///
+  /// ⚠️ **不能靠 `failureReason` 的文案推断** —— 文案会被改、
+  ///    会被手工编辑。判断依据必须是**打款动作有没有发生**。
+  failedBeforePayout Boolean @default(false)
   /// 卡死告警已发出的时刻（兜底扫描写）
   /// ⚠️ 只为「告警去重」而存在：不写它的话兜底扫描每 5 分钟就把同一张单
   ///    捞出来再打一遍日志 —— 一晚上几千行噪音
@@ -1309,6 +1318,8 @@ model Payout {
 
   statement SettlementStatement? @relation(fields: [statementId], references: [id], onDelete: Restrict)
   entries PayoutEntry[]
+  /// 人工操作留痕（阶段 5l）
+  operations PayoutOperation[]
 
   @@index([status])
   /// ⚠️ 阶段 5h-2：P6 闸按 statementId 查出款单，量大时全表扫
@@ -1335,4 +1346,49 @@ model PayoutEntry {
 
   @@index([payoutId])
   @@map("payout_entries")
+}
+
+/// 出款单的人工操作留痕（阶段 5l）。
+///
+/// ⚠️ **涉及钱的操作必须能追溯** —— 「谁在什么时候把哪张单重打了」
+///    是运营出问题时第一个要回答的问题。
+///    只在 `payouts` 上记「最近一次」会丢掉反复解卡的历史。
+model PayoutOperation {
+  id String @id @default(uuid())
+  /// 出款单 id
+  payoutId String
+  /// 操作类型
+  action PayoutOperationAction
+  /// 操作人（平台超管的用户 id）
+  operatorId String
+  /// 操作时刻
+  operatedAt DateTime @default(now())
+  /// 操作原因（**必填** —— 涉及钱的操作不能没有理由）
+  reason String
+  /// 操作前的状态（留痕要能看出「从哪来」）
+  fromStatus PayoutStatus
+  /// 操作后的状态
+  toStatus PayoutStatus
+  /// 操作前的尝试次数（留痕要能看出「重试了几次」）
+  attemptCountBefore Int?
+  createdAt DateTime @default(now())
+
+  /// 所属出款单（与 `payout_entries` 同款：`onDelete: Cascade` ——
+  /// 出款单被删则留痕跟着删；实际上出款单**没有删除接口**
+  /// （只有 `CANCELLED` 状态），所以这条几乎不会触发）
+  payout Payout @relation(fields: [payoutId], references: [id], onDelete: Cascade)
+
+  @@index([payoutId, operatedAt])
+  @@index([operatorId])
+  @@map("payout_operations")
+}
+
+/// 出款单的人工操作类型
+enum PayoutOperationAction {
+  /// 重试：FAILED → APPROVED（确定没打，安全重打）
+  RETRY
+  /// 解卡转失败：PROCESSING → FAILED（认定没打，结束这件事）
+  UNSTUCK_TO_FAILED
+  /// 解卡重打：PROCESSING → APPROVED（⚠️ 可能重复打款）
+  UNSTUCK_TO_APPROVED
 }

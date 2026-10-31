@@ -76,14 +76,22 @@ const LIST = {
 };
 
 /** 渲染页面并收集文字 */
-async function renderPage(): Promise<string[]> {
-  const element = await PayoutsPage();
+async function renderPage(
+  params: { page?: string; pageSize?: string } = {},
+): Promise<string[]> {
+  const element = await PayoutsPage({
+    searchParams: Promise.resolve(params),
+  });
   return collectText(element);
 }
 
 /** 渲染页面并收集链接地址 */
-async function renderHrefs(): Promise<string[]> {
-  const element = await PayoutsPage();
+async function renderHrefs(
+  params: { page?: string; pageSize?: string } = {},
+): Promise<string[]> {
+  const element = await PayoutsPage({
+    searchParams: Promise.resolve(params),
+  });
   return collectHrefs(element);
 }
 
@@ -100,16 +108,34 @@ describe('出款单列表页：取数', () => {
     const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
     // ⚠️ **精确匹配而不是 `toContain`**：`toContain('/merchant/payouts')`
     //    连 `/merchant/payoutsXYZ` 也放得过，路径写歪了照样绿。
-    expect(path).toBe('/merchant/payouts?pageSize=100');
+    expect(path).toBe('/merchant/payouts?page=1&pageSize=100');
   });
 
   it('⚠️ 显式请求 pageSize=100（后端 clampPagination 的上限就是 100）', async () => {
     // ⚠️ **少了这个参数 → 后端退回缺省的 20** → 页面写着「共 N 张出款单」
-    //    却只画 20 张，第 21 条之后商家永远看不到，还没有分页控件可翻。
+    //    却只画 20 张，第 21 条之后商家永远看不到。
     await renderPage();
 
     const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
     expect(path).toContain('pageSize=100');
+  });
+
+  it('⚠️ 页码与每页条数从 URL 读（阶段 5l：纯服务端翻页）', async () => {
+    await renderPage({ page: '3', pageSize: '20' });
+
+    const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
+    expect(path).toBe('/merchant/payouts?page=3&pageSize=20');
+  });
+
+  it('⚠️ 非法页码落回第 1 页（page=0 / 非法串）', async () => {
+    await renderPage({ page: '0' });
+    const [zeroPage] = apiFetchAuthedMock.mock.calls[0] as [string];
+    expect(zeroPage).toBe('/merchant/payouts?page=1&pageSize=100');
+
+    apiFetchAuthedMock.mockClear();
+    await renderPage({ page: 'abc' });
+    const [badPage] = apiFetchAuthedMock.mock.calls[0] as [string];
+    expect(badPage).toBe('/merchant/payouts?page=1&pageSize=100');
   });
 });
 
@@ -241,24 +267,66 @@ describe('出款单列表页：申请出款的入口', () => {
 });
 
 describe('出款单列表页：超过一页时的提示', () => {
-  it('⚠️ total 大于本页条数时说明「只显示最近 100 张」', async () => {
+  it('⚠️ total 大于本页条数时说明「本页显示 N 张」', async () => {
     apiFetchAuthedMock.mockResolvedValue({ ...LIST, total: 120 });
 
     const texts = await renderPage();
 
     expect(hasText(texts, '共 120 张出款单')).toBe(true);
     expect(hasText(texts, '本页显示 1 张')).toBe(true);
-    // ⚠️ **必须说清楚「更多出款单要找平台」**：只写「本页显示 1 张」
-    //    商家会以为另外 119 张丢了。
-    expect(hasText(texts, '更多出款单请联系平台')).toBe(true);
   });
 
-  it('⚠️ total 不大于本页条数时不说「只显示最近 100 张」', async () => {
+  it('⚠️ total 不大于本页条数时不说「本页显示」', async () => {
     const texts = await renderPage();
 
     expect(hasText(texts, '共 1 张出款单')).toBe(true);
     expect(hasText(texts, '本页显示')).toBe(false);
+  });
+
+  it('⚠️ 不能再让商家「找平台要」（阶段 5l 有翻页了）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({ ...LIST, total: 120 });
+
+    const texts = await renderPage();
+
+    // ⚠️ **有翻页控件后这句话是骗人的**：商家自己能翻到下一页，
+    //    还告诉他「只能找平台」是把他引到一条不通的路上。
     expect(hasText(texts, '更多出款单请联系平台')).toBe(false);
+  });
+});
+
+describe('出款单列表页：翻页控件（阶段 5l）', () => {
+  it('⚠️ 只有一页时不显示翻页控件', async () => {
+    const hrefs = await renderHrefs();
+
+    // ⚠️ **一页时不该出现「下一页」**：点了只会停在原地。
+    expect(hrefs.some((href) => href.includes('page=2'))).toBe(false);
+  });
+
+  it('⚠️ 多页时有翻页链接，且带上 pageSize', async () => {
+    apiFetchAuthedMock.mockResolvedValue({ ...LIST, total: 250 });
+
+    const hrefs = await renderHrefs();
+
+    // ⚠️ **翻页链接必须带 `pageSize`** —— 漏掉的话翻一次页，
+    //    每页条数被重置，页码与实际条数对不上。
+    expect(hrefs).toContain('?page=2&pageSize=100');
+  });
+
+  it('⚠️ 每页条数三档都有链接（20 / 50 / 100）', async () => {
+    const hrefs = await renderHrefs();
+
+    expect(hrefs).toContain('?page=1&pageSize=20');
+    expect(hrefs).toContain('?page=1&pageSize=50');
+    expect(hrefs).toContain('?page=1&pageSize=100');
+  });
+
+  it('⚠️ 换每页条数时页码重置为 1', async () => {
+    apiFetchAuthedMock.mockResolvedValue({ ...LIST, total: 250 });
+
+    const hrefs = await renderHrefs({ page: '3' });
+
+    // ⚠️ **页码是按旧的每页条数算的**：新的条数下第 3 页可能已越界。
+    expect(hrefs.some((href) => href.includes('page=3&pageSize=20'))).toBe(false);
   });
 });
 
@@ -297,10 +365,18 @@ describe('出款单列表页：类型标记与失败提示（阶段 5h-2）', ()
     expect(hasText(texts, 'SOMETHING_NEW')).toBe(false);
   });
 
-  it('⚠️ 出款失败时提示商家去核对出款情况', async () => {
+  it('⚠️ 出款失败时显示后端给的业务口径（可能已打 → 去核对）', async () => {
     apiFetchAuthedMock.mockResolvedValue({
       ...LIST,
-      items: [{ ...ITEM, status: 'FAILED' as const }],
+      items: [
+        {
+          ...ITEM,
+          status: 'FAILED' as const,
+          // ⚠️ **后端已经按「钱打没打」分流**（阶段 5l）——
+          //    前端原样显示，不再自己拼措辞。
+          failureReason: '出款未完成，请联系平台确认出款情况',
+        },
+      ],
     });
 
     const texts = await renderPage();
@@ -308,17 +384,32 @@ describe('出款单列表页：类型标记与失败提示（阶段 5h-2）', ()
     expect(hasText(texts, '出款失败')).toBe(true);
     // ⚠️ **这句提示不能省**：失败的单可能真的已经打出去了，
     //    商家不去核对就会直接再申请一笔。
-    //
-    // ⚠️ **措辞是「确认出款情况」而不是「确认是否已到账」** —— 失败有两种：
-    //    ① 渠道试满 3 次（钱**可能**已打出去）
-    //    ② 账户不可用（**确定没打**）
-    //    「是否已到账」对第 ② 类不成立，会让商家为一个确定没打钱的单
-    //    白打一个电话核对。
     expect(hasText(texts, '请联系平台确认出款情况')).toBe(true);
     expect(hasText(texts, '请联系平台确认是否已到账')).toBe(false);
   });
 
-  it('⚠️ 不是失败状态时不显示那句核对提示', async () => {
+  it('⚠️ 确定没打时显示的是「本次未打款」那句（不矛盾）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...LIST,
+      items: [
+        {
+          ...ITEM,
+          status: 'FAILED' as const,
+          failureReason:
+            '收款账号信息异常，本次未打款，请更新收款账户后重新申请',
+        },
+      ],
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '本次未打款')).toBe(true);
+    // ⚠️ **不能同时说「请联系平台确认出款情况」** —— 钱确定没打，
+    //    让商家去核对「钱到没到」是白跑一趟。
+    expect(hasText(texts, '请联系平台确认出款情况')).toBe(false);
+  });
+
+  it('⚠️ 不是失败状态时不显示失败原因', async () => {
     const texts = await renderPage();
 
     expect(hasText(texts, '请联系平台确认出款情况')).toBe(false);

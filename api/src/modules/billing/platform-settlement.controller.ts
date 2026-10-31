@@ -12,6 +12,7 @@ import {
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { UserRole } from '@prisma/client';
 import { Roles } from '../../common/decorators/roles.decorator';
+import { toIntOr } from '../../common/http/pagination';
 import { CreateSettlementDto } from './dto/create-settlement.dto';
 import { SettlementListQueryDto } from './dto/settlement-list-query.dto';
 import { SettlementService } from './settlement.service';
@@ -63,6 +64,22 @@ export class PlatformSettlementController {
   @ApiOperation({ summary: '结算单详情（含明细）' })
   async detail(@Param('id', new ParseUUIDPipe()) id: string) {
     return this.settlements.detail(id);
+  }
+
+  @Get('settlements/:id/entries')
+  @ApiOperation({ summary: '结算单明细（分页）' })
+  // ⚠️ **`page` / `pageSize` 用 `toIntOr` 转一下**：这里没有 DTO，
+  //    `@Query('page')` 拿到的是裸字符串（`PayoutListQueryDto` 那套
+  //    `@Type(() => Number)` 用不上），不转的话服务层会拿到 NaN。
+  async entries(
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+  ) {
+    return this.settlements.listEntries(id, {
+      page: toIntOr(page, undefined),
+      pageSize: toIntOr(pageSize, undefined),
+    });
   }
 
   @Post('settlements/:id/confirm')

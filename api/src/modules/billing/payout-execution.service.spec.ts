@@ -359,6 +359,37 @@ describe('PayoutExecutionService', () => {
 
       expect(prisma.tx()!.payoutEntry.deleteMany).toHaveBeenCalled();
     });
+
+    it('⚠️ 落 FAILED 时带上「钱确定没打出去」的标记', async () => {
+      const prisma = fakePrisma();
+      const service = makeService(prisma);
+
+      await service.markFailed('payout-a', {
+        reason: '收款账号信息异常，本次未打款，请更新收款账户后重新申请',
+        failedAt: new Date(),
+        failedBeforePayout: true,
+      });
+
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        failedBeforePayout: boolean;
+      };
+      expect(data.failedBeforePayout).toBe(true);
+    });
+
+    it('⚠️ 不传时默认 false（宁可不给重试，也不能误重试）', async () => {
+      const prisma = fakePrisma();
+      const service = makeService(prisma);
+
+      await service.markFailed('payout-a', {
+        reason: '渠道超时',
+        failedAt: new Date(),
+      });
+
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        failedBeforePayout: boolean;
+      };
+      expect(data.failedBeforePayout).toBe(false);
+    });
   });
 
   describe('scheduleRetry', () => {

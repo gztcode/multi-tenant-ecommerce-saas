@@ -73,8 +73,24 @@ export interface PayoutView {
   payoutTxnId: string | null;
   /** 已尝试次数（含首次） */
   attemptCount: number;
-  /** 最近一次失败的原因（给运营看） */
+  /**
+   * 最近一次失败的原因（**业务口径**，阶段 5l）。
+   *
+   * ⚠️ **不是原文** —— 原文可能是渠道的异常（带主机名、请求 id）或内部的
+   *    解密信息，商家看到的是**内部术语**。
+   *    渠道原文只在平台端的 `failureDetail` 里。
+   */
   failureReason: string | null;
+  /**
+   * 「钱确定没打出去」的标记（阶段 5l）。
+   *
+   * ⚠️ **`true` = 渠道从未被调用 → 可安全重试**；
+   *    `false` = 钱**可能已经打出去** → 不能重试，只能人工核对渠道。
+   *
+   * ⚠️ **不能靠 `failureReason` 的文案推断** —— 文案会被改、会被手工编辑。
+   *    判断依据必须是**打款动作有没有发生**。
+   */
+  failedBeforePayout: boolean;
   /** 开始执行的时刻 */
   processingAt: string | null;
   /** 打款成功时刻 */
@@ -114,6 +130,39 @@ export interface PlatformPayoutView extends PayoutView {
   tenantId: string;
   tenantName: string;
   subdomain: string;
+  /**
+   * 渠道侧的失败原文（**只有平台端有**，阶段 5l）。
+   *
+   * ⚠️ **只在 `FAILED` 时非 null**；长度截断到 500；去掉换行。
+   */
+  failureDetail: string | null;
+}
+
+/**
+ * 人工操作留痕的一行（阶段 5l）。
+ *
+ * ⚠️ **只在平台端详情接口返回** —— 列表接口没有（避免 N+1）。
+ */
+export interface PayoutOperationView {
+  id: string;
+  /** `RETRY` / `UNSTUCK_TO_FAILED` / `UNSTUCK_TO_APPROVED` */
+  action: string;
+  /** 操作人（平台超管的用户 id） */
+  operatorId: string;
+  /**
+   * 操作人的显示名。
+   *
+   * ⚠️ **查不到人时回落到 `operatorId`** —— 账号被删了也不能让留痕消失。
+   */
+  operatorName: string;
+  /** 操作时刻（ISO 8601） */
+  operatedAt: string;
+  /** 操作原因（必填 —— 涉及钱的操作不能没有理由） */
+  reason: string;
+  /** 操作前的状态 */
+  fromStatus: string;
+  /** 操作后的状态 */
+  toStatus: string;
 }
 
 /** 可申请周期的预览（商家端「申请出款」页用） */
@@ -675,6 +724,360 @@ export class PayoutService {
   }
 
   /**
+   * 平台端人工重试（阶段 5l）。
+   *
+   * ⚠️ **只允许「确定没打钱」的单重试** —— `failedBeforePayout = true`
+   *    意味着渠道**从未被调用**（解密失败 / 打款前的闸 / 没有可用渠道）。
+   *    `false` 的单钱**可能已经打出去** → 重试 = **重复打款**。
+   *
+   * ⚠️ **重试要重新纳入流水 + 重算金额** ——
+   *    `markFailed` 落 `FAILED` 时释放了 `payout_entries`，
+   *    而那张表**同时是「这张单要打哪些流水」的凭证**。
+   *    不重新纳入 → 账实不符（商家能对同期重新申请 → 同一笔打两次）。
+   *
+   * @param reason 操作原因（必填，会记进 `payout_operations`）
+   */
+  async retry(payoutId: string, reason: string): Promise<PlatformPayoutView> {
+    const trimmed = reason?.trim() ?? '';
+    if (!trimmed) {
+      throw new BadRequestException('操作原因不能为空');
+    }
+    const context = getTenantContext();
+    const operatorId = context.userId;
+    if (!operatorId) {
+      throw new BadRequestException('缺少用户上下文');
+    }
+
+    return tenantContext.run(platformScope(), async () => {
+      const payout = await this.prisma.payout.findFirst({
+        where: { id: payoutId },
+      });
+      if (!payout) {
+        throw new NotFoundException('出款单不存在');
+      }
+      if (payout.status !== PayoutStatus.FAILED) {
+        throw new ConflictException(
+          `出款单状态已变（当前是 ${payout.status}），只有失败的出款单能重试`,
+        );
+      }
+      // ⚠️ **硬闸**：钱可能已打出去的单**不能重试**
+      if (!payout.failedBeforePayout) {
+        throw new ConflictException(
+          '该出款单可能已经打款（渠道调过了，只是没成功回包），不能直接重试。' +
+            '请先核对渠道是否已到账。',
+        );
+      }
+
+      const period = { from: payout.periodStart, to: payout.periodEnd };
+      const periodLabel = formatPeriodLabel(payout.periodStart);
+
+      // ⚠️⚠️ **活跃单检查不能直接用 `findActivePayout`** ——
+      //    那个方法**只在商家侧（租户作用域）调用**（不手写 tenantId，
+      //    靠扩展附加）。这里跑在**平台作用域**下 → 扩展不附加 tenantId →
+      //    直接用会**跨租户匹配**（所有租户的 periodStart 都是同一天）。
+      //    → 自己写，口径必须与部分唯一索引
+      //    `payouts_tenantId_period_kind_active_uniq`
+      //    （`(tenantId, periodStart, kind)`，
+      //    `WHERE status NOT IN ('REJECTED','CANCELLED','FAILED')`）**逐字一致**。
+      const other = await this.prisma.payout.findFirst({
+        where: {
+          tenantId: payout.tenantId,
+          periodStart: payout.periodStart,
+          // ⚠️ **kind 是索引的一部分，必须带** —— 同期不同 kind 的单不冲突
+          kind: payout.kind,
+          status: {
+            notIn: [
+              PayoutStatus.REJECTED,
+              PayoutStatus.CANCELLED,
+              PayoutStatus.FAILED,
+            ],
+          },
+          // ⚠️ **排除自己**
+          id: { not: payout.id },
+        },
+      });
+      if (other) {
+        throw new ConflictException(
+          `该期（${periodLabel}）已有另一张活跃出款单 ${other.payoutNo}，` +
+            '请先处理那张单再重试这张。',
+        );
+      }
+
+      // ⚠️⚠️ **按 kind 分支重算** —— 补差单**绝不能**调 `computeAmounts`
+      //    （那会把整期佣金再扣一遍，护栏 X13）。
+      const isSupplement = payout.kind === PayoutKind.SUPPLEMENT;
+      const amounts = isSupplement
+        ? await this.computeSupplementAmounts(payout, period)
+        : await this.computeAmounts(payout.tenantId, period);
+
+      // ⚠️ **金额变了 = 事实变了** —— 该让商家重新申请（走正常审批），
+      //    而不是运营替他决定打多少（5h-1 的 P5 是同一个道理）。
+      if (amounts.netAmount !== payout.netAmount) {
+        throw new ConflictException(
+          `该期（${periodLabel}）的金额已变化` +
+            `（原锁定 ${payout.netAmount} 分，现在重算是 ${amounts.netAmount} 分），` +
+            '不能直接重试。请让商家重新申请。',
+        );
+      }
+      // ⚠️⚠️ **笔数也要一致** —— 只比金额会漏掉「一笔换一笔、总额不变」
+      //    的情形（例如 A 单退款冲回 1000 分、B 单回填 1000 分）：
+      //    金额一样 → 放行 → 但**纳入的流水集合变了** →
+      //    被换掉的那笔流水「没被任何单占用」→ 商家能对它再申请一张补差单
+      //    → **同一笔流水打两次钱**。
+      //
+      //    ⚠️ **`payouts` 表只存了 `entryCount`（笔数），没存纳入的流水 id** ——
+      //    所以只能比笔数。笔数与金额同时一致，才认为「纳入范围没变」。
+      if (amounts.entryCount !== payout.entryCount) {
+        throw new ConflictException(
+          `该期（${periodLabel}）的货款流水笔数已变化` +
+            `（原锁定 ${payout.entryCount} 笔，现在重算是 ${amounts.entryCount} 笔），` +
+            '不能直接重试。请让商家重新申请。',
+        );
+      }
+      if (amounts.entryCount === 0) {
+        throw new ConflictException(
+          `该期（${periodLabel}）已无货款流水，不能重试出款`,
+        );
+      }
+
+      const updated = await this.prisma.$transaction(async (tx) => {
+        const affected = await tx.payout.updateMany({
+          // ⚠️ **必须带状态条件** —— 否则两个超管同时点「重试」会双双「成功」
+          where: {
+            id: payoutId,
+            status: PayoutStatus.FAILED,
+            failedBeforePayout: true,
+          },
+          data: {
+            status: PayoutStatus.APPROVED,
+            attemptCount: 0,
+            failureReason: null,
+            failedAt: null,
+            failedBeforePayout: false,
+            processingAt: null,
+            // ⚠️ **approvedAt 不刷新** —— 它的语义是「审批时间」，
+            //    刷新它会让平台端显示的审批时间变成假的。
+          },
+        });
+        if (affected.count === 0) {
+          throw new ConflictException('出款单状态已变，不能重复重试');
+        }
+
+        // ⚠️ **重新纳入明细** —— 与 `approve` 同款：先删后插
+        //    （`payout_entries.entryId` 是全局唯一索引，不先删就插会撞 P2002）
+        await tx.payoutEntry.deleteMany({ where: { payoutId } });
+        if (amounts.entryIds.length > 0) {
+          await tx.payoutEntry.createMany({
+            data: amounts.entryIds.map((entryId) => ({ payoutId, entryId })),
+          });
+        }
+
+        // ⚠️ **操作留痕** —— 涉及钱的操作必须能追溯
+        await tx.payoutOperation.create({
+          data: {
+            payoutId,
+            action: 'RETRY',
+            operatorId,
+            reason: trimmed,
+            fromStatus: PayoutStatus.FAILED,
+            toStatus: PayoutStatus.APPROVED,
+            attemptCountBefore: payout.attemptCount,
+          },
+        });
+
+        return tx.payout.findFirst({ where: { id: payoutId } });
+      });
+      if (!updated) {
+        throw new NotFoundException('出款单不存在');
+      }
+
+      // ⚠️ **入队必须在事务提交之后**（与 `approve` 同款）
+      await this.enqueueRetry(updated.id);
+
+      return this.toPlatformView(updated);
+    });
+  }
+
+  /**
+   * 人工重试后的入队（阶段 5l）。
+   *
+   * ⚠️ **jobId 的轮次来自「历史「重新打款」次数 + 1」** ——
+   *    **不能用 `attemptCount`**（它刚被重置成 0 了），
+   *    也**绝不能复用 jobId**：BullMQ 里 failed job 的 hash 还在，
+   *    用同一个 jobId 重新入队会被**静默忽略**（不报错、不入队 → 重试从未发生）。
+   *
+   * ⚠️⚠️ **要数的是「所有会重新打款的操作」，不能只数 `RETRY`** ——
+   *    `unstick → APPROVED`（解卡后重新打款）**也是一次重新打款**。
+   *    若只数 `RETRY`，就会出现：
+   *    ① `unstick → APPROVED` → jobId `payout-a-retry-1`（`RETRY` 计数为 0）
+   *    ② 那个 job 失败了（BullMQ 留着 failed job 的 hash）
+   *    ③ 再走一次 `retry` → `RETRY` 计数仍是 0 → jobId **又**是
+   *       `payout-a-retry-1` → **被 BullMQ 静默忽略** → 重试从未发生，
+   *       钱永远打不出去。
+   *    → 两种动作一起数，轮次才真正单调递增。
+   *
+   * ⚠️ **减 1 是因为「本次操作已经落库了」** —— `enqueueRetry` 在事务
+   *    **提交之后**才跑，而留痕行是在同一个事务里写的 →
+   *    查出来的计数**含本次**。
+   *    减掉它 → 轮次就是「第几次重新打款」（第一次 → `-retry-1`）。
+   *    ⚠️ **不减也不会撞 jobId**（计数仍然单调递增），减它只是让
+   *    轮次编号符合语义。
+   */
+  private async enqueueRetry(payoutId: string): Promise<void> {
+    const count = await this.prisma.payoutOperation.count({
+      where: {
+        payoutId,
+        // ⚠️ **两种「会重新打款」的动作都算**（理由见上）
+        action: { in: ['RETRY', 'UNSTUCK_TO_APPROVED'] },
+      },
+    });
+    // ⚠️ **本次操作已计入** → 减 1 才是「第几次重新打款」
+    const done = Math.max(count - 1, 0);
+    try {
+      await this.queues.addWithOptions(
+        PAYOUT_QUEUE,
+        'execute',
+        { payoutId },
+        `payout-${payoutId}-retry-${done + 1}`,
+        { attempts: 1, removeOnComplete: true },
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await this.prisma.payout.updateMany({
+        where: { id: payoutId, status: PayoutStatus.APPROVED },
+        // ⚠️ **界面口径** —— 原始异常只进日志
+        data: { failureReason: '打款任务提交失败，系统将自动重试' },
+      });
+      this.logger.error(
+        `出款人工重试后入队失败：${payoutId} —— ${reason}（将由兜底扫描重新入队）`,
+      );
+    }
+  }
+
+  /**
+   * 平台端解除卡单（阶段 5l）。
+   *
+   * ⚠️ **卡在 `PROCESSING` 的单钱可能已经打出去**（5h-2 的 R3：绝不自动重试）——
+   *    所以「重新打款」这个方向**必须由运营在核对渠道后手动决定**，
+   *    且界面要警示 + 必填原因。
+   *
+   * @param to `FAILED` = 认定没打出去（结束这件事）；`APPROVED` = 重新打款
+   */
+  async unstick(
+    payoutId: string,
+    input: { to: 'FAILED' | 'APPROVED'; reason: string },
+  ): Promise<PlatformPayoutView> {
+    const trimmed = input?.reason?.trim() ?? '';
+    if (!trimmed) {
+      throw new BadRequestException('操作原因不能为空');
+    }
+    const context = getTenantContext();
+    const operatorId = context.userId;
+    if (!operatorId) {
+      throw new BadRequestException('缺少用户上下文');
+    }
+
+    return tenantContext.run(platformScope(), async () => {
+      const payout = await this.prisma.payout.findFirst({
+        where: { id: payoutId },
+      });
+      if (!payout) {
+        throw new NotFoundException('出款单不存在');
+      }
+      if (payout.status !== PayoutStatus.PROCESSING) {
+        throw new ConflictException(
+          `出款单状态已变（当前是 ${payout.status}），只有卡在「打款中」的出款单能解卡`,
+        );
+      }
+
+      // ⚠️ **必须确认它真的卡住了** —— 否则运营一点就把**正在进行的打款**打断了。
+      //    阈值与 `scanStuck` 的 `stuckThresholdMs` 一致（10 分钟）。
+      const thresholdMs = 10 * 60 * 1000;
+      if (
+        !payout.processingAt ||
+        Date.now() - payout.processingAt.getTime() < thresholdMs
+      ) {
+        throw new ConflictException(
+          '该出款单可能正在打款中（未超过卡住阈值），请稍后再试',
+        );
+      }
+
+      const toStatus =
+        input.to === 'APPROVED' ? PayoutStatus.APPROVED : PayoutStatus.FAILED;
+
+      // ⚠️ **用数据库时钟** —— 与 `markFailed` 同款（worker 传的也是
+      //    `await this.prisma.databaseNow()`）。不要用 `new Date()`：
+      //    应用时钟与数据库时钟有偏差，判定边界会漂。
+      const failedAt = await this.prisma.databaseNow();
+
+      const updated = await this.prisma.$transaction(async (tx) => {
+        const affected = await tx.payout.updateMany({
+          // ⚠️ **必须带状态条件**（并发护栏，与 `approve` 同款）
+          where: { id: payoutId, status: PayoutStatus.PROCESSING },
+          data: {
+            status: toStatus,
+            // ⚠️ **processingAt 必须清** —— 不清的话兜底扫描会把它
+            //    当成卡住的单反复捞出来
+            processingAt: null,
+            ...(toStatus === PayoutStatus.FAILED
+              ? {
+                  failedAt,
+                  failureReason:
+                    '出款单被平台人工标记为失败（钱未打出去），可重新申请或重试',
+                  // ⚠️ **认定「没打出去」→ 转 FAILED 后可重试**
+                  failedBeforePayout: true,
+                  // ⚠️ **attemptCount 保持不动** —— 保留「这张单卡住时
+                  //    试了几次」这个事实，排查时要看
+                }
+              : {
+                  // ⚠️ **重新打款**：明细**绝不能释放**（释放了商家就能
+                  //    对同期重新申请 → 同一笔流水打两次）
+                  attemptCount: 0,
+                  // ⚠️ **approvedAt 不刷新**（语义是「审批时间」）
+                }),
+          },
+        });
+        if (affected.count === 0) {
+          throw new ConflictException('出款单状态已变，不能重复解卡');
+        }
+
+        // ⚠️ **转 FAILED 时要释放明细** —— 与 `markFailed` 同款：
+        //    单子结束了，商家可以对该期重新申请
+        if (toStatus === PayoutStatus.FAILED) {
+          await tx.payoutEntry.deleteMany({ where: { payoutId } });
+        }
+
+        await tx.payoutOperation.create({
+          data: {
+            payoutId,
+            action:
+              toStatus === PayoutStatus.FAILED
+                ? 'UNSTUCK_TO_FAILED'
+                : 'UNSTUCK_TO_APPROVED',
+            operatorId,
+            reason: trimmed,
+            fromStatus: PayoutStatus.PROCESSING,
+            toStatus,
+            attemptCountBefore: payout.attemptCount,
+          },
+        });
+
+        return tx.payout.findFirst({ where: { id: payoutId } });
+      });
+      if (!updated) {
+        throw new NotFoundException('出款单不存在');
+      }
+
+      // ⚠️ **重新打款要入队**（转 FAILED 不用）
+      if (toStatus === PayoutStatus.APPROVED) {
+        await this.enqueueRetry(updated.id);
+      }
+
+      return this.toPlatformView(updated);
+    });
+  }
+
+  /**
    * 商家的出款单列表（只读）。
    *
    * ⚠️ **不传 tenantId**：商家侧靠租户作用域扩展自动过滤。
@@ -735,10 +1138,13 @@ export class PayoutService {
     });
   }
 
-  /** 平台的出款单详情（含明细与商家名） */
-  async detailForPlatform(
-    payoutId: string,
-  ): Promise<PlatformPayoutView & { entries: PayoutEntryView[] }> {
+  /** 平台的出款单详情（含明细、商家名与操作记录） */
+  async detailForPlatform(payoutId: string): Promise<
+    PlatformPayoutView & {
+      entries: PayoutEntryView[];
+      operations: PayoutOperationView[];
+    }
+  > {
     return tenantContext.run(platformScope(), async () => {
       const payout = await this.prisma.payout.findFirst({
         where: { id: payoutId },
@@ -747,7 +1153,43 @@ export class PayoutService {
         throw new NotFoundException('出款单不存在');
       }
       const entries = await this.entriesOf(payout);
-      return { ...(await this.toPlatformView(payout)), entries };
+      // ⚠️ **操作记录只在详情接口查** —— 放进 `toPlatformView` 会让
+      //    **列表页的每一行都多查一次**（N+1）。
+      const operations = await this.prisma.payoutOperation.findMany({
+        where: { payoutId: payout.id },
+        orderBy: { operatedAt: 'desc' },
+      });
+      // ⚠️ **操作人 id 要转成名字** —— 留痕表只存 id，
+      //    光看一串 uuid 谁都认不出是谁操作的，而「谁」正是留痕要回答的第一个问题。
+      //    ⚠️ **一次查齐**（不是每条留痕查一次）—— 一张单可能有多条留痕。
+      const operatorIds = [...new Set(operations.map((op) => op.operatorId))];
+      const operators =
+        operatorIds.length > 0
+          ? await this.prisma.user.findMany({
+              where: { id: { in: operatorIds } },
+              select: { id: true, displayName: true },
+            })
+          : [];
+      const operatorNameById = new Map(
+        operators.map((operator) => [operator.id, operator.displayName]),
+      );
+      return {
+        ...(await this.toPlatformView(payout)),
+        entries,
+        // ⚠️ **时间要转成字符串** —— 前端要的是 ISO 8601，不是 `Date`。
+        operations: operations.map((operation) => ({
+          id: operation.id,
+          action: operation.action,
+          operatorId: operation.operatorId,
+          // ⚠️ **查不到人（账号被删）就回落到 id** —— 留痕不能凭空消失
+          operatorName:
+            operatorNameById.get(operation.operatorId) ?? operation.operatorId,
+          operatedAt: operation.operatedAt.toISOString(),
+          reason: operation.reason,
+          fromStatus: operation.fromStatus,
+          toStatus: operation.toStatus,
+        })),
+      };
     });
   }
 
@@ -1225,6 +1667,44 @@ export class PayoutService {
     };
   }
 
+  /**
+   * 商家端看到的失败原因（**业务口径**，阶段 5l）。
+   *
+   * ⚠️ **按「钱打没打出去」分流** —— 这顺带解决了 5k 的遗留 5
+   *    （「`FAILED` 承载了两种语义」）：
+   * - **确定没打**（`failedBeforePayout = true`）→ 商家能**做点什么**
+   *   （更新收款账户后重新申请）；
+   * - **可能已打**（`false`）→ 商家只能**去核对**（可能钱已经到账了）。
+   *
+   * ⚠️ **第二类为什么不能说「是否已到账」** —— 那会让商家以为「可能没到」，
+   *    而实际是「可能已经到了，请去查」。
+   *
+   * ⚠️ **第二类必须换成通用措辞** —— 那批值是**渠道侧的原文**
+   *    （「渠道金额核对不通过（请求 9000 分，渠道返回 9001 分）」
+   *    「假出款网关模拟的失败（第 3 次尝试）」），带内部术语与数字，
+   *    商家看到只会困惑。原文只在平台端的 `failureDetail` 里。
+   *
+   * ⚠️⚠️ **第一类按白名单透传** —— 「渠道从未被调用」那几处写入的值
+   *    **本来就是给商家看的措辞**（见 `MERCHANT_SAFE_FAILURE_REASONS`），
+   *    解密失败的根因只进日志、从不进 `failureReason`。
+   *    → 在这里统一替换成一句笼统的话反而会**说错原因**
+   *    （金额异常的单被告知「收款账号信息异常」→ 商家去改收款账户，
+   *    改完再申请还是同样的错 → 白跑一趟）。
+   *
+   *    但**白名单之外的一律替换成通用措辞** —— `failureReason` 是
+   *    调用方传进来的字符串，将来有人往这个桶里写进内部术语时，
+   *    商家端不会跟着泄出去（**默认安全**）。
+   */
+  private merchantFailureReason(payout: Payout): string | null {
+    if (!payout.failureReason) return null;
+    if (payout.failedBeforePayout) {
+      return MERCHANT_SAFE_FAILURE_REASONS.includes(payout.failureReason)
+        ? payout.failureReason
+        : MERCHANT_SAFE_FAILURE_REASONS[0];
+    }
+    return '出款未完成，请联系平台确认出款情况';
+  }
+
   /** 单据 → 对外字段（租户视角） */
   private toView(payout: Payout): PayoutView {
     return {
@@ -1250,7 +1730,16 @@ export class PayoutService {
       payoutChannel: payout.payoutChannel,
       payoutTxnId: payout.payoutTxnId,
       attemptCount: payout.attemptCount,
-      failureReason: payout.failureReason,
+      // ⚠️ **业务口径，不是原文**（阶段 5l）——
+      //    原文可能是渠道的异常（带主机名、请求 id）或内部的解密信息，
+      //    商家看到的是**内部术语**。
+      //    ⚠️ **默认安全**：共用视图给业务口径 → 新增端点若用 `toView`，
+      //    默认就是脱敏的；只有平台端视图额外暴露原文（`failureDetail`）。
+      failureReason: this.merchantFailureReason(payout),
+      // ⚠️ **「钱确定没打出去」的标记**（阶段 5l）——
+      //    平台端的「重试」按钮只对 true 的单出现；
+      //    商家端也拿它（前端据此给商家不同的提示）。
+      failedBeforePayout: payout.failedBeforePayout,
       processingAt: payout.processingAt?.toISOString() ?? null,
       paidAt: payout.paidAt?.toISOString() ?? null,
       failedAt: payout.failedAt?.toISOString() ?? null,
@@ -1276,7 +1765,28 @@ export class PayoutService {
       // ⚠️ **查不到商家名就回落到 id 本身**：商家被删了也要让超管看到这一行。
       tenantName: tenant?.name ?? payout.tenantId,
       subdomain: tenant?.subdomain ?? '—',
+      // ⚠️ **渠道侧的原文**（只有平台端有）—— 超管排查要靠它。
+      //    ⚠️ **三条护栏**：只在 FAILED 时返回、长度截断、去换行。
+      failureDetail: this.platformFailureDetail(payout),
     };
+  }
+
+  /**
+   * 平台端看到的失败详情（**渠道侧的原文**，阶段 5l）。
+   *
+   * ⚠️ **它看不到解密根因** —— 那是 5k 的遗留 4（根因只进日志，
+   *    从不进 `failureReason`）。界面上要写清这一点。
+   *
+   * ⚠️ **三条护栏**：只在 `FAILED` 时返回、长度截断、去掉换行
+   *    （原文可能带 `\n` → 直接渲染会破坏界面布局）。
+   */
+  private platformFailureDetail(payout: Payout): string | null {
+    if (payout.status !== PayoutStatus.FAILED) return null;
+    const raw = payout.failureReason;
+    if (!raw) return null;
+    const text = raw.replace(/\r?\n/g, ' ').trim();
+    if (!text) return null;
+    return text.length > 500 ? `${text.slice(0, 500)}…` : text;
   }
 
   /**
@@ -1304,6 +1814,8 @@ export class PayoutService {
         // ⚠️ **查不到商家名就回落到 id 本身**：商家被删了也要让超管看到这一行。
         tenantName: tenant?.name ?? payout.tenantId,
         subdomain: tenant?.subdomain ?? '—',
+        // ⚠️ **批量版也要给 `failureDetail`** —— 漏了列表页就没有它
+        failureDetail: this.platformFailureDetail(payout),
       };
     });
   }
@@ -1321,6 +1833,28 @@ export class PayoutService {
     };
   }
 }
+
+/**
+ * 商家端**可以直接看到**的失败措辞白名单（阶段 5l）。
+ *
+ * ⚠️ **只收「渠道从未被调用」那一桶**（`failedBeforePayout = true`）——
+ *    这些值由 worker 在打款前拦截时写入，**本来就是给商家看的措辞**。
+ *    `PayoutWorker.checkGates` 与 `PayoutWorker` 的三处写入点
+ *    （收款账号信息异常 / 出款金额异常 / 没有可用的出款渠道）
+ *    与本清单**逐字一致** —— 改文案时两处要一起改。
+ *
+ * ⚠️ **「可能已打」那一桶不在这里** —— 那些值是渠道侧的原文
+ *    （带主机名、请求 id、金额数字），商家端一律换成通用措辞。
+ *
+ * ⚠️ **第一条同时是兜底值** —— 白名单外的值（例如将来有人往这个桶里
+ *    写进内部术语）会退回它，而不是把原文泄给商家。
+ */
+const MERCHANT_SAFE_FAILURE_REASONS: readonly string[] = [
+  '收款账号信息异常，本次未打款，请更新收款账户后重新申请',
+  '出款金额异常，本次未打款，请联系平台核对',
+  '没有可用的出款渠道',
+  '出款单被平台人工标记为失败（钱未打出去），可重新申请或重试',
+];
 
 /**
  * 生成出款单号。

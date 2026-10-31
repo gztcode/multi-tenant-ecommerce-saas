@@ -301,6 +301,142 @@ describe('PayoutWorker', () => {
     expect(call[1].reason).toContain('本次未打款');
   });
 
+  it('⚠️ 打款前的失败 → 标记「确定没打」（可安全重试）', async () => {
+    const execution = fakeExecution({
+      ...claim,
+      account: null,
+      accountError: '出款单的收款账号快照 尚未加密（版本 0）',
+    });
+    const provider = fakeProvider({ status: 'SUCCESS' });
+    const worker = new PayoutWorker(
+      execution as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      new Map([['fake-payout', provider]]),
+    );
+
+    await worker.process({
+      name: 'execute',
+      data: { payoutId: 'payout-a' },
+    } as never);
+
+    const call = execution.markFailed.mock.calls[0] as unknown as [
+      string,
+      { failedBeforePayout?: boolean },
+    ];
+    // ⚠️ **渠道从未被调用 → 钱确定没打出去** → 可安全重试
+    expect(call[1].failedBeforePayout).toBe(true);
+  });
+
+  it('⚠️ 打款前的闸没过（金额异常）→ 标记「确定没打」（可安全重试）', async () => {
+    const execution = fakeExecution({
+      ...claim,
+      netAmount: 0,
+    });
+    const provider = fakeProvider({ status: 'SUCCESS' });
+    const worker = new PayoutWorker(
+      execution as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      new Map([['fake-payout', provider]]),
+    );
+
+    await worker.process({
+      name: 'execute',
+      data: { payoutId: 'payout-a' },
+    } as never);
+
+    const call = execution.markFailed.mock.calls[0] as unknown as [
+      string,
+      { failedBeforePayout?: boolean; reason: string },
+    ];
+    // ⚠️ **渠道从未被调用 → 钱确定没打出去** → 可安全重试
+    expect(call[1].failedBeforePayout).toBe(true);
+    // ⚠️ **顺带确认走的是「打款前的闸」这条路径**（不是别的分支）
+    expect(call[1].reason).toContain('本次未打款');
+    expect(provider.execute).not.toHaveBeenCalled();
+  });
+
+  it('⚠️ 打款前的闸没过（收款账户缺失）→ 标记「确定没打」（可安全重试）', async () => {
+    // ⚠️ **没有 `accountError`** → 走的是 `checkGates` 的账户缺失闸，
+    //    不是 5k 的解密失败分支（那条已有单独的用例）
+    const execution = fakeExecution({
+      ...claim,
+      account: null,
+    });
+    const provider = fakeProvider({ status: 'SUCCESS' });
+    const worker = new PayoutWorker(
+      execution as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      new Map([['fake-payout', provider]]),
+    );
+
+    await worker.process({
+      name: 'execute',
+      data: { payoutId: 'payout-a' },
+    } as never);
+
+    const call = execution.markFailed.mock.calls[0] as unknown as [
+      string,
+      { failedBeforePayout?: boolean; reason: string },
+    ];
+    expect(call[1].failedBeforePayout).toBe(true);
+    expect(provider.execute).not.toHaveBeenCalled();
+  });
+
+  it('⚠️ 没有可用的出款渠道 → 标记「确定没打」（可安全重试）', async () => {
+    const execution = fakeExecution(claim);
+    const worker = new PayoutWorker(
+      execution as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      // ⚠️ **一个渠道都没有** → `firstProvider()` 返回 undefined
+      new Map(),
+    );
+
+    await worker.process({
+      name: 'execute',
+      data: { payoutId: 'payout-a' },
+    } as never);
+
+    const call = execution.markFailed.mock.calls[0] as unknown as [
+      string,
+      { failedBeforePayout?: boolean; reason: string },
+    ];
+    // ⚠️ **渠道压根没被调用** → 钱确定没打出去 → 可安全重试
+    expect(call[1].failedBeforePayout).toBe(true);
+    expect(call[1].reason).toContain('没有可用的出款渠道');
+  });
+
+  it('⚠️ 渠道金额核对不通过 → 标记「可能已打」（不可重试）', async () => {
+    const execution = fakeExecution(claim);
+    // ⚠️ **渠道返回的金额与请求的不一致** → X3 拦截 → 落 FAILED
+    const provider = fakeProvider({ status: 'SUCCESS', amount: 8501 });
+    const worker = new PayoutWorker(
+      execution as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      new Map([['fake-payout', provider]]),
+    );
+
+    await worker.process({
+      name: 'execute',
+      data: { payoutId: 'payout-a' },
+    } as never);
+
+    const call = execution.markFailed.mock.calls[0] as unknown as [
+      string,
+      { failedBeforePayout?: boolean; reason: string },
+    ];
+    // ⚠️ **渠道调过了（可能已打出去）→ 不能重试**
+    expect(call[1].failedBeforePayout).toBe(false);
+    expect(call[1].reason).toContain('金额核对不通过');
+    // ⚠️ **这条最关键**：渠道确实被调用过 —— 若这里被改成 `true`，
+    //    平台端的「重试」按钮就会出现在一张**可能已经打出去**的单上
+    expect(provider.execute).toHaveBeenCalled();
+  });
+
   it('渠道失败且未超上限 → 退回 APPROVED 并延迟重新入队', async () => {
     const execution = fakeExecution(claim);
     const provider = fakeProvider({
@@ -444,6 +580,35 @@ describe('PayoutWorker', () => {
     expect(execution.markFailed).toHaveBeenCalled();
     expect(execution.scheduleRetry).not.toHaveBeenCalled();
     expect(queues.addWithOptions).not.toHaveBeenCalled();
+  });
+
+  it('⚠️ 渠道失败试满上限 → 标记「可能已打」（不可重试）', async () => {
+    const execution = fakeExecution({
+      ...claim,
+      attemptCount: PAYOUT_MAX_ATTEMPTS,
+    });
+    const provider = fakeProvider({
+      status: 'FAILED',
+      failureReason: '渠道超时',
+    });
+    const worker = new PayoutWorker(
+      execution as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      new Map([['fake-payout', provider]]),
+    );
+
+    await worker.process({
+      name: 'execute',
+      data: { payoutId: 'payout-a' },
+    } as never);
+
+    const call = execution.markFailed.mock.calls[0] as unknown as [
+      string,
+      { failedBeforePayout?: boolean },
+    ];
+    // ⚠️ **渠道调过了（可能已打出去）→ 不能重试**
+    expect(call[1].failedBeforePayout).toBe(false);
   });
 
   it('渠道抛异常 → 当成失败处理，不冒到 BullMQ', async () => {

@@ -287,6 +287,55 @@ export interface PlatformPayoutDetail extends PlatformPayoutItem {
     amount: number;
     occurredAt: string;
   }>;
+  /**
+   * 失败详情（**渠道侧的原文**，只有平台端有）。
+   *
+   * ⚠️ **商家端没有这个字段** —— 商家看到的是业务口径的 `failureReason`。
+   * ⚠️ **它看不到解密根因** —— 那是 5k 的遗留 4（根因只进日志）。
+   */
+  failureDetail: string | null;
+  /**
+   * 「钱确定没打出去」的标记（阶段 5l）。
+   *
+   * ⚠️ **只有它为 true 才给「重试」按钮** —— 钱可能已经打出去的单
+   *    重试 = **重复打款**。
+   */
+  failedBeforePayout: boolean;
+  /**
+   * 人工操作留痕（阶段 5l）。
+   *
+   * ⚠️ **只有平台端详情接口有** —— 列表接口没有。
+   */
+  operations: Array<{
+    id: string;
+    action: string;
+    operatorId: string;
+    /**
+     * 操作人的显示名。
+     *
+     * ⚠️ **查不到人时后端回落到 `operatorId`** —— 账号被删了留痕也不消失。
+     */
+    operatorName: string;
+    /** ISO 8601 */
+    operatedAt: string;
+    reason: string;
+    fromStatus: string;
+    toStatus: string;
+  }>;
+}
+
+/**
+ * 人工操作类型 → 中文文案（阶段 5l）。
+ *
+ * ⚠️ **未知类型回落到「人工操作」** —— 不显示裸枚举。
+ */
+export function describePayoutOperation(action: string): string {
+  const labels: Record<string, string> = {
+    RETRY: '重试出款',
+    UNSTUCK_TO_FAILED: '解除卡单（标记为失败）',
+    UNSTUCK_TO_APPROVED: '解除卡单（重新打款）',
+  };
+  return labels[action] ?? '人工操作';
 }
 
 /** 列表接口的信封 */
