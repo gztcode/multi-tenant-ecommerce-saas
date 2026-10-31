@@ -192,6 +192,7 @@ function fakePrisma(options: {
         (args?: {
           where?: {
             tenantId?: string | { in: string[] };
+            id?: string | { in: string[] };
             occurredAt?: { gte?: Date; lt?: Date };
           };
         }) => {
@@ -204,6 +205,13 @@ function fakePrisma(options: {
                 ? [where.tenantId]
                 : where.tenantId.in;
             filtered = filtered.filter((row) => ids.includes(row.tenantId));
+          }
+          // ⚠️ **按 `where.id.in` 过滤**（阶段 5l 的明细分页用）：
+          //    明细是「先查关联行 → 再按 id 集合取流水」，
+          //    假实现不按 id 过滤的话，会把**没被这张单纳入**的流水也带进来。
+          if (where?.id) {
+            const ids = typeof where.id === 'string' ? [where.id] : where.id.in;
+            filtered = filtered.filter((row) => ids.includes(row.id));
           }
           if (where?.occurredAt) {
             const { gte, lt } = where.occurredAt;
@@ -261,7 +269,19 @@ function fakePrisma(options: {
       ),
     },
     settlementStatementEntry: {
-      findMany: jest.fn(() => Promise.resolve(options.linkedRows ?? [])),
+      // ⚠️ **按 `where.statementId` 过滤**（阶段 5l 的明细分页用）：
+      //    关联行是「哪张单纳入了哪些流水」，不按 `statementId` 过滤的话，
+      //    别的单的关联行也会被带进来 → 明细翻页会串单。
+      findMany: jest.fn((args?: { where?: { statementId?: string } }) => {
+        const rows = options.linkedRows ?? [];
+        const statementId = args?.where?.statementId;
+        if (!statementId) {
+          return Promise.resolve(rows);
+        }
+        return Promise.resolve(
+          rows.filter((row) => row.statementId === statementId),
+        );
+      }),
       deleteMany: jest.fn(() => Promise.resolve({ count: 1 })),
       createMany: jest.fn(() => {
         calls.push('createMany');
@@ -1086,5 +1106,172 @@ describe('缺笔检测（阶段 5j）', () => {
     expect(june?.missingEntryCount).toBe(0);
     // ⚠️ **7 月那期缺 1 笔**（真实 2 笔、纳入 1 笔）
     expect(july?.missingEntryCount).toBe(1);
+  });
+});
+
+describe('明细分页（阶段 5l）', () => {
+  /**
+   * 造 5 笔流水，**发生时间刻意与关联行的顺序不一致**。
+   *
+   * ⚠️ **这是这条用例的核心**：排序键 `occurredAt` 在 `commission_entries` 上，
+   *    关联表 `settlement_statement_entries` 上没有它 → 数据库层排不了。
+   *    若实现写成「先 `skip/take` 再排序」，拿到的就是「关联表顺序里的前 N 条」，
+   *    **不是**「按发生时间的前 N 条」→ 翻页时漏行/重复。
+   */
+  function fiveEntries() {
+    return [
+      entry({ id: 'e-3', occurredAt: new Date('2024-06-30T00:00:00.000Z') }),
+      entry({ id: 'e-1', occurredAt: new Date('2024-06-10T00:00:00.000Z') }),
+      entry({ id: 'e-5', occurredAt: new Date('2024-06-15T00:00:00.000Z') }),
+      entry({ id: 'e-2', occurredAt: new Date('2024-06-20T00:00:00.000Z') }),
+      entry({ id: 'e-4', occurredAt: new Date('2024-06-25T00:00:00.000Z') }),
+    ];
+  }
+
+  /** 关联行：顺序与 `occurredAt` 排序**故意错开** */
+  function linkedRows() {
+    return [
+      { entryId: 'e-3', statementId: 'stmt-a' },
+      { entryId: 'e-1', statementId: 'stmt-a' },
+      { entryId: 'e-5', statementId: 'stmt-a' },
+      { entryId: 'e-2', statementId: 'stmt-a' },
+      { entryId: 'e-4', statementId: 'stmt-a' },
+    ];
+  }
+
+  it('⚠️ 按发生时间排序（不是按关联行的顺序）', async () => {
+    const prisma = fakePrisma({
+      entries: fiveEntries(),
+      statement: statement({ entryCount: 5 }),
+      linkedRows: linkedRows(),
+    });
+
+    const service = makeService(prisma);
+    const result = await service.listEntries('stmt-a', { page: 1, pageSize: 50 });
+
+    // ⚠️ **顺序必须是 e-1、e-5、e-2、e-4、e-3**（按 occurredAt 升序：
+    //    10 日 → 15 日 → 20 日 → 25 日 → 30 日）：
+    //    关联行的顺序是 e-3、e-1、e-5、e-2、e-4。
+    //    若实现直接用关联行的顺序（不排序），这里挂。
+    expect(result.items.map((item) => item.entryId)).toEqual([
+      'e-1',
+      'e-5',
+      'e-2',
+      'e-4',
+      'e-3',
+    ]);
+    expect(result.total).toBe(5);
+  });
+
+  it('⚠️ 跨页不漏行、不重复（先全量排序 → 内存切片）', async () => {
+    const prisma = fakePrisma({
+      entries: fiveEntries(),
+      statement: statement({ entryCount: 5 }),
+      linkedRows: linkedRows(),
+    });
+
+    const service = makeService(prisma);
+    const first = await service.listEntries('stmt-a', { page: 1, pageSize: 2 });
+    const second = await service.listEntries('stmt-a', { page: 2, pageSize: 2 });
+    const third = await service.listEntries('stmt-a', { page: 3, pageSize: 2 });
+
+    const ids = [
+      ...first.items.map((item) => item.entryId),
+      ...second.items.map((item) => item.entryId),
+      ...third.items.map((item) => item.entryId),
+    ];
+
+    // ⚠️ **5 笔一行不多一行不少**：漏行 → 超管核账核不上；
+    //    重复行 → 同一笔流水被算两次。
+    expect(ids).toHaveLength(5);
+    expect(new Set(ids).size).toBe(5);
+    expect(ids).toEqual(['e-1', 'e-5', 'e-2', 'e-4', 'e-3']);
+    // ⚠️ **每页的 total 都是全量笔数**（不是本页条数）
+    expect(first.total).toBe(5);
+    expect(second.total).toBe(5);
+    expect(third.total).toBe(5);
+  });
+
+  it('⚠️ 超出范围的页返回空数组（不报错）', async () => {
+    const prisma = fakePrisma({
+      entries: fiveEntries(),
+      statement: statement({ entryCount: 5 }),
+      linkedRows: linkedRows(),
+    });
+
+    const service = makeService(prisma);
+    const result = await service.listEntries('stmt-a', { page: 99, pageSize: 2 });
+
+    expect(result.items).toEqual([]);
+    expect(result.total).toBe(5);
+  });
+
+  it('⚠️ 结算单不存在 → 404（与详情接口同一份判定）', async () => {
+    const prisma = fakePrisma({
+      entries: [],
+      statements: [null],
+    });
+
+    const service = makeService(prisma);
+
+    await expect(
+      service.listEntries('stmt-missing', { page: 1, pageSize: 50 }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('⚠️ pageSize 超过上限时夹到 100（不能一次拖走全部）', async () => {
+    const prisma = fakePrisma({
+      entries: fiveEntries(),
+      statement: statement({ entryCount: 5 }),
+      linkedRows: linkedRows(),
+    });
+
+    const service = makeService(prisma);
+    const result = await service.listEntries('stmt-a', {
+      page: 1,
+      pageSize: 999999,
+    });
+
+    expect(result.pageSize).toBe(100);
+    // ⚠️ **上限是 100**：写 999999 也不能一次拿到 5 笔以上的上限
+    expect(result.items.length).toBeLessThanOrEqual(100);
+  });
+
+  it('⚠️ 关联行指向的流水查不到 → 跳过而不是崩（与详情接口同款）', async () => {
+    const prisma = fakePrisma({
+      entries: [entry({ id: 'e-1' })],
+      statement: statement({ entryCount: 2 }),
+      linkedRows: [
+        { entryId: 'e-1', statementId: 'stmt-a' },
+        { entryId: 'e-missing', statementId: 'stmt-a' },
+      ],
+    });
+
+    const service = makeService(prisma);
+    const result = await service.listEntries('stmt-a', { page: 1, pageSize: 50 });
+
+    // ⚠️ **崩掉整页比少显示一行糟得多**
+    expect(result.items.map((item) => item.entryId)).toEqual(['e-1']);
+    expect(result.total).toBe(1);
+  });
+
+  it('⚠️ 明细里不能夹带别的结算单的流水', async () => {
+    const prisma = fakePrisma({
+      entries: [
+        entry({ id: 'e-1', occurredAt: new Date('2024-06-10T00:00:00.000Z') }),
+        entry({ id: 'e-other', occurredAt: new Date('2024-06-11T00:00:00.000Z') }),
+      ],
+      statement: statement({ entryCount: 1 }),
+      linkedRows: [
+        { entryId: 'e-1', statementId: 'stmt-a' },
+        { entryId: 'e-other', statementId: 'stmt-other' },
+      ],
+    });
+
+    const service = makeService(prisma);
+    const result = await service.listEntries('stmt-a', { page: 1, pageSize: 50 });
+
+    // ⚠️ **只返回这张单纳入的流水**
+    expect(result.items.map((item) => item.entryId)).toEqual(['e-1']);
   });
 });

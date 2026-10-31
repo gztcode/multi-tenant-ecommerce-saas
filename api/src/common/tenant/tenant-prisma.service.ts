@@ -622,6 +622,15 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
     return this.client.payoutEntry;
   }
 
+  // ------- 出款单的人工操作留痕（阶段 5l）模型 delegate 代理 -------
+
+  // 不在租户白名单里，但业务代码要读写它（操作留痕，无 tenantId 字段）
+  // ⚠️ 因此**不受租户作用域约束**——查询前必须自行校验 payoutId 属于当前租户。
+  //    留痕只在**平台作用域**下读写（只有平台超管能操作出款单）。
+  get payoutOperation() {
+    return this.client.payoutOperation;
+  }
+
   // ------- PrismaClient 实例级方法代理 -------
   // $connect / $disconnect 由生命周期钩子分别调用，
   // 这里仍然透传出来让服务消费者可以手动关闭连接（例如测试用例）。

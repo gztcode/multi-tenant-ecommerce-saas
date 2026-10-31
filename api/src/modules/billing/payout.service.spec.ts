@@ -105,6 +105,16 @@ function payout(overrides: {
   snapshotAccountNoCipher?: string | null;
   snapshotMaskedAccountNo?: string | null;
   snapshotEncryptionVersion?: number;
+  /** 出款单号（对外凭证） */
+  payoutNo?: string;
+  /**
+   * 这次失败是否发生在打款之前（阶段 5l）。
+   *
+   * ⚠️ **默认 false** —— 与真实数据一致（老数据一律 false）。
+   */
+  failedBeforePayout?: boolean;
+  /** 开始执行的时刻（进 `PROCESSING` 时写） */
+  processingAt?: Date | null;
 }) {
   const receiptAmount = overrides.receiptAmount ?? 10000;
   const commissionAmount = overrides.commissionAmount ?? 2000;
@@ -112,7 +122,7 @@ function payout(overrides: {
   return {
     id: overrides.id ?? 'payout-a',
     tenantId: overrides.tenantId ?? 'tenant-a',
-    payoutNo: 'PAY202508010000000001',
+    payoutNo: overrides.payoutNo ?? 'PAY202508010000000001',
     periodStart: overrides.periodStart ?? new Date('2025-07-01T00:00:00.000Z'),
     periodEnd: new Date('2025-08-01T00:00:00.000Z'),
     statementId:
@@ -136,7 +146,8 @@ function payout(overrides: {
     payoutTxnId: null,
     attemptCount: overrides.attemptCount ?? 0,
     failureReason: overrides.failureReason ?? null,
-    processingAt: null,
+    processingAt:
+      overrides.processingAt === undefined ? null : overrides.processingAt,
     paidAt: null,
     failedAt: null,
     snapshotAccountName: overrides.snapshotAccountName ?? null,
@@ -145,6 +156,9 @@ function payout(overrides: {
     snapshotAccountNoCipher: overrides.snapshotAccountNoCipher ?? null,
     snapshotMaskedAccountNo: overrides.snapshotMaskedAccountNo ?? null,
     snapshotEncryptionVersion: overrides.snapshotEncryptionVersion ?? 0,
+    // ⚠️ **阶段 5l：这次失败是否发生在打款之前** ——
+    //    true = 渠道从未被调用 → 钱确定没打出去 → 可安全重试。
+    failedBeforePayout: overrides.failedBeforePayout ?? false,
     createdAt: new Date('2025-08-01T00:00:00.000Z'),
     updatedAt: new Date('2025-08-01T00:00:00.000Z'),
   };
@@ -266,6 +280,28 @@ function fakePrisma(options: {
   createThrows?: boolean;
   /** 商家信息 */
   tenant?: { name: string; subdomain: string } | null;
+  /**
+   * 人工操作留痕的**条数**（阶段 5l：`enqueueRetry` 用它算 jobId 的轮次）。
+   */
+  payoutOperationCount?: number;
+  /** 人工操作留痕的明细（阶段 5l：详情接口要返回） */
+  payoutOperations?: Array<{
+    id: string;
+    payoutId: string;
+    action: string;
+    operatorId: string;
+    operatedAt: Date;
+    reason: string;
+    fromStatus: string;
+    toStatus: string;
+    attemptCountBefore: number | null;
+  }>;
+  /**
+   * 平台超管用户（阶段 5l：详情接口要把留痕里的 `operatorId` 转成显示名）。
+   *
+   * ⚠️ **默认给一个 `admin-a`** —— 留痕的默认操作人就是 `admin-a`。
+   */
+  users?: Array<{ id: string; displayName: string }>;
 }) {
   const calls: string[] = [];
   /**
@@ -281,6 +317,9 @@ function fakePrisma(options: {
       updateMany: jest.Mock;
       findFirst: jest.Mock;
     };
+    payoutOperation: {
+      create: jest.Mock;
+    };
     payoutEntry: {
       createMany: jest.Mock;
       deleteMany: jest.Mock;
@@ -292,6 +331,28 @@ function fakePrisma(options: {
    *    后者会留下一个**没用到的参数**，本仓库的 eslint 没开
    *    `argsIgnorePattern` → 每个桩都要报 unused-vars。
    */
+  /**
+   * ⚠️ **`payoutSequence` 的原始副本**（不被消费）。
+   *
+   * 顶层 `payout.findFirst` 会**按调用顺序把序列取空**（`shift()`），
+   * 而事务里的 `tx.payout.findFirst`（回读改完的那张单）发生在**之后**
+   * → 那时序列已经空了 → 回读会拿到 `null` → 服务层抛「出款单不存在」。
+   *
+   * → 留一份不被消费的副本，事务里的回读用它。
+   */
+  const payoutSequenceOriginal = options.payoutSequence
+    ? [...options.payoutSequence]
+    : null;
+
+  /**
+   * ⚠️ **事务里写过的「会重新打款」的留痕条数**。
+   *
+   * 真实库里 `enqueueRetry` 跑在事务提交**之后** → 它查 `payoutOperation.count`
+   * 时，**本次操作的留痕已经落库** → 计数含本次。
+   * 假 Prisma 要还原这个事实，否则算出来的 jobId 轮次会差 1。
+   */
+  let repayoutOperationsCreated = 0;
+
   const prisma = {
     calls,
     databaseNow: jest.fn(() =>
@@ -377,6 +438,26 @@ function fakePrisma(options: {
         Promise.resolve({ count: options.updateManyCount ?? 1 }),
       ),
     },
+    payoutOperation: {
+      /**
+       * ⚠️ **阶段 5l：只用于算 jobId 的轮次** ——
+       *    `enqueueRetry` 用「历史「重新打款」次数 + 1」当轮次，
+       *    **绝不能复用 jobId**（BullMQ 里 failed job 的 hash 还在，
+       *    用同一个 jobId 重新入队会被静默忽略 → 重试从未发生）。
+       *
+       * ⚠️ **计数要含「事务里刚写的那条留痕」** —— 真实库里
+       *    `enqueueRetry` 跑在事务提交**之后**，查出来的计数已经含本次操作。
+       *    → 这里返回「配置值 + 事务里写过的重新打款条数」。
+       */
+      count: jest.fn<Promise<number>, [args?: QueryArgs]>(() =>
+        Promise.resolve(
+          (options.payoutOperationCount ?? 0) + repayoutOperationsCreated,
+        ),
+      ),
+      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
+        Promise.resolve(options.payoutOperations ?? []),
+      ),
+    },
     payoutEntry: {
       createMany: jest.fn<Promise<{ count: number }>, [args?: QueryArgs]>(() =>
         Promise.resolve({ count: 1 }),
@@ -418,6 +499,36 @@ function fakePrisma(options: {
             : options.tenant,
         ),
       ),
+      /**
+       * ⚠️ **批量版**（`toPlatformViews` 用它，避免 N+1）——
+       *    只返回配置里的那一个商家（单测不验跨商家场景）。
+       */
+      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
+        Promise.resolve(
+          options.tenant === undefined
+            ? [{ id: 'tenant-a', name: '商家甲', subdomain: 'shop-a' }]
+            : [{ id: 'tenant-a', ...options.tenant }],
+        ),
+      ),
+    },
+    /**
+     * 平台超管（阶段 5l：详情接口要把留痕的 `operatorId` 转成显示名）。
+     *
+     * ⚠️ **按 `where.id.in` 过滤** —— 服务层一次查齐所有操作人，
+     *    不该把无关的人也带回来。
+     */
+    user: {
+      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>((args) => {
+        const users = options.users ?? [
+          { id: 'admin-a', displayName: '超管甲' },
+        ];
+        const where = args?.where as { id?: { in?: string[] } } | undefined;
+        const ids = where?.id?.in;
+        if (!ids) {
+          return Promise.resolve(users);
+        }
+        return Promise.resolve(users.filter((user) => ids.includes(user.id)));
+      }),
     },
     $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => {
       calls.push('$transaction');
@@ -457,8 +568,43 @@ function fakePrisma(options: {
             () => Promise.resolve({ count: options.updateManyCount ?? 1 }),
           ),
           findFirst: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
-            Promise.resolve(options.payout ?? null),
+            // ⚠️ **事务里的回读** —— 配了 `payoutSequence` 就取它的**第一项**
+            //    （那是「查这张单」的结果；事务里的回读拿到的就是同一张单）。
+            //    用的是**不被消费的副本**（见 `payoutSequenceOriginal`）。
+            Promise.resolve(
+              payoutSequenceOriginal
+                ? (payoutSequenceOriginal.find(
+                    (item): item is NonNullable<typeof item> => item !== null,
+                  ) ?? null)
+                : (options.payout ?? null),
+            ),
           ),
+        },
+        payoutOperation: {
+          /**
+           * ⚠️ **操作留痕**（阶段 5l）—— 涉及钱的操作必须能追溯
+           *    「谁在什么时候把这张单怎么了」。
+           */
+          create: jest.fn<Promise<unknown>, [args?: QueryArgs]>((args) => {
+            const action = (args?.data as { action?: string } | undefined)
+              ?.action;
+            // ⚠️ **「会重新打款」的两种动作都算**（与 `enqueueRetry` 的
+            //    计数口径一致）—— `RETRY` 与 `UNSTUCK_TO_APPROVED`。
+            if (action === 'RETRY' || action === 'UNSTUCK_TO_APPROVED') {
+              repayoutOperationsCreated += 1;
+            }
+            return Promise.resolve({
+              id: 'op-1',
+              payoutId: 'payout-a',
+              action: 'RETRY',
+              operatorId: 'admin-a',
+              operatedAt: new Date('2025-08-15T00:00:00.000Z'),
+              reason: '渠道恢复了',
+              fromStatus: 'FAILED',
+              toStatus: 'APPROVED',
+              attemptCountBefore: 0,
+            });
+          }),
         },
         payoutEntry: {
           createMany: jest.fn<Promise<{ count: number }>, [args?: QueryArgs]>(
@@ -2022,5 +2168,665 @@ describe('申请出款的请求体（护栏 P4：金额一律后端算）', () =
     const dto = new ApplyPayoutDto();
     dto.period = '2025-07';
     expect(await validate(dto)).toHaveLength(0);
+  });
+});
+
+/**
+ * 阶段 5l Task 3：平台端人工重试。
+ *
+ * ⚠️ **四道闸，每道都对应一条「挡得住」的用例**：
+ *    ① 状态必须是 `FAILED`；
+ *    ② `failedBeforePayout` 必须是 true（钱确定没打出去）；
+ *    ③ 该期（tenantId + periodStart + kind）没有别的活跃单；
+ *    ④ 重算金额必须与锁定金额一致。
+ *    外加「原因为空」这道闸。
+ */
+describe('平台端人工重试（阶段 5l）', () => {
+  it('⚠️ 不是 FAILED 状态 → 409', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [payout({ status: PayoutStatus.APPROVED })],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await expect(
+      asPlatform(() => service.retry('payout-a', '渠道恢复了')),
+    ).rejects.toThrow(/状态已变/);
+    // ⚠️ **没落库**：状态不对就一个字都不能改
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ failedBeforePayout = false → 409（钱可能已打，不能重试）', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({ status: PayoutStatus.FAILED, failedBeforePayout: false }),
+      ],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await expect(
+      asPlatform(() => service.retry('payout-a', '想再试一次')),
+    ).rejects.toThrow(/可能已经打款/);
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ 该期有别的活跃出款单 → 409，且消息点名那张单', async () => {
+    // ⚠️ **`payoutSequence` 按调用顺序返回** —— 第 1 次是「查这张单」，
+    //    第 2 次是「查该期有没有别的活跃单」。
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({
+          status: PayoutStatus.FAILED,
+          failedBeforePayout: true,
+        }),
+        payout({
+          id: 'payout-other',
+          payoutNo: 'PAY-OTHER-1',
+          status: PayoutStatus.REQUESTED,
+        }),
+      ],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await expect(
+      asPlatform(() => service.retry('payout-a', '渠道恢复了')),
+    ).rejects.toThrow(/PAY-OTHER-1/);
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ 原因为空 → 400', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({
+          status: PayoutStatus.FAILED,
+          failedBeforePayout: true,
+        }),
+      ],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await expect(
+      asPlatform(() => service.retry('payout-a', '   ')),
+    ).rejects.toThrow(/原因/);
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ 重算金额与锁定金额不一致 → 409（金额变了就得让商家重新申请）', async () => {
+    // ⚠️ **闸④** —— 事实变了（回填补进来一笔）→ 金额与当初锁定的不同。
+    //    此时运营替商家决定打多少 = 越权。
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({
+          status: PayoutStatus.FAILED,
+          failedBeforePayout: true,
+          netAmount: 8000,
+        }),
+      ],
+      receipts: [receipt({ id: 'r-1', amount: 11000 })],
+      statement: statement({ netAmount: 2000 }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await expect(
+      asPlatform(() => service.retry('payout-a', '渠道恢复了')),
+    ).rejects.toThrow(/金额已变化/);
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ 金额没变但笔数变了 → 409（纳入的流水集合变了）', async () => {
+    // ⚠️ **「一笔换一笔、总额不变」** —— 例如 A 单退款冲回 1000 分、
+    //    B 单回填 1000 分：金额一样、笔数一样 → 只比金额会放行 →
+    //    但**纳入的流水集合变了** → 被换掉的那笔「没被任何单占用」→
+    //    商家能对它再申请一张补差单 → **同一笔流水打两次钱**。
+    //
+    //    这里造「金额相同、笔数不同」：锁定 1 笔 8000 分，
+    //    现在该期有 2 笔（5000 + 3000 = 8000）。
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({
+          status: PayoutStatus.FAILED,
+          failedBeforePayout: true,
+          netAmount: 8000,
+          entryCount: 1,
+        }),
+      ],
+      receipts: [
+        receipt({ id: 'r-1', amount: 5000 }),
+        receipt({ id: 'r-2', amount: 3000 }),
+      ],
+      statement: statement({ netAmount: 0 }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await expect(
+      asPlatform(() => service.retry('payout-a', '渠道恢复了')),
+    ).rejects.toThrow(/笔数已变化/);
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ 重试成功 → 转 APPROVED、重新纳入明细、留痕、并入队', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [
+        // ① 查这张单
+        payout({
+          status: PayoutStatus.FAILED,
+          failedBeforePayout: true,
+          netAmount: 8000,
+        }),
+        // ② 查该期有没有别的活跃单 → 没有
+        null,
+      ],
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+      statement: statement({ netAmount: 2000 }),
+    });
+    const queues = fakeQueues();
+    const service = makeService(prisma, queues);
+
+    await asPlatform(() => service.retry('payout-a', '渠道恢复了'));
+
+    const tx = prisma.tx();
+    expect(tx).not.toBeNull();
+
+    // ⚠️ **条件更新必须带状态 + failedBeforePayout**（并发护栏）：
+    //    否则两个超管同时点「重试」会双双「成功」。
+    expect(argsOf(tx!.payout.updateMany).where).toEqual({
+      id: 'payout-a',
+      status: PayoutStatus.FAILED,
+      failedBeforePayout: true,
+    });
+
+    const data = argsOf(tx!.payout.updateMany).data as Record<string, unknown>;
+    expect(data.status).toBe(PayoutStatus.APPROVED);
+    expect(data.failureReason).toBeNull();
+    expect(data.failedAt).toBeNull();
+    expect(data.failedBeforePayout).toBe(false);
+    // ⚠️ **attemptCount 归零** —— 这是新一轮打款
+    expect(data.attemptCount).toBe(0);
+    // ⚠️ **approvedAt 不刷新** —— 它的语义是「审批时间」，
+    //    刷新它会让平台端显示的审批时间变成假的。
+    expect(data.approvedAt).toBeUndefined();
+
+    // ⚠️⚠️ **必须重新纳入明细** —— `markFailed` 落 FAILED 时释放了
+    //    `payout_entries`，而那张表**同时是「这张单要打哪些流水」的凭证**。
+    //    不重新纳入 → 商家能对同期重新申请 → 同一笔打两次。
+    expect(tx!.payoutEntry.deleteMany).toHaveBeenCalledWith({
+      where: { payoutId: 'payout-a' },
+    });
+    expect(tx!.payoutEntry.createMany).toHaveBeenCalledTimes(1);
+    expect(argsOf(tx!.payoutEntry.createMany).data).toEqual([
+      { payoutId: 'payout-a', entryId: 'r-1' },
+    ]);
+
+    // ⚠️ **操作留痕**
+    expect(tx!.payoutOperation.create).toHaveBeenCalledTimes(1);
+    expect(argsOf(tx!.payoutOperation.create).data).toMatchObject({
+      payoutId: 'payout-a',
+      action: 'RETRY',
+      operatorId: 'admin-a',
+      reason: '渠道恢复了',
+      fromStatus: PayoutStatus.FAILED,
+      toStatus: PayoutStatus.APPROVED,
+    });
+
+    // ⚠️ **入队了**（事务提交之后）
+    expect(queues.addWithOptions).toHaveBeenCalled();
+    const jobId = queues.addWithOptions.mock.calls[0] as unknown as [
+      string,
+      string,
+      unknown,
+      string,
+      unknown,
+    ];
+    expect(jobId[3]).toBe('payout-payout-a-retry-1');
+  });
+
+  it('⚠️ jobId 的轮次来自「历史「重新打款」次数 + 1」（绝不复用 jobId）', async () => {
+    // ⚠️ **BullMQ 里 failed job 的 hash 还在** ——
+    //    用同一个 jobId 重新入队会被**静默忽略**（不报错、不入队）。
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({
+          status: PayoutStatus.FAILED,
+          failedBeforePayout: true,
+          netAmount: 8000,
+        }),
+        null,
+      ],
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+      statement: statement({ netAmount: 2000 }),
+      // ⚠️ **已经人工重试过 2 次**
+      payoutOperationCount: 2,
+    });
+    const queues = fakeQueues();
+    const service = makeService(prisma, queues);
+
+    await asPlatform(() => service.retry('payout-a', '渠道恢复了'));
+
+    const call = queues.addWithOptions.mock.calls[0] as unknown as [
+      string,
+      string,
+      unknown,
+      string,
+      unknown,
+    ];
+    // ⚠️ **轮次是 3，不是 1** —— 也不可能是 `attemptCount`（它刚被重置成 0）
+    //
+    // ⚠️ **计数含「本次操作」** —— `enqueueRetry` 跑在事务提交之后，
+    //    查出来的条数已经含刚写的那条留痕 → 减 1 才是「第几次重新打款」。
+    expect(call[3]).toBe('payout-payout-a-retry-3');
+  });
+
+  it('⚠️ 解卡重打也算一次「重新打款」（否则与 retry 撞 jobId）', async () => {
+    // ⚠️⚠️ **这是真会踩的坑** ——
+    //    若 jobId 的轮次只数 `RETRY` 操作，就会出现：
+    //    ① `unstick → APPROVED` → jobId `payout-a-retry-1`
+    //       （`RETRY` 计数为 0）
+    //    ② 那个 job 失败了（BullMQ 留着 failed job 的 hash）
+    //    ③ 再走一次 `retry` → `RETRY` 计数仍是 0 → jobId **又**是
+    //       `payout-a-retry-1` → **被 BullMQ 静默忽略** → 重试从未发生，
+    //       钱永远打不出去。
+    //
+    //    → 两种「会重新打款」的动作必须一起数。
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({
+          status: PayoutStatus.PROCESSING,
+          netAmount: 8000,
+          processingAt: new Date(Date.now() - 60 * 60 * 1000),
+        }),
+      ],
+    });
+    const queues = fakeQueues();
+    const service = makeService(prisma, queues);
+
+    await asPlatform(() =>
+      service.unstick('payout-a', {
+        to: 'APPROVED',
+        reason: '核对渠道：确认未到账',
+      }),
+    );
+
+    const call = queues.addWithOptions.mock.calls[0] as unknown as [
+      string,
+      string,
+      unknown,
+      string,
+      unknown,
+    ];
+    expect(call[3]).toBe('payout-payout-a-retry-1');
+    // ⚠️ **计数要含「解卡重打」这一条** —— 查 count 时用的 where
+    //    必须同时覆盖两种动作
+    expect(argsOf(prisma.payoutOperation.count).where).toEqual({
+      payoutId: 'payout-a',
+      action: { in: ['RETRY', 'UNSTUCK_TO_APPROVED'] },
+    });
+  });
+});
+
+/**
+ * 阶段 5l Task 3：解除卡单。
+ *
+ * ⚠️ **卡在 `PROCESSING` 的单钱可能已经打出去**（5h-2 的 R3：绝不自动重试）
+ *    → 「重新打款」这个方向必须由运营在核对渠道后手动决定。
+ */
+describe('平台端解除卡单（阶段 5l）', () => {
+  /** 造一张「卡住超过 10 分钟」的单 */
+  function stuckPayout(
+    overrides: {
+      status?: PayoutStatus;
+      processingAt?: Date | null;
+      attemptCount?: number;
+    } = {},
+  ) {
+    return payout({
+      status: overrides.status ?? PayoutStatus.PROCESSING,
+      netAmount: 8000,
+      // ⚠️ **默认「卡住很久了」** —— `processingAt` 是 `Date.now() - 1 小时`，
+      //    超过解卡的 10 分钟阈值。（默认值取 `Date.now()` 是在造数据时算的，
+      //    与断言时相差不到一秒，不影响阈值判定。）
+      processingAt:
+        overrides.processingAt === undefined
+          ? new Date(Date.now() - 60 * 60 * 1000)
+          : overrides.processingAt,
+    });
+  }
+
+  it('⚠️ 不是 PROCESSING 状态 → 409', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [payout({ status: PayoutStatus.FAILED })],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await expect(
+      asPlatform(() =>
+        service.unstick('payout-a', { to: 'FAILED', reason: '人工判定' }),
+      ),
+    ).rejects.toThrow(/状态已变/);
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ 原因为空 → 400', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [stuckPayout()],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await expect(
+      asPlatform(() =>
+        service.unstick('payout-a', { to: 'FAILED', reason: '  ' }),
+      ),
+    ).rejects.toThrow(/原因/);
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ processingAt 为空 → 409（无法证明它卡住了）', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [stuckPayout({ processingAt: null })],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await expect(
+      asPlatform(() =>
+        service.unstick('payout-a', { to: 'FAILED', reason: '人工判定' }),
+      ),
+    ).rejects.toThrow(/可能正在打款中/);
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ 转 FAILED → 释放明细（商家可以对该期重新申请）', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [stuckPayout()],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await asPlatform(() =>
+      service.unstick('payout-a', { to: 'FAILED', reason: '核对渠道：没到账' }),
+    );
+
+    const tx = prisma.tx();
+    expect(tx).not.toBeNull();
+    const data = argsOf(tx!.payout.updateMany).data as Record<string, unknown>;
+    expect(data.status).toBe(PayoutStatus.FAILED);
+    // ⚠️ **认定「没打出去」→ 转 FAILED 后可重试**
+    expect(data.failedBeforePayout).toBe(true);
+    // ⚠️ **processingAt 必须清** —— 不清的话兜底扫描会把它
+    //    当成卡住的单反复捞出来
+    expect(data.processingAt).toBeNull();
+    // ⚠️ **释放明细** —— 单子结束了，商家可以对该期重新申请
+    expect(tx!.payoutEntry.deleteMany).toHaveBeenCalledWith({
+      where: { payoutId: 'payout-a' },
+    });
+    // ⚠️ **留痕**
+    expect(argsOf(tx!.payoutOperation.create).data).toMatchObject({
+      action: 'UNSTUCK_TO_FAILED',
+      fromStatus: PayoutStatus.PROCESSING,
+      toStatus: PayoutStatus.FAILED,
+    });
+  });
+
+  it('⚠️ 转 APPROVED → 绝不释放明细（释放了商家能对同期重新申请 → 同一笔打两次）', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [stuckPayout()],
+    });
+    const queues = fakeQueues();
+    const service = makeService(prisma, queues);
+
+    await asPlatform(() =>
+      service.unstick('payout-a', {
+        to: 'APPROVED',
+        reason: '核对渠道：确认未到账',
+      }),
+    );
+
+    const tx = prisma.tx();
+    expect(tx).not.toBeNull();
+    const data = argsOf(tx!.payout.updateMany).data as Record<string, unknown>;
+    expect(data.status).toBe(PayoutStatus.APPROVED);
+    expect(data.attemptCount).toBe(0);
+    // ⚠️ **明细绝不能释放**
+    expect(tx!.payoutEntry.deleteMany).not.toHaveBeenCalled();
+    expect(argsOf(tx!.payoutOperation.create).data).toMatchObject({
+      action: 'UNSTUCK_TO_APPROVED',
+      toStatus: PayoutStatus.APPROVED,
+    });
+    // ⚠️ **重新打款要入队**
+    expect(queues.addWithOptions).toHaveBeenCalled();
+  });
+});
+
+/**
+ * 阶段 5l Task 4：失败原因的口径收口。
+ *
+ * ⚠️ **商家端只看业务口径**（不含渠道原文）—— 原文可能是渠道的异常
+ *    （带主机名、端口、请求 id）或内部的解密信息。
+ * ⚠️ **平台端额外拿 `failureDetail`**（渠道原文）—— 超管排查要靠它。
+ */
+describe('失败原因的口径（阶段 5l）', () => {
+  it('⚠️ 商家端视图：确定没打 → 白名单内的业务措辞原样透传', async () => {
+    // ⚠️ **这一桶的值本来就是给商家看的措辞** ——
+    //    worker 在「渠道从未被调用」时写入的就是这种话。
+    //    统一换成一句笼统的话反而会**说错原因**
+    //    （金额异常的单被告知「收款账号信息异常」→ 商家白跑一趟）。
+    const prisma = fakePrisma({
+      payout: payout({
+        status: PayoutStatus.FAILED,
+        failedBeforePayout: true,
+        failureReason: '出款金额异常，本次未打款，请联系平台核对',
+      }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    // ⚠️ **商家端视图要在租户作用域下测** —— `detailForTenant` 不跑
+    //    platformScope（它靠当前租户上下文）
+    const view = await asTenant(() => service.detailForTenant('payout-a'));
+
+    expect(view.failureReason).toContain('本次未打款');
+    expect(view.failureReason).toContain('出款金额异常');
+  });
+
+  it('⚠️ 商家端视图：确定没打但措辞不在白名单 → 退回安全措辞（不泄内部术语）', async () => {
+    // ⚠️ **`failureReason` 是调用方传进来的字符串** ——
+    //    将来有人往这个桶里写进内部术语时，商家端不能跟着泄出去。
+    const prisma = fakePrisma({
+      payout: payout({
+        status: PayoutStatus.FAILED,
+        failedBeforePayout: true,
+        failureReason: '出款单的收款账号快照 尚未加密（版本 0）',
+      }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    const view = await asTenant(() => service.detailForTenant('payout-a'));
+
+    expect(view.failureReason).toContain('本次未打款');
+    expect(view.failureReason).not.toContain('尚未加密');
+    expect(view.failureReason).not.toContain('版本 0');
+  });
+
+  it('⚠️ 商家端视图：可能已打 → 通用措辞（不含渠道原文）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({
+        status: PayoutStatus.FAILED,
+        failedBeforePayout: false,
+        failureReason: 'connect ECONNREFUSED 10.0.0.5:6379',
+      }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    const view = await asTenant(() => service.detailForTenant('payout-a'));
+
+    expect(view.failureReason).toContain('请联系平台确认出款情况');
+    expect(view.failureReason).not.toContain('ECONNREFUSED');
+    expect(view.failureReason).not.toContain('10.0.0.5');
+  });
+
+  it('⚠️ 平台端视图：额外给 failureDetail（渠道原文）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({
+        status: PayoutStatus.FAILED,
+        failedBeforePayout: false,
+        failureReason: 'connect ECONNREFUSED 10.0.0.5:6379',
+      }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    const view = await asPlatform(() => service.detailForPlatform('payout-a'));
+
+    expect(view.failureDetail).toContain('ECONNREFUSED');
+  });
+
+  it('⚠️ 平台端视图：failureReason 也走业务口径（原文只在 failureDetail）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({
+        status: PayoutStatus.FAILED,
+        failedBeforePayout: false,
+        failureReason: 'connect ECONNREFUSED 10.0.0.5:6379',
+      }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    const view = await asPlatform(() => service.detailForPlatform('payout-a'));
+
+    // ⚠️ **共用视图给业务口径** —— 只有 `failureDetail` 才给原文
+    expect(view.failureReason).not.toContain('ECONNREFUSED');
+    expect(view.failureDetail).toContain('ECONNREFUSED');
+  });
+
+  it('⚠️ failureDetail 只在 FAILED 时返回', async () => {
+    const prisma = fakePrisma({
+      payout: payout({
+        status: PayoutStatus.APPROVED,
+        failureReason: 'connect ECONNREFUSED 10.0.0.5:6379',
+      }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    const view = await asPlatform(() => service.detailForPlatform('payout-a'));
+
+    expect(view.failureDetail).toBeNull();
+  });
+
+  it('⚠️ failureDetail 去掉换行（原文带 \\n 会破坏界面布局）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({
+        status: PayoutStatus.FAILED,
+        failureReason: '第一行\n第二行\r\n第三行',
+      }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    const view = await asPlatform(() => service.detailForPlatform('payout-a'));
+
+    expect(view.failureDetail).not.toContain('\n');
+    expect(view.failureDetail).not.toContain('\r');
+  });
+
+  it('⚠️ failureDetail 截断到 500 字符', async () => {
+    const prisma = fakePrisma({
+      payout: payout({
+        status: PayoutStatus.FAILED,
+        failureReason: 'x'.repeat(800),
+      }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    const view = await asPlatform(() => service.detailForPlatform('payout-a'));
+
+    expect(view.failureDetail).toHaveLength(501); // 500 + 省略号
+    expect(view.failureDetail?.endsWith('…')).toBe(true);
+  });
+
+  it('⚠️ 视图带上 failedBeforePayout（前端据此决定按钮与提示）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({
+        status: PayoutStatus.FAILED,
+        failedBeforePayout: true,
+      }),
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    const view = await asPlatform(() => service.detailForPlatform('payout-a'));
+
+    expect(view.failedBeforePayout).toBe(true);
+  });
+});
+
+/**
+ * 阶段 5l Task 5：详情接口带上「操作记录」。
+ *
+ * ⚠️ **留痕表建了、写了，但界面上看不到 → 运营不知道自己做過什么**。
+ */
+describe('平台端详情：操作记录（阶段 5l）', () => {
+  it('详情接口返回操作记录（时间转成 ISO 字符串）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({ status: PayoutStatus.FAILED }),
+      payoutOperations: [
+        {
+          id: 'op-1',
+          payoutId: 'payout-a',
+          action: 'RETRY',
+          operatorId: 'admin-a',
+          operatedAt: new Date('2025-08-15T00:00:00.000Z'),
+          reason: '渠道恢复了',
+          fromStatus: 'FAILED',
+          toStatus: 'APPROVED',
+          attemptCountBefore: 2,
+        },
+      ],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    const view = await asPlatform(() => service.detailForPlatform('payout-a'));
+
+    expect(view.operations).toHaveLength(1);
+    expect(view.operations[0]).toMatchObject({
+      id: 'op-1',
+      action: 'RETRY',
+      operatorId: 'admin-a',
+      // ⚠️ **操作人要转成显示名** —— 界面上不能只给一串 uuid
+      operatorName: '超管甲',
+      // ⚠️ **必须是字符串** —— 前端要的是 ISO 8601
+      operatedAt: '2025-08-15T00:00:00.000Z',
+      reason: '渠道恢复了',
+      fromStatus: 'FAILED',
+      toStatus: 'APPROVED',
+    });
+  });
+
+  it('⚠️ 查不到操作人（账号被删）→ 回落到 operatorId，不让留痕消失', async () => {
+    const prisma = fakePrisma({
+      payout: payout({ status: PayoutStatus.FAILED }),
+      // ⚠️ **查不到 `admin-a` 这个用户**
+      users: [],
+      payoutOperations: [
+        {
+          id: 'op-1',
+          payoutId: 'payout-a',
+          action: 'RETRY',
+          operatorId: 'admin-a',
+          operatedAt: new Date('2025-08-15T00:00:00.000Z'),
+          reason: '渠道恢复了',
+          fromStatus: 'FAILED',
+          toStatus: 'APPROVED',
+          attemptCountBefore: 2,
+        },
+      ],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    const view = await asPlatform(() => service.detailForPlatform('payout-a'));
+
+    expect(view.operations[0].operatorName).toBe('admin-a');
+  });
+
+  it('⚠️ 操作记录只在详情接口查（列表页每行都查就是 N+1）', async () => {
+    const prisma = fakePrisma({
+      payouts: [payout({ id: 'payout-a' })],
+      payoutCount: 1,
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await asPlatform(() => service.listForPlatform({}));
+
+    expect(prisma.payoutOperation.findMany).not.toHaveBeenCalled();
   });
 });

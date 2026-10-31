@@ -22,24 +22,42 @@ interface PayoutListResult {
 }
 
 /**
- * 一页最多取多少张出款单。
+ * 每页条数的可选档位（阶段 5l）。
  *
- * ⚠️ **上限就是 100**（后端 `clampPagination` 的 `MAX_PAGE_SIZE`），
- *    再大也会被夹回 100。
+ * ⚠️ **默认档必须是 100** —— 与改造前一致。改成 20 会被商家当成
+ *    「数据丢了」（出款单是要核账的凭证，少列几行就是事故）。
  */
-const PAGE_SIZE = 100;
+const PAGE_SIZE_OPTIONS = [20, 50, 100] as const;
 
-export default async function PayoutsPage() {
+export default async function PayoutsPage({
+  searchParams,
+}: {
+  // Next.js 15 起 searchParams 是 Promise，必须 await。
+  searchParams: Promise<{ page?: string; pageSize?: string }>;
+}) {
+  // ⚠️ **页码与每页条数从 URL 读** —— 纯服务端翻页，不需要客户端组件。
+  const params = await searchParams;
+  const parsedPage = Number.parseInt(params.page ?? '1', 10);
+  const page =
+    Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : 1;
+  const parsedPageSize = Number.parseInt(params.pageSize ?? '100', 10);
+  // ⚠️ **夹到 1..100**（上限与后端 `clampPagination` 的 `MAX_PAGE_SIZE` 一致）：
+  //    写大了后端也会夹回来，但页面上的「每页 N 条」得跟实际一致。
+  const pageSize = Math.min(
+    100,
+    Math.max(1, Number.isFinite(parsedPageSize) ? parsedPageSize : 100),
+  );
+
   let data: PayoutListResult | null = null;
   let error: string | null = null;
 
   try {
-    // ⚠️ **显式请求 `pageSize=100`**（后端 `clampPagination` 的
+    // ⚠️ **显式请求 `pageSize`**（后端 `clampPagination` 的
     // `MAX_PAGE_SIZE` 就是 100，再大也会被夹回 100）：
     // 不带这个参数 → 后端退回缺省的 20 → 页面上写着「共 N 张出款单」
-    // 却只画 20 张，第 21 条之后商家永远看不到，还没有分页控件可翻。
+    // 却只画 20 张，第 21 条之后商家永远看不到。
     data = await apiFetchAuthed<PayoutListResult>(
-      `/merchant/payouts?pageSize=${PAGE_SIZE}`,
+      `/merchant/payouts?page=${page}&pageSize=${pageSize}`,
     );
   } catch (cause) {
     error =
@@ -51,6 +69,8 @@ export default async function PayoutsPage() {
   }
 
   const items = data?.items ?? [];
+  const total = data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   return (
     <div className="flex flex-col gap-6">
@@ -84,13 +104,26 @@ export default async function PayoutsPage() {
           <p className="text-xs text-muted-foreground">
             共 {data.total} 张出款单
             {data.total > items.length ? `（本页显示 ${items.length} 张）` : ''}
-            {/* ⚠️ **明确告诉商家超量时怎么办**：本页一次最多取 100 张
-                （后端 `clampPagination` 的 `MAX_PAGE_SIZE`），超出部分
-                只能找平台要。**不能写成「已显示全部」** —— 那是骗商家。 */}
-            {data.total > items.length
-              ? '。本页只显示最近 100 张，更多出款单请联系平台'
-              : ''}
+            {/* ⚠️ **不能再写「更多出款单请联系平台」** —— 现在有翻页控件了，
+                商家自己就能翻到下一页（阶段 5l）。 */}
           </p>
+          {/* ⚠️ **每页条数三档** —— 默认 100（与改造前一致） */}
+          <div className="flex gap-2 text-sm">
+            {PAGE_SIZE_OPTIONS.map((size) => (
+              <Link
+                key={size}
+                href={`?page=1&pageSize=${size}`}
+                className={
+                  size === pageSize
+                    ? 'underline font-medium'
+                    : 'underline-offset-4 hover:underline'
+                }
+              >
+                {size}
+              </Link>
+            ))}
+            <span className="text-muted-foreground">条 / 页</span>
+          </div>
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b text-left">
@@ -128,14 +161,18 @@ export default async function PayoutsPage() {
                     <td>{describePayoutKind(payout.kind)}</td>
                     <td>
                       {describePayoutStatus(payout.status)}
-                      {/* ⚠️ **失败有两种，商家都需要联系平台**：
-                          ① 渠道试满 3 次 —— 钱**可能已经打出去**（渠道超时 / 网络中断）
-                          ② 账户不可用（解密失败 / 快照缺失）—— **确定没打**
-                          一句「请联系平台确认出款情况」对两类都成立，
-                          且与详情页的措辞一致（同端不能两套说法）。 */}
-                      {payout.status === 'FAILED' && (
+                      {/* ⚠️ **失败原因直接用后端给的业务口径**（阶段 5l）——
+                          后端按「钱打没打出去」分流：
+                          ① 确定没打（账户不可用 / 金额异常 / 人工转失败）
+                             → 「收款账号信息异常，本次未打款，请更新收款账户后重新申请」
+                          ② 可能已打（渠道试满 / 金额核对不通过）
+                             → 「出款未完成，请联系平台确认出款情况」
+                          ⚠️ **前端不要自己拼措辞** —— 两端必须一套说法，
+                          而且「哪些失败意味着没打钱」的知识在后端
+                          （那里才有 `failedBeforePayout` 这个事实依据）。 */}
+                      {payout.status === 'FAILED' && payout.failureReason && (
                         <p className="text-xs text-destructive">
-                          出款失败，请联系平台确认出款情况
+                          {payout.failureReason}
                         </p>
                       )}
                     </td>
@@ -149,6 +186,35 @@ export default async function PayoutsPage() {
               )}
             </tbody>
           </table>
+          {/* ⚠️ **翻页** —— 纯服务端：`<Link>` 改 URL，Server Component 重渲染。
+              商家端没有筛选条件，所以翻页链接只需要带 `page` 与 `pageSize`。 */}
+          {totalPages > 1 && (
+            <div className="flex items-center gap-4 text-sm">
+              <Link
+                href={`?page=${Math.max(1, page - 1)}&pageSize=${pageSize}`}
+                className={
+                  page <= 1
+                    ? 'pointer-events-none opacity-40'
+                    : 'underline-offset-4 hover:underline'
+                }
+              >
+                上一页
+              </Link>
+              <span>
+                第 {page} / {totalPages} 页，共 {total} 张
+              </span>
+              <Link
+                href={`?page=${Math.min(totalPages, page + 1)}&pageSize=${pageSize}`}
+                className={
+                  page >= totalPages
+                    ? 'pointer-events-none opacity-40'
+                    : 'underline-offset-4 hover:underline'
+                }
+              >
+                下一页
+              </Link>
+            </div>
+          )}
         </>
       )}
     </div>

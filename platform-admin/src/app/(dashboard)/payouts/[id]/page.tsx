@@ -5,6 +5,7 @@ import {
   describePayoutAccount,
   describePayoutEntryType,
   describePayoutKind,
+  describePayoutOperation,
   describePayoutStatus,
   describePayoutTimeline,
   formatCents,
@@ -181,6 +182,19 @@ export default async function PayoutDetailPage({
               </div>
             )}
 
+            {/* ⚠️ **失败详情 = 渠道侧的原文**（只有平台端有）——
+                超管排查要靠它（「Unsupported state or unable to
+                authenticate data」比「收款账号信息异常」有用得多）。
+                ⚠️ **看不到解密根因** —— 那是只进日志的（5k 的遗留 4）。 */}
+            {payout.failureDetail && (
+              <div className="flex justify-between py-2 text-sm text-muted-foreground">
+                <span>失败详情</span>
+                <span className="max-w-[60%] break-words text-right">
+                  {payout.failureDetail}
+                </span>
+              </div>
+            )}
+
             {/* ⚠️ **打款渠道名**：超管要看到「钱是打给哪个渠道的」——
                 对账、排查重复打款都靠这条线索。渠道名**只给平台端**，
                 商家不关心（商家端页面不显示这一项）。 */}
@@ -207,10 +221,25 @@ export default async function PayoutDetailPage({
               </div>
             )}
 
+            {/* ⚠️ **操作记录** —— 涉及钱的操作必须能追溯「谁在什么时候
+                把这张单怎么了」。留痕写进库里还不够，要看得见。 */}
+            {payout.operations.length > 0 && (
+              <div className="flex flex-col gap-1 border-t pt-2 text-sm">
+                <span className="text-muted-foreground">操作记录</span>
+                {payout.operations.map((op) => (
+                  <p key={op.id} className="text-muted-foreground">
+                    {formatDateTime(op.operatedAt)} · {op.operatorName} ·{' '}
+                    {describePayoutOperation(op.action)} · {op.reason}
+                  </p>
+                ))}
+              </div>
+            )}
+
             <PayoutActions
               payoutId={payout.id}
               status={payout.status}
               requestedAmount={payout.requestedAmount}
+              failedBeforePayout={payout.failedBeforePayout}
             />
           </div>
         </CardContent>

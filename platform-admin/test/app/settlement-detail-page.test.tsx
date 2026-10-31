@@ -49,6 +49,7 @@ import type { SettlementDetail } from '@/lib/billing';
 import {
   collectClassNames,
   collectComponentProps,
+  collectHrefs,
   collectText,
   hasText,
 } from '../helpers/page-tree';
@@ -102,6 +103,7 @@ const DETAIL: SettlementDetail = {
 async function renderPage(id = 'statement-1'): Promise<string[]> {
   const element = await SettlementDetailPage({
     params: Promise.resolve({ id }),
+    searchParams: Promise.resolve({}),
   });
   return collectText(element);
 }
@@ -112,6 +114,7 @@ async function renderRowActionProps(
 ): Promise<Record<string, unknown>[]> {
   const element = await SettlementDetailPage({
     params: Promise.resolve({ id }),
+    searchParams: Promise.resolve({}),
   });
   return collectComponentProps(
     element,
@@ -138,6 +141,7 @@ async function renderRowActionProps(
 async function renderHint(id = 'statement-1'): Promise<string | null> {
   const element = await SettlementDetailPage({
     params: Promise.resolve({ id }),
+    searchParams: Promise.resolve({}),
   });
 
   const visit = (node: unknown): string | null => {
@@ -181,9 +185,47 @@ async function renderHint(id = 'statement-1'): Promise<string | null> {
   return visit(element);
 }
 
+/**
+ * 结算单明细分页接口的响应（阶段 5l）。
+ *
+ * ⚠️ **明细单独一个端点** —— 详情接口的 `entries` 是无上限全量返回，
+ *    页面改用 `/platform/settlements/:id/entries` 取当前页。
+ */
+const ENTRIES_PAGE = {
+  items: DETAIL.entries,
+  total: 2,
+  page: 1,
+  pageSize: 50,
+};
+
+/**
+ * 只覆盖**详情接口**的返回值，明细分页端点仍走 `ENTRIES_PAGE`。
+ *
+ * ⚠️ **为什么需要这个**：详情页现在调两个接口，
+ *    直接 `mockResolvedValue` 会把**明细也一起覆盖掉** →
+ *    改个 `netAmount` 的用例顺带把明细表也改了，测的就不是那件事了。
+ */
+function mockDetail(detail: unknown): void {
+  apiFetchAuthedMock.mockImplementation((path: string) => {
+    if (path.includes('/entries')) {
+      return Promise.resolve(ENTRIES_PAGE);
+    }
+    return Promise.resolve(detail);
+  });
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
-  apiFetchAuthedMock.mockResolvedValue(DETAIL);
+  // ⚠️ **按路径分派**：详情页现在调**两个**接口 ——
+  //    ① `/platform/settlements/:id`（单头信息）
+  //    ② `/platform/settlements/:id/entries`（明细分页，阶段 5l）
+  //    同一个 mock 一律返回 DETAIL 的话，明细表会拿到没有 `items` 的对象。
+  apiFetchAuthedMock.mockImplementation((path: string) => {
+    if (path.includes('/entries')) {
+      return Promise.resolve(ENTRIES_PAGE);
+    }
+    return Promise.resolve(DETAIL);
+  });
   // ⚠️ 真实的 `notFound()` 抛的是 Next 内部异常；
   //    这里换成一个**好认的**自定义错误，断言时不会跟别的错误混。
   notFoundMock.mockImplementation(() => {
@@ -195,9 +237,25 @@ describe('结算单详情页：取数', () => {
   it('按 id 拉详情', async () => {
     await renderPage('statement-1');
 
-    expect(apiFetchAuthedMock).toHaveBeenCalledTimes(1);
-    const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
+    const detailCall = apiFetchAuthedMock.mock.calls.find(
+      (call) => !(call[0] as string).includes('/entries'),
+    );
+    expect(detailCall).toBeDefined();
+    const [path] = detailCall as [string];
     expect(path).toBe('/platform/settlements/statement-1');
+  });
+
+  it('⚠️ 明细走分页端点（阶段 5l，不再全量渲染）', async () => {
+    await renderPage('statement-1');
+
+    const entriesCall = apiFetchAuthedMock.mock.calls.find((call) =>
+      (call[0] as string).includes('/entries'),
+    );
+    expect(entriesCall).toBeDefined();
+    const [path] = entriesCall as [string];
+    expect(path).toBe(
+      '/platform/settlements/statement-1/entries?page=1&pageSize=50',
+    );
   });
 
   it('⚠️ 取数失败时显示错误提示，且不崩', async () => {
@@ -260,7 +318,7 @@ describe('结算单详情页：金额与状态', () => {
   });
 
   it('⚠️ 净额为负时显示成 ¥-50.00（平台倒欠商家钱）', async () => {
-    apiFetchAuthedMock.mockResolvedValue({ ...DETAIL, netAmount: -5000 });
+    mockDetail({ ...DETAIL, netAmount: -5000 });
 
     const texts = await renderPage();
 
@@ -334,7 +392,18 @@ describe('结算单详情页：明细', () => {
   });
 
   it('没有明细时显示「暂无明细。」而不是空白表', async () => {
-    apiFetchAuthedMock.mockResolvedValue({ ...DETAIL, entries: [] });
+    // ⚠️ **明细来自分页端点**（阶段 5l），不是详情接口的 `entries`。
+    apiFetchAuthedMock.mockImplementation((path: string) => {
+      if (path.includes('/entries')) {
+        return Promise.resolve({
+          items: [],
+          total: 0,
+          page: 1,
+          pageSize: 50,
+        });
+      }
+      return Promise.resolve(DETAIL);
+    });
 
     const texts = await renderPage();
 
@@ -342,9 +411,72 @@ describe('结算单详情页：明细', () => {
   });
 });
 
+describe('结算单详情页：明细分页（阶段 5l）', () => {
+  it('⚠️ 明细走分页端点，页码与每页条数从 URL 读', async () => {
+    const element = await SettlementDetailPage({
+      params: Promise.resolve({ id: 'statement-1' }),
+      searchParams: Promise.resolve({ page: '2', pageSize: '20' }),
+    });
+    void element;
+
+    const entriesCall = apiFetchAuthedMock.mock.calls.find((call) =>
+      (call[0] as string).includes('/entries'),
+    );
+    expect(entriesCall).toBeDefined();
+    const [path] = entriesCall as [string];
+    expect(path).toBe(
+      '/platform/settlements/statement-1/entries?page=2&pageSize=20',
+    );
+  });
+
+  it('⚠️ 明细翻页链接必须带上 pageSize', async () => {
+    apiFetchAuthedMock.mockImplementation((path: string) => {
+      if (path.includes('/entries')) {
+        return Promise.resolve({
+          items: DETAIL.entries,
+          total: 120,
+          page: 1,
+          pageSize: 50,
+        });
+      }
+      return Promise.resolve(DETAIL);
+    });
+
+    const element = await SettlementDetailPage({
+      params: Promise.resolve({ id: 'statement-1' }),
+      searchParams: Promise.resolve({}),
+    });
+    const hrefs = collectHrefs(element);
+
+    // ⚠️ **漏掉 pageSize 的话翻一次页，每页条数就被重置回默认的 50 条**，
+    //    页码与实际条数对不上。
+    expect(hrefs).toContain('?page=2&pageSize=50');
+  });
+
+  it('⚠️ 明细取数失败时单头信息照样显示（不阻断整页）', async () => {
+    const { ApiError } = await vi.importActual<
+      typeof import('@/lib/api-client')
+    >('@/lib/api-client');
+    apiFetchAuthedMock.mockImplementation((path: string) => {
+      if (path.includes('/entries')) {
+        return Promise.reject(
+          new ApiError(500, 'INTERNAL', '明细炸了'),
+        );
+      }
+      return Promise.resolve(DETAIL);
+    });
+
+    const texts = await renderPage();
+
+    // ⚠️ **单头信息比明细更要紧**：明细挂了也要能看到这张单的状态与金额。
+    expect(hasText(texts, '示例店铺')).toBe(true);
+    expect(hasText(texts, '加载结算明细失败')).toBe(true);
+  });
+});
+
 describe('结算单详情页：缺笔可见（阶段 5j）', () => {
   it('⚠️ 缺笔时详情页给出修账指引', async () => {
-    apiFetchAuthedMock.mockResolvedValue({
+    mockDetail({
       ...DETAIL,
       missingEntryCount: 2,
       canRecalculate: true,
@@ -360,7 +492,7 @@ describe('结算单详情页：缺笔可见（阶段 5j）', () => {
   });
 
   it('⚠️ 能重算时指引说「取消确认 → 重算」', async () => {
-    apiFetchAuthedMock.mockResolvedValue({
+    mockDetail({
       ...DETAIL,
       missingEntryCount: 2,
       canRecalculate: true,
@@ -377,7 +509,7 @@ describe('结算单详情页：缺笔可见（阶段 5j）', () => {
   });
 
   it('⚠️ 不能重算时（被出款单引用）改指引为调账', async () => {
-    apiFetchAuthedMock.mockResolvedValue({
+    mockDetail({
       ...DETAIL,
       missingEntryCount: 2,
       canRecalculate: false,
@@ -394,7 +526,7 @@ describe('结算单详情页：缺笔可见（阶段 5j）', () => {
   });
 
   it('⚠️ 草稿单直接说「重算」，不说「先取消确认再重算」', async () => {
-    apiFetchAuthedMock.mockResolvedValue({
+    mockDetail({
       ...DETAIL,
       status: 'DRAFT' as const,
       confirmedAt: null,
@@ -431,7 +563,7 @@ describe('结算单详情页：缺笔可见（阶段 5j）', () => {
   });
 
   it('⚠️ 缺笔的提示要标红', async () => {
-    apiFetchAuthedMock.mockResolvedValue({
+    mockDetail({
       ...DETAIL,
       missingEntryCount: 2,
       canRecalculate: true,
@@ -439,6 +571,7 @@ describe('结算单详情页：缺笔可见（阶段 5j）', () => {
 
     const element = await SettlementDetailPage({
       params: Promise.resolve({ id: 'statement-1' }),
+      searchParams: Promise.resolve({}),
     });
     const classNames = collectClassNames(element);
 

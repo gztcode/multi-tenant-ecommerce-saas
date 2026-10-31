@@ -134,6 +134,8 @@ export class PayoutWorker extends WorkerHost {
         // ⚠️ **文案要自证「没打钱」**
         reason: '收款账号信息异常，本次未打款，请更新收款账户后重新申请',
         failedAt: await this.prisma.databaseNow(),
+        // ⚠️ **渠道从未被调用** → 钱确定没打出去 → 可安全重试
+        failedBeforePayout: true,
       });
       return;
     }
@@ -144,6 +146,8 @@ export class PayoutWorker extends WorkerHost {
       await this.execution.markFailed(payoutId, {
         reason: gateFailure,
         failedAt: await this.prisma.databaseNow(),
+        // ⚠️ **渠道从未被调用** → 钱确定没打出去 → 可安全重试
+        failedBeforePayout: true,
       });
       return;
     }
@@ -157,6 +161,8 @@ export class PayoutWorker extends WorkerHost {
       await this.execution.markFailed(payoutId, {
         reason: '没有可用的出款渠道',
         failedAt: await this.prisma.databaseNow(),
+        // ⚠️ **渠道压根没被调用** → 钱确定没打出去 → 可安全重试
+        failedBeforePayout: true,
       });
       return;
     }
@@ -246,6 +252,8 @@ export class PayoutWorker extends WorkerHost {
       await this.execution.markFailed(payoutId, {
         reason: `渠道金额核对不通过（请求 ${requestedAmount} 分，渠道返回 ${result.amount} 分）`,
         failedAt: now,
+        // ⚠️ **渠道已经调过了** → 钱**可能**已经打出去 → 不能重试
+        failedBeforePayout: false,
       });
       return;
     }
@@ -270,7 +278,12 @@ export class PayoutWorker extends WorkerHost {
     now: Date,
   ): Promise<void> {
     if (attemptCount >= PAYOUT_MAX_ATTEMPTS) {
-      await this.execution.markFailed(payoutId, { reason, failedAt: now });
+      await this.execution.markFailed(payoutId, {
+        reason,
+        failedAt: now,
+        // ⚠️ **渠道已经调过了** → 钱**可能**已经打出去 → 不能重试
+        failedBeforePayout: false,
+      });
       return;
     }
 

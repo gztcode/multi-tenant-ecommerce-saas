@@ -84,6 +84,11 @@ const DETAIL: PlatformPayoutDetail = {
   snapshotAccountName: '张三',
   snapshotBankName: '招商银行',
   maskedSnapshotAccountNo: '************1234',
+  // ⚠️ **阶段 5l 新增**：失败详情（渠道侧原文）、「钱确定没打出去」的标记、
+  //    以及人工操作留痕。**只有平台端详情接口有**（列表接口没有）。
+  failureDetail: null,
+  failedBeforePayout: false,
+  operations: [],
   entries: [
     {
       entryId: 'entry-1',
@@ -613,6 +618,67 @@ describe('出款单详情页：明细', () => {
     const texts = await renderPage();
 
     expect(hasText(texts, '暂无明细。')).toBe(true);
+  });
+});
+
+describe('出款单详情页：操作记录（阶段 5l）', () => {
+  it('⚠️ 有留痕时显示操作人、动作与原因', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      operations: [
+        {
+          id: 'op-1',
+          action: 'RETRY',
+          operatorId: 'admin-a',
+          operatorName: '超管甲',
+          operatedAt: '2026-02-02T03:04:05.000Z',
+          reason: '渠道恢复了',
+          fromStatus: 'FAILED',
+          toStatus: 'APPROVED',
+        },
+      ],
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '操作记录')).toBe(true);
+    // ⚠️ **操作人要显示名字** —— 只给一串 uuid 谁都认不出是谁干的
+    expect(hasText(texts, '超管甲')).toBe(true);
+    // ⚠️ **动作要显示中文** —— 不能把裸枚举 `RETRY` 糊到界面上
+    expect(hasText(texts, '重试出款')).toBe(true);
+    expect(hasText(texts, 'RETRY')).toBe(false);
+    expect(hasText(texts, '渠道恢复了')).toBe(true);
+  });
+
+  it('⚠️ 没有留痕时不显示「操作记录」这一段', async () => {
+    apiFetchAuthedMock.mockResolvedValue({ ...DETAIL, operations: [] });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '操作记录')).toBe(false);
+  });
+
+  it('⚠️ 未知操作类型回落到「人工操作」，不显示裸枚举', async () => {
+    apiFetchAuthedMock.mockResolvedValue({
+      ...DETAIL,
+      operations: [
+        {
+          id: 'op-1',
+          action: 'WEIRD_NEW_ACTION',
+          operatorId: 'admin-a',
+          operatorName: '超管甲',
+          operatedAt: '2026-02-02T03:04:05.000Z',
+          reason: '手工改的',
+          fromStatus: 'FAILED',
+          toStatus: 'APPROVED',
+        },
+      ],
+    });
+
+    const texts = await renderPage();
+
+    expect(hasText(texts, '人工操作')).toBe(true);
+    expect(hasText(texts, 'WEIRD_NEW_ACTION')).toBe(false);
   });
 });
 

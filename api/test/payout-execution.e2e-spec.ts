@@ -90,6 +90,16 @@ interface PayoutBody {
   maskedSnapshotAccountNo: string | null;
   statementId: string | null;
   createdAt: string;
+  /**
+   * 「钱确定没打出去」的标记（阶段 5l）。
+   *
+   * ⚠️ **`false` = 渠道调过了 → 钱可能已打出去** → 商家端看不到渠道原文。
+   */
+  failedBeforePayout?: boolean;
+  /**
+   * 渠道侧的失败原文（**只有平台端详情接口有**，阶段 5l）。
+   */
+  failureDetail?: string | null;
 }
 
 /** 可申请周期的响应体 */
@@ -674,7 +684,21 @@ describe('出款执行 (e2e)', () => {
       PayoutStatus.FAILED,
     );
     expect(failed).not.toBeNull();
-    expect(failed!.failureReason).toContain('金额核对不通过');
+    // ⚠️ **阶段 5l：商家端只看业务口径** —— 渠道原文（「渠道金额核对不通过
+    //    （请求 9000 分，渠道返回 9001 分）」）带内部数字与术语，
+    //    商家看到只会困惑。原文挪到平台端的 `failureDetail`。
+    expect(failed!.failureReason).toContain('请联系平台确认出款情况');
+    expect(failed!.failureReason).not.toContain('金额核对不通过');
+    // ⚠️ **渠道调过了 → 钱可能已打出去** → 不能重试
+    expect(failed!.failedBeforePayout).toBe(false);
+
+    // ⚠️ **平台端才看得到渠道原文** —— 超管排查要靠它
+    const platformDetail = await http(app)
+      .get(`/api/v1/platform/payouts/${applied.id}`)
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    const platformBody = platformDetail.body as PayoutBody;
+    expect(platformBody.failureDetail).toContain('金额核对不通过');
   });
 
   // ============================================================
@@ -756,6 +780,9 @@ describe('出款执行 (e2e)', () => {
     // ⚠️ **不许再退回内部术语** —— 「非法」「金额非法」这类词商家看不懂
     expect(failed!.failureReason).not.toContain('出款金额非法');
     expect(failed!.attemptCount).toBe(1);
+    // ⚠️ **阶段 5l：金额不对是在「调渠道之前」拦下的** → 渠道从未被调用
+    //    → 钱确定没打出去 → 这张单**可以重试**
+    expect(failed!.failedBeforePayout).toBe(true);
   });
 
   // ============================================================
@@ -783,7 +810,19 @@ describe('出款执行 (e2e)', () => {
     );
     expect(failed).not.toBeNull();
     expect(failed!.attemptCount).toBe(3);
-    expect(failed!.failureReason).toContain('模拟的失败');
+    // ⚠️ **阶段 5l：商家端只看业务口径** —— 渠道的原文（「假出款网关模拟的失败
+    //    （第 3 次尝试）」）不泄给商家；原文在平台端的 `failureDetail`。
+    expect(failed!.failureReason).toContain('请联系平台确认出款情况');
+    expect(failed!.failureReason).not.toContain('模拟的失败');
+    // ⚠️ **渠道调过了 → 钱可能已打出去** → 不能重试
+    expect(failed!.failedBeforePayout).toBe(false);
+
+    const platformDetail = await http(app)
+      .get(`/api/v1/platform/payouts/${applied.id}`)
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    const platformBody = platformDetail.body as PayoutBody;
+    expect(platformBody.failureDetail).toContain('模拟的失败');
   });
 
   it('X12：渠道失败时落 APPROVED（等重试）并记 failureReason', async () => {

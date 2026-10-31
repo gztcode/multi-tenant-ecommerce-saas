@@ -132,6 +132,22 @@ interface DetailBody extends StatementBody {
   }>;
 }
 
+/** 明细分页响应体（阶段 5l） */
+interface EntriesPageBody {
+  items: Array<{
+    entryId: string;
+    orderNo: string;
+    type: string;
+    amount: number;
+    rateBps: number;
+    baseAmount: number;
+    occurredAt: string;
+  }>;
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
 /** 报表响应体（对账用） */
 interface ReportBody {
   commissionRevenue: number;
@@ -1389,6 +1405,167 @@ describe('平台侧的结算单 (e2e)', () => {
       .get('/api/v1/platform/settlements/not-a-uuid')
       .set('authorization', `Bearer ${adminToken}`)
       .expect(400);
+  });
+
+  // ============================================================
+  // 明细分页（阶段 5l）
+  // ============================================================
+
+  /** 拉明细分页 */
+  async function fetchEntries(
+    token: string,
+    id: string,
+    query: Record<string, string> = {},
+  ): Promise<EntriesPageBody> {
+    const params = new URLSearchParams(query);
+    const suffix = params.toString();
+    const response = await http(app)
+      .get(
+        `/api/v1/platform/settlements/${id}/entries${suffix ? `?${suffix}` : ''}`,
+      )
+      .set('authorization', `Bearer ${token}`)
+      .expect(200);
+    return response.body as EntriesPageBody;
+  }
+
+  it('明细分页：每一行都能对上流水，且按发生时间排序', async () => {
+    const adminToken = await loginPlatformAdmin();
+    const merchant = await createMerchant(app, prisma);
+    const period = month('2024-08');
+
+    const orderA = await seedOrder(merchant.tenantId);
+    await seedEntry(merchant.tenantId, orderA, {
+      type: CommissionEntryType.COMMISSION,
+      amount: 100,
+      occurredAt: inside(period, 20),
+    });
+    const orderB = await seedOrder(merchant.tenantId);
+    await seedEntry(merchant.tenantId, orderB, {
+      type: CommissionEntryType.REVERSAL,
+      amount: -30,
+      occurredAt: inside(period, 10),
+    });
+
+    const body = await generate(adminToken, '2024-08', merchant.tenantId);
+    const page = await fetchEntries(adminToken, body.items[0].id);
+
+    expect(page.total).toBe(2);
+    expect(page.page).toBe(1);
+    expect(page.items).toHaveLength(2);
+    // ⚠️ **明细是按时间排的**：10 日那笔（REVERSAL）在前，20 日那笔在后。
+    expect(page.items[0].type).toBe('REVERSAL');
+    expect(page.items[0].amount).toBe(-30);
+    expect(page.items[1].type).toBe('COMMISSION');
+    expect(page.items[1].amount).toBe(100);
+    expect(page.items[0].occurredAt < page.items[1].occurredAt).toBe(true);
+  });
+
+  it('⚠️ 明细分页：跨页不漏行、不重复', async () => {
+    const adminToken = await loginPlatformAdmin();
+    const merchant = await createMerchant(app, prisma);
+    const period = month('2024-09');
+
+    // ⚠️ **5 笔**：每页 2 笔 → 3 页
+    for (let day = 1; day <= 5; day += 1) {
+      const orderId = await seedOrder(merchant.tenantId);
+      await seedEntry(merchant.tenantId, orderId, {
+        type: CommissionEntryType.COMMISSION,
+        amount: 100,
+        occurredAt: inside(period, day),
+      });
+    }
+
+    const body = await generate(adminToken, '2024-09', merchant.tenantId);
+    const id = body.items[0].id;
+
+    const first = await fetchEntries(adminToken, id, { page: '1', pageSize: '2' });
+    const second = await fetchEntries(adminToken, id, {
+      page: '2',
+      pageSize: '2',
+    });
+    const third = await fetchEntries(adminToken, id, {
+      page: '3',
+      pageSize: '2',
+    });
+
+    const ids = [
+      ...first.items.map((item) => item.entryId),
+      ...second.items.map((item) => item.entryId),
+      ...third.items.map((item) => item.entryId),
+    ];
+
+    // ⚠️ **5 笔一行不多一行不少**：漏行 → 超管核账核不上；
+    //    重复行 → 同一笔流水被算两次。
+    expect(ids).toHaveLength(5);
+    expect(new Set(ids).size).toBe(5);
+    // ⚠️ **每页的 total 都是全量笔数**（不是本页条数）
+    expect(first.total).toBe(5);
+    expect(second.total).toBe(5);
+    expect(third.total).toBe(5);
+    // ⚠️ **页内顺序按发生时间**
+    expect(first.items[0].occurredAt < first.items[1].occurredAt).toBe(true);
+  });
+
+  it('⚠️ 明细分页：pageSize 超过上限时夹到 100', async () => {
+    const adminToken = await loginPlatformAdmin();
+    const merchant = await createMerchant(app, prisma);
+    const period = month('2024-10');
+
+    const orderId = await seedOrder(merchant.tenantId);
+    await seedEntry(merchant.tenantId, orderId, {
+      type: CommissionEntryType.COMMISSION,
+      amount: 100,
+      occurredAt: inside(period, 10),
+    });
+
+    const body = await generate(adminToken, '2024-10', merchant.tenantId);
+    const page = await fetchEntries(adminToken, body.items[0].id, {
+      pageSize: '999999',
+    });
+
+    // ⚠️ **不能一次拖走全部**（`clampPagination` 的 `MAX_PAGE_SIZE`）
+    expect(page.pageSize).toBe(100);
+  });
+
+  it('明细分页：单据不存在 → 404', async () => {
+    const adminToken = await loginPlatformAdmin();
+
+    await http(app)
+      .get(
+        '/api/v1/platform/settlements/00000000-0000-4000-8000-000000000000/entries',
+      )
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(404);
+  });
+
+  it('明细分页：id 不是 uuid → 400', async () => {
+    const adminToken = await loginPlatformAdmin();
+
+    await http(app)
+      .get('/api/v1/platform/settlements/not-a-uuid/entries')
+      .set('authorization', `Bearer ${adminToken}`)
+      .expect(400);
+  });
+
+  it('⚠️ 明细分页：商家账号调 → 403（不能看别人家的明细）', async () => {
+    const adminToken = await loginPlatformAdmin();
+    const merchant = await createMerchant(app, prisma);
+    const period = month('2024-11');
+
+    const orderId = await seedOrder(merchant.tenantId);
+    await seedEntry(merchant.tenantId, orderId, {
+      type: CommissionEntryType.COMMISSION,
+      amount: 100,
+      occurredAt: inside(period, 10),
+    });
+
+    const body = await generate(adminToken, '2024-11', merchant.tenantId);
+    const id = body.items[0].id;
+
+    await http(app)
+      .get(`/api/v1/platform/settlements/${id}/entries`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(403);
   });
 
   // ============================================================

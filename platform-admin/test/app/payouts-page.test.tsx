@@ -84,7 +84,9 @@ const LIST: PayoutListResult = {
 };
 
 /** 渲染页面并收集文字 */
-async function renderPage(params: { period?: string } = {}): Promise<string[]> {
+async function renderPage(
+  params: { period?: string; page?: string; pageSize?: string } = {},
+): Promise<string[]> {
   const element = await PayoutsPage({
     searchParams: Promise.resolve(params),
   });
@@ -92,7 +94,9 @@ async function renderPage(params: { period?: string } = {}): Promise<string[]> {
 }
 
 /** 渲染页面并收集链接地址 */
-async function renderHrefs(params: { period?: string } = {}): Promise<string[]> {
+async function renderHrefs(
+  params: { period?: string; page?: string; pageSize?: string } = {},
+): Promise<string[]> {
   const element = await PayoutsPage({
     searchParams: Promise.resolve(params),
   });
@@ -112,7 +116,7 @@ describe('出款单列表页：周期来自 URL', () => {
     const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
     // ⚠️ **精确匹配而不是 `toContain`**：`toContain('/platform/payouts')`
     //    连 `/platform/payoutsXYZ` 也放得过，路径写歪了照样绿。
-    expect(path).toBe('/platform/payouts?pageSize=100');
+    expect(path).toBe('/platform/payouts?page=1&pageSize=100');
   });
 
   it('给了周期 → 路径里带 period', async () => {
@@ -120,7 +124,7 @@ describe('出款单列表页：周期来自 URL', () => {
 
     const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
     // ⚠️ **精确匹配**：参数顺序与编码方式都锁死。
-    expect(path).toBe('/platform/payouts?period=2026-01&pageSize=100');
+    expect(path).toBe('/platform/payouts?period=2026-01&page=1&pageSize=100');
   });
 
   it('⚠️ 两种路径都带 pageSize=100（后端 clampPagination 的上限就是 100）', async () => {
@@ -128,12 +132,12 @@ describe('出款单列表页：周期来自 URL', () => {
     //    页面看上去「只有这些单据」→ 平台据此打款会漏打。
     await renderPage();
     const [withoutPeriod] = apiFetchAuthedMock.mock.calls[0] as [string];
-    expect(withoutPeriod).toBe('/platform/payouts?pageSize=100');
+    expect(withoutPeriod).toBe('/platform/payouts?page=1&pageSize=100');
 
     apiFetchAuthedMock.mockClear();
     await renderPage({ period: '2026-01' });
     const [withPeriod] = apiFetchAuthedMock.mock.calls[0] as [string];
-    expect(withPeriod).toBe('/platform/payouts?period=2026-01&pageSize=100');
+    expect(withPeriod).toBe('/platform/payouts?period=2026-01&page=1&pageSize=100');
   });
 
   it('⚠️ 周期格式非法 → 提示，且根本不调后端', async () => {
@@ -142,6 +146,53 @@ describe('出款单列表页：周期来自 URL', () => {
     expect(hasText(texts, '周期格式非法')).toBe(true);
     // ⚠️ **非法周期的明细比没有明细更糟**：所以压根不调后端。
     expect(apiFetchAuthedMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('出款单列表页：翻页（阶段 5l）', () => {
+  it('⚠️ 页码与每页条数从 URL 读', async () => {
+    await renderPage({ page: '3', pageSize: '20' });
+
+    const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
+    expect(path).toBe('/platform/payouts?page=3&pageSize=20');
+  });
+
+  it('⚠️ 非法页码落回第 1 页', async () => {
+    await renderPage({ page: '0' });
+    const [zeroPage] = apiFetchAuthedMock.mock.calls[0] as [string];
+    expect(zeroPage).toBe('/platform/payouts?page=1&pageSize=100');
+  });
+
+  it('⚠️ 翻页链接必须带上 period（否则筛选被悄悄重置）', async () => {
+    apiFetchAuthedMock.mockResolvedValue({ ...LIST, total: 250 });
+
+    const hrefs = await renderHrefs({ period: '2026-01' });
+
+    // ⚠️ **漏掉 period 的话超管筛完周期一翻页，筛选就被重置成「全部周期」**，
+    //    看到的是一份完全不相干的列表。
+    expect(hrefs).toContain('?period=2026-01&page=2&pageSize=100');
+  });
+
+  it('⚠️ 只有一页时不显示翻页控件', async () => {
+    const hrefs = await renderHrefs();
+
+    expect(hrefs.some((href) => href.includes('page=2'))).toBe(false);
+  });
+
+  it('⚠️ 多页时有翻页链接', async () => {
+    apiFetchAuthedMock.mockResolvedValue({ ...LIST, total: 250 });
+
+    const hrefs = await renderHrefs();
+
+    expect(hrefs).toContain('?page=2&pageSize=100');
+  });
+
+  it('⚠️ 每页条数三档都有链接（20 / 50 / 100）', async () => {
+    const hrefs = await renderHrefs();
+
+    expect(hrefs).toContain('?page=1&pageSize=20');
+    expect(hrefs).toContain('?page=1&pageSize=50');
+    expect(hrefs).toContain('?page=1&pageSize=100');
   });
 });
 
