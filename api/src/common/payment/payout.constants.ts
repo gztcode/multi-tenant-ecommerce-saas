@@ -15,6 +15,14 @@ export const PAYOUT_PROVIDERS = 'PAYOUT_PROVIDERS';
 export type PayoutProviderMap = Map<string, PayoutProvider>;
 
 /**
+ * 拉渠道流水的默认每页条数（阶段 5m 技术债）。
+ *
+ * ⚠️ **真渠道一次拉不动整个时间窗** —— 银行 / 支付渠道的对账查询都有分页上限，
+ *    一个月的流水动辄几万条。对账服务循环翻页时用它当 `pageSize`。
+ */
+export const CHANNEL_LIST_PAGE_SIZE = 500;
+
+/**
  * 假出款网关不可用时的统一文案（阶段 5m）。
  *
  * ⚠️ **两条独立的报错路径要用同一个常量**：

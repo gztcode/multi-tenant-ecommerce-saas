@@ -66,6 +66,11 @@ function fakeExecution(claim: unknown) {
     claimForExecution: jest.fn(() => Promise.resolve(claim)),
     markPaid: jest.fn(() => Promise.resolve(true)),
     markFailed: jest.fn(() => Promise.resolve(true)),
+    // ⚠️ **记渠道名**（阶段 5m 技术债）—— worker 只调它，不自己写库。
+    //    用例要断言「worker 确实调了它，且失败不阻断打款」。
+    recordChannel: jest.fn<Promise<void>, [string, string]>(() =>
+      Promise.resolve(),
+    ),
     // ⚠️ **默认返回「本次」的 attemptCount = 1** —— 与真实实现一致
     //    （`scheduleRetry` 退回 `APPROVED` 时读回的是**当前**的计数）。
     //    ⚠️ **类型带 `| null`** —— 真实实现读不到行时返回 `null`（不重试）。
@@ -171,6 +176,74 @@ describe('PayoutWorker', () => {
       { channel: string },
     ];
     expect(call[1].channel).toBe('fake-payout');
+  });
+
+  it('⚠️ 调渠道前就调 execution.recordChannel 记下渠道名', async () => {
+    // ⚠️ **必须在调渠道之前落** —— 原来只有 `markPaid` 才写 →
+    //    卡在 `PROCESSING` 的单渠道名是 null → 将来「按渠道取 provider」定位不到。
+    //
+    // ⚠️ **worker 不自己写库** —— 写库的落点统一在
+    //    `PayoutExecutionService.recordChannel`（worker 只调它）。
+    const execution = fakeExecution(claim);
+    const provider = fakeProvider({ status: 'SUCCESS', amount: 8500 });
+    const worker = new PayoutWorker(
+      execution as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      new Map([['fake-payout', provider]]),
+    );
+
+    await worker.process({
+      name: 'execute',
+      data: { payoutId: 'payout-a' },
+    } as never);
+
+    // ⚠️ **记的是「实际调用的那个渠道」**
+    expect(execution.recordChannel).toHaveBeenCalledWith(
+      'payout-a',
+      'fake-payout',
+    );
+    // ⚠️ **顺序也要咬住** —— 记渠道名必须发生在**调渠道之前**：
+    //    渠道调完之后再写就晚了（那时 `PROCESSING` 的单仍然没有渠道名）。
+    //    用 `mock.invocationCallOrder`（全局递增的调用序号）比较先后。
+    const recordOrder = execution.recordChannel.mock.invocationCallOrder[0];
+    const executeOrder = provider.execute.mock.invocationCallOrder[0];
+    expect(recordOrder).toBeLessThan(executeOrder);
+  });
+
+  it('⚠️ 记渠道名失败 → 照样打款（辅助动作不能拖垮主流程）', async () => {
+    // ⚠️ **DB 抖动时放弃打款 = 钱永远打不出去** ——
+    //    单子卡在 `PROCESSING`，兜底扫描只告警、绝不重试，商家永远收不到钱。
+    const warnSpy = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+
+    try {
+      const execution = fakeExecution(claim);
+      const provider = fakeProvider({ status: 'SUCCESS', amount: 8500 });
+      execution.recordChannel.mockRejectedValue(new Error('数据库抖动'));
+      const worker = new PayoutWorker(
+        execution as unknown as never,
+        fakePrisma() as unknown as never,
+        fakeQueues() as unknown as never,
+        new Map([['fake-payout', provider]]),
+      );
+
+      await worker.process({
+        name: 'execute',
+        data: { payoutId: 'payout-a' },
+      } as never);
+
+      // ⚠️ **钱必须打出去**
+      expect(provider.execute).toHaveBeenCalled();
+      expect(execution.markPaid).toHaveBeenCalled();
+      // ⚠️ **失败原因要进日志** —— 否则「渠道名没记上」这件事完全不可见
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('数据库抖动'),
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('⚠️ 渠道金额核对不通过 → markFailed（护栏 X3）', async () => {

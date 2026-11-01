@@ -20,6 +20,7 @@ import {
 import { withTimeout } from '../../common/util/with-timeout';
 import { clampPagination } from '../../common/http/pagination';
 import {
+  CHANNEL_LIST_PAGE_SIZE,
   FAKE_PAYOUT_UNAVAILABLE_MESSAGE,
   PAYOUT_PROVIDERS,
 } from '../../common/payment/payout.constants';
@@ -221,20 +222,16 @@ export class PayoutReconciliationService {
         to.getTime() + RECONCILIATION_EXPANDED_MARGIN_HOURS * 3600_000,
       ),
     };
-    const channelRecords = await provider.listPayouts({
-      from: expanded.from,
-      to: expanded.to,
-    });
+    const channelRecords = await this.fetchChannelRecords(
+      provider,
+      expanded.from,
+      expanded.to,
+    );
     // ⚠️ **渠道侧不承诺输出顺序** —— 假网关按 `referenceNo` 分组输出，
     //    真渠道更是分页/倒序/按状态分组都有 → 排序由比对引擎负责
     //    （引擎内部按 `paidAt` 升序排、`paidAt` 相同时按 `providerTxnId` 兜底）。
     //    ⚠️ **时间窗筛的是「发起打款时刻」** —— 假网关是同步的，两者等同；
     //    真渠道是异步的（发起与到账可能跨天）→ 真渠道接入时这个语义要重定。
-    if (channelRecords.length > RECONCILIATION_MAX_CHANNEL_RECORDS) {
-      throw new ConflictException(
-        `渠道返回了 ${channelRecords.length} 条流水，超过上限 ${RECONCILIATION_MAX_CHANNEL_RECORDS} 条，请缩小时间窗`,
-      );
-    }
 
     // ---- ② 查本地参与比对的单 ----
     const localPayouts = await this.loadLocalPayouts(from, to);
@@ -311,6 +308,78 @@ export class PayoutReconciliationService {
       diffCount: output.diffs.length,
       matchedCount: output.matchedCount,
     };
+  }
+
+  /**
+   * 拉渠道侧的流水（**循环翻页**，阶段 5m 技术债）。
+   *
+   * ⚠️ **必须翻页** —— 真渠道（银行 / 支付渠道）一次拉不动整个时间窗：
+   *    对账查询都有分页上限，一个月的流水动辄几万条。
+   *    结束条件是「本页不满 `pageSize`」—— 拿满一页说明可能还有下一页。
+   *    ⚠️ 这个结束条件**依赖 provider 真的按 `pageSize` 返回**（见
+   *    `PayoutProvider.listPayouts` 的契约注释）：某个渠道若自作主张把每页
+   *    压得更小（比如最多给 100 条而我们请求 500），这里会在第 1 页就
+   *    判定「到底了」→ **静默只拿到一小部分流水**，比对结果全错且不报错。
+   *
+   * ⚠️ **真渠道接入时要重算超时预算** —— `RECONCILIATION_TIMEOUT_MS` 是 30 秒，
+   *    而翻页是**串行**的（最多 21 页 × 500 条）。本地假网关是内存操作、
+   *    微秒级，30 秒绰绰有余；真实渠道每页 1～2 秒时，10000 条（20 页）
+   *    **必然超时**。接入真渠道时要把「超时上限」与「页数」一起算，
+   *    或者改成并发翻页。现在只有一个本地假网关，改了也无从验证。
+   *
+   * @returns 去重后的渠道流水
+   */
+  private async fetchChannelRecords(
+    provider: PayoutProvider,
+    from: Date,
+    to: Date,
+  ): Promise<ChannelPayoutRecord[]> {
+    /** 去重后的结果 */
+    const records: ChannelPayoutRecord[] = [];
+    /** 已见过的渠道交易号（只记非空的） */
+    const seenTxnIds = new Set<string>();
+    /** ⚠️ **收到的原始条数（含重复）** —— 上限守卫按它算 */
+    let receivedCount = 0;
+
+    for (let page = 1; ; page += 1) {
+      const rows = await provider.listPayouts({
+        from,
+        to,
+        page,
+        pageSize: CHANNEL_LIST_PAGE_SIZE,
+      });
+      receivedCount += rows.length;
+      for (const row of rows) {
+        // ⚠️ **按 `providerTxnId` 去重** —— 页码分页的固有缺陷：
+        //    翻页期间渠道侧数据变动会让**页边界漂移**，相邻两页可能出现同一条流水。
+        //    重复的流水进到比对引擎会被当成两笔 → 产出**假的差异项**，
+        //    甚至触发假的「自动纠正」（把真没打出去的单改成已付）。
+        // ⚠️ **空串不去重** —— 真渠道可能给空串，按空串去重会让不同的记录互相吞掉。
+        if (row.providerTxnId) {
+          if (seenTxnIds.has(row.providerTxnId)) {
+            continue;
+          }
+          seenTxnIds.add(row.providerTxnId);
+        }
+        records.push(row);
+      }
+      // ⚠️ **累计条数超上限就抛错** ——
+      //    ① 文案不能改：运营与文档都按这句话理解；
+      //    ② 它同时是**死循环的保险丝** —— 万一某个 provider 实现了分页却
+      //       实际忽略分页参数（每页都返回全量），累计条数会在第 2 页就超限
+      //       → 不会无限循环；
+      //    ③ 按**收到的原始条数**判（含重复），不是去重后的数量 ——
+      //       这个守卫的目的是防内存爆掉，要保守。
+      if (receivedCount > RECONCILIATION_MAX_CHANNEL_RECORDS) {
+        throw new ConflictException(
+          `渠道返回了 ${receivedCount} 条流水，超过上限 ${RECONCILIATION_MAX_CHANNEL_RECORDS} 条，请缩小时间窗`,
+        );
+      }
+      if (rows.length < CHANNEL_LIST_PAGE_SIZE) {
+        break;
+      }
+    }
+    return records;
   }
 
   /**
@@ -560,23 +629,43 @@ export class PayoutReconciliationService {
   /** 对账任务详情 + 差异列表 */
   async detail(id: string): Promise<unknown> {
     return tenantContext.run(platformScope(), async () => {
+      // ⚠️ **第一个查询只取任务本体** —— 差异项要单独查（见下）。
+      //    带 `include: { items: true }` 会把**这个任务的全部差异项**捞进内存，
+      //    一个任务能产生上万条 → 捞完再截断只是把内存峰值推迟到截断之前。
       const reconciliation = await this.prisma.payoutReconciliation.findFirst({
         where: { id },
-        include: { items: true },
       });
       if (!reconciliation) {
         throw new NotFoundException('对账任务不存在');
       }
-      // ⚠️ **差异项要截断** —— 一个对账任务最多能产生上万条差异
+      // ⚠️ **差异项要在查询层截断** —— 一个对账任务最多能产生上万条差异
       //    （渠道记录数上限就是 10000 条），一次性全吐给浏览器会卡死。
       //    → 截断并**明确告诉前端被截断了**（`itemsTruncated`），
       //    静默截断会让人以为「就这些差异」。
-      const items = reconciliation.items.slice(0, RECONCILIATION_MAX_ITEMS);
+      // ⚠️ **必须按 `reconciliationId` 限定** —— 这张表没有 `tenantId`、
+      //    不受租户作用域约束 → 不限定就是**全平台数据泄露**。
+      // ⚠️ **要排序，且必须是「双键」** —— 原来靠 `include` 拿到的是无序的。
+      //    但只按 `createdAt` 排**不够**：差异项是 `createMany` 批量插的，
+      //    `createdAt` 是 `@default(now())` → **同一批次的行可能是同一个毫秒**。
+      //    同毫秒内谁先谁后由执行计划决定（更新 / vacuum / 页分裂之后会变）
+      //    → `take` 截断后「显示哪 200 条」就飘了，前端看到的差异项会莫名换一批。
+      //    → 用 `id` 兜底做二级键，顺序才真的确定。
+      //    （同一先例见 `common/payment/payout-verification.service.ts` 的 `orderBy`）
+      const items = await this.prisma.payoutReconciliationItem.findMany({
+        where: { reconciliationId: id },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        take: RECONCILIATION_MAX_ITEMS,
+      });
+      // ⚠️ **总数要单独查** —— 截断后 `items.length` 已经不是真实条数，
+      //    而前端要靠 `itemsTotal` 知道「还有多少条没显示」。
+      const itemsTotal = await this.prisma.payoutReconciliationItem.count({
+        where: { reconciliationId: id },
+      });
       return {
         ...reconciliation,
         items,
-        itemsTruncated: reconciliation.items.length > items.length,
-        itemsTotal: reconciliation.items.length,
+        itemsTruncated: itemsTotal > items.length,
+        itemsTotal,
       };
     });
   }
@@ -625,20 +714,21 @@ export class PayoutReconciliationService {
     pendingInfo: number;
   }> {
     return tenantContext.run(platformScope(), async () => {
-      const items = await this.prisma.payoutReconciliationItem.findMany({
+      // ⚠️ **在数据库里聚合，不要把全部未处置差异拉进内存数** ——
+      //    差异表会越积越多（一个对账任务就能产生上万条）→ 全表扫会把内存打爆。
+      const grouped = await this.prisma.payoutReconciliationItem.groupBy({
+        by: ['severity'],
         where: { resolution: ReconciliationResolution.PENDING },
-        select: { severity: true },
+        _count: { _all: true },
       });
+      // ⚠️ **缺哪一档就是 0** —— `groupBy` 只返回**出现过**的取值，
+      //    直接把 `undefined` 放进返回值会让口径漂移（前端拿到 undefined）。
+      const countOf = (severity: ReconciliationSeverity): number =>
+        grouped.find((g) => g.severity === severity)?._count._all ?? 0;
       return {
-        pendingCritical: items.filter(
-          (i) => i.severity === ReconciliationSeverity.CRITICAL,
-        ).length,
-        pendingWarning: items.filter(
-          (i) => i.severity === ReconciliationSeverity.WARNING,
-        ).length,
-        pendingInfo: items.filter(
-          (i) => i.severity === ReconciliationSeverity.INFO,
-        ).length,
+        pendingCritical: countOf(ReconciliationSeverity.CRITICAL),
+        pendingWarning: countOf(ReconciliationSeverity.WARNING),
+        pendingInfo: countOf(ReconciliationSeverity.INFO),
       };
     });
   }

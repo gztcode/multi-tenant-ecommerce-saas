@@ -1,4 +1,4 @@
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, Logger } from '@nestjs/common';
 import { PayoutStatus, SettlementStatus } from '@prisma/client';
 import { PayoutExecutionService } from './payout-execution.service';
 import { PayoutCipherService } from './payout-cipher.service';
@@ -90,6 +90,13 @@ function defaultTopPayout() {
 function fakePrisma(
   options: {
     updateManyCount?: number;
+    /**
+     * **顶层** `payout.updateMany` 返回的 `count`（阶段 5m 技术债）。
+     *
+     * ⚠️ **与 `updateManyCount` 是两回事** —— 后者管的是**事务里**的
+     *    `tx.payout.updateMany`；`recordChannel` 不走事务，用的是顶层的。
+     */
+    topUpdateManyCount?: number;
     payout?: unknown;
     statementCount?: number;
     /** `scanStuck` 的两次 `findMany` 的返回（① PROCESSING、② APPROVED） */
@@ -182,10 +189,11 @@ function fakePrisma(
       };
       return fn(tx);
     }),
-    // ⚠️ **顶层 `payout`** —— 只有 `markStuckLogged` 与 `scanStuck` 用它（不走事务）
+    // ⚠️ **顶层 `payout`** —— 只有 `markStuckLogged`、`scanStuck`、
+    //    `recordChannel` 用它（不走事务）
     payout: {
       updateMany: jest.fn<Promise<{ count: number }>, [unknown]>(() =>
-        Promise.resolve({ count: 1 }),
+        Promise.resolve({ count: options.topUpdateManyCount ?? 1 }),
       ),
       // ⚠️ **按调用次序返回不同的结果** —— `scanStuck` 连着查两次
       //    （① PROCESSING、② APPROVED），配置驱动要能区分这两次
@@ -399,6 +407,49 @@ describe('PayoutExecutionService', () => {
         bankName: '测试银行',
         accountNo: plain,
       });
+    });
+  });
+
+  describe('recordChannel', () => {
+    it('只写 payoutChannel 一个字段，且带 PROCESSING 守卫', async () => {
+      const prisma = fakePrisma();
+      const service = makeService(prisma);
+
+      await service.recordChannel('payout-a', 'fake-payout');
+
+      const args = argsOf(prisma.payout.updateMany) as {
+        where: { id: string; status: string };
+        data: Record<string, unknown>;
+      };
+      expect(args.where.id).toBe('payout-a');
+      // ⚠️ **守卫必须在** —— 状态已被对账纠正 / 人工处置改过时不该误写
+      expect(args.where.status).toBe(PayoutStatus.PROCESSING);
+      // ⚠️ **只写一个字段** —— 不碰状态、不碰 attemptCount
+      expect(Object.keys(args.data)).toEqual(['payoutChannel']);
+      expect(args.data.payoutChannel).toBe('fake-payout');
+    });
+
+    it('⚠️ 条件更新影响 0 行 → 不抛异常，只记 warn', async () => {
+      // ⚠️ **不抛** —— 状态已被别人改过不是错误，只是「渠道名没记上」。
+      //    抛出去会让 worker 的 catch 分支把原因记成「数据库故障」，掩盖真相。
+      const warnSpy = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      try {
+        const prisma = fakePrisma({ topUpdateManyCount: 0 });
+        const service = makeService(prisma);
+
+        await expect(
+          service.recordChannel('payout-a', 'fake-payout'),
+        ).resolves.toBeUndefined();
+
+        // ⚠️ **日志不能丢** —— 状态已被改过时静默无写入会让问题查不出来
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining('payout-a'),
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
   });
 

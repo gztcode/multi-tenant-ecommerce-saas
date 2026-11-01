@@ -4,7 +4,14 @@ import { Test } from '@nestjs/testing';
 import { ValidationPipe } from '@nestjs/common';
 import cookieParser from 'cookie-parser';
 import type { Queue } from 'bullmq';
-import { PayoutStatus, ReconciliationDiffType } from '@prisma/client';
+import {
+  PayoutStatus,
+  ReconciliationDiffType,
+  ReconciliationResolution,
+  ReconciliationSeverity,
+  ReconciliationSource,
+  ReconciliationStatus,
+} from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.interceptor';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
@@ -87,6 +94,26 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
   /** 在平台作用域里执行一段逻辑（测试代码在 HTTP 请求之外，没有上下文） */
   function asPlatform<T>(fn: () => Promise<T>): Promise<T> {
     return tenantContext.run(platformScope(), async () => fn());
+  }
+
+  /**
+   * 造一批差异项（只填必填字段）。
+   *
+   * ⚠️ **差异类型随便填 `STATUS_MISMATCH`** —— 统计端点只按
+   *    `severity` 与 `resolution` 统计，类型不参与口径。
+   */
+  function makeDiffItems(
+    reconciliationId: string,
+    count: number,
+    severity: ReconciliationSeverity,
+    resolution: ReconciliationResolution,
+  ) {
+    return Array.from({ length: count }, () => ({
+      reconciliationId,
+      type: ReconciliationDiffType.STATUS_MISMATCH,
+      severity,
+      resolution,
+    }));
   }
 
   /** 平台超管登录（种子里已有这个账号） */
@@ -208,6 +235,62 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
     expect(Array.isArray(listBody.items)).toBe(true);
     expect(listBody.total).toBeGreaterThanOrEqual(0);
 
+    // ⚠️ **先清干净再数** —— e2e 文件共享同一个测试库，
+    //    前面用例留下的 PENDING 差异会混进计数 → 精确断言必须从已知状态开始。
+    // ⚠️ **在文件中间清库是安全的**：本文件之后还要读对账数据的用例
+    //    （「平台端点可达」）都**自己造数据**、不依赖前序用例留下的行
+    //    （见它 `beforeAll` 之后那句注释）。
+    // ⚠️ **必须用共享的 `resetPayoutData` 而不是就地手写 deleteMany** ——
+    //    e2e 的 `globalSetup` 每轮只清一次库，手写清理迟早会漏掉某张表
+    //    （以前就出现过「六类差异变七类」），共享 helper 改一处全对一处。
+    await resetPayoutData(prisma);
+
+    // ⚠️ **造出已知的差异分布** —— 统计端点要的是**精确数字**：
+    //    「是 number」那种断言没有牙齿，统计口径写错了照样过。
+    const reconciliation = await asPlatform(() =>
+      prisma.payoutReconciliation.create({
+        data: {
+          channel: 'fake-payout',
+          source: ReconciliationSource.API,
+          windowFrom: new Date(Date.now() - 24 * 60 * 60 * 1000),
+          windowTo: new Date(),
+          status: ReconciliationStatus.COMPLETED,
+          triggeredBy: 'admin-1',
+        },
+      }),
+    );
+    await asPlatform(() =>
+      prisma.payoutReconciliationItem.createMany({
+        data: [
+          ...makeDiffItems(
+            reconciliation.id,
+            2,
+            ReconciliationSeverity.CRITICAL,
+            ReconciliationResolution.PENDING,
+          ),
+          ...makeDiffItems(
+            reconciliation.id,
+            3,
+            ReconciliationSeverity.WARNING,
+            ReconciliationResolution.PENDING,
+          ),
+          ...makeDiffItems(
+            reconciliation.id,
+            1,
+            ReconciliationSeverity.INFO,
+            ReconciliationResolution.PENDING,
+          ),
+          // ⚠️ **已处置的不该被算进去** —— 这条是 `RESOLVED`
+          ...makeDiffItems(
+            reconciliation.id,
+            1,
+            ReconciliationSeverity.CRITICAL,
+            ReconciliationResolution.RESOLVED,
+          ),
+        ],
+      }),
+    );
+
     // ⚠️ **统计端点必须排在 `:id` 之前** —— 两者都是 3 段路径
     const summary = await http(app)
       .get('/api/v1/platform/payout-reconciliations/summary')
@@ -218,9 +301,11 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
       pendingWarning: number;
       pendingInfo: number;
     };
-    expect(typeof summaryBody.pendingCritical).toBe('number');
-    expect(typeof summaryBody.pendingWarning).toBe('number');
-    expect(typeof summaryBody.pendingInfo).toBe('number');
+    expect(summaryBody).toEqual({
+      pendingCritical: 2,
+      pendingWarning: 3,
+      pendingInfo: 1,
+    });
   });
 
   /** 其余四个端点也要真的打一遍 —— 路径改过，别再被遮蔽了 */

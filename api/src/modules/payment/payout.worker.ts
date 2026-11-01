@@ -179,6 +179,21 @@ export class PayoutWorker extends WorkerHost {
       return;
     }
 
+    // ⚠️ **先记下渠道名，再调渠道** —— 见 `PayoutExecutionService.recordChannel`
+    //    的说明：卡在 `PROCESSING` 的单必须能定位到渠道。
+    //
+    // ⚠️ **catch 留在 worker 侧** —— 「落库失败要不要阻断打款」是**调用方**
+    //    的决策。DB 抖动时放弃打款 = 钱永远打不出去（兜底扫描只告警、
+    //    绝不重试）→ 商家永远收不到钱。→ 记 warn 后继续打款。
+    try {
+      await this.execution.recordChannel(payoutId, provider.channel);
+    } catch (error) {
+      this.logger.warn(
+        `出款 ${payoutId} 记录出款渠道失败（渠道 ${provider.channel}）：` +
+          `${error instanceof Error ? error.message : String(error)} —— 继续打款`,
+      );
+    }
+
     let result: PayoutExecuteResult;
     try {
       result = await provider.execute({

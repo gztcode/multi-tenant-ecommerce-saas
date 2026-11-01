@@ -7,7 +7,10 @@ import {
   PayoutProvider,
   PayoutQuery,
 } from './payout-provider.interface';
-import { FAKE_PAYOUT_UNAVAILABLE_MESSAGE } from './payout.constants';
+import {
+  CHANNEL_LIST_PAGE_SIZE,
+  FAKE_PAYOUT_UNAVAILABLE_MESSAGE,
+} from './payout.constants';
 
 /** 假出款网关的渠道名 */
 export const FAKE_PAYOUT_CHANNEL = 'fake-payout';
@@ -245,8 +248,17 @@ export class FakePayoutProvider implements PayoutProvider {
    * ⚠️ **时间窗是左闭右开** `[from, to)`。
    * ⚠️ **失败的那次尝试也在结果里** —— 否则「第一次失败第二次成功」
    *    在渠道侧只剩一条 SUCCESS，对账就测不出重试场景。
+   *
+   * ⚠️ **分页**（阶段 5m 技术债）：`page` / `pageSize` 都不传 = 全量（旧行为）。
+   *    传了就按页切片，**切片必须在时间窗筛选之后** —— 否则页边界
+   *    和筛选条件各算各的，翻页会漏记录 / 重记录。
    */
-  listPayouts(query: { from: Date; to: Date }): Promise<ChannelPayoutRecord[]> {
+  listPayouts(query: {
+    from: Date;
+    to: Date;
+    page?: number;
+    pageSize?: number;
+  }): Promise<ChannelPayoutRecord[]> {
     if (!isFakePayoutEnabled()) {
       // ⚠️ **抛错而不是返回空数组** —— 返回空数组会被当成
       //    「渠道说这一笔没有」→ 所有本地已付单全变成 E 类。
@@ -272,7 +284,33 @@ export class FakePayoutProvider implements PayoutProvider {
         }
       }
     }
-    return Promise.resolve(records);
+    // ⚠️ **不分页 = 原样全量返回** —— 旧调用方（核实服务、测试里的 mock）
+    //    不传这两个参数，行为不能变。
+    if (query.page === undefined && query.pageSize === undefined) {
+      return Promise.resolve(records);
+    }
+    // ⚠️ **`page` 小于 1 当作 1** —— `slice` 的负数下标是从末尾数的，
+    //    `page = 0` 会算出负的 start → 静默返回空数组 → 调用方以为「没流水了」。
+    //
+    // ⚠️ **非有限数必须显式回落** —— `Math.max(1, NaN)` 的结果**仍然是 `NaN`**
+    //    （`Math.max` 的规则：任一参数是 `NaN`，结果就是 `NaN`）
+    //    → `start = NaN` → `slice(NaN, NaN)` = `[]`，与「page = 0」同款的
+    //    静默空数组：调用方会把空数组当成「渠道说这个时间窗没有流水」
+    //    → 所有本地已付单全变成 E 类差异（假告警）。
+    //    同文件的 `toFiniteCount` 就是同一个教训（`Math.floor('abc')` → NaN）。
+    //    → `page` 非有限数回落 1，`pageSize` 非有限数回落到默认值。
+    // ⚠️ **先判 `undefined` 再用 `Number.isFinite`** —— `Number.isFinite` 不是
+    //    类型谓词，直接用它收窄不了 `number | undefined`（要么加断言，要么这样写）。
+    const page =
+      query.page !== undefined && Number.isFinite(query.page)
+        ? Math.max(1, query.page)
+        : 1;
+    const pageSize =
+      query.pageSize !== undefined && Number.isFinite(query.pageSize)
+        ? Math.max(1, query.pageSize)
+        : CHANNEL_LIST_PAGE_SIZE;
+    const start = (page - 1) * pageSize;
+    return Promise.resolve(records.slice(start, start + pageSize));
   }
 
   /** 记下一次打款尝试（两个索引都建） */

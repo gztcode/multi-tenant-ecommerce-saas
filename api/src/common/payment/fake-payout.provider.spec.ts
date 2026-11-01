@@ -4,6 +4,7 @@ import {
   FakePayoutProvider,
   isFakePayoutEnabled,
 } from './fake-payout.provider';
+import { CHANNEL_LIST_PAGE_SIZE } from './payout.constants';
 
 /**
  * 假出款网关的单元测试。
@@ -275,6 +276,173 @@ describe('FakePayoutProvider', () => {
       to: executedAt,
     });
     expect(includeEnd).toHaveLength(0);
+  });
+
+  /**
+   * 造 N 笔不同业务单号的流水（分页用例用）。
+   *
+   * ⚠️ **必须用不同的 `referenceNo`** —— 假网关按 `referenceNo` 分组存流水，
+   *    同一单号的多条记录会落在同一个分组里，顺序断言就不稳。
+   */
+  const seedPayouts = async (
+    provider: FakePayoutProvider,
+    count: number,
+  ): Promise<void> => {
+    for (let i = 0; i < count; i++) {
+      await provider.execute({
+        ...input,
+        referenceId: `payout-${i}`,
+        referenceNo: `PAY20250801000000000${i}`,
+        amount: 8500 + i,
+      });
+    }
+  };
+
+  /** 覆盖分页用的时间窗（宽松到必然包含所有记录） */
+  const window = {
+    from: new Date(Date.now() - 60_000),
+    to: new Date(Date.now() + 60_000),
+  };
+
+  it('listPayouts：不传 page / pageSize → 返回窗口内全部记录（旧行为不变）', async () => {
+    const provider = new FakePayoutProvider();
+    await seedPayouts(provider, 3);
+
+    const records = await provider.listPayouts(window);
+
+    // ⚠️ **回归保护** —— 旧调用方（核实服务、测试里的 mock）不传这两个参数，
+    //    行为不能被分页改坏
+    expect(records).toHaveLength(3);
+  });
+
+  it('listPayouts：page=1, pageSize=2 → 返回前 2 条', async () => {
+    const provider = new FakePayoutProvider();
+    await seedPayouts(provider, 3);
+
+    const records = await provider.listPayouts({
+      ...window,
+      page: 1,
+      pageSize: 2,
+    });
+
+    expect(records).toHaveLength(2);
+    expect(records.map((r) => r.referenceNo)).toEqual([
+      'PAY202508010000000000',
+      'PAY202508010000000001',
+    ]);
+  });
+
+  it('listPayouts：page=2, pageSize=2 → 返回第 3、4 条（与第 1 页拼起来等于全量）', async () => {
+    const provider = new FakePayoutProvider();
+    await seedPayouts(provider, 4);
+
+    const firstPage = await provider.listPayouts({
+      ...window,
+      page: 1,
+      pageSize: 2,
+    });
+    const secondPage = await provider.listPayouts({
+      ...window,
+      page: 2,
+      pageSize: 2,
+    });
+    const all = await provider.listPayouts(window);
+
+    expect(secondPage.map((r) => r.referenceNo)).toEqual([
+      'PAY202508010000000002',
+      'PAY202508010000000003',
+    ]);
+    // ⚠️ **翻页不能漏记录、不能重记录，顺序也不能乱** ——
+    //    这是调用方「循环翻页直到翻空」能拿到全量的前提
+    expect([...firstPage, ...secondPage]).toEqual(all);
+  });
+
+  it('listPayouts：页码超出范围 → 返回空数组（调用方据此停止翻页）', async () => {
+    const provider = new FakePayoutProvider();
+    await seedPayouts(provider, 3);
+
+    const records = await provider.listPayouts({
+      ...window,
+      page: 3,
+      pageSize: 2,
+    });
+
+    // ⚠️ **空数组是翻页的结束信号** —— 不能抛错，也不能返回最后一页
+    expect(records).toEqual([]);
+  });
+
+  it('listPayouts：page=0 → 等价于 page=1（不是空数组）', async () => {
+    const provider = new FakePayoutProvider();
+    await seedPayouts(provider, 3);
+
+    const records = await provider.listPayouts({
+      ...window,
+      page: 0,
+      pageSize: 2,
+    });
+
+    // ⚠️ **防 `slice` 负下标** —— `page = 0` 会算出负的 start，
+    //    `slice` 从末尾数 → 静默返回空数组 → 调用方以为「没流水了」
+    expect(records).toHaveLength(2);
+    expect(records.map((r) => r.referenceNo)).toEqual([
+      'PAY202508010000000000',
+      'PAY202508010000000001',
+    ]);
+  });
+
+  it('listPayouts：page=NaN → 等价于 page=1（不是空数组）', async () => {
+    const provider = new FakePayoutProvider();
+    await seedPayouts(provider, 3);
+
+    const records = await provider.listPayouts({
+      ...window,
+      page: Number.NaN,
+      pageSize: 2,
+    });
+
+    // ⚠️ **`Math.max(1, NaN)` 的结果仍然是 `NaN`** —— 不能指望它做下界保护。
+    //    `start = NaN` → `slice(NaN, NaN)` 静默返回空数组 → 调用方以为
+    //    「渠道说这个时间窗没有流水」→ 所有本地已付单全变成 E 类差异（假告警）。
+    expect(records).toHaveLength(2);
+    expect(records.map((r) => r.referenceNo)).toEqual([
+      'PAY202508010000000000',
+      'PAY202508010000000001',
+    ]);
+  });
+
+  it('listPayouts：pageSize=NaN → 回落到默认 500（窗口内不足则一次性返回全部）', async () => {
+    const provider = new FakePayoutProvider();
+    await seedPayouts(provider, 3);
+
+    const records = await provider.listPayouts({
+      ...window,
+      page: 1,
+      pageSize: Number.NaN,
+    });
+
+    expect(records).toHaveLength(3);
+  });
+
+  it('listPayouts：只传 page 不传 pageSize → 用默认 pageSize（500），不足则一次性返回全部', async () => {
+    const provider = new FakePayoutProvider();
+    await seedPayouts(provider, 3);
+
+    const records = await provider.listPayouts({ ...window, page: 1 });
+
+    expect(records).toHaveLength(3);
+    expect(CHANNEL_LIST_PAGE_SIZE).toBe(500);
+  });
+
+  it('listPayouts：只传 pageSize 不传 page → 等价于 page=1，返回第一页', async () => {
+    const provider = new FakePayoutProvider();
+    await seedPayouts(provider, 3);
+
+    const records = await provider.listPayouts({ ...window, pageSize: 2 });
+
+    expect(records.map((r) => r.referenceNo)).toEqual([
+      'PAY202508010000000000',
+      'PAY202508010000000001',
+    ]);
   });
 
   it('listPayouts：网关未启用 → 抛错（不是返回空数组）', async () => {

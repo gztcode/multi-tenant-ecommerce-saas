@@ -207,6 +207,51 @@ export class PayoutExecutionService {
   }
 
   /**
+   * 记录**本次实际调用的出款渠道名**到 `payouts.payoutChannel`。
+   *
+   * ⚠️ **为什么必须在「调渠道之前」写** —— 原来 `payoutChannel` 只有
+   *    `markPaid` 才写 → 一张卡在 `PROCESSING` 的单渠道名是 `null`：
+   *    ① `payout-reconciliation-resolver` 拿不到值，只能硬回落成 `'fake-payout'`；
+   *    ② 将来接第二家渠道时，`PROCESSING` 的单**定位不到渠道** ——
+   *    解卡核实闸（`pickProvider`）与打款 worker（`firstProvider`）都是
+   *    「取第一个注册的渠道」，将来要改成「按 `payouts.payoutChannel` 取」，
+   *    前提就是这里先把渠道名写上。
+   *
+   * ⚠️ **只写 `payoutChannel` 一个字段** —— 状态机与重试预算由本服务独家管，
+   *    越权写状态会绕开条件更新。`where` 带 `status: PROCESSING`：
+   *    状态已被别人改过（对账纠正 / 人工处置）时不会误写。
+   *
+   * ⚠️ **落库失败不阻断打款是调用方的决策** —— 打款是主流程，
+   *    「记一下渠道名」是辅助动作。DB 抖动时若因此放弃打款，钱就
+   *    **永远打不出去**（单子卡在 `PROCESSING`，兜底扫描只告警、绝不重试）
+   *    → 商家永远收不到钱，且没有补偿路径。反过来，渠道名没记上的后果
+   *    只是「这张单的对账口径退化成人工判断」，远小于「钱没打出去」。
+   *    → 这里**抛出去**，由 worker 捕获后记 warn 日志再继续打款。
+   *
+   * ⚠️ **不抛异常的两件事**：DB 报错向上抛（调用方决定要不要阻断），
+   *    但 `count === 0`（状态已被改过）**不抛** —— 那不是错误，
+   *    只是「这张单的渠道名没记上」，只记 warn 日志。
+   *
+   * @param payoutId 出款单 id
+   * @param channel 本次实际调用的渠道名
+   */
+  async recordChannel(payoutId: string, channel: string): Promise<void> {
+    await tenantContext.run(platformScope(), async () => {
+      const affected = await this.prisma.payout.updateMany({
+        where: { id: payoutId, status: PayoutStatus.PROCESSING },
+        data: { payoutChannel: channel },
+      });
+      if (affected.count === 0) {
+        // ⚠️ **要补日志** —— 状态已经被别人改过（对账纠正 / 人工处置），
+        //    这张单的渠道名没记上。不留痕的话事后无从判断它到底走的哪家渠道。
+        this.logger.warn(
+          `出款 ${payoutId} 记录出款渠道未命中（状态已变），渠道 ${channel}`,
+        );
+      }
+    });
+  }
+
+  /**
    * 打款成功：`PROCESSING → PAID`，并把引用的结算单一并转 `PAID`。
    *
    * ⚠️ **结算单联动在同一个事务里**（设计 §6.5）：
