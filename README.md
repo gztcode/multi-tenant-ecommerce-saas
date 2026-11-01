@@ -2,36 +2,34 @@
 
 前后端完全分离的多租户电商底座。一个实例服务多个商家：每个商家有自己的店铺、商品、订单与客户。
 
-**当前进度：阶段 5c「刷新令牌宽限期（RFC 9700）」已完成并验收通过。**
-阶段 5c 修的是**登录被踢下线**的老毛病：以前刷新令牌是**一次性**的，
-同一枚旧令牌被提交第二次就会被判成「重放」→ 吊销用户**所有设备**的登录，
-于是商家只要**同时开两个后台标签页**就会被踢出登录。
-现在后端给轮换后的旧令牌一个**宽限期**（60 秒）：这枚令牌在宽限期内被重复提交，
-后端返回**同一枚**新令牌，**不吊销令牌族**。
+**当前进度：阶段 5m「渠道对账」已完成并验收通过。**
 
-新增能力：后端的宽限期判定（`handleRevokedToken`）+ 宽限密文的**定时清理**；
-商家侧与前台侧把 `jwt` 回调的**决策逻辑**抽成可测模块
-（`src/lib/jwt-callback.ts`）并补上了单测 —— 护栏不再零覆盖。
-客户端超时后重试、两个标签页串行抵达、跨副本各刷一次 —— 这些情况
-**不再把用户踢下线**。宽限期**不替代**前端自己的去重与「送不回 cookie 就不刷」的判断，
-两者互补。
+从阶段 5c 到 5m，推进的主线是**把「钱」这一层补完整**：
+
+| 阶段 | 内容 |
+|------|------|
+| 5c | 刷新令牌宽限期（RFC 9700）—— 修「同时开两个后台标签页被踢下线」 |
+| 5d | 主题与错误处理收口 —— 商家改主题前台真实生效；前端错误一律中文兜底；Redis 挂死有降级 |
+| 5e | 抽佣流水明细 —— 超管能看到「哪个商家贡献了多少」 |
+| 5f | 支付可靠性 —— webhook 投递失败可补偿；两个兜底扫描 |
+| 5g | 结算单 —— 商家 × 自然月的应收单据 |
+| 5h-1 / 5h-2 | 出款申请与真正打款 —— 申请 → 审批 → 打款 → 失败重试 → 卡死兜底 |
+| 5i | 账目口径收口 —— 平台报表切到流水表；商家侧对账单 |
+| 5j | 资金安全与账务闭环 —— 收款账户改密文存储；「缺笔」两端可见 |
+| 5k | 资金链路收尾 —— 解密失败落 `FAILED` + 启动自检 |
+| 5l | 出款运维兜底 —— 人工重试 / 解卡重打 + 留痕；两端列表分页 |
+| 5m | 渠道对账 —— 六类差异 + A 类自动纠正 + CSV 账单导入 |
+
+最新的 5m 补的是**「钱到底打没打出去」这件事没人能独立回答**的缺口：
+渠道账单与本地出款单两套账，各说各话。现在有一套**纯函数比对引擎**（`payout-reconcile.engine.ts`）
+把渠道记录与本地单据对齐，分出 A–F 六类差异（渠道说已打本地还卡着 / 本地记失败其实打了 /
+金额不符 / 渠道有本地没有 / 渠道没有本地却已付 / 状态不符），A 类**自动纠正**，
+其余走人工四道闸；真渠道没有批量查单接口时，可以**导入 CSV 账单**完成对账。
 
 设计文档见
-[`docs/superpowers/specs/2026-10-27-plan-05c-auth-grace-period-design.md`](docs/superpowers/specs/2026-10-27-plan-05c-auth-grace-period-design.md)；
-阶段 5c 的验收记录见
-[`docs/superpowers/plans/2026-10-27-plan-05c-acceptance.md`](docs/superpowers/plans/2026-10-27-plan-05c-acceptance.md)；
-阶段 5b 的验收记录见
-[`docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md`](docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md)；
-阶段 5a 的验收记录见
-[`docs/superpowers/plans/2026-10-25-plan-05a-acceptance.md`](docs/superpowers/plans/2026-10-25-plan-05a-acceptance.md)；
-阶段 4 的验收记录见
-[`docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md`](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md)；
-阶段 3 的验收记录见
-[`docs/superpowers/plans/2026-10-24-plan-03-acceptance.md`](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md)；
-阶段 2b / 2a / 1 的见
-[`2026-10-22-plan-02b-acceptance.md`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md) /
-[`2026-10-22-plan-02a-acceptance.md`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md) /
-[`2026-10-21-plan-01-acceptance.md`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md)。
+[`docs/superpowers/specs/2026-10-31-plan-05m-payout-reconciliation-design.md`](docs/superpowers/specs/2026-10-31-plan-05m-payout-reconciliation-design.md)；
+各阶段的验收记录见 [`docs/superpowers/plans/`](docs/superpowers/plans/)——
+**验收记录里有「实施期偏离计划」的表格**，记着当初计划里的真缺陷与踩过的坑，改代码前值得先翻。
 
 ---
 
@@ -93,8 +91,8 @@ cd platform-admin && npm install && cp .env.example .env && npm run dev   # :300
 | 服务 | 宿主机端口 | 容器内端口 |
 |------|-----------|-----------|
 | PostgreSQL | **15432** | 5432 |
-| Redis（计划 3） | 16380 | 6379 |
-| MinIO（计划 2） | 19000 | 9000 |
+| Redis | 16380 | 6379 |
+| MinIO | 19000 | 9000 |
 
 ### 示例账号（seed 造的）
 
@@ -107,17 +105,22 @@ cd platform-admin && npm install && cp .env.example .env && npm run dev   # :300
 > 邮箱在 seed 写入前会统一小写化——登录路径把输入小写化后**精确匹配**查询，
 > 而唯一索引是 `UNIQUE (lower(email))`，两边不一致会登不进去（阶段 3 手测踩到过）。
 
-### 本地跑假支付网关
+### 本地跑假支付 / 假出款网关
 
-假网关的支付页（`/api/v1/pay/fake/:paymentId`）**只在非生产环境下存在**：
-`NODE_ENV=production` 且 `FAKE_PAYMENT_ENABLED=true` 时进程**硬失败**——
-假网关的支付页无需登录就能把订单付掉。
+两个假网关都**只在非生产环境下存在**，且**默认关闭**——它们是**安全边界**，不是便利开关：
+
+- **假支付网关**的支付页（`/api/v1/pay/fake/:paymentId`）**无需登录**就能把订单付掉。
+- **假出款网关**（阶段 5h-2）会模拟「打款失败」——不打开它，被审批的出款单会一直失败。
 
 ```bash
 cd api && FAKE_PAYMENT_ENABLED=true \
   FAKE_PAYMENT_SECRET=local-fake-payment-secret-at-least-16-chars \
+  FAKE_PAYOUT_ENABLED=true \
   npm run start:dev
 ```
+
+`NODE_ENV=production` 且任一开关为 `true` 时，进程**硬失败**（`assert-secure-config.ts`）。
+两个开关**相互独立**，不要合并成一个。
 
 ---
 
@@ -125,15 +128,15 @@ cd api && FAKE_PAYMENT_ENABLED=true \
 
 ```bash
 cd api
-npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数等，160 条）
-npm run test:e2e      # 端到端（481 条，27 个套件）
+npm test              # 单元测试（隔离机制 / 状态机转移表 / 账目纯函数等，628 条 / 32 个套件）
+npm run test:e2e      # 端到端（646 条 / 39 个套件）
 npm run test:cov:e2e  # 项目真实覆盖率
 ```
 
 > ✅ **跑 e2e 不需要停 api 容器**（阶段 5c 实测更正）。队列前缀隔离
 > （`BULLMQ_PREFIX=bull-e2e`）与每轮清库早已实现，**容器 api 全程在跑**的情况下
-> 连跑 3 轮 e2e 均 481/481 全绿。若仍遇到**随机的假失败**，
-> 再 `docker compose stop api` 排除。
+> 连跑 3 轮 e2e 均全绿（阶段 5c 实测）；阶段 5m 验收时 646/646 全绿。
+> 若仍遇到**随机的假失败**，再 `docker compose stop api` 排除。
 > 历史背景见
 > [阶段 3 验收记录 §一](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md)。
 
@@ -141,23 +144,20 @@ npm run test:cov:e2e  # 项目真实覆盖率
 **三个前端都有单元测试**（Vitest）：
 
 ```bash
-cd merchant-admin  && npm test   # 200 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费白名单 + 令牌刷新 + jwt 回调的决策逻辑
-cd storefront     && npm test   # 184 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）+ jwt 回调的决策逻辑
-cd platform-admin && npm test   # 181 条：计费中转路由的白名单 + 三个页面的页面级测试 + 套餐表单的组件测试
+cd storefront     && npm test   # 209 条 / 24 个文件：中转路由与纯函数的白名单 + 组件测试（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询 / 结算页）
+cd merchant-admin && npm test   # 406 条 / 27 个文件：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费与出款白名单 + 令牌刷新 + jwt 回调的决策逻辑 + 组件测试
+cd platform-admin && npm test   # 395 条 / 16 个文件：计费中转路由的白名单 + 页面级测试 + 套餐表单的组件测试
 ```
 
-> ⚠️ **组件测试的基建在 `storefront` 与 `platform-admin` 上**（`vitest.config.ts` + `test/setup.ts`）。
-> `merchant-admin` 还没有 —— 这直接导致 `merchant-admin/src/auth.ts` 的
-> `jwt` 回调**零自动化覆盖**（详见阶段 4 验收记录 §四）。
->
-> ✅ **阶段 5c 已把「零覆盖」这个洞补上了**（但不等于补上了组件测试基建）：
-> `jwt` 回调的**决策逻辑**被抽成纯模块 `src/lib/jwt-callback.ts`
-> （两个前端各一份，逐行一致），并在 **node 环境**下测了 9 条 ——
-> 「accessToken 过期时刷新」「送不回去 cookie 时不刷新」
-> 「刷新失败时作废会话 / 保留旧令牌」都有了断言。
-> ⚠️ **`merchant-admin` 的 jsdom 组件测试基建仍缺**，属阶段 5d 的活。
+> ✅ **三个前端都具备组件测试基建**（`vitest.config.ts` + `test/setup.ts`，
+> 组件测试在自己的文件里用 `// @vitest-environment jsdom` 逐文件切换）。
+> 阶段 5c 还把 `jwt` 回调的**决策逻辑**抽成纯模块 `src/lib/jwt-callback.ts`
+> （`storefront` 与 `merchant-admin` 各一份，逐行一致），并测了 9 条 ——
+> 「accessToken 过期时刷新」「送不回去 cookie 时不刷新」「刷新失败时作废会话 / 保留旧令牌」。
 
 e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物理隔离。
+
+> ⚠️ **e2e 必须串行跑**（`--runInBand`）——共享同一个测试库与 Redis 队列，并行会互相干扰。
 
 ### 数据库迁移
 
@@ -176,6 +176,9 @@ cd api && npm run prisma:deploy
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 ```
 
+> ⚠️ **`prisma migrate dev` 目前不可用**——有 3 条历史迁移的 checksum 与本机对不上。
+> 新增迁移请照旧**手写 SQL**（`api/prisma/migrations/<时间戳>_<名字>/migration.sql`）。
+
 ---
 
 ## 架构要点
@@ -188,21 +191,49 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 - **子域名是路由标识，不是凭证**：`X-Tenant-Subdomain` 由网关注入，客户端设的值不可信；
   真正的访问控制来自认证与 RBAC。
 - **前端不直连后端**：后端没开 CORS（设计上前端与 API 同源，由 Nginx 反代），
-  写操作走各自的同源中转路由。
+  写操作走各自的同源中转路由（`src/app/api/**/route.ts`），
+  由服务端路由拿 session 里的 accessToken 去调后端。
 - **订单状态流转一律用条件更新**：把 `from` 状态放进 `updateMany` 的 `where`，
   靠受影响行数判定并发赢家（阶段 3 的护栏 10）。改状态与动库存**必须在同一个事务里**——
   分成两个事务的话，释放失败时订单已是终态而库存没还回去，那批库存就永久卡在预占里。
 - **库存三种流水**：下单 `RESERVE`（扣库存）、取消/超时 `RELEASE`（还库存）、
   支付成功 `DEDUCT`（**不动库存**，只是把预占转成售出）。释放与扣减都要校验
   「该订单在该 SKU 上尚未被冲抵的预占量」，否则能凭空造货。
+- **金额全程整数分**，费率用万分比。计钱逻辑抽成**纯函数**
+  （`billing/ledger.ts`、`billing/commission.ts`、`billing/settlement.ts`），
+  让「计钱的每一条分支都能被完整断言」。
+- **资金链路**：支付成功 → 抽佣流水 + 货款流水 → 结算单（商家 × UTC 自然月）→
+  商家申请出款 → 平台审批 → 打款 → 渠道对账。
+  结算单的金额**只从流水算**，不从订单重新聚合；确认之后冻结。
+- **打款的钱是密文**：收款账户与出款单快照用 AES-256-GCM 加密存储，
+  密钥来自 `PAYOUT_ACCOUNT_ENCRYPTION_KEY`；启动时自检，密钥不对**进程直接起不来**。
 
 ---
 
 ## 文档
 
-- 设计文档：[`docs/superpowers/specs/2026-10-21-multi-tenant-ecommerce-saas-design.md`](docs/superpowers/specs/2026-10-21-multi-tenant-ecommerce-saas-design.md)
-- 实施计划：[`docs/superpowers/plans/`](docs/superpowers/plans/)
-- 验收记录：[`阶段 1`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md) / [`阶段 2a`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md) / [`阶段 2b`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md) / [`阶段 3`](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md) / [`阶段 4`](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md) / [`阶段 5a`](docs/superpowers/plans/2026-10-25-plan-05a-acceptance.md) / [`阶段 5b`](docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md) / [`阶段 5c`](docs/superpowers/plans/2026-10-27-plan-05c-acceptance.md)
+- 设计文档：[`docs/superpowers/specs/`](docs/superpowers/specs/)
+- 实施计划与验收记录：[`docs/superpowers/plans/`](docs/superpowers/plans/)
+- 各阶段的验收记录：
+  [`阶段 1`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md) /
+  [`阶段 2a`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md) /
+  [`阶段 2b`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md) /
+  [`阶段 3`](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md) /
+  [`阶段 4`](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md) /
+  [`阶段 5a`](docs/superpowers/plans/2026-10-25-plan-05a-acceptance.md) /
+  [`阶段 5b`](docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md) /
+  [`阶段 5c`](docs/superpowers/plans/2026-10-27-plan-05c-acceptance.md) /
+  [`阶段 5d`](docs/superpowers/plans/2026-10-27-plan-05d-acceptance.md) /
+  [`阶段 5e`](docs/superpowers/plans/2026-10-27-plan-05e-acceptance.md) /
+  [`阶段 5f`](docs/superpowers/plans/2026-10-27-plan-05f-acceptance.md) /
+  [`阶段 5g`](docs/superpowers/plans/2026-10-28-plan-05g-acceptance.md) /
+  [`阶段 5h-1`](docs/superpowers/plans/2026-10-29-plan-05h-payout-ledger-acceptance.md) /
+  [`阶段 5h-2`](docs/superpowers/plans/2026-10-29-plan-05h2-payout-execution-acceptance.md) /
+  [`阶段 5i`](docs/superpowers/plans/2026-10-30-plan-05i-ledger-reconciliation-acceptance.md) /
+  [`阶段 5j`](docs/superpowers/plans/2026-10-30-plan-05j-fund-security-ledger-closure-acceptance.md) /
+  [`阶段 5k`](docs/superpowers/plans/2026-10-30-plan-05k-fund-closure-acceptance.md) /
+  [`阶段 5l`](docs/superpowers/plans/2026-10-30-plan-05l-payout-ops-acceptance.md) /
+  [`阶段 5m`](docs/superpowers/plans/2026-10-31-plan-05m-payout-reconciliation-acceptance.md)
 
 ---
 
@@ -215,7 +246,7 @@ git push -u origin <分支名>
 ```
 
 **若 `git push` 超时失败**（某些网络环境下 `github.com:443` 不可达，但 `api.github.com` 可达），
-改用仓库里��� API 推送脚本：
+改用仓库里的 API 推送脚本：
 
 ```bash
 export GH_TOKEN=$(gh auth token)
@@ -237,73 +268,90 @@ node tools/push-via-api.mjs <本地分支> <远端分支>
 | 计划 5a | 营销：优惠券与满减活动 —— **已完成并验收通过**（有条件通过） |
 | 计划 5b | 平台计费：SaaS 订阅、套餐、额度、抽佣、报表 —— **已完成并验收通过**（有条件通过） |
 | 计划 5c | 刷新令牌宽限期（RFC 9700）—— **已完成并验收通过** |
+| 计划 5d | 主题统一 / 错误收口 / Redis 挂死 —— **已完成并验收通过** |
+| 计划 5e | 抽佣流水明细 —— **已完成并验收通过** |
+| 计划 5f | 支付可靠性 —— **已完成并验收通过**（有条件通过：浏览器手测未做） |
+| 计划 5g | 结算单 —— **已完成并验收通过** |
+| 计划 5h-1 | 出款申请与审批 —— **已完成并验收通过** |
+| 计划 5h-2 | 真正打款与补差调账 —— **已完成并验收通过** |
+| 计划 5i | 账目口径收口（报表切流水表 + 商家侧对账单）—— **已完成并验收通过** |
+| 计划 5j | 资金安全与账务闭环（账户改密文存储 + 缺笔可见性）—— **已完成并验收通过** |
+| 计划 5k | 资金链路收尾（解密失败落 FAILED + 商家端账户可见性 + 启动自检）—— **已完成并验收通过** |
+| 计划 5l | 出款运维兜底（人工重试 / 解卡带留痕 + 失败口径分流 + 列表分页）—— **已完成并验收通过** |
+| 计划 5m | 渠道对账（六类差异 + A 类自动纠正 + 四道闸人工处置 + CSV 导入 + 平台端界面）—— **已完成并验收通过** |
 
-### 阶段 5c 之后的剩余技术债
+### 阶段 5m 之后的剩余技术债
 
-阶段 4 验收时列的技术债清单里，有几条在阶段 5b 之后**变得更值钱**了
-（详见[阶段 5b 验收记录 §八](docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md)）：
+阶段 5m 的验收记录 §六 逐条列了遗留。按主题归拢（**细节与取舍理由见该节**）：
 
-1. **抽佣流水明细** —— 现在的报表只有四个总数，超管看不到「哪个商家贡献了多少」。
-   要出明细得补一张抽佣流水表（设计文档 §九当初的取舍：不建独立表，代价就是跨订单聚合）。
-2. **套餐的 `maxStores` 只声明不约束** —— 没有「新增店铺」接口，那个上限当前无处可施。
-3. **换套餐时账单的周期长度语义** —— 定价已修正（按待生效的套餐出账），
-   但周期长度按新套餐的 `periodDays` 算这一点还没定论。
-4. **M11 的可观测性** —— `markInvoicePaid` 里的 `status` 条件在当前实现下测不到
-   （订阅期写的是绝对值，天然幂等）。
+**资金链路**
 
-阶段 4 验收时列的**下一阶段优先项**（与 5b 无关）：
+1. **漏结流水无主动告警** —— 出款侧的对账（5m）与账务侧的「缺笔」（5j）**没有打通**，
+   一笔漏结的货款两边都不会主动报出来。
+2. **出款单作废重开没有解** —— 出款单 `APPROVED` 之后想改金额，只能驳回让商家重新申请。
+3. **「已付但渠道没记录」的单仍不能一键重试** —— 解卡闸能确认「渠道明确说没打」，
+   但渠道**明确拒付**的单不在闸的放行范围内。
+4. **`FAILED` 承载了两种语义** —— 「渠道试满 3 次」（钱**可能**已打）与「解密失败」（**确定**没打）
+   共用一个状态。**不新增状态是刻意的选择**，代价是商家端只能用一句通用措辞。
+5. **崩溃窗口没有自动恢复** —— 事务提交到 `markFailed` 之间进程崩溃，出款单会卡在 `PROCESSING`。
+   5l 补了解卡按钮，但**没有自动恢复**。
+6. **密钥配错会让一批出款单落 `FAILED` 且不会自愈** —— 修好密钥后要人工逐单重试。
+7. **出款侧之外的账目没有对账** —— 结算单 / 抽佣流水 / 商家对账单的「缺笔」不在 5m 范围内。
 
-1. ~~**修多标签页的「先后」刷新竞态**~~ —— **阶段 5c 已做**：后端给轮换后的旧令牌
-   加了**宽限期**（60 秒），宽限期内重复提交返回**同一枚**新令牌、不吊销令牌族。
-   （「幂等刷新端点」那条备选路线没用上。）
-2. **给 `merchant-admin` 补组件测试基建** —— 不补这套基建，`auth.ts` 的 `jwt` 回调
-   **永远测不了**（失败注入 #6 / #8 证明：把「过期时刷新」整段删掉，75 条测试全绿）。
-   护栏 3 / 5 现在只有手测在守。
-   （⚠️ 阶段 5b 已经把同一套基建搬到了 `platform-admin`，照着搬一遍即可。）
-   （✅ 阶段 5c 已经把 `jwt` 回调的**决策逻辑**抽成纯函数模块
-   `src/lib/jwt-callback.ts` 并补上了单测 —— 护栏 3 / 5 不再只靠手测；
-   但 jsdom 组件测试基建本身**仍未补**。）
-3. **把分组标量（字阶 / 间距 / 阴影 / 字重）在前台接上消费者** —— 商家改这些值，
-   前台**纹丝不动且无提示**（实测 `--text-base` 变了，渲染出来的字号没变）。
-   要么在 `@theme inline` 里补上映射，要么**先把这些输入框在前台隐藏掉**。
-4. **修字体 token 在服务端就失效** —— `@layer theme{...--font-sans:var(--font-sans)}`
-   是循环引用，`--font-geist-sans` 又只挂在 `<body>` 上 → **商家改字体前台从来没生效过**。
-   要两端一起改。
-5. **统一前台的错误处理** —— 后端挂掉时页面把 Node 原始错误串 `fetch failed`
-   显示给了用户，没有重试按钮。
-6. **给商家后台做主题实时预览** —— 商家改主色时**自己都看不到变化**，
-   只能切到另一个标签页看前台。
-7. ~~**给 e2e 的队列做隔离 + 每轮清库**~~ —— **早已实现**（`BULLMQ_PREFIX=bull-e2e`
-   + 每轮清库）。阶段 5c 实测确认：**不需要停 api 容器**，连跑 3 轮 e2e 均全绿。
-8. **退货入库流程** —— 退款不回补库存是有意的取舍，但配套的退货入库始终没实现。
+**对账**
+
+8. **渠道接口没有分页** —— 与「单次最多 10000 条」的上限冲突，真渠道接入前必须补分页或分片拉取。
+9. **「渠道长期不返回终态」的单发现不了** —— 非终态一律不算差异（归入 g 档），
+   强行分类会高频误报。
+10. **CSV 导入的 A 类自动纠正没有人工确认闸** —— 运营把状态词映射成 `SUCCESS`，
+    就能把卡在 `PROCESSING` 的单自动改成已付款。彻底堵住属设计层面的决定。
+11. **渠道名只是任务上的标签** —— `loadLocalPayouts` 不按渠道过滤，
+    同一时间窗导入两个渠道的账单会互相参与。
+12. **`PROCESSING` 的单没有 `payoutChannel`** —— 按渠道取会取不到，导致解卡被拒。
+    接第二家渠道时必须同时改 `firstProvider()` 与核实服务。
+13. **两个性能问题** —— `summary` 端点全表扫（应改 `groupBy`）；
+    详情的 `include: { items: true }` 是「捞完再截」（截断应做在查询层）。
+
+**主题与前端**（阶段 5d 遗留）
+
+14. 商家改字号时**行高比例不跟随**（CSS 不允许除以长度，需产品策略）。
+15. **Tailwind 内置阴影刻度商家配不了**。
+16. **`merchant-admin` 的多数中转路由仍用 `!session`**（当前 34 个路由文件、共 48 处）——
+    结果正确，只多一次无用往返。
+17. **部分 token 在 storefront 没有消费者** —— 配了看不到效果。
+18. 其余：前端颜色选择器、`platform-admin` 的租户主题配置页、改密码时吊销令牌族、
+    三份 `api-client` / `theme.ts` 重复、dark 模式从未启用。
+
+**工具链与测试**
+
+19. **`prisma migrate dev` 仍不可用**（3 条历史迁移 checksum 不符），照旧手写 SQL。
+20. **5h-1 遗留的两条概率性 e2e flaky** —— `payment-compensation`「扫描 A…」与 `payout`「P7…」，
+    原因是本进程的 BullMQ worker 抢走了测试自己入队的 job。
+21. **告警基建缺失** —— 项目里只有 Logger，**没有告警**。
+    连续多轮补偿都没处理掉的情况，运营不会收到任何信号。
+22. **跨副本分布式刷新锁** —— 扩副本前必须做（5c 遗留）。
 
 ### 阶段 4 验收发现的下一阶段优先项（详见
 [验收记录 §七](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md)）：
 
 > ⚠️ 下面这份是**阶段 4 验收当时的原始清单**，保留作历史记录。
-> 阶段 5c 之后哪些已完成，请看上面「阶段 5c 之后的剩余技术债」一节。
+> 阶段 5m 之后哪些已完成，请看上面「阶段 5m 之后的剩余技术债」一节。
 
-1. **修多标签页的「先后」刷新竞态** —— 优先级最高：本阶段实测发现，**商家只要同时开
-   两个后台标签页就会被踢出登录**（旧 refreshToken 被判成「真正的重放」→
-   吊销全设备登录）。需要后端配合：给轮换后的旧令牌一个**宽限期**，
-   或提供**幂等刷新端点**。
-2. **给 `merchant-admin` 补组件测试基建** —— 不补这套基建，`auth.ts` 的 `jwt` 回调
-   **永远测不了**（失败注入 #6 / #8 证明：把「过期时刷新」整段删掉，75 条测试全绿）。
-   护栏 3 / 5 现在只有手测在守。
-3. **把分组标量（字阶 / 间距 / 阴影 / 字重）在前台接上消费者** —— 商家改这些值，
-   前台**纹丝不动且无提示**（实测 `--text-base` 变了，渲染出来的字号没变）。
-   要么在 `@theme inline` 里补上映射，要么**先把这些输入框在前台隐藏掉**。
-4. **修字体 token 在服务端就失效** —— `@layer theme{...--font-sans:var(--font-sans)}`
-   是循环引用，`--font-geist-sans` 又只挂在 `<body>` 上 → **商家改字体前台从来没生效过**。
-   要两端一起改。
-5. **统一前台的错误处理** —— 后端挂掉时页面把 Node 原始错误串 `fetch failed`
-   显示给了用户，没有重试按钮。
-6. **给商家后台做主题实时预览** —— 商家改主色时**自己都看不到变化**，
-   只能切到另一个标签页看前台。
-7. **给 e2e 的队列做隔离 + 每轮清库** —— 否则每次跑 e2e 都要先停 api 容器，
-   会持续制造「实测报缺陷、复现不出来」的假象。
+1. ~~**修多标签页的「先后」刷新竞态**~~ —— **阶段 5c 已做**：后端给轮换后的旧令牌
+   加了**宽限期**（60 秒），宽限期内重复提交返回**同一枚**新令牌、不吊销令牌族。
+   （「幂等刷新端点」那条备选路线没用上。）
+2. ~~**给 `merchant-admin` 补组件测试基建**~~ —— **阶段 5b 已把同一套基建搬到 `platform-admin`**，
+   `merchant-admin` 也已有组件测试；阶段 5c 把 `jwt` 回调的**决策逻辑**抽成纯函数模块
+   `src/lib/jwt-callback.ts` 并补上了单测。
+3. ~~**把分组标量（字阶 / 间距 / 阴影 / 字重）在前台接上消费者**~~ —— **阶段 5d 已做**。
+4. ~~**修字体 token 在服务端就失效**~~ —— **阶段 5d 已做**。
+5. ~~**统一前台的错误处理**~~ —— **阶段 5d 已做**。
+6. ~~**给商家后台做主题实时预览**~~ —— **阶段 5d 已做**：主题表单带预览区，
+   改主色/字体/字阶/字重/阴影/间距时预览区实时联动，且与后台自身的 UI 隔离
+   （后台按钮不跟着店铺主题变）。
+7. ~~**给 e2e 的队列做隔离 + 每轮清库**~~ —— **早已实现**（`BULLMQ_PREFIX=bull-e2e`
+   + 每轮清库）。阶段 5c 实测确认：**不需要停 api 容器**，连跑 3 轮 e2e 均全绿。
 8. **退货入库流程** —— 退款不回补库存是有意的取舍，但配套的退货入库始终没实现。
-9. **跨店会员** —— 等有了会员体系的需求再动。
 
 阶段 3 遗留、本阶段仍未解决的（详见阶段 4 验收记录 §六）：
 跨店会员不支持、游客订单查不到、退款不回补库存、购物车金额是估算值、
