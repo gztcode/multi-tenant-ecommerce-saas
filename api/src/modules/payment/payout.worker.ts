@@ -8,13 +8,16 @@ import { PayoutExecutionService } from '../billing/payout-execution.service';
 import {
   PayoutExecuteResult,
   PayoutProvider,
-} from './payout-provider.interface';
-import { PAYOUT_PROVIDERS } from './payment.constants';
+} from '../../common/payment/payout-provider.interface';
+import { PAYOUT_PROVIDERS } from '../../common/payment/payout.constants';
+import { PayoutReconciliationService } from './payout-reconciliation.service';
 
 /** 出款队列任务的数据 */
 export interface PayoutJob {
-  /** 出款单 id */
+  /** 出款单 id（`'execute'` job） */
   payoutId: string;
+  /** 渠道名（`'reconcile'` job） */
+  channel?: string;
 }
 
 /**
@@ -77,6 +80,10 @@ export class PayoutWorker extends WorkerHost {
     private readonly queues: QueueService,
     @Inject(PAYOUT_PROVIDERS)
     private readonly providers: Map<string, PayoutProvider>,
+    // ⚠️ **加在末尾且可选** —— `payout-worker.spec.ts` 用位置参数构造 worker，
+    //    必填的话那个 spec 的 20 处构造都要补参数（超出本 Task 的改动范围）。
+    //    可选 → 现有用例一行不用改。
+    private readonly reconciliation?: PayoutReconciliationService,
   ) {
     super();
   }
@@ -84,6 +91,11 @@ export class PayoutWorker extends WorkerHost {
   async process(job: Job<PayoutJob>): Promise<void> {
     if (job.name === 'scan') {
       await this.runScan();
+      return;
+    }
+    if (job.name === 'reconcile') {
+      // ⚠️ **定时对账**（阶段 5m）
+      await this.runReconcile(job.data.channel);
       return;
     }
     if (job.name !== 'execute') {
@@ -244,7 +256,15 @@ export class PayoutWorker extends WorkerHost {
 
     if (result.status !== 'SUCCESS') {
       const reason = result.failureReason ?? '渠道返回失败';
-      await this.handleFailure(payoutId, attemptCount, reason, now);
+      await this.handleFailure(
+        payoutId,
+        attemptCount,
+        reason,
+        now,
+        // ⚠️ **渠道交易号一路带下来** —— `handleFailure` 拿不到 `result`
+        //    就只能传空字符串，「实时核实」对 `FAILED` 的单就成了死代码
+        result.providerTxnId,
+      );
       return;
     }
 
@@ -254,6 +274,8 @@ export class PayoutWorker extends WorkerHost {
         failedAt: now,
         // ⚠️ **渠道已经调过了** → 钱**可能**已经打出去 → 不能重试
         failedBeforePayout: false,
+        // ⚠️ **新增**（阶段 5m）：渠道调过了 → 交易号要存
+        providerTxnId: result.providerTxnId,
       });
       return;
     }
@@ -276,6 +298,7 @@ export class PayoutWorker extends WorkerHost {
     attemptCount: number,
     reason: string,
     now: Date,
+    providerTxnId: string,
   ): Promise<void> {
     if (attemptCount >= PAYOUT_MAX_ATTEMPTS) {
       await this.execution.markFailed(payoutId, {
@@ -283,6 +306,8 @@ export class PayoutWorker extends WorkerHost {
         failedAt: now,
         // ⚠️ **渠道已经调过了** → 钱**可能**已经打出去 → 不能重试
         failedBeforePayout: false,
+        // ⚠️ **新增**（阶段 5m）：渠道失败时也会给交易号 → 存下来才能核实
+        providerTxnId,
       });
       return;
     }
@@ -347,6 +372,36 @@ export class PayoutWorker extends WorkerHost {
     }
     if (rescues.length > 0) {
       this.logger.warn(`出款救援：${rescues.length} 张 APPROVED 单重新入队`);
+    }
+  }
+
+  /**
+   * 定时对账（阶段 5m）。
+   *
+   * ⚠️ **失败不抛到 BullMQ** —— 抛出去会让 BullMQ 把它记成失败 job，
+   *    而对账服务**自己已经**把任务落成了 `FAILED` 并写了原因。
+   */
+  private async runReconcile(channel: string | undefined): Promise<void> {
+    if (!channel) {
+      // ⚠️ **不能静默跳过** —— `channel` 缺失只可能是代码 bug
+      //    （scheduler 投 job 时一定带 channel），静默 return 会让这个 bug
+      //    永远查不出来，而且每天静默丢掉一整轮对账。
+      this.logger.warn('定时对账 job 缺少 channel 参数，跳过');
+      return;
+    }
+    if (!this.reconciliation) {
+      return;
+    }
+    try {
+      await this.reconciliation.runScheduled(channel);
+    } catch (error) {
+      // ⚠️ **日志要带上渠道** —— 这个窗口今天没对成，没人会自动再触发它
+      //    → 漏了哪一天必须查得到。
+      this.logger.error(
+        `定时渠道对账失败（渠道 ${channel}）：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 

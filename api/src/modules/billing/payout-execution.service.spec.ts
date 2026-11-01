@@ -1,6 +1,8 @@
+import { ConflictException } from '@nestjs/common';
 import { PayoutStatus, SettlementStatus } from '@prisma/client';
 import { PayoutExecutionService } from './payout-execution.service';
 import { PayoutCipherService } from './payout-cipher.service';
+import type { PayoutVerificationTarget } from '../../common/payment/payout-verification';
 
 /**
  * 出款执行状态落库服务的单元测试。
@@ -25,14 +27,63 @@ function argsOf(mock: {
   return ((call ?? [])[0] ?? {}) as Record<string, unknown>;
 }
 
+/**
+ * 取事务里 `payout.updateMany` 写下的 **`releasedEntryIds`**（阶段 5m）。
+ *
+ * ⚠️ **不能用 `argsOf`** —— 它取的是**第一次**调用，而 `releasedEntryIds`
+ *    写在**第二次**（第一次是改状态）。这里按字段找那次调用。
+ *
+ * ⚠️ **找不到就返回 `undefined`** —— 调用方据此断言「一条都没写」。
+ */
+function releasedEntryIdsData(tx: {
+  payout: { updateMany: { mock: { calls: unknown[][] } } };
+}): string | undefined {
+  for (const call of tx.payout.updateMany.mock.calls) {
+    const data = (call[0] as { data?: Record<string, unknown> } | undefined)
+      ?.data;
+    if (data && 'releasedEntryIds' in data) {
+      return data.releasedEntryIds as string;
+    }
+  }
+  return undefined;
+}
+
 /** 事务客户端的形状（只列本服务真正用到的那几个方法） */
 interface FakeTx {
   payout: {
     updateMany: jest.Mock;
     findFirst: jest.Mock;
   };
-  payoutEntry: { deleteMany: jest.Mock };
+  payoutEntry: { deleteMany: jest.Mock; findMany: jest.Mock; createMany: jest.Mock };
   settlementStatement: { updateMany: jest.Mock };
+  payoutOperation: { create: jest.Mock };
+}
+
+/**
+ * B 类人工处置的**默认出款单行**（顶层 `payout.findFirst` 的返回值）。
+ *
+ * ⚠️ **各项自洽** —— 闸 ② 会校验「明细金额合计 == receiptAmount」
+ *    与「笔数 == entryCount」与「净额 == 货款 − 佣金」，
+ *    默认值不满足这些恒等式的话，所有用例都会卡在闸 ② 后面都走不到。
+ */
+function defaultTopPayout() {
+  return {
+    id: 'payout-a',
+    tenantId: 'tenant-a',
+    payoutNo: 'PAY202508200000000001',
+    status: PayoutStatus.FAILED,
+    kind: 'NORMAL',
+    statementId: 'stmt-a',
+    releasedEntryIds: JSON.stringify(['entry-1', 'entry-2']),
+    receiptAmount: 10000,
+    commissionAmount: 500,
+    netAmount: 9500,
+    entryCount: 2,
+    payoutChannel: 'fake-payout',
+    payoutTxnId: 'txn-1',
+    attemptCount: 3,
+    periodStart: new Date('2025-08-01T00:00:00.000Z'),
+  };
 }
 
 /** 一只最小可用的假 Prisma */
@@ -43,6 +94,26 @@ function fakePrisma(
     statementCount?: number;
     /** `scanStuck` 的两次 `findMany` 的返回（① PROCESSING、② APPROVED） */
     findManyResults?: unknown[][];
+    /**
+     * 事务里 `payoutEntry.findMany` 返回的**被释放的流水 id**（阶段 5m）。
+     *
+     * ⚠️ **默认空数组** —— 没有明细可释放时不该写 `releasedEntryIds`
+     *    （空数组 ≠ null，语义不同：空数组意味着「当初就没有明细」）。
+     */
+    releasedEntryIds?: string[];
+    /**
+     * 顶层 `payout.findFirst` 返回的**出款单行**（B 类人工处置用，阶段 5m）。
+     *
+     * ⚠️ **与事务里的 `tx.payout.findFirst` 是两回事** ——
+     *    B 类处置读的是顶层 `this.prisma.payout.findFirst`。
+     */
+    topPayout?: unknown;
+    /** 顶层 `merchantReceipt.findMany` 返回的流水（闸 ② 的金额校验用） */
+    receipts?: Array<{ id: string; amount: number }>;
+    /** 顶层 `settlementStatement.findFirst` 返回的结算单（闸 ④ 的状态检查用） */
+    statement?: { status: string } | null;
+    /** 顶层 `payoutEntry.findMany` 返回的占用明细（闸 ③ 用） */
+    occupiedEntries?: unknown[];
   } = {},
 ) {
   let tx: FakeTx | null = null;
@@ -76,10 +147,36 @@ function fakePrisma(
           deleteMany: jest.fn<Promise<{ count: number }>, [unknown]>(() =>
             Promise.resolve({ count: 1 }),
           ),
+          /**
+           * ⚠️ **阶段 5m：删明细前先读出被释放的流水 id**（`markFailed`）——
+           *    记到 `payouts.releasedEntryIds`，后面的「人工确认渠道已打款」
+           *    靠它复原明细。
+           *
+           * ⚠️ **返回带 `entryId` 的对象数组**（不是 id 数组）——
+           *    实现里是 `releasedEntries.map((e) => e.entryId)`。
+           */
+          findMany: jest.fn<Promise<unknown>, [unknown]>(() =>
+            Promise.resolve(
+              (options.releasedEntryIds ?? []).map((entryId) => ({ entryId })),
+            ),
+          ),
+          /**
+           * ⚠️ **B 类人工处置用** —— 复原明细。
+           *    事务对象必须**齐备**：缺一个方法就是 TypeError。
+           */
+          createMany: jest.fn<Promise<{ count: number }>, [unknown]>(() =>
+            Promise.resolve({ count: 1 }),
+          ),
         },
         settlementStatement: {
           updateMany: jest.fn<Promise<{ count: number }>, [unknown]>(() =>
             Promise.resolve({ count: options.statementCount ?? 1 }),
+          ),
+        },
+        // ⚠️ **B 类人工处置用** —— 写留痕（`payoutOperation.create`）。
+        payoutOperation: {
+          create: jest.fn<Promise<unknown>, [unknown]>(() =>
+            Promise.resolve({ id: 'op-1' }),
           ),
         },
       };
@@ -97,18 +194,76 @@ function fakePrisma(
         findManySeq += 1;
         return Promise.resolve(result);
       }),
+      /**
+       * ⚠️ **B 类人工处置读的是顶层**（`this.prisma.payout.findFirst`），
+       *    **不是事务里的 `tx.payout.findFirst`** —— 两个是不同的 mock。
+       */
+      findFirst: jest.fn<Promise<unknown>, [unknown]>(() =>
+        Promise.resolve(
+          options.topPayout === undefined
+            ? defaultTopPayout()
+            : options.topPayout,
+        ),
+      ),
     },
+    // ⚠️ **B 类人工处置：闸 ② 的金额校验**（顶层，不走事务）
+    merchantReceipt: {
+      findMany: jest.fn<Promise<unknown[]>, [unknown]>(() =>
+        Promise.resolve(options.receipts ?? []),
+      ),
+    },
+    // ⚠️ **B 类人工处置：闸 ③ 的占用检查**（顶层，`payout_entries` 不在租户白名单）
+    payoutEntry: {
+      findMany: jest.fn<Promise<unknown[]>, [unknown]>(() =>
+        Promise.resolve(options.occupiedEntries ?? []),
+      ),
+    },
+    // ⚠️ **B 类人工处置：闸 ④ 的结算单状态检查**（顶层，不走事务）
+    settlementStatement: {
+      findFirst: jest.fn<Promise<unknown>, [unknown]>(() =>
+        Promise.resolve(
+          options.statement === undefined
+            ? { status: SettlementStatus.CONFIRMED }
+            : options.statement,
+        ),
+      ),
+    },
+    // ⚠️ **数据库时钟** —— `confirmPaidAfterReconciliation` 用它取 `paidAt`
+    databaseNow: jest.fn<Promise<Date>, []>(() =>
+      Promise.resolve(new Date('2025-08-20T00:00:00.000Z')),
+    ),
   };
 
   return Object.assign(prisma, { tx: () => tx });
 }
 
+/**
+ * 假核实服务（阶段 5m）。
+ *
+ * ⚠️ **默认给「渠道说没打」**（`FAILED`）—— 老用例都不碰核实，
+ *    默认值只要能让闸放行即可，老用例的行为就不变。
+ *
+ * ⚠️ **核实闸本身的三种结论由 e2e 验**（`test/payout-reconciliation.e2e-spec.ts`）——
+ *    这里只保证老用例不被新增的闸改变行为。
+ */
+function fakeVerification(verdict: 'PAID' | 'FAILED' | 'UNKNOWN' = 'FAILED') {
+  return {
+    // ⚠️ **带参数类型** —— 用例要断言「核实对象是谁」（闸 ④ 的回归测试），
+    //    参数不声明的话 `mock.calls[0][0]` 是 `undefined`，TS 直接报错。
+    verify: jest.fn((_target: PayoutVerificationTarget) =>
+      Promise.resolve({ verdict, source: 'REALTIME' as const }),
+    ),
+  };
+}
+
 function makeService(
   prisma: ReturnType<typeof fakePrisma>,
+  verification: ReturnType<typeof fakeVerification> = fakeVerification(),
 ): PayoutExecutionService {
   return new PayoutExecutionService(
     prisma as unknown as never,
     new PayoutCipherService(),
+    verification,
   );
 }
 
@@ -324,6 +479,37 @@ describe('PayoutExecutionService', () => {
         prisma.tx()!.settlementStatement.updateMany,
       ).not.toHaveBeenCalled();
     });
+
+    /**
+     * ⚠️ **失败时刻必须被清掉** —— 这条护栏以前**没有任何测试咬住**
+     *    （阶段 5m 的失败注入把 `failedAt: null` 删掉，全量 627 条单测 +
+     *    646 条 e2e 全绿）。
+     *
+     * ⚠️ **为什么重要** —— `failedAt` 记的是「落 FAILED 那一刻」的判断。
+     *    残留着它，一张**已经 PAID** 的单会被对账引擎按 `failedAt` 再次捞进
+     *    另一个时间窗（引擎按 `paidAt` / `processingAt` / `failedAt` 三个
+     *    时间戳捞本地单）→ 造出假差异，或让 E 类（本地已付、渠道查不到）
+     *    的口径判错。
+     */
+    it('重试成功后清掉失败时刻与「钱没打出去」的标记', async () => {
+      const prisma = fakePrisma({
+        payout: { kind: 'NORMAL', statementId: 'stmt-a', attemptCount: 2 },
+      });
+      const service = makeService(prisma);
+
+      await service.markPaid('payout-a', {
+        providerTxnId: 'txn-1',
+        channel: 'fake-payout',
+        paidAt: new Date('2025-08-20T00:00:00.000Z'),
+      });
+
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        failedAt: Date | null;
+        failedBeforePayout: boolean;
+      };
+      expect(data.failedAt).toBeNull();
+      expect(data.failedBeforePayout).toBe(false);
+    });
   });
 
   describe('markFailed', () => {
@@ -349,7 +535,7 @@ describe('PayoutExecutionService', () => {
     });
 
     it('⚠️ 释放明细占用（否则商家重新申请撞唯一索引 → 500）', async () => {
-      const prisma = fakePrisma();
+      const prisma = fakePrisma({ releasedEntryIds: ['entry-1', 'entry-2'] });
       const service = makeService(prisma);
 
       await service.markFailed('payout-a', {
@@ -358,6 +544,29 @@ describe('PayoutExecutionService', () => {
       });
 
       expect(prisma.tx()!.payoutEntry.deleteMany).toHaveBeenCalled();
+      // ⚠️ **阶段 5m：被释放的流水 id 要记进 `releasedEntryIds`** ——
+      //    后面的「人工确认渠道已打款」靠它复原明细，不记就永远复原不了
+      expect(prisma.tx()!.payoutEntry.findMany).toHaveBeenCalledWith({
+        where: { payoutId: 'payout-a' },
+        select: { entryId: true },
+      });
+      expect(releasedEntryIdsData(prisma.tx()!)).toBe(
+        JSON.stringify(['entry-1', 'entry-2']),
+      );
+    });
+
+    it('⚠️ 没有明细可释放时，绝不写 `releasedEntryIds`（空数组 ≠ null）', async () => {
+      // ⚠️ **空数组的语义是「当初就没有明细」**（与 null 不同）→
+      //    B 类处置会据此误判「可复原」→ 这里必须一条都不写
+      const prisma = fakePrisma();
+      const service = makeService(prisma);
+
+      await service.markFailed('payout-a', {
+        reason: '渠道超时',
+        failedAt: new Date(),
+      });
+
+      expect(releasedEntryIdsData(prisma.tx()!)).toBeUndefined();
     });
 
     it('⚠️ 落 FAILED 时带上「钱确定没打出去」的标记', async () => {
@@ -586,6 +795,187 @@ describe('PayoutExecutionService', () => {
 
       expect(await service.scanStuck(new Date())).toEqual([]);
       expect(prisma.payout.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('confirmPaidAfterReconciliation', () => {
+    /** 一份「四闸全过」的默认配置 —— 各用例只覆盖自己关心的那一项 */
+    function bClassOptions(
+      overrides: Parameters<typeof fakePrisma>[0] = {},
+    ) {
+      return {
+        // ⚠️ **金额自洽** —— 闸 ② 要「明细合计 == receiptAmount」
+        //    「笔数 == entryCount」「净额 == 货款 − 佣金」
+        receipts: [
+          { id: 'entry-1', amount: 6000 },
+          { id: 'entry-2', amount: 4000 },
+        ],
+        ...overrides,
+      };
+    }
+
+    it('四闸全过 → FAILED 转 PAID，复原明细并写留痕', async () => {
+      const prisma = fakePrisma(bClassOptions());
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      const ok = await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      expect(ok).toBe(true);
+      expect(prisma.tx()!.payoutEntry.createMany).toHaveBeenCalled();
+      expect(prisma.tx()!.payoutOperation.create).toHaveBeenCalled();
+    });
+
+    it('⚠️ 闸 ④ 的核实对象来自库里的 payoutNo（调用方无从替换）', async () => {
+      // ⚠️ **回归测试** —— 修复前是 `input.payoutNo ?? payout.payoutNo`，
+      //    调用方传别的单号就能核实别的单 → **闸 ④ 被完全绕过**。
+      //    现在核实对象**只**来自库里读到的 `payout.payoutNo`。
+      const prisma = fakePrisma(bClassOptions());
+      const verification = fakeVerification('PAID');
+      const service = makeService(prisma, verification);
+
+      await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+        // ⚠️ **传别的单号** —— 修复前它会覆盖核实对象
+        ...({ payoutNo: 'PAY-OTHER-TENANT-999' } as Record<string, unknown>),
+      });
+
+      // ⚠️ **核实用的必须是本单的号** —— 不能是被替换的别的单号
+      const target = verification.verify.mock.calls[0]![0];
+      expect(target.payoutNo).toBe('PAY202508200000000001');
+      expect(target.payoutNo).not.toBe('PAY-OTHER-TENANT-999');
+      expect(target.id).toBe('payout-a');
+    });
+
+    it('⚠️ 补差单确认已付款 → 结算单状态不变（护栏 X6）', async () => {
+      // ⚠️ **回归测试** —— 修复前补差单也会把结算单改成 PAID。
+      //    `markPaid` 里有这道护栏，B 类处置的事务里漏了。
+      const prisma = fakePrisma(
+        bClassOptions({
+          topPayout: { ...defaultTopPayout(), kind: 'SUPPLEMENT' },
+        }),
+      );
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      const ok = await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      expect(ok).toBe(true);
+      // ⚠️ **结算单联动一次都不能发生**
+      expect(
+        prisma.tx()!.settlementStatement.updateMany,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('正常单 → 结算单 CONFIRMED → PAID', async () => {
+      const prisma = fakePrisma(bClassOptions());
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      const data = argsOf(prisma.tx()!.settlementStatement.updateMany).data as {
+        status: string;
+        paidAt: Date;
+      };
+      expect(data.status).toBe(SettlementStatus.PAID);
+      // ⚠️ **用 `getTime()` 比** —— `toBe` 比的是引用，同一时刻的两个
+      //    `Date` 实例不相等 → 断言会假失败
+      expect(data.paidAt.getTime()).toBe(
+        new Date('2025-08-20T00:00:00.000Z').getTime(),
+      );
+    });
+
+    it('⚠️ 事务内状态更新没命中 → 抛 ConflictException，不写留痕', async () => {
+      // ⚠️ **回归测试** —— 修复前无视 `affected.count`：
+      //    事务照样提交 → 留痕说「从 FAILED 改到 PAID」，**但状态根本没改**
+      //    → 留痕会说谎。留痕是事后追责的唯一凭据，不能撒谎。
+      const prisma = fakePrisma(bClassOptions({ updateManyCount: 0 }));
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      await expect(
+        service.confirmPaidAfterReconciliation('payout-a', {
+          reason: '渠道确认已打款',
+          operatorId: 'admin-1',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      // ⚠️ **留痕绝不能写** —— 状态没改，留痕却写了就是撒谎
+      expect(prisma.tx()!.payoutOperation.create).not.toHaveBeenCalled();
+    });
+
+    it('⚠️ 跨租户读被 tenantId 限制住（闸 ② 的货款流水）', async () => {
+      // ⚠️ **`MerchantReceipt` 在租户白名单里，但本方法跑在平台作用域**
+      //    → 租户扩展不附加任何过滤 → 不显式带 `tenantId` 就是跨租户读。
+      const prisma = fakePrisma(bClassOptions());
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      const where = argsOf(prisma.merchantReceipt.findMany).where as {
+        tenantId: string;
+        id: { in: string[] };
+      };
+      expect(where.tenantId).toBe('tenant-a');
+      expect(where.id.in).toEqual(['entry-1', 'entry-2']);
+    });
+
+    it('⚠️ 跨租户读被 tenantId 限制住（闸 ④ 的结算单）', async () => {
+      // ⚠️ **`SettlementStatement` 同样在租户白名单里** → 平台作用域下
+      //    扩展不附加过滤 → 不显式带 `tenantId` 就会读到别的租户的结算单
+      const prisma = fakePrisma(bClassOptions());
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      const where = argsOf(prisma.settlementStatement.findFirst).where as {
+        id: string;
+        tenantId: string;
+      };
+      expect(where.id).toBe('stmt-a');
+      expect(where.tenantId).toBe('tenant-a');
+    });
+
+    it('⚠️ 结算单联动没命中（已是 PAID）→ 不抛错，事务照常提交', async () => {
+      // ⚠️ **结算单联动没命中是正常的** —— 可能已经被另一张单联动过了
+      //    → 幂等，不是异常 → **不能抛**（抛了会连累出款单本身改成 PAID）。
+      const prisma = fakePrisma(bClassOptions({ statementCount: 0 }));
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      const ok = await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      expect(ok).toBe(true);
+      expect(prisma.tx()!.payoutOperation.create).toHaveBeenCalled();
+    });
+
+    it('渠道核实不是 PAID → 拒绝，不动账', async () => {
+      const prisma = fakePrisma(bClassOptions());
+      const service = makeService(prisma, fakeVerification('FAILED'));
+
+      await expect(
+        service.confirmPaidAfterReconciliation('payout-a', {
+          reason: '渠道确认已打款',
+          operatorId: 'admin-1',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(prisma.$transaction).not.toHaveBeenCalled();
     });
   });
 });

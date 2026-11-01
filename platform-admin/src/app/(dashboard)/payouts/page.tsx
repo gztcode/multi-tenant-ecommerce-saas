@@ -6,6 +6,7 @@ import {
   formatCents,
   type PayoutListResult,
 } from '@/lib/payout';
+import { type ReconciliationSummary } from '@/lib/reconciliation';
 import {
   Table,
   TableBody,
@@ -100,6 +101,23 @@ export default async function PayoutsPage({
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   /**
+   * 未处置的渠道对账差异统计（给顶部横幅用，阶段 5m）。
+   *
+   * ⚠️ **统计取不到时不报错** —— 横幅只是提醒，
+   *    「统计接口挂了」不该把整张出款单列表也一起拖下水。
+   *    取不到就当没有待处置差异（横幅不显示），
+   *    运营仍可从导航进「渠道对账」页自己看。
+   */
+  let summary: ReconciliationSummary | null = null;
+  try {
+    summary = await apiFetchAuthed<ReconciliationSummary>(
+      '/platform/payout-reconciliations/summary',
+    );
+  } catch {
+    summary = null;
+  }
+
+  /**
    * 拼一个带全部当前筛选条件的 query。
    *
    * ⚠️ **翻页 / 换每页条数时必须把 `period` 一起带上** ——
@@ -120,6 +138,17 @@ export default async function PayoutsPage({
 
   return (
     <div className="flex flex-col gap-6">
+      {/* ⚠️ **严重差异横幅要带跳转链接** —— 运营在出款页看到「钱可能有问题」，
+          得能一键跳到对账页去处置，光有一句红字没用。 */}
+      {summary && summary.pendingCritical > 0 ? (
+        <p role="alert" className="text-sm text-destructive">
+          有 {summary.pendingCritical} 条严重的渠道对账差异尚未处置（
+          {summary.pendingWarning} 条警告、{summary.pendingInfo} 条提示）。{' '}
+          <Link href="/reconciliations" className="underline">
+            去查看
+          </Link>
+        </p>
+      ) : null}
       <h2 className="text-2xl font-bold">出款</h2>
 
       {periodError && <p className="text-sm text-destructive">{periodError}</p>}

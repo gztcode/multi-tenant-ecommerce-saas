@@ -14,7 +14,7 @@ import {
 import { AppModule } from '../src/app.module';
 import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.interceptor';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
-import { FakePayoutProvider } from '../src/modules/payment/fake-payout.provider';
+import { FakePayoutProvider } from '../src/common/payment/fake-payout.provider';
 import { PayoutWorker } from '../src/modules/payment/payout.worker';
 import {
   platformScope,

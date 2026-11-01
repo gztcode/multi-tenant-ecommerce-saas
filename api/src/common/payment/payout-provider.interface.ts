@@ -64,6 +64,36 @@ export interface PayoutExecuteResult {
   failureReason?: string;
 }
 
+/** 渠道侧的出款流水（对账用） */
+export interface ChannelPayoutRecord {
+  /** 渠道侧的业务单号（= 我们传给渠道的 `payoutNo`） */
+  referenceNo?: string;
+  /** 渠道交易号（= 我们拿到的 `providerTxnId`） */
+  providerTxnId: string;
+  /** 渠道实际打出的金额（整数分） */
+  amount: number;
+  /** 渠道侧状态（开放字符串：`SUCCESS` / `FAILED` / `PROCESSING` / …） */
+  status: string;
+  /** 渠道侧的打款时刻 */
+  paidAt?: Date;
+  /** 失败原因（渠道原文） */
+  failureReason?: string;
+}
+
+/**
+ * 单笔核实的入参 —— ⚠️ **两个键至少给一个**。
+ *
+ * ⚠️ **`referenceNo` 是必须支持的** —— 「卡在 `PROCESSING` 的单」**没有 `payoutTxnId`**
+ * （它是 `markPaid` 的唯一写入点），而解卡核实闸的对象恰恰是 `PROCESSING` 的单。
+ * 只按 `providerTxnId` 查 → 核实闸对它的全部对象都是死代码。
+ */
+export interface PayoutQuery {
+  /** 渠道交易号（`PAID` 的单才有） */
+  providerTxnId?: string;
+  /** 渠道侧业务单号（= 我们的 `payoutNo`，**所有调过渠道的单都有**） */
+  referenceNo?: string;
+}
+
 /**
  * 出款渠道。
  *
@@ -80,6 +110,22 @@ export interface PayoutProvider {
   /** 打款 */
   execute(input: PayoutExecuteInput): Promise<PayoutExecuteResult>;
 
-  /** 查一笔打款的状态（对账用）。本阶段假网关恒返回已完成 */
-  queryPayout(providerTxnId: string): Promise<{ status: string }>;
+  /**
+   * 查一笔打款的状态（对账 / 核实用）。
+   *
+   * ⚠️ **返回的 `status` 是开放字符串** —— 调用方只认 `'SUCCESS'` 与 `'FAILED'`，
+   * 其余一律当「问不出结论」处理（fail-closed）。
+   */
+  queryPayout(
+    query: PayoutQuery,
+  ): Promise<{ status: string; amount?: number; paidAt?: Date }>;
+
+  /**
+   * ⚠️ **批量查渠道侧的出款流水**（对账用）。
+   * 时间窗是**左闭右开**的 `[from, to)`。
+   *
+   * ⚠️ **必须包含失败的那次尝试** —— 否则「第一次失败第二次成功」在渠道侧
+   * 只剩一条 SUCCESS，看起来像「只打了一次」，对账就测不出重试场景。
+   */
+  listPayouts(query: { from: Date; to: Date }): Promise<ChannelPayoutRecord[]>;
 }

@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 import {
   describePayoutEntryType,
   describePayoutKind,
+  describePayoutOperation,
   describePayoutStatus,
   describePayoutTimeline,
   formatCents,
@@ -133,5 +134,34 @@ describe('formatCents', () => {
     expect(formatCents(0)).toBe('¥0.00');
     expect(formatCents(5)).toBe('¥0.05');
     expect(formatCents(-200)).toBe('¥-2.00');
+  });
+});
+
+describe('describePayoutOperation', () => {
+  it('已知操作类型翻成中文', () => {
+    expect(describePayoutOperation('RETRY')).toBe('重试出款');
+    expect(describePayoutOperation('UNSTUCK_TO_FAILED')).toBe(
+      '解除卡单（标记为失败）',
+    );
+    expect(describePayoutOperation('UNSTUCK_TO_APPROVED')).toBe(
+      '解除卡单（重新打款）',
+    );
+  });
+
+  it('⚠️ 阶段 5m 的两条对账留痕要有自己的文案', () => {
+    // ⚠️ **少了它们就回落到「人工操作」** ——
+    //    而 `RECONCILE_TO_PAID` **恰恰不是人工做的**（渠道对账自动纠正的，
+    //    操作人是 `system:reconciliation`）→ 说成「人工操作」是说谎。
+    expect(describePayoutOperation('RECONCILE_TO_PAID')).toBe(
+      '渠道对账自动纠正为已付款',
+    );
+    expect(describePayoutOperation('MANUAL_CONFIRM_PAID')).toBe(
+      '人工确认已付款（渠道对账）',
+    );
+  });
+
+  it('⚠️ 未知类型回落到「人工操作」，不显示裸枚举', () => {
+    expect(describePayoutOperation('WHATEVER')).toBe('人工操作');
+    expect(describePayoutOperation('WHATEVER')).not.toContain('WHATEVER');
   });
 });

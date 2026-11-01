@@ -18,6 +18,7 @@ import {
   tenantContext,
 } from '../src/common/tenant/tenant-context';
 import { PAYOUT_QUEUE } from '../src/common/queue/queue.constants';
+import { FakePayoutProvider } from '../src/common/payment/fake-payout.provider';
 import { http } from './helpers';
 import { createMerchant, unique } from './merchant-fixture';
 
@@ -154,6 +155,7 @@ describe('出款单的人工处置与失败原因口径 (e2e)', () => {
   let app: INestApplication;
   let prisma: TenantPrismaService;
   let payoutQueue: Queue;
+  let fakeProvider: FakePayoutProvider;
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({
@@ -175,6 +177,7 @@ describe('出款单的人工处置与失败原因口径 (e2e)', () => {
 
     prisma = app.get(TenantPrismaService);
     payoutQueue = app.get(getQueueToken(PAYOUT_QUEUE));
+    fakeProvider = app.get(FakePayoutProvider);
 
     // ⚠️ **暂停出款队列** —— 理由见文件头。
     //    不暂停的话，重试入队的 job 会被 worker 立刻消费，
@@ -381,6 +384,33 @@ describe('出款单的人工处置与失败原因口径 (e2e)', () => {
       }),
     );
     return created.id;
+  }
+
+  /**
+   * 在渠道侧造一条「这笔明确没打出去」的流水（阶段 5m）。
+   *
+   * ⚠️ **解卡前必须有这条** —— 阶段 5m 给 `unstick` 加了「渠道核实闸」：
+   *    只有**渠道明确说 `FAILED`** 才放行；问不出结论一律拒绝
+   *    （「渠道查不到这条」≠「渠道说没打」）。
+   *    → 解卡用例要造出「运营核对过渠道、确认没打」这个前提。
+   */
+  async function seedChannelFailure(options: {
+    payoutId: string;
+    payoutNo: string;
+    amount: number;
+  }): Promise<void> {
+    fakeProvider.armScenario({ failTimes: 1 });
+    await fakeProvider.execute({
+      referenceId: options.payoutId,
+      referenceNo: options.payoutNo,
+      amount: options.amount,
+      account: {
+        accountName: '张三',
+        bankName: '招商银行',
+        accountNo: PLAIN_ACCOUNT_NO,
+      },
+      attempt: 1,
+    });
   }
 
   /** 给一张出款单挂上明细（模拟它占着这些货款流水） */
@@ -823,6 +853,7 @@ describe('出款单的人工处置与失败原因口径 (e2e)', () => {
     const scenario = await setupMerchant(period, [10000, 20000]);
 
     try {
+      const payoutNo = `PAYOPS-UNSTICK-F-${unique()}`;
       const payoutId = await seedPayout({
         tenantId: scenario.merchant.tenantId,
         period,
@@ -838,11 +869,19 @@ describe('出款单的人工处置与失败原因口径 (e2e)', () => {
         processingAt: new Date(Date.now() - 20 * 60 * 1000),
         approvedAt: new Date(),
         approvedBy: admin.userId,
+        payoutNo,
       });
       scenario.payoutIds.push(payoutId);
       // ⚠️ **卡住的单仍然占着明细** —— 它还没结束
       await attachEntries(payoutId, scenario.receiptIds);
       expect(await countEntries(payoutId)).toBe(2);
+
+      // ⚠️ **阶段 5m：解卡前渠道要说「没打」** —— 核实闸只放行这一种结论
+      await seedChannelFailure({
+        payoutId,
+        payoutNo,
+        amount: 30000,
+      });
 
       const response = await platformUnstick(
         admin.token,
@@ -889,6 +928,7 @@ describe('出款单的人工处置与失败原因口径 (e2e)', () => {
     const scenario = await setupMerchant(period, [10000, 20000]);
 
     try {
+      const payoutNo = `PAYOPS-UNSTICK-A-${unique()}`;
       const payoutId = await seedPayout({
         tenantId: scenario.merchant.tenantId,
         period,
@@ -902,9 +942,18 @@ describe('出款单的人工处置与失败原因口径 (e2e)', () => {
         processingAt: new Date(Date.now() - 20 * 60 * 1000),
         approvedAt: new Date(),
         approvedBy: admin.userId,
+        payoutNo,
       });
       scenario.payoutIds.push(payoutId);
       await attachEntries(payoutId, scenario.receiptIds);
+
+      // ⚠️ **阶段 5m：解卡重打前渠道要说「没打」** ——
+      //    核实闸只放行这一种结论（问不出结论一律拒绝，防重复打款）
+      await seedChannelFailure({
+        payoutId,
+        payoutNo,
+        amount: 30000,
+      });
 
       const response = await platformUnstick(
         admin.token,

@@ -671,15 +671,17 @@ describe('优惠预览与我的券的每用户状态 (e2e)', () => {
     it('券的窗口横跨两个时钟：数据库钟说有效 → 预览里它可用', async () => {
       const merchant = await createMerchant(app, prisma);
       const customer = await registerCustomer(merchant.subdomain);
-      // 券的窗口：[2019-11-01, 2026-11-01)
-      //   - 数据库钟（真实时间 ~2026-10）落在窗口**内** → 有效
+      // 券的窗口：[2019-11-01, 现在 + 365 天)
+      //   - 数据库钟（真实时间 = 现在）落在窗口**内** → 有效
       //   - 应用钟（冻到 2019-06）落在窗口**前** → 未开始
       const coupon = await createCoupon(merchant.token, {
         name: '横跨两个时钟的券',
         value: 1000,
         minAmount: 0,
         startsAt: '2019-11-01T00:00:00.000Z',
-        endsAt: '2026-11-01T00:00:00.000Z',
+        // ⚠️ **结束时间必须永远在未来** —— 原来硬编码 '2026-11-01'，
+        //    到 2026-11-01 当天数据库钟就越过它 → 券被判「已过期」→ 这条用例红了。
+        endsAt: new Date(Date.now() + 365 * 86_400_000).toISOString(),
       });
       await claimCoupon(customer.token, coupon.id);
 

@@ -112,11 +112,13 @@ describe('出款单列表页：周期来自 URL', () => {
   it('不给周期 → 路径里没有 period（列出全部）', async () => {
     await renderPage();
 
-    expect(apiFetchAuthedMock).toHaveBeenCalledTimes(1);
-    const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
+    const paths = apiFetchAuthedMock.mock.calls.map((call) => call[0] as string);
     // ⚠️ **精确匹配而不是 `toContain`**：`toContain('/platform/payouts')`
     //    连 `/platform/payoutsXYZ` 也放得过，路径写歪了照样绿。
-    expect(path).toBe('/platform/payouts?page=1&pageSize=100');
+    expect(paths).toContain('/platform/payouts?page=1&pageSize=100');
+    // ⚠️ **横幅还要拉一次未处置差异统计**（阶段 5m）——
+    //    出款列表页顶部那条「有 N 条严重差异」的横幅。
+    expect(paths).toContain('/platform/payout-reconciliations/summary');
   });
 
   it('给了周期 → 路径里带 period', async () => {
@@ -140,12 +142,17 @@ describe('出款单列表页：周期来自 URL', () => {
     expect(withPeriod).toBe('/platform/payouts?period=2026-01&page=1&pageSize=100');
   });
 
-  it('⚠️ 周期格式非法 → 提示，且根本不调后端', async () => {
+  it('⚠️ 周期格式非法 → 提示，且不调出款明细', async () => {
     const texts = await renderPage({ period: '2026-13' });
 
     expect(hasText(texts, '周期格式非法')).toBe(true);
-    // ⚠️ **非法周期的明细比没有明细更糟**：所以压根不调后端。
-    expect(apiFetchAuthedMock).not.toHaveBeenCalled();
+    // ⚠️ **非法周期的明细比没有明细更糟**：所以压根不调出款列表。
+    //    ⚠️ **横幅的统计仍然要调** —— 那条横幅与周期无关，
+    //    「有 N 条严重差异未处置」在任何周期下都得显示。
+    const paths = apiFetchAuthedMock.mock.calls.map((call) => call[0] as string);
+    expect(paths.some((path) => path.startsWith('/platform/payouts'))).toBe(
+      false,
+    );
   });
 });
 

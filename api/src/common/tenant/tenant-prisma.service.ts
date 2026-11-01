@@ -631,6 +631,20 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
     return this.client.payoutOperation;
   }
 
+  // ------- 渠道对账（阶段 5m）模型 delegate 代理 -------
+
+  // ⚠️ **不带 tenantId** —— 对账是平台级动作，跨所有租户（与 `PayoutOperation` 同款）
+  // ⚠️ 因此**不受租户作用域约束** —— 查询前必须自行校验归属
+  get payoutReconciliation() {
+    return this.client.payoutReconciliation;
+  }
+
+  // ⚠️ **不带 tenantId，且 `payoutId` 可空**（D 类没有本地单）
+  // ⚠️ 因此**不受租户作用域约束** —— 任何列表/详情查询**必须**同时带 `reconciliationId`
+  get payoutReconciliationItem() {
+    return this.client.payoutReconciliationItem;
+  }
+
   // ------- PrismaClient 实例级方法代理 -------
   // $connect / $disconnect 由生命周期钩子分别调用，
   // 这里仍然透传出来让服务消费者可以手动关闭连接（例如测试用例）。

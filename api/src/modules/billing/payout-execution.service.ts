@@ -1,10 +1,22 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { PayoutStatus, SettlementStatus } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
+import { PAYOUT_VERIFICATION } from '../../common/payment/payout-verification';
+// ⚠️ **必须 `import type`** —— `PayoutVerification` 是接口，被用在
+//    带装饰器的构造器参数上（`emitDecoratorMetadata` + `isolatedModules`
+//    下，TS1272 要求装饰器签名里引用的类型必须是 type-only 导入）。
+import type { PayoutVerification } from '../../common/payment/payout-verification';
 import { PayoutCipherService } from './payout-cipher.service';
 
 /** 打款的结果（worker 传给本服务） */
@@ -34,6 +46,13 @@ export interface MarkFailedInput {
    *    会落成「不可重试」（安全方向）。
    */
   failedBeforePayout?: boolean;
+  /**
+   * ⚠️ **新增**（阶段 5m）：渠道交易号。失败时渠道也会给 —— 不存就无从核实。
+   *
+   * ⚠️ **只在渠道被调用过时才传** —— 渠道压根没被调用时传假值会污染核实判断。
+   * ⚠️ **不传就不写**（`undefined` 会被 Prisma 忽略）—— 不能覆盖已有的值。
+   */
+  providerTxnId?: string;
 }
 
 /** 退回 APPROVED 等下一次重试的结果 */
@@ -88,6 +107,10 @@ export class PayoutExecutionService {
   constructor(
     private readonly prisma: TenantPrismaService,
     private readonly cipher: PayoutCipherService,
+    // ⚠️ **注入核实服务**（阶段 5m）—— B 类人工处置的闸 ④ 要用。
+    //    按 token 注入（契约在 `common/`）→ **不产生 billing → payment 的模块边**。
+    @Inject(PAYOUT_VERIFICATION)
+    private readonly verification: PayoutVerification,
   ) {}
 
   /**
@@ -207,9 +230,21 @@ export class PayoutExecutionService {
             payoutTxnId: input.providerTxnId,
             // ⚠️ **失败原因要清掉**：重试成功后之前那次失败的原因不该留着
             failureReason: null,
+            // ⚠️ **新增**（阶段 5m）：`failedAt` 与 `failedBeforePayout` 也要清。
+            //    残留的 `failedAt` 会让这张单落进**另一个**对账窗口；
+            //    停在 `true` 的 `failedBeforePayout` 会让一张 `PAID` 的单
+            //    带着「钱确定没打出去」的标记 —— 语义自相矛盾。
+            failedAt: null,
+            failedBeforePayout: false,
           },
         });
         if (affected.count === 0) {
+          // ⚠️ **补日志**（阶段 5m）—— 现状是完全静默。
+          //    对账纠正与 worker 可能撞车（worker 先落了 `PAID`），
+          //    这时「渠道打了两次」的怀疑无法排除 → 有日志才查得清。
+          this.logger.warn(
+            `出款 ${payoutId} 的 markPaid 未命中（状态已变，可能已被对账纠正或人工处理）`,
+          );
           return false;
         }
 
@@ -260,6 +295,12 @@ export class PayoutExecutionService {
             // ⚠️ **「钱确定没打出去」的标记**（阶段 5l）——
             //    平台端的「重试」按钮只对 true 的单出现。
             failedBeforePayout: input.failedBeforePayout ?? false,
+            // ⚠️ **新增**（阶段 5m）：存渠道交易号。
+            //    `payoutTxnId` 的唯一写入点原本是 `markPaid` → `FAILED` 的单
+            //    没有交易号 → 「实时核实」对它们无从谈起。
+            //    ⚠️ **`undefined` 会被 Prisma 忽略** → 渠道没被调用时不会写入空值，
+            //    也不会覆盖已有的交易号。
+            payoutTxnId: input.providerTxnId,
           },
         });
         if (affected.count === 0) {
@@ -267,7 +308,27 @@ export class PayoutExecutionService {
         }
         // ⚠️ **与状态更新同一个事务** —— 分开写会出现
         //    「状态已 FAILED、明细还占着」的窗口
+        //
+        // ⚠️ **读 id 与删明细必须同事务**（阶段 5m）—— 分开写会出现
+        //    「明细已删、id 没记上」的窗口 → 这张单永远复原不了（只能落人工处理）。
+        const releasedEntries = await tx.payoutEntry.findMany({
+          where: { payoutId },
+          select: { entryId: true },
+        });
         await tx.payoutEntry.deleteMany({ where: { payoutId } });
+        if (releasedEntries.length > 0) {
+          // ⚠️ **只有释放了明细才记** —— 没有明细可释放时不要写空数组，
+          //    否则 B 类处置会误判「可复原」（闸 ① 要的是「当初那批」，
+          //    空数组意味着「当初就没有明细」→ 与 null 的语义不同）
+          await tx.payout.updateMany({
+            where: { id: payoutId },
+            data: {
+              releasedEntryIds: JSON.stringify(
+                releasedEntries.map((e) => e.entryId),
+              ),
+            },
+          });
+        }
         return true;
       });
 
@@ -276,6 +337,315 @@ export class PayoutExecutionService {
       );
       return result;
     });
+  }
+
+  /**
+   * B 类人工处置：`FAILED → PAID`（阶段 5m）。
+   *
+   * ⚠️ **必须复原明细** —— `markFailed` 释放了 `payout_entries`，
+   *    不复原的话这批流水在出款维度上**凭空消失**（商家少拿、账上无出款记录）。
+   * ⚠️ **不能用「重算」复原** —— 补差单的纳入范围依赖 `payout_entries` 本身，
+   *    明细已释放 → 重算失真 → 复原不出「当初那批」。只能用 `releasedEntryIds`。
+   *
+   * ## 四道闸（缺一不可）
+   *
+   * | 闸 | 检查 |
+   * |---|---|
+   * | ① 明细可复原 | `releasedEntryIds` 非空 |
+   * | ② 金额与笔数 | **带符号**金额之和 == `receiptAmount` 且笔数 == `entryCount`；另校验 `netAmount == receiptAmount − commissionAmount` |
+   * | ③ 明细未被他人占用 | 那些 `entryId` 是否已被**别的**出款单占用 |
+   * | ④ 渠道核实 + 结算单状态 | 渠道说 SUCCESS？结算单状态允许联动？ |
+   *
+   * ## ⚠️ **核实对象与结算单一律从库里读到的 `payout` 取**（阶段 5m 审查修正）
+   *
+   * ⚠️ **不能由调用方指定** —— 核实对象（`payoutNo`）与结算单（`statementId`）
+   *    一旦允许调用方传入，闸 ④ 就形同虚设：
+   *    传别的单的 `payoutNo` → 核实的是**别的单**，
+   *    渠道说「那单打了」 → 闸放行 → 把**这张**单改成已付款 → 重复付款。
+   *    传别的单的 `statementId` → 结算单状态检查看的不是**这张单**的结算单。
+   *    → 这两个字段已从方法签名里**删除**，调用方无法再影响闸 ④。
+   *
+   * @throws ConflictException 闸没过时抛（业务错误，不冒成 500）
+   */
+  async confirmPaidAfterReconciliation(
+    payoutId: string,
+    input: {
+      /** 人工确认的原因（会进留痕） */
+      reason: string;
+      /** 操作人（平台超管的用户 id） */
+      operatorId: string;
+      /** 关联的对账任务 id */
+      reconciliationId?: string;
+    },
+  ): Promise<boolean> {
+    const trimmed = input.reason?.trim() ?? '';
+    if (!trimmed) {
+      throw new BadRequestException('操作原因不能为空');
+    }
+
+    return tenantContext.run(platformScope(), async () => {
+      const payout = await this.prisma.payout.findFirst({
+        where: { id: payoutId },
+      });
+      if (!payout) {
+        throw new NotFoundException('出款单不存在');
+      }
+      if (payout.status !== PayoutStatus.FAILED) {
+        throw new ConflictException(
+          `出款单状态已变（当前是 ${payout.status}），只有记成失败的出款单能确认已付款`,
+        );
+      }
+
+      // ---- 闸 ①：明细可复原 ----
+      const releasedEntryIds = this.parseReleasedEntryIds(
+        payout.releasedEntryIds,
+      );
+      if (releasedEntryIds.length === 0) {
+        throw new ConflictException(
+          '这张出款单的明细无法复原（没有记录被释放的流水），需人工处理',
+        );
+      }
+
+      // ---- 闸 ②：金额与笔数对得上 ----
+      //
+      // ⚠️ **必须显式带 `tenantId`**（阶段 5m 审查修正）——
+      //    `MerchantReceipt` **在租户白名单里**，但本方法跑在**平台作用域**
+      //    （`tenantContext.run(platformScope(), ...)`）→
+      //    租户扩展对平台作用域**不附加任何过滤**（`resolveScope` 返回
+      //    `{ kind: 'platform' }`，见 `tenant-prisma.service.ts`）。
+      //    → 不显式带 `tenantId` 就是**跨租户读**：
+      //    别的租户恰好有同 id 的流水时，会被算进本单的金额合计里
+      //    → 闸 ② 拿错数据算账（补差单的明细校验尤其致命）。
+      //    显式带上是**纵深防御**：即使将来作用域判定变了，这里仍然安全。
+      const receipts = await this.prisma.merchantReceipt.findMany({
+        where: { id: { in: releasedEntryIds }, tenantId: payout.tenantId },
+        select: { id: true, amount: true },
+      });
+      if (receipts.length !== releasedEntryIds.length) {
+        throw new ConflictException(
+          '被释放的货款流水已被删除，明细无法复原，需人工处理',
+        );
+      }
+      // ⚠️ **带符号求和** —— `merchant_receipts.amount` 的冲回是负数，
+      //    取绝对值会把「退了一笔」算成「多了一笔」。
+      const sum = receipts.reduce((acc, r) => acc + r.amount, 0);
+      if (sum !== payout.receiptAmount) {
+        throw new ConflictException(
+          `明细金额与出款单对不上（明细合计 ${sum} 分，出款单 ${payout.receiptAmount} 分），账已漂移，需人工账务处理`,
+        );
+      }
+      if (receipts.length !== payout.entryCount) {
+        throw new ConflictException(
+          `明细笔数与出款单对不上（明细 ${receipts.length} 笔，出款单 ${payout.entryCount} 笔），需人工账务处理`,
+        );
+      }
+      if (payout.netAmount !== payout.receiptAmount - payout.commissionAmount) {
+        throw new ConflictException(
+          '出款单的金额不自洽（净额 ≠ 货款 − 佣金），需人工账务处理',
+        );
+      }
+
+      // ---- 闸 ③：明细未被他人占用 ----
+      // ⚠️ **`payout_entries` 不在租户白名单** → 扩展不附加任何过滤 →
+      //    这次查询会**跨租户读到全平台**的行。
+      //    ⚠️ **读到不等于泄露**：结果只用于「有没有被占用」的布尔判断，
+      //    不返回给调用方、不写进响应、不进留痕。
+      //    ⚠️ **判定条件是「同租户 + 同期」** —— 而 `payout_entries` 自己
+      //    没有 `tenantId`、没有 `periodStart`（只有 `payoutId` 与 `entryId`）
+      //    → 只能 join `payout` 拿到这两个值，再在应用层比对。
+      //    （写进 `where` 的嵌套过滤也等价，但要先取到 `payout.periodStart`
+      //    这个具体时刻，写起来更绕。）
+      const occupied = await this.prisma.payoutEntry.findMany({
+        where: {
+          entryId: { in: releasedEntryIds },
+          // ⚠️ **排除本单自己**（本单的明细已被释放，理论上查不到，
+          //    但别的出款单占用时要能查出来）
+          NOT: { payoutId },
+        },
+        select: {
+          entryId: true,
+          payout: { select: { tenantId: true, periodStart: true } },
+        },
+      });
+      const conflicting = occupied.filter(
+        (e) =>
+          e.payout.tenantId === payout.tenantId &&
+          e.payout.periodStart.getTime() === payout.periodStart.getTime(),
+      );
+      if (conflicting.length > 0) {
+        throw new ConflictException(
+          '这批流水已被同期的另一个出款单占用，疑似重复付款，需人工退款处理',
+        );
+      }
+
+      // ---- 闸 ④：渠道核实 + 结算单状态 ----
+      //
+      // ⚠️ **核实对象一律取自库里读到的 `payout`**（阶段 5m 审查修正）——
+      //    之前这里是 `input.payoutNo ?? payout.payoutNo`，而 `input.payoutNo`
+      //    由调用方传入 → 传别的单的号就能核实别的单 → **闸 ④ 被完全绕过**
+      //    （渠道说「那单打了」→ 放行 → 这张单被改成已付款 → 重复付款）。
+      //    → `input.payoutNo` 已从签名删除，核实对象不再受调用方影响。
+      const verdict = await this.verification.verify({
+        id: payout.id,
+        payoutNo: payout.payoutNo,
+        payoutTxnId: payout.payoutTxnId,
+      });
+      if (verdict.verdict !== 'PAID') {
+        throw new ConflictException(
+          '渠道核实没有确认这笔已打款，无法标记为已付款（请先执行渠道对账）',
+        );
+      }
+
+      // ⚠️ **结算单一律取自库里读到的 `payout`**（同上）——
+      //    `input.statementId` 已从签名删除 → 闸 ④ 看的结算单
+      //    永远是**这张单自己的**结算单。
+      const statementId = payout.statementId;
+      if (statementId) {
+        //
+        // ⚠️ **必须显式带 `tenantId`**（阶段 5m 审查修正）——
+        //    `SettlementStatement` **在租户白名单里**，但本方法跑在
+        //    **平台作用域** → 租户扩展**不附加任何过滤**
+        //    （`resolveScope` 在平台作用域返回 `{ kind: 'platform' }`）。
+        //    → 不显式带就是**跨租户读**：查到的可能是别的租户的结算单
+        //    → 拿它的状态当闸 ④ 的判据 → 闸 ④ 形同虚设。
+        const statement = await this.prisma.settlementStatement.findFirst({
+          where: { id: statementId, tenantId: payout.tenantId },
+          select: { status: true },
+        });
+        // ⚠️ **`statementId` 为 null 是常态**（零额抽佣的商家该期没有结算单）
+        //    → 跳过联动，不算异常。
+        if (statement) {
+          if (
+            statement.status !== SettlementStatus.CONFIRMED &&
+            statement.status !== SettlementStatus.PAID
+          ) {
+            throw new ConflictException(
+              '关联的结算单状态不允许联动（只有已确认或已付款的可以），需人工处理',
+            );
+          }
+        }
+      }
+
+      // ---- 通过四闸：执行 ----
+      const paidAt = await this.prisma.databaseNow();
+      try {
+        await this.prisma.$transaction(async (tx) => {
+          // 1. 还原明细
+          await tx.payoutEntry.createMany({
+            data: releasedEntryIds.map((entryId) => ({ payoutId, entryId })),
+            skipDuplicates: false,
+          });
+
+          // 2. 转 PAID
+          //
+          // ⚠️ **必须看 `affected.count`**（阶段 5m 审查修正）——
+          //    条件更新 `status: FAILED` 没命中，说明状态**已被别人改了**
+          //    （worker 先落了 `PAID`，或另一路人工处置已经改过）。
+          //    之前这里无视返回值 → 事务照样提交 → 下面第 4 步写一条留痕
+          //    说「从 FAILED 改到 PAID」，**但状态根本没改** → 留痕会说谎，
+          //    而留痕是事后追责的唯一凭据。
+          //    → 没命中就抛出去，让整个事务回滚（不留痕、不改结算单）。
+          const paidAffected = await tx.payout.updateMany({
+            where: { id: payoutId, status: PayoutStatus.FAILED },
+            data: {
+              status: PayoutStatus.PAID,
+              paidAt,
+              payoutChannel: payout.payoutChannel ?? 'fake-payout',
+              payoutTxnId: verdict.providerTxnId ?? payout.payoutTxnId,
+              failureReason: null,
+              // ⚠️ **要清空** —— 它们记的是「落 FAILED 那一刻」的判断，
+              //    现在是 PAID 了，留着会误导
+              failedAt: null,
+              failedBeforePayout: false,
+              // ⚠️ **attemptCount 不重置** —— 钱已经打了，次数是历史事实
+            },
+          });
+          if (paidAffected.count === 0) {
+            throw new ConflictException(
+              '出款单状态已变（可能已被对账纠正或人工处理过），无法标记为已付款',
+            );
+          }
+
+          // 3. 结算单联动（`statementId` 为 null 时跳过）
+          //
+          // ⚠️ **只有正常单才联动结算单**（护栏 X6）——
+          //    补差单（`kind === 'SUPPLEMENT'`）**不改结算单状态**：
+          //    结算单在正常单 `PAID` 时已经转过了，补差单再转一次就是重复联动。
+          //    （与 `markPaid` 里的同一道护栏保持一致。）
+          if (statementId && payout.kind === 'NORMAL') {
+            const statementAffected = await tx.settlementStatement.updateMany({
+              where: { id: statementId, status: SettlementStatus.CONFIRMED },
+              data: { status: SettlementStatus.PAID, paidAt },
+            });
+            // ⚠️ **这里没命中是正常的，不抛错** —— 结算单可能已经是 `PAID`
+            //    （另一张单先联动过了）→ 幂等，不是异常。
+            //    但**要记日志**：count === 0 且结算单确实存在时，
+            //    说明它处于一个「既不是 CONFIRMED 也不是 PAID」的中间态
+            //    （闸 ④ 允许的是 CONFIRMED / PAID）→ 值得留痕排查。
+            if (statementAffected.count === 0) {
+              this.logger.warn(
+                `出款 ${payoutId} 的结算单 ${statementId} 联动未命中` +
+                  '（状态不是 CONFIRMED —— 可能已被其他单联动，或处于中间态）',
+              );
+            }
+          }
+
+          // 4. 留痕
+          await tx.payoutOperation.create({
+            data: {
+              payoutId,
+              action: 'MANUAL_CONFIRM_PAID',
+              operatorId: input.operatorId,
+              reason: trimmed,
+              fromStatus: PayoutStatus.FAILED,
+              toStatus: PayoutStatus.PAID,
+              attemptCountBefore: payout.attemptCount,
+              reconciliationId: input.reconciliationId ?? null,
+            },
+          });
+        });
+      } catch (error) {
+        // ⚠️ **数据库是最后一道兜底** —— 撞部分唯一索引
+        //    `payouts_tenantId_period_kind_active_uniq` 说明商家已经重新申请过
+        //    同一期 → **必须翻成业务错误**，不能让它冒成 500。
+        if (this.isUniqueViolation(error)) {
+          throw new ConflictException(
+            '出款单状态已变（商家可能已重新申请同一期），无法标记为已付款',
+          );
+        }
+        throw error;
+      }
+
+      this.logger.log(
+        `对账人工确认已付款：${payoutId}（操作人 ${input.operatorId}）`,
+      );
+      return true;
+    });
+  }
+
+  /** 解析 `releasedEntryIds`（JSON 数组字符串）；解析不出就当「不可复原」 */
+  private parseReleasedEntryIds(raw: string | null): string[] {
+    if (!raw) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed.filter((v): v is string => typeof v === 'string');
+    } catch {
+      return [];
+    }
+  }
+
+  /** 判断是不是 Prisma 的唯一约束冲突（P2002） */
+  private isUniqueViolation(error: unknown): boolean {
+    return (
+      typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: string }).code === 'P2002'
+    );
   }
 
   /**

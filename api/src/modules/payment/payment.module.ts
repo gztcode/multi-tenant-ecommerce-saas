@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { MulterModule } from '@nestjs/platform-express';
 import { AuthModule } from '../auth/auth.module';
 import { OrderModule } from '../order/order.module';
 import { CouponModule } from '../coupon/coupon.module';
@@ -15,13 +16,16 @@ import { WebhookWorker } from './webhook.worker';
 import { CompensationService } from './compensation.service';
 import { CompensationWorker } from './compensation.worker';
 import { FakePaymentProvider } from './fake-payment.provider';
-import { FakePayoutProvider } from './fake-payout.provider';
 import { PayoutWorker } from './payout.worker';
 import { PayoutScanScheduler } from './payout-scan.scheduler';
+import { PayoutReconciliationResolver } from './payout-reconciliation-resolver.service';
+import { PayoutReconciliationService } from './payout-reconciliation.service';
+import { PayoutReconcileScheduler } from './payout-reconcile.scheduler';
+import { PlatformPayoutReconciliationController } from './platform-payout-reconciliation.controller';
 import { FakePayoutController } from './fake-payout.controller';
 import { PaymentProvider } from './payment-provider.interface';
-import { PayoutProvider } from './payout-provider.interface';
-import { PAYMENT_PROVIDERS, PAYOUT_PROVIDERS } from './payment.constants';
+import { PAYMENT_PROVIDERS } from './payment.constants';
+import { PayoutProvidersModule } from '../../common/payment/payout-providers.module';
 
 /**
  * 支付模块（阶段 3 Task 5）。
@@ -66,13 +70,26 @@ import { PAYMENT_PROVIDERS, PAYOUT_PROVIDERS } from './payment.constants';
  * 而 `Map` 让「按渠道名找 provider」不需要 switch/if 链。
  */
 @Module({
-  imports: [AuthModule, OrderModule, CouponModule, BillingModule],
+  imports: [
+    AuthModule,
+    OrderModule,
+    CouponModule,
+    BillingModule,
+    // ⚠️ **出款渠道表与核实服务**（阶段 5m）——
+    //    `@Global()` 模块，不产生模块依赖边（billing 也要用它）。
+    PayoutProvidersModule,
+    // ⚠️ **multipart**（阶段 5m）—— 本仓第一个文件上传的接口。
+    //    MulterModule 提供 `FileInterceptor` 需要的 multer 实例。
+    MulterModule.register({ limits: { fileSize: 5 * 1024 * 1024 } }),
+  ],
   controllers: [
     PaymentController,
     WebhookController,
     FakePaymentController,
     SubscriptionPaymentController,
     FakePayoutController,
+    // ⚠️ **渠道对账**（阶段 5m）
+    PlatformPayoutReconciliationController,
   ],
   providers: [
     PaymentService,
@@ -83,7 +100,6 @@ import { PAYMENT_PROVIDERS, PAYOUT_PROVIDERS } from './payment.constants';
     CompensationService,
     CompensationWorker,
     FakePaymentProvider,
-    FakePayoutProvider,
     // ⚠️ **出款执行消费端**（阶段 5h-2）：`PayoutExecutionService`
     //    来自 `BillingModule`（已导出），依赖方向 `payment → billing` 单向。
     PayoutWorker,
@@ -91,6 +107,13 @@ import { PAYMENT_PROVIDERS, PAYOUT_PROVIDERS } from './payment.constants';
     //    `PayoutWorker` 只负责消费 `scan` job，没人往队列里投它的话
     //    `APPROVED` 救援路径就是死代码（审批后入队失败 → 单子永远停在已审批）。
     PayoutScanScheduler,
+    // ⚠️ **对账差异的处置**（阶段 5m Task 6）：A 类自动纠正 `PROCESSING → PAID`。
+    //    B 类的人工处置在 billing 的 `PayoutExecutionService`（四道闸）。
+    PayoutReconciliationResolver,
+    // ⚠️ **渠道对账**（阶段 5m）：对账服务 + 定时任务注册器。
+    //    ⚠️ `PayoutReconciliationResolver` 已在上面注册（Task 6）—— 不重复注册。
+    PayoutReconciliationService,
+    PayoutReconcileScheduler,
     {
       provide: PAYMENT_PROVIDERS,
       useFactory: (fake: FakePaymentProvider): Map<string, PaymentProvider> => {
@@ -99,15 +122,6 @@ import { PAYMENT_PROVIDERS, PAYOUT_PROVIDERS } from './payment.constants';
         return providers;
       },
       inject: [FakePaymentProvider],
-    },
-    {
-      provide: PAYOUT_PROVIDERS,
-      useFactory: (fake: FakePayoutProvider): Map<string, PayoutProvider> => {
-        const providers = new Map<string, PayoutProvider>();
-        providers.set(fake.channel, fake);
-        return providers;
-      },
-      inject: [FakePayoutProvider],
     },
   ],
   exports: [PaymentService, PaymentMethodService, RenewalService],

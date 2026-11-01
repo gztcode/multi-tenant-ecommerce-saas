@@ -49,9 +49,17 @@ describe('支付补偿扫描', () => {
     compensation = app.get(CompensationService);
     payments = app.get(PaymentService);
     webhookQueue = app.get(getQueueToken(PAYMENT_WEBHOOK_QUEUE));
+
+    // ⚠️ **暂停回调队列** —— 重投的 job **不带 delay** → 直接进 `waiting`
+    //    → 进程内的回调 worker 立刻消费掉它 → 断言时 job 已经不在队列里了。
+    //    这条用例断言的就是「job 还在队列里」，所以必须让它留在队列里。
+    //    （同文件另一条用例改用 `getJob` 绕开，也是同一个原因。）
+    await webhookQueue.pause();
   });
 
   afterAll(async () => {
+    // ⚠️ **必须先恢复队列** —— 否则同一 Redis 上的后续 e2e 跑不动。
+    await webhookQueue.resume();
     await app.close();
     delete process.env.FAKE_PAYMENT_ENABLED;
     delete process.env.FAKE_PAYMENT_SECRET;

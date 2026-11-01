@@ -1309,6 +1309,31 @@ model Payout {
   /// ⚠️ **不能靠 `failureReason` 的文案推断** —— 文案会被改、
   ///    会被手工编辑。判断依据必须是**打款动作有没有发生**。
   failedBeforePayout Boolean @default(false)
+  /// ⚠️ **释放明细时记下的那批流水 id**（JSON 数组字符串）。
+  ///
+  /// `markFailed` / `unstick` 会 `deleteMany` 释放 `payout_entries`
+  /// （`entryId` 是全局唯一索引，不释放商家重新申请会撞 P2002 → 500）。
+  /// 释放之后「这张单原本要打哪些流水」就**丢了** ——
+  /// 而 B 类（渠道说钱打了、本地记失败）要转 `PAID` 时**必须复原它**，
+  /// 否则这批流水在出款维度上凭空消失（商家少拿、账上无出款记录）。
+  ///
+  /// ⚠️ **为什么不用「重算」复原**：补差单（`kind='SUPPLEMENT'`）的纳入范围
+  /// 是「本单已占 ∪ 未被他单占用」，**依赖 `payout_entries` 本身** ——
+  /// 明细已被释放 → 重算出的范围失真 → 复原不出「当初那批」。
+  /// 记下 id 是**唯一精确**的复原方式。
+  ///
+  /// ⚠️ **存量单没有这一列**（`null`）→ B 类的人工处置对它们不可用 →
+  /// 落人工待处理项，不猜。
+  ///
+  /// ⚠️ **刻意用 `String` 存 JSON 而不是 Prisma 的 `Json` 类型** ——
+  ///    本仓既有的 7 处结构化字段（`themeTokens` / `paymentConfig` / `attributes` /
+  ///    `skuSnapshot` / `rawResponse` / `payload` / `features`）都用 `Json`，
+  ///    这里保持一致才算「与仓库其余写法一致」→ **本字段是刻意的例外**。
+  ///    理由：它**只有一个写入方**（`markFailed` / `unstick`）且**只读不回写**，
+  ///    用 `String` 可以省掉 `Prisma.InputJsonValue` 的类型体操。
+  ///    ⚠️ **代价**：读的时候必须自己 `JSON.parse` 并兜住解析失败 ——
+  ///    写方只有一个且总是写合法 JSON，所以这个代价是可接受的。
+  releasedEntryIds String?
   /// 卡死告警已发出的时刻（兜底扫描写）
   /// ⚠️ 只为「告警去重」而存在：不写它的话兜底扫描每 5 分钟就把同一张单
   ///    捞出来再打一遍日志 —— 一晚上几千行噪音
@@ -1371,6 +1396,16 @@ model PayoutOperation {
   toStatus PayoutStatus
   /// 操作前的尝试次数（留痕要能看出「重试了几次」）
   attemptCountBefore Int?
+  /// ⚠️ **新增**（阶段 5m）：触发的对账任务 id。
+  /// 没有它就答不出「这次对账纠正了哪几张单」——
+  /// 留痕只有「谁在什么时候把哪张单改了」，没有「为什么」。
+  ///
+  /// ⚠️ **刻意不声明外键** —— 对账任务可能因保留策略被清理，
+  /// 而留痕是审计凭证，**必须活得比任务久** → 不能 `ON DELETE CASCADE`；
+  /// `ON DELETE SET NULL` 又会丢掉「这次对账」这一信息，
+  /// 而这一列的全部意义就是这个信息。
+  /// → 与 `Subscription.planId` 同款处理：service 层写入时校验 id 存在。
+  reconciliationId String?
   createdAt DateTime @default(now())
 
   /// 所属出款单（与 `payout_entries` 同款：`onDelete: Cascade` ——
@@ -1380,6 +1415,9 @@ model PayoutOperation {
 
   @@index([payoutId, operatedAt])
   @@index([operatorId])
+  /// ⚠️ 这一列存在的唯一理由就是「答得出『这次对账纠正了哪几张单』」，
+  /// 答这句话的查询就是 `where: { reconciliationId }` → 没有索引就是全表扫。
+  @@index([reconciliationId])
   @@map("payout_operations")
 }
 
@@ -1391,4 +1429,172 @@ enum PayoutOperationAction {
   UNSTUCK_TO_FAILED
   /// 解卡重打：PROCESSING → APPROVED（⚠️ 可能重复打款）
   UNSTUCK_TO_APPROVED
+  /// 对账发现渠道已打款，本地是 PROCESSING → 自动纠正为 PAID（阶段 5m）
+  RECONCILE_TO_PAID
+  /// 人工确认「渠道已打款」→ FAILED 纠正为 PAID（阶段 5m）
+  MANUAL_CONFIRM_PAID
+}
+
+/// 对账的数据来源（阶段 5m）
+enum ReconciliationSource {
+  /// 渠道 API 批量查单
+  API
+  /// 渠道账单文件导入
+  FILE
+}
+
+/// 对账任务的状态（阶段 5m）
+enum ReconciliationStatus {
+  /// 执行中
+  RUNNING
+  /// 已完成
+  COMPLETED
+  /// 失败（超限 / 渠道不可用 / 解析出错）
+  FAILED
+}
+
+/// 差异类型（阶段 5m；对应设计 §四·4.3 的 A–F 六类）
+enum ReconciliationDiffType {
+  /// A：渠道成功，本地卡在 PROCESSING
+  CHANNEL_PENDING_LOCAL
+  /// B：渠道成功，本地记成了 FAILED
+  CHANNEL_SUCCESS_LOCAL_FAILED
+  /// C：渠道成功，本地已付但金额不符
+  AMOUNT_MISMATCH
+  /// D：渠道有、本地没有这张单（漏记出款）
+  CHANNEL_ONLY
+  /// E：渠道没有、本地已付（最危险）
+  LOCAL_PAID_CHANNEL_ABSENT
+  /// F：渠道状态与本地状态不符（且不是 A/B 的形态）—— 例如渠道说拒付、本地记 PAID
+  STATUS_MISMATCH
+}
+
+/// 差异的严重级（决定预警强度）
+enum ReconciliationSeverity {
+  /// A 类：渠道说已打，本地卡在中间
+  INFO
+  /// B 类：渠道说已打，本地误判失败
+  WARNING
+  /// C / D / E / F
+  CRITICAL
+}
+
+/// 差异的处置状态
+enum ReconciliationResolution {
+  /// 待处置
+  PENDING
+  /// 已处置
+  RESOLVED
+  /// 已忽略（经核实无需处理）
+  IGNORED
+}
+
+/// 渠道对账任务（阶段 5m）。
+///
+/// ⚠️ **不带 `tenantId`** —— 对账是**平台级**动作，跨所有租户
+/// （与 `PayoutOperation` 同款）→ **不登记进 `TENANT_SCOPED_MODELS`**。
+///
+/// ⚠️ **它不受任何租户作用域约束** —— 任何忘了带 `reconciliationId` 的查询
+/// 都会返回**全平台数据**。本表本身不含商家金额（只有统计数字），风险可控；
+/// 但**必须**在 `tenant-models.ts` 里写明这条警告（与 `PayoutOperation` 同款）。
+model PayoutReconciliation {
+  id String @id @default(uuid())
+  /// 渠道名
+  channel String
+  /// 数据来源
+  source ReconciliationSource
+  /// 对账窗口起点（含）
+  windowFrom DateTime
+  /// 对账窗口终点（不含）
+  windowTo DateTime
+  /// 账单文件名（FILE 来源）
+  fileName String?
+  /// 列映射（FILE 来源，JSON 字符串）
+  ///
+  /// ⚠️ **刻意用 `String` 存 JSON 而不是 `Json` 类型** ——
+  ///    理由同 `payouts.releasedEntryIds`：单写入方、只读、
+  ///    省掉 `Prisma.InputJsonValue` 的类型体操。
+  columnMapping String?
+  status ReconciliationStatus @default(RUNNING)
+  /// 触发人（定时任务为 `system:scheduler`）
+  triggeredBy String?
+  startedAt DateTime @default(now())
+  finishedAt DateTime?
+  /// 渠道侧流水条数（⚠️ 一张本地单可能对应多条 → 这个数会大于 localCount）
+  channelCount Int @default(0)
+  /// 本地参与比对的单数
+  localCount Int @default(0)
+  /// 匹配一致的**本地单**数（口径 = 本地单数，不是渠道流水条数）
+  matchedCount Int @default(0)
+  /// 差异笔数
+  diffCount Int @default(0)
+  /// 失败原因（FAILED 时）
+  errorMessage String?
+  createdAt DateTime @default(now())
+
+  items PayoutReconciliationItem[]
+
+  @@index([channel, windowFrom])
+  @@index([status])
+  @@map("payout_reconciliations")
+}
+
+/// 渠道对账的差异明细（阶段 5m）。
+///
+/// ⚠️ **同样不带 `tenantId`** → 不登记白名单 → 裸 delegate。
+///
+/// ⚠️ **本表不受任何作用域约束，且 `payoutId` 可空**（D 类没有本地单）→
+/// 「按 `payoutId` 反查租户」这个安全网在 D 类上**直接失效** →
+/// 任何列表/详情查询**必须**同时按 `reconciliationId` 限定，
+/// 且 `reconciliationId` 只能来自平台超管的权限检查之后。
+/// 本表含 `channelReferenceNo`（= 商家的出款单号）与金额 → **泄露即跨租户泄露**。
+model PayoutReconciliationItem {
+  id String @id @default(uuid())
+  reconciliationId String
+  /// 差异类型
+  type ReconciliationDiffType
+  /// 严重级
+  severity ReconciliationSeverity
+  /// 关联的本地出款单（⚠️ D 类可能为空 —— 渠道有、本地没有）
+  ///
+  /// ⚠️ **刻意不加外键** —— `payouts` 表事实上没有物理删除路径
+  /// （只有 `CANCELLED` 状态），悬空引用时反查返回空即可；
+  /// 而 D 类的 `payoutId` 为 null，加外键约束会平白增加 DDL 复杂度而收益为零。
+  payoutId String?
+  /// 渠道流水号
+  channelTxnId String?
+  /// 渠道侧业务单号
+  channelReferenceNo String?
+  /// 渠道侧金额（分）
+  channelAmount Int?
+  /// 渠道侧状态
+  channelStatus String?
+  /// 渠道侧打款时刻
+  channelPaidAt DateTime?
+  /// 本地金额（分）
+  localAmount Int?
+  /// 本地状态
+  localStatus PayoutStatus?
+  /// 处置状态
+  resolution ReconciliationResolution @default(PENDING)
+  /// 处置人
+  resolvedBy String?
+  /// 处置时刻
+  resolvedAt DateTime?
+  /// 处置说明
+  note String?
+  createdAt DateTime @default(now())
+
+  reconciliation PayoutReconciliation @relation(fields: [reconciliationId], references: [id], onDelete: Cascade)
+
+  @@index([reconciliationId])
+  @@index([resolution, severity])
+  // ⚠️ **(payoutId, type) 而不是 (payoutId)** —— 去重查询要同时按
+  //    payoutId 与 type 过滤；只按 payoutId 建索引的话 type 只能回表过滤。
+  //    「按 payoutId 反查某张单的全部差异」也仍然走这个索引的前缀。
+  @@index([payoutId, type])
+  // ⚠️ **D 类（渠道有、本地没有）没有 payoutId** → 去重只能按渠道流水号
+  //    → 这个键上必须有索引，否则每次对账都全表扫。
+  @@index([channelTxnId, type])
+  @@map("payout_reconciliation_items")
 }

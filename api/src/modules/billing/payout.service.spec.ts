@@ -233,6 +233,27 @@ function argsOf(mock: { mock: { calls: unknown[][] } }): QueryArgs {
 }
 
 /**
+ * 取事务里 `payout.updateMany` 写下的 **`releasedEntryIds`**（阶段 5m）。
+ *
+ * ⚠️ **不能用 `argsOf`** —— 它取的是**第一次**调用，而 `releasedEntryIds`
+ *    写在**第二次**（第一次是改状态）。这里按字段找那次调用。
+ *
+ * ⚠️ **找不到就返回 `undefined`** —— 调用方据此断言「一条都没写」。
+ */
+function releasedEntryIdsData(tx: {
+  payout: { updateMany: { mock: { calls: unknown[][] } } };
+}): string | undefined {
+  for (const call of tx.payout.updateMany.mock.calls) {
+    const data = (call[0] as { data?: Record<string, unknown> } | undefined)
+      ?.data;
+    if (data && 'releasedEntryIds' in data) {
+      return data.releasedEntryIds as string;
+    }
+  }
+  return undefined;
+}
+
+/**
  * 一只最小可用的假 Prisma。
  *
  * ⚠️ **只实现服务层真正用到的那几个方法**：多写一个就多一处
@@ -274,6 +295,13 @@ function fakePrisma(options: {
   ownLinkedRows?: Array<{ entryId: string }>;
   /** **其他单占用的** `payout_entries`（补差单重算用） */
   otherLinkedRows?: Array<{ entryId: string }>;
+  /**
+   * 事务里 `payoutEntry.findMany` 返回的**被释放的流水 id**（阶段 5m）。
+   *
+   * ⚠️ **默认空数组** —— 没有明细可释放时不该写 `releasedEntryIds`
+   *    （空数组 ≠ null，语义不同：空数组意味着「当初就没有明细」）。
+   */
+  releasedEntryIds?: string[];
   /** 收款账户（null = 没填） */
   account?: ReturnType<typeof payoutAccount> | null;
   /** 事务里的 `create` 要不要抛 P2002 */
@@ -323,6 +351,7 @@ function fakePrisma(options: {
     payoutEntry: {
       createMany: jest.Mock;
       deleteMany: jest.Mock;
+      findMany: jest.Mock;
     };
   } | null = null;
 
@@ -615,6 +644,19 @@ function fakePrisma(options: {
           deleteMany: jest.fn<Promise<{ count: number }>, [args?: QueryArgs]>(
             () => Promise.resolve({ count: 1 }),
           ),
+          /**
+           * ⚠️ **阶段 5m：删明细前先读出被释放的流水 id**（解卡转 FAILED、
+           *    worker 的 `markFailed` 都要用）—— 记到 `payouts.releasedEntryIds`，
+           *    后面的「人工确认渠道已打款」靠它复原明细。
+           *
+           * ⚠️ **返回带 `entryId` 的对象数组**（不是 id 数组）——
+           *    实现里是 `releasedEntries.map((e) => e.entryId)`。
+           */
+          findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
+            Promise.resolve(
+              (options.releasedEntryIds ?? []).map((entryId) => ({ entryId })),
+            ),
+          ),
         },
       };
       return fn(tx);
@@ -640,20 +682,43 @@ function fakeQueues() {
 }
 
 /**
+ * 假的核实服务（阶段 5m）。
+ *
+ * ⚠️ **默认结论是 `FAILED`（渠道明确说没打）** —— 解卡闸只放行这一种结论；
+ *    默认给 `UNKNOWN` 的话，下面所有 `unstick` 的老用例都会被闸挡住，
+ *    它们要验的是「释放明细 / 留痕 / 不释放明细」，不是闸本身。
+ *
+ * ⚠️ **闸本身的三种结论由 e2e 验**（`test/payout-unstick-gate.e2e-spec.ts`）——
+ *    这里只保证老用例不被新增的闸改变行为。
+ */
+function fakeVerification(verdict: 'PAID' | 'FAILED' | 'UNKNOWN' = 'FAILED') {
+  return {
+    verify: jest.fn(() =>
+      Promise.resolve({ verdict, source: 'REALTIME' as const }),
+    ),
+  };
+}
+
+/**
  * 把假 Prisma 塞进服务（只用到 `as unknown as` 的一次性断言）。
  *
  * ⚠️ **阶段 5i Task 6：多注入一个 `LedgerService`** ——
  *    「可申请周期」列表改成走 `LedgerService.aggregatePeriods`（批量聚合）。
  *    这里**用同一只假 Prisma** 构造它 → 聚合看到的数据与老实现一致。
+ *
+ * ⚠️ **阶段 5m：再注入一个核实服务** —— 解卡重打前要问渠道「这笔打没打」
+ *    （防重复打款）。默认给「渠道明确说没打」→ 闸放行，老用例行为不变。
  */
 function makeService(
   prisma: ReturnType<typeof fakePrisma>,
   queues: ReturnType<typeof fakeQueues> = fakeQueues(),
+  verification: ReturnType<typeof fakeVerification> = fakeVerification(),
 ): PayoutService {
   return new PayoutService(
     prisma as unknown as never,
     queues as unknown as never,
     new LedgerService(prisma as unknown as never),
+    verification,
   );
 }
 
@@ -2535,6 +2600,7 @@ describe('平台端解除卡单（阶段 5l）', () => {
   it('⚠️ 转 FAILED → 释放明细（商家可以对该期重新申请）', async () => {
     const prisma = fakePrisma({
       payoutSequence: [stuckPayout()],
+      releasedEntryIds: ['entry-1', 'entry-2'],
     });
     const service = makeService(prisma, fakeQueues());
 
@@ -2561,6 +2627,44 @@ describe('平台端解除卡单（阶段 5l）', () => {
       fromStatus: PayoutStatus.PROCESSING,
       toStatus: PayoutStatus.FAILED,
     });
+    // ⚠️ **阶段 5m：被释放的流水 id 要记进 `releasedEntryIds`** ——
+    //    后面的「人工确认渠道已打款」靠它复原明细，不记就永远复原不了
+    expect(tx!.payoutEntry.findMany).toHaveBeenCalledWith({
+      where: { payoutId: 'payout-a' },
+      select: { entryId: true },
+    });
+    expect(releasedEntryIdsData(tx!)).toBe(
+      JSON.stringify(['entry-1', 'entry-2']),
+    );
+  });
+
+  it('⚠️ 转 FAILED → 没有明细可释放时，绝不写 `releasedEntryIds`（空数组 ≠ null）', async () => {
+    // ⚠️ **空数组的语义是「当初就没有明细」**（与 null 不同）→
+    //    B 类处置会据此误判「可复原」→ 这里必须一条都不写
+    const prisma = fakePrisma({
+      payoutSequence: [stuckPayout()],
+    });
+    const service = makeService(prisma, fakeQueues());
+
+    await asPlatform(() =>
+      service.unstick('payout-a', { to: 'FAILED', reason: '核对渠道：没到账' }),
+    );
+
+    const tx = prisma.tx();
+    expect(tx).not.toBeNull();
+    // ⚠️ **只更新了状态那一次**，没有第二次写 `releasedEntryIds`
+    expect(tx!.payout.updateMany).toHaveBeenCalledTimes(1);
+    expect(
+      (
+        tx!.payout.updateMany as unknown as {
+          mock: { calls: unknown[][] };
+        }
+      ).mock.calls.some((call) => {
+        const data = (call[0] as { data?: Record<string, unknown> } | undefined)
+          ?.data;
+        return data !== undefined && 'releasedEntryIds' in data;
+      }),
+    ).toBe(false);
   });
 
   it('⚠️ 转 APPROVED → 绝不释放明细（释放了商家能对同期重新申请 → 同一笔打两次）', async () => {
@@ -2590,6 +2694,102 @@ describe('平台端解除卡单（阶段 5l）', () => {
     });
     // ⚠️ **重新打款要入队**
     expect(queues.addWithOptions).toHaveBeenCalled();
+  });
+
+  // ============================================================
+  // 阶段 5m：解卡重打的前置闸（渠道核实）
+  // ============================================================
+
+  it('⚠️ 渠道核实说 PAID → 409（钱已经打过了，重打就是重复打款）', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [stuckPayout()],
+    });
+    const verification = fakeVerification('PAID');
+    const service = makeService(prisma, fakeQueues(), verification);
+
+    await expect(
+      asPlatform(() =>
+        service.unstick('payout-a', { to: 'APPROVED', reason: '想重打' }),
+      ),
+    ).rejects.toThrow(/重复打款/);
+
+    // ⚠️ **一个字都不能改** —— 状态、明细、入队全都不动
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ 渠道核实问不出结论（UNKNOWN）→ 409（宁可不做，也不要重复打款）', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [stuckPayout()],
+    });
+    const verification = fakeVerification('UNKNOWN');
+    const service = makeService(prisma, fakeQueues(), verification);
+
+    await expect(
+      asPlatform(() =>
+        service.unstick('payout-a', { to: 'APPROVED', reason: '想重打' }),
+      ),
+    ).rejects.toThrow(/无法确认该笔是否已打款/);
+
+    expect(prisma.tx()).toBeNull();
+  });
+
+  it('⚠️ 渠道核实说 FAILED → 放行（渠道明确说没打）', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [stuckPayout()],
+    });
+    const verification = fakeVerification('FAILED');
+    const service = makeService(prisma, fakeQueues(), verification);
+
+    await asPlatform(() =>
+      service.unstick('payout-a', { to: 'FAILED', reason: '渠道确认没打' }),
+    );
+
+    expect(prisma.tx()).not.toBeNull();
+  });
+
+  it('⚠️ 核实用的键是 `payoutNo`（卡住的单没有 `payoutTxnId`）', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({
+          status: PayoutStatus.PROCESSING,
+          netAmount: 8000,
+          processingAt: new Date(Date.now() - 60 * 60 * 1000),
+          payoutNo: 'PAY202508010000009999',
+        }),
+      ],
+    });
+    const verification = fakeVerification('FAILED');
+    const service = makeService(prisma, fakeQueues(), verification);
+
+    await asPlatform(() =>
+      service.unstick('payout-a', { to: 'FAILED', reason: '渠道确认没打' }),
+    );
+
+    // ⚠️ **`referenceNo` 才是对所有状态都成立的查询键** ——
+    //    `PROCESSING` 的单**没有** `payoutTxnId`（那是 `markPaid` 写的），
+    //    只按交易号查 → 核实闸对它的全部对象都是死代码。
+    expect(verification.verify).toHaveBeenCalledWith({
+      id: 'payout-a',
+      payoutNo: 'PAY202508010000009999',
+      payoutTxnId: null,
+    });
+  });
+
+  it('⚠️ 闸在「未超过卡住阈值」检查之后 —— 阈值没过就不该去问渠道', async () => {
+    const prisma = fakePrisma({
+      payoutSequence: [stuckPayout({ processingAt: new Date() })],
+    });
+    const verification = fakeVerification('FAILED');
+    const service = makeService(prisma, fakeQueues(), verification);
+
+    await expect(
+      asPlatform(() =>
+        service.unstick('payout-a', { to: 'FAILED', reason: '人工判定' }),
+      ),
+    ).rejects.toThrow(/可能正在打款中/);
+
+    // ⚠️ **顺序有讲究** —— 先判「还在正常打款中，别打断」，再判「渠道核实」
+    expect(verification.verify).not.toHaveBeenCalled();
   });
 });
 

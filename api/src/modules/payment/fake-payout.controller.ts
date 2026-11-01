@@ -12,7 +12,7 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import {
   FakePayoutProvider,
   isFakePayoutEnabled,
-} from './fake-payout.provider';
+} from '../../common/payment/fake-payout.provider';
 
 /**
  * 假出款网关的控制端。

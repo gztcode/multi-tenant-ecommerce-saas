@@ -15,7 +15,7 @@ import {
 import { AppModule } from '../src/app.module';
 import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.interceptor';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
-import { FakePayoutProvider } from '../src/modules/payment/fake-payout.provider';
+import { FakePayoutProvider } from '../src/common/payment/fake-payout.provider';
 import {
   platformScope,
   tenantContext,
@@ -1346,5 +1346,47 @@ describe('出款执行 (e2e)', () => {
       }),
     );
     expect(count).toBe(0);
+  });
+
+  // ============================================================
+  // 阶段 5m：渠道失败 → 交易号与被释放的明细 id 都要留下
+  // ============================================================
+
+  it('⚠️ 渠道失败 → payoutTxnId 与 releasedEntryIds 都要有值（阶段 5m）', async () => {
+    // ⚠️ **这两条是「实时核实」与「B 类人工处置」的前提**：
+    //    没有 payoutTxnId → 核实闸对 FAILED 的单是死代码；
+    //    没有 releasedEntryIds → B 类永远复原不出明细。
+    const adminToken = await loginPlatformAdmin();
+    const period = month('2026-10');
+    const { merchant } = await setupMerchantWithPeriod(adminToken, period, {
+      receiptAmount: 10000,
+      commissionAmount: 1500,
+    });
+
+    // ⚠️ **先 arm 再 approve** —— approve 会立刻入队，worker 随时可能抢到 job；
+    //    arm 晚一步就可能来不及。`times: 3` = 三次尝试全失败 →
+    //    终态是 FAILED（`PAYOUT_MAX_ATTEMPTS = 3`）。
+    await armScenario(adminToken, { times: 3 });
+
+    const applied = await apply(merchant.token, period.label);
+    await approve(adminToken, applied.id);
+
+    const failed = await waitForStatus(
+      merchant.token,
+      applied.id,
+      PayoutStatus.FAILED,
+    );
+    expect(failed).not.toBeNull();
+
+    // ⚠️ **直接查库** —— 商家端响应体里没有这两个字段
+    const row = await asPlatform(() =>
+      prisma.payout.findFirst({ where: { id: applied.id } }),
+    );
+    // ⚠️ **渠道交易号必须存下来** —— 渠道失败时也会给
+    expect(row!.payoutTxnId).toBeTruthy();
+    // ⚠️ **释放的明细 id 必须记下来** —— 否则 B 类复原不出明细
+    expect(row!.releasedEntryIds).toBeTruthy();
+    const entryIds = JSON.parse(row!.releasedEntryIds!) as string[];
+    expect(entryIds.length).toBeGreaterThan(0);
   });
 });

@@ -334,6 +334,11 @@ export function describePayoutOperation(action: string): string {
     RETRY: '重试出款',
     UNSTUCK_TO_FAILED: '解除卡单（标记为失败）',
     UNSTUCK_TO_APPROVED: '解除卡单（重新打款）',
+    // ⚠️ **阶段 5m 的两条** —— 少了它们就会回落到「人工操作」，
+    //    而 `RECONCILE_TO_PAID` **恰恰不是人工做的**（是渠道对账自动纠正的，
+    //    操作人是 `system:reconciliation`）→ 说成「人工操作」是**说谎**。
+    RECONCILE_TO_PAID: '渠道对账自动纠正为已付款',
+    MANUAL_CONFIRM_PAID: '人工确认已付款（渠道对账）',
   };
   return labels[action] ?? '人工操作';
 }

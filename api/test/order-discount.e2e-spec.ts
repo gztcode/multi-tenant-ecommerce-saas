@@ -1321,8 +1321,8 @@ describe('下单优惠与券的预占核销 (e2e)', () => {
       const customer = await registerCustomer(merchant.subdomain);
       const addressId = await createAddress(customer.token);
 
-      // 券的窗口：[2019-11-01, 2026-11-01)
-      //   - 数据库钟（真实时间 ~2026-10）落在窗口**内** → 有效 → 用得上
+      // 券的窗口：[2019-11-01, 现在 + 365 天)
+      //   - 数据库钟（真实时间 = 现在）落在窗口**内** → 有效 → 用得上
       //   - 应用钟（冻到 2019-06）落在窗口**前** → 未开始 → 用不上
       // 两个时钟给出**不同**结果，所以这条用例能区分实现用的是哪一个。
       const coupon = await createCoupon(merchant.token, {
@@ -1330,7 +1330,9 @@ describe('下单优惠与券的预占核销 (e2e)', () => {
         minAmount: 0,
         name: '横跨两个时钟的券',
         startsAt: '2019-11-01T00:00:00.000Z',
-        endsAt: '2026-11-01T00:00:00.000Z',
+        // ⚠️ **结束时间必须永远在未来** —— 原来硬编码 '2026-11-01'，
+        //    到 2026-11-01 当天数据库钟就越过它 → 券被判「已过期」→ 这条用例红了。
+        endsAt: new Date(Date.now() + 365 * 86_400_000).toISOString(),
       });
       await claimCoupon(customer.token, coupon.id);
 

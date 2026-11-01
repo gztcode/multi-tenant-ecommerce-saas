@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  Inject,
   Injectable,
   Logger,
   NotFoundException,
@@ -13,6 +14,11 @@ import {
 } from '@prisma/client';
 import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import { clampPagination } from '../../common/http/pagination';
+import { PAYOUT_VERIFICATION } from '../../common/payment/payout-verification';
+// ⚠️ **必须 `import type`** —— `PayoutVerification` 是接口，被用在
+//    带装饰器的构造器参数上（`emitDecoratorMetadata` + `isolatedModules`
+//    下，TS1272 要求装饰器签名里引用的类型必须是 type-only 导入）。
+import type { PayoutVerification } from '../../common/payment/payout-verification';
 import { PAYOUT_QUEUE } from '../../common/queue/queue.constants';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
@@ -212,6 +218,10 @@ export class PayoutService {
     private readonly prisma: TenantPrismaService,
     private readonly queues: QueueService,
     private readonly ledger: LedgerService,
+    // ⚠️ **注入核实服务**（阶段 5m）—— 解卡重打前要问渠道「这笔打没打」。
+    //    按 token 注入（契约在 `common/`）→ **不产生 billing → payment 的模块边**。
+    @Inject(PAYOUT_VERIFICATION)
+    private readonly verification: PayoutVerification,
   ) {}
 
   /**
@@ -1002,6 +1012,47 @@ export class PayoutService {
         );
       }
 
+      // ⚠️⚠️ **解卡重打的前置闸**（阶段 5m，设计 §六·6.3）——
+      //    没有这道闸，运营点一下「解卡重打」就是**确定性地重复打款**：
+      //    「卡在 PROCESSING」最可能的成因是「请求发出去了、回包丢了」→
+      //    钱**可能已经打到商家账上**。
+      //
+      //    ⚠️ **这道闸罩住整个 `unstick`**（两个分支都会导致重打）：
+      //    `to='APPROVED'` 直接重新入队；`to='FAILED'` 设 `failedBeforePayout: true`
+      //    → 制造出一张「可安全重试」的单 → 之后能被 `retry` 重打。
+      //
+      //    ⚠️⚠️ **渠道选取必须与打款 worker 一致** —— 本闸问的是
+      //    「第一个已注册渠道」（见 `common/payment/payout-verification.service.ts`
+      //    的 `pickProvider`），打款 worker 也是取「第一个已注册渠道」
+      //    （见 `modules/payment/payout.worker.ts` 的 `firstProvider`）。
+      //    **两处必须一起改** —— 若一处改了另一处没改，就会出现
+      //    「钱打到 A 渠道、核实查 B 渠道」→
+      //    核实从 B 渠道问出「没打」，实际钱已经从 A 渠道打出去了
+      //    → **重复打款**。
+      const verdict = await this.verification.verify({
+        id: payout.id,
+        payoutNo: payout.payoutNo,
+        payoutTxnId: payout.payoutTxnId,
+      });
+      if (verdict.verdict === 'PAID') {
+        // ⚠️ **渠道说钱已经打了** → 绝不能解卡
+        //    （本 Task 的偏离说明：这里**不自动纠正**成 PAID ——
+        //    纠正逻辑在 payment 模块的 resolver，billing 调不到。
+        //    运营下一步是去对账页执行一次对账，A 类会被自动纠正。）
+        throw new ConflictException(
+          '渠道核实显示这张出款单已经打款成功，不能解卡重打（否则会重复打款）。' +
+            '请到「渠道对账」页对账后查看结论。',
+        );
+      }
+      if (verdict.verdict === 'UNKNOWN') {
+        // ⚠️ **问不出结论就不放行** ——
+        //    「渠道查不到这条」不等于「渠道说没打」。
+        throw new ConflictException(
+          '无法确认该笔是否已打款，请先执行渠道对账再解卡',
+        );
+      }
+      // verdict === 'FAILED' → 渠道明确说没打 → 允许解卡
+
       const toStatus =
         input.to === 'APPROVED' ? PayoutStatus.APPROVED : PayoutStatus.FAILED;
 
@@ -1044,7 +1095,22 @@ export class PayoutService {
         // ⚠️ **转 FAILED 时要释放明细** —— 与 `markFailed` 同款：
         //    单子结束了，商家可以对该期重新申请
         if (toStatus === PayoutStatus.FAILED) {
+          // ⚠️ **读 id 与删明细同事务**（阶段 5m）—— 与 `markFailed` 同款理由
+          const releasedEntries = await tx.payoutEntry.findMany({
+            where: { payoutId },
+            select: { entryId: true },
+          });
           await tx.payoutEntry.deleteMany({ where: { payoutId } });
+          if (releasedEntries.length > 0) {
+            await tx.payout.updateMany({
+              where: { id: payoutId },
+              data: {
+                releasedEntryIds: JSON.stringify(
+                  releasedEntries.map((e) => e.entryId),
+                ),
+              },
+            });
+          }
         }
 
         await tx.payoutOperation.create({

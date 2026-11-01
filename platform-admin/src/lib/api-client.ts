@@ -1,6 +1,14 @@
 import { auth } from '@/auth';
 
-const API_BASE_URL =
+/**
+ * 后端服务地址。
+ *
+ * ⚠️ **导出来是为了 multipart 转发**（`app/api/billing/reconciliations/import/route.ts`）——
+ *    `apiFetch` 硬编码了 `content-type: application/json` 且会
+ *    `JSON.stringify(body)`，multipart 必须自己写一条裸 fetch，
+ *    而裸 fetch 又需要这个 base URL —— **不能另写一个**（两处漂移）。
+ */
+export const API_BASE_URL =
   process.env.API_BASE_URL ?? 'http://localhost:3000/api/v1';
 
 export class ApiError extends Error {

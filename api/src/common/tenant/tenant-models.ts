@@ -121,6 +121,21 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   //    而它**没有 `tenantId` 列** → Prisma 直接报错。
   //    ⚠️ 它**不受作用域约束** → 任何忘了带 `payoutId` 的查询都会返回全平台数据。
   //    它只在**平台作用域**下读写（只有平台超管能操作出款单）。
+  //
+  // ⚠️ **`PayoutReconciliation` 刻意排除**（阶段 5m）——
+  //    它是「渠道对账任务」，**没有 `tenantId`**（对账是**平台级**动作，跨所有租户，
+  //    与 `PayoutOperation` 同款）。
+  //    ⚠️ **不要把它登记进白名单** —— 登记了扩展会给它附加 tenantId 条件，
+  //    而它**没有 `tenantId` 列** → Prisma 直接报错。
+  //    ⚠️ 它**不受作用域约束** → 任何忘了带 `reconciliationId` 的查询都会返回全平台数据。
+  //    它只在**平台作用域**下读写（只有平台超管能操作对账）。
+  //
+  // ⚠️ **`PayoutReconciliationItem` 同样刻意排除**（阶段 5m）——
+  //    它**没有 `tenantId`** 字段，且 `payoutId` **可空**（D 类「渠道有、本地没有」没有本地单）
+  //    → 「按 `payoutId` 反查租户」这个安全网在 D 类上**直接失效**。
+  //    ⚠️ 它含 `channelReferenceNo`（= 商家的出款单号）与金额 → **泄露即跨租户泄露**。
+  //    ⚠️ 任何列表/详情查询**必须**同时按 `reconciliationId` 限定，
+  //    且 `reconciliationId` 只能来自平台超管的权限检查之后。
 ]);
 
 /**

@@ -4,7 +4,7 @@ import {
   PayoutWorker,
   payoutRetryDelayMs,
 } from './payout.worker';
-import type { PayoutProvider } from './payout-provider.interface';
+import type { PayoutProvider } from '../../common/payment/payout-provider.interface';
 
 /**
  * 出款 worker 的单元测试。
@@ -28,6 +28,7 @@ interface FakeProvider {
   provider: string;
   execute: jest.Mock;
   queryPayout: jest.Mock;
+  listPayouts: jest.Mock;
 }
 
 function fakeProvider(result: {
@@ -54,6 +55,8 @@ function fakeProvider(result: {
       });
     }),
     queryPayout: jest.fn(() => Promise.resolve({ status: 'SUCCESS' })),
+    // ⚠️ **新增**（阶段 5m）：批量查单。默认返回空数组。
+    listPayouts: jest.fn(() => Promise.resolve([])),
   };
 }
 

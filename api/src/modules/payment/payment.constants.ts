@@ -1,5 +1,4 @@
 import type { PaymentProvider } from './payment-provider.interface';
-import type { PayoutProvider } from './payout-provider.interface';
 
 /**
  * 渠道表的注入令牌。
@@ -14,12 +13,11 @@ export const PAYMENT_PROVIDERS = 'PAYMENT_PROVIDERS';
 export type PaymentProviderMap = Map<string, PaymentProvider>;
 
 /**
- * 出款渠道表的注入令牌。
+ * ⚠️ **出款渠道表的 token（`PAYOUT_PROVIDERS`）与类型住在
+ *    `common/payment/payout.constants`**（阶段 5m）。
  *
- * ⚠️ 与 `PAYMENT_PROVIDERS` **分开**：收款渠道与打款渠道是两套表，
- *    混在一张表里会出现「按渠道名找打款实现时匹配到收款实现」。
+ * 原因：渠道表要在一个 `@Global()` 模块里注册，billing 才能拿到它 ——
+ * 而 billing **绝对不能 import payment**（会成模块环）。
+ * ⚠️ **这里不做 re-export** —— 同一个 token 从两处导出会让人分不清
+ *    「它到底住在哪」；请直接 import `common/payment/payout.constants`。
  */
-export const PAYOUT_PROVIDERS = 'PAYOUT_PROVIDERS';
-
-/** 出款渠道表的类型别名 */
-export type PayoutProviderMap = Map<string, PayoutProvider>;
