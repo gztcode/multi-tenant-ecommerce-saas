@@ -26,7 +26,7 @@ npm run test:cov:e2e       # e2e + 覆盖率
 
 npm run prisma:generate    # 生成 Prisma Client
 npm run prisma:deploy      # 应用迁移（prisma migrate deploy）
-npm run prisma:migrate     # 创建新迁移（prisma migrate dev）
+npm run prisma:migrate     # ⚠️ 本仓不可用：历史迁移 checksum 不符会要求 migrate reset；新迁移手写 migration.sql
 npm run prisma:seed        # 造超管 + 示例店铺 + 示例账号
 
 npm run backfill:ledger    # 回填抽佣流水（scripts/backfill-commission-entries.ts）
@@ -378,8 +378,8 @@ NextAuth 的 `auth()` 只能在服务端请求作用域里调用。所以：
 - **金额、时区、时钟**：金额全程整数分；周期标识统一走 `formatPeriodLabel`（UTC 自然月），
   不要各处自己算月份；过期判定统一用**数据库时钟**（`prisma.databaseNow()`），
   多副本部署时各机器时钟有偏差——但秒级的宽限期判定用应用时钟（`AuthService` 的事）。
-- **迁移历史**：`20261022071848_add_sku_stock_version` 在全新库上会失败，**不要动它**
-  （后面有 `20261024160000_ensure_sku_stock_version` 兜底）。
+- **迁移历史**：`20261022071848_add_sku_stock_version` 在全新库上整条跳过是**故意的**
+  （`ALTER TABLE IF EXISTS`），**不要动它**（后面有 `20261024160000_ensure_sku_stock_version` 兜底）。
   托管数据库上需要 DBA 先装 `pg_trgm` 扩展（`CREATE EXTENSION IF NOT EXISTS pg_trgm;`）——
   商品搜索依赖它，而 `CREATE EXTENSION` 需要超级用户权限。
 - **假支付 / 假出款网关**：`FAKE_PAYMENT_ENABLED` / `FAKE_PAYOUT_ENABLED` **默认关闭**，
