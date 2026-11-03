@@ -17,6 +17,13 @@
 - 本机标准端口被占用，固定使用：PostgreSQL **15432**、Redis **16380**、MinIO **19000**（控制台 19001）。
 - `tools/push-via-api.mjs`：本机 `github.com:443` 常不可达，`git push` 超时时改用
   `GH_TOKEN=$(gh auth token) node tools/push-via-api.mjs <本地分支> <远端分支>`。
+  ⚠️ **但中文分支名（如 `gzt/电商项目`）会让它失败** —— 脚本用
+  `gh api --method POST ... --input -` 传 body，`gh` 的参数编码对中文分支名出错
+  （报 422 / 打印字节数组）。**带中文分支名时改用 `tools/push-via-api-curl.mjs`**
+  （curl 直连 API，JSON body 与 URL 都按 UTF-8 原样传）。
+  ⚠️ **父提交必须是远端已存在的 SHA** —— 本地 `main` 往往比 `origin/main` 多几个
+  提交，用本地 SHA 当父会报 422 `Parent SHA does not exist`。用
+  `BASE_COMMIT=$(gh api repos/<repo>/commits/main --jq .sha)`。
 
 ## 先读什么
 
