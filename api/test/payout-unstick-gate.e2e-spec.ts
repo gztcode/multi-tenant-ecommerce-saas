@@ -441,7 +441,7 @@ describe('解卡重打的前置闸 (e2e)', () => {
       expect(await listEntries(payout.id)).toHaveLength(2);
 
       // 造渠道流水（成功）
-      await fakeProvider.execute({
+      await fakeProvider.submit({
         referenceId: payout.id,
         referenceNo: payout.payoutNo,
         amount: payout.netAmount,
@@ -480,8 +480,10 @@ describe('解卡重打的前置闸 (e2e)', () => {
       processingAt: new Date(Date.now() - 20 * 60 * 1000),
     });
     // 造渠道流水（失败）
-    fakeProvider.armScenario({ failTimes: 1 });
-    await fakeProvider.execute({
+    // ⚠️ **阶段 6b：解卡闸只认「确定失败」** —— 结果未知的失败会被核实
+    //    服务判为「问不出结论」，解卡会被拒绝。
+    fakeProvider.armScenario({ definitiveFailureTimes: 1 });
+    await fakeProvider.submit({
       referenceId: payout.id,
       referenceNo: payout.payoutNo,
       amount: payout.netAmount,

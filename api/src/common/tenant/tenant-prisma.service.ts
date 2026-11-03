@@ -645,6 +645,16 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
     return this.client.payoutReconciliationItem;
   }
 
+  // ------- 平台设置（阶段 6a）模型 delegate 代理 -------
+
+  // ⚠️ 不在租户白名单里（平台级表，**不要**登记到 tenant-models.ts），
+  //    但 `PlatformSettingService` 要读它 —— 所以在这里透出。
+  //    `findUnique` / `upsert` 在它上面是安全的（不受租户作用域约束）；
+  //    读写仍统一包在 `tenantContext.run(platformScope(), ...)` 里，语义明确。
+  get platformSetting() {
+    return this.client.platformSetting;
+  }
+
   // ------- PrismaClient 实例级方法代理 -------
   // $connect / $disconnect 由生命周期钩子分别调用，
   // 这里仍然透传出来让服务消费者可以手动关闭连接（例如测试用例）。

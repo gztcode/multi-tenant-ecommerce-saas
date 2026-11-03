@@ -92,7 +92,11 @@
       "json",
       "ts"
     ],
-    "rootDir": "src",
+    "rootDir": ".",
+    "roots": [
+      "<rootDir>/src",
+      "<rootDir>/test/channel-contract"
+    ],
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
       "^.+\\.(t|j)s$": "ts-jest"
@@ -101,14 +105,14 @@
       "/node_modules/(?!(@nestjs/bullmq|@nestjs/bull-shared)/)"
     ],
     "setupFiles": [
-      "<rootDir>/../test/setup-unit-env.ts"
+      "<rootDir>/test/setup-unit-env.ts"
     ],
     "collectCoverageFrom": [
       "**/*.(t|j)s",
       "!main.ts",
       "!**/*.module.ts"
     ],
-    "coverageDirectory": "../coverage",
+    "coverageDirectory": "coverage",
     "testEnvironment": "node"
   }
 }

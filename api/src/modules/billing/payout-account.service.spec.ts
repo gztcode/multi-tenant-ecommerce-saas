@@ -1,5 +1,13 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  NotFoundException,
+} from '@nestjs/common';
 
+import { PlatformSettingService } from '../../common/platform-settings/platform-setting.service';
+import { PayoutProviderRegistry } from '../../common/payment/payout-provider.registry';
+import { NO_CAPABILITIES } from '../../common/channel/channel.types';
+import type { PayoutProvider } from '../../common/payment/payout-provider.interface';
 import { tenantContext } from '../../common/tenant/tenant-context';
 import { PayoutAccountService, maskAccountNo } from './payout-account.service';
 import { PayoutCipherService } from './payout-cipher.service';
@@ -25,6 +33,7 @@ function payoutAccount(overrides?: {
   maskedAccountNo?: string;
   encryptionVersion?: number;
   updatedAt?: Date;
+  preferredChannel?: string | null;
 }) {
   return {
     id: overrides?.id ?? 'acct-a',
@@ -34,6 +43,10 @@ function payoutAccount(overrides?: {
     accountNoCipher: overrides?.accountNoCipher ?? 'cipher-6222000000000000',
     maskedAccountNo: overrides?.maskedAccountNo ?? '************0000',
     encryptionVersion: overrides?.encryptionVersion ?? 1,
+    preferredChannel:
+      overrides?.preferredChannel === undefined
+        ? null
+        : overrides.preferredChannel,
     createdAt: new Date('2025-08-01T00:00:00.000Z'),
     updatedAt: overrides?.updatedAt ?? new Date('2025-08-02T00:00:00.000Z'),
   };
@@ -102,13 +115,55 @@ function fakePrisma(options: {
   return prisma;
 }
 
+/**
+ * 构造一个**真实**的注册表，只注册给定渠道（非 devOnly）。
+ *
+ * ⚠️ **不用假的注册表**：「已启用 / 未启用」的判断有一半在
+ *    `channel-config.isChannelEnabled` 里（读环境变量），假注册表会把
+ *    这条真实规则整个跳过。用真注册表 + 环境变量才测得到。
+ */
+function makeRegistry(channels: string[]): PayoutProviderRegistry {
+  const providers = channels.map(
+    (channel) =>
+      ({
+        channel,
+        provider: `${channel}-provider`,
+        capabilities: NO_CAPABILITIES,
+      }) as unknown as PayoutProvider,
+  );
+  return new PayoutProviderRegistry(providers);
+}
+
+/** 假的平台设置服务：只实现本服务用到的那一个方法 */
+function makePlatformSettings(defaultChannel?: string | Error) {
+  return {
+    getPayoutDefaultChannel: jest.fn(() =>
+      defaultChannel instanceof Error
+        ? Promise.reject(defaultChannel)
+        : Promise.resolve({
+            channel: defaultChannel ?? 'fake-payout',
+            source: 'DATABASE' as const,
+          }),
+    ),
+  };
+}
+
+type FakePlatformSettings = ReturnType<typeof makePlatformSettings>;
+
 /** 把假 Prisma 塞进服务（只用到 `as unknown as` 的一次性断言） */
 function makeService(
   prisma: ReturnType<typeof fakePrisma>,
+  options: {
+    registry?: PayoutProviderRegistry;
+    settings?: FakePlatformSettings;
+  } = {},
 ): PayoutAccountService {
   return new PayoutAccountService(
     prisma as unknown as never,
     new PayoutCipherService(),
+    options.registry ?? makeRegistry(['fake-payout']),
+    (options.settings ??
+      makePlatformSettings()) as unknown as PlatformSettingService,
   );
 }
 
@@ -368,6 +423,201 @@ describe('收款账户：写（有则更新、无则新建）', () => {
 
     const call = argsOf(prisma.merchantPayoutAccount.findFirst);
     expect(call.where?.tenantId).toBeUndefined();
+  });
+});
+
+describe('默认出款渠道（阶段 6a Task 5）', () => {
+  // ⚠️ **必须显式启用渠道**：`isChannelEnabled` 读环境变量；
+  //    不设的话非生产只默认启用 `fake-payout`，`channel-a/b` 一律算未启用。
+  beforeEach(() => {
+    process.env.PAYOUT_ENABLED_CHANNELS = 'channel-a,channel-b';
+  });
+  afterEach(() => {
+    delete process.env.PAYOUT_ENABLED_CHANNELS;
+  });
+
+  it('商家配了 A、平台默认 B → 用商家 A，来源 MERCHANT', async () => {
+    const prisma = fakePrisma({
+      account: payoutAccount({ preferredChannel: 'channel-a' }),
+    });
+    const settings = makePlatformSettings('channel-b');
+    const service = makeService(prisma, {
+      registry: makeRegistry(['channel-a', 'channel-b']),
+      settings,
+    });
+
+    const view = await asTenant(() => service.get());
+
+    expect(view?.preferredChannel).toBe('channel-a');
+    expect(view?.effectiveChannel).toBe('channel-a');
+    expect(view?.effectiveSource).toBe('MERCHANT');
+    expect(view?.preferredChannelUnavailable).toBe(false);
+    // ⚠️ **商家配了就不该再读平台默认**：两边都配了时以商家为准。
+    expect(settings.getPayoutDefaultChannel).not.toHaveBeenCalled();
+  });
+
+  it('商家没配、平台默认 B → 用平台 B，来源 PLATFORM', async () => {
+    const prisma = fakePrisma({ account: payoutAccount() });
+    const service = makeService(prisma, {
+      registry: makeRegistry(['channel-a', 'channel-b']),
+      settings: makePlatformSettings('channel-b'),
+    });
+
+    const view = await asTenant(() => service.get());
+
+    expect(view?.preferredChannel).toBeNull();
+    expect(view?.effectiveChannel).toBe('channel-b');
+    expect(view?.effectiveSource).toBe('PLATFORM');
+    expect(view?.preferredChannelUnavailable).toBe(false);
+  });
+
+  it('⚠️ 存量数据配了已停用渠道 → 仍显示商家值，unavailable=true（不回落平台默认）', async () => {
+    // ⚠️ **渠道已注册但未启用**（例如部署时从启用列表里删掉了它）。
+    const prisma = fakePrisma({
+      account: payoutAccount({ preferredChannel: 'channel-a' }),
+    });
+    const settings = makePlatformSettings('channel-b');
+    const service = makeService(prisma, {
+      registry: makeRegistry(['channel-a', 'channel-b']),
+      settings,
+    });
+    // 只启用 channel-b → channel-a 变成「已停用」
+    process.env.PAYOUT_ENABLED_CHANNELS = 'channel-b';
+
+    const view = await asTenant(() => service.get());
+
+    // ⚠️ **执行时会 fail-closed**：展示值必须仍是商家配的那个，
+    //    否则商家会以为自己在用平台默认渠道，实际出款却直接失败。
+    expect(view?.effectiveChannel).toBe('channel-a');
+    expect(view?.effectiveSource).toBe('MERCHANT');
+    expect(view?.preferredChannelUnavailable).toBe(true);
+    expect(settings.getPayoutDefaultChannel).not.toHaveBeenCalled();
+  });
+
+  it('⚠️ 平台也没配默认渠道（409）→ 不整页失败，返回空渠道 + unavailable', async () => {
+    const prisma = fakePrisma({ account: payoutAccount() });
+    const service = makeService(prisma, {
+      registry: makeRegistry(['channel-a']),
+      settings: makePlatformSettings(
+        new ConflictException('平台未配置默认出款渠道'),
+      ),
+    });
+
+    const view = await asTenant(() => service.get());
+
+    // ⚠️ **「平台还没设置」是可预期的配置状态，不该 500**。
+    expect(view?.effectiveChannel).toBe('');
+    expect(view?.effectiveSource).toBe('PLATFORM');
+    expect(view?.preferredChannelUnavailable).toBe(true);
+  });
+
+  it('⚠️ 商家配了未启用渠道 → 保存 400 且不写库', async () => {
+    const prisma = fakePrisma({ account: payoutAccount() });
+    const service = makeService(prisma, {
+      registry: makeRegistry(['channel-a']),
+    });
+
+    await expect(
+      asTenant(() =>
+        service.set({
+          accountName: '张三',
+          bankName: '招商银行',
+          accountNo: '6225880000000000',
+          preferredChannel: 'channel-x',
+        }),
+      ),
+    ).rejects.toThrow(/出款渠道「channel-x」/);
+
+    expect(prisma.merchantPayoutAccount.updateMany).not.toHaveBeenCalled();
+    expect(prisma.merchantPayoutAccount.create).not.toHaveBeenCalled();
+  });
+
+  it('⚠️ 空串 → 清除配置（写 null）', async () => {
+    const prisma = fakePrisma({
+      account: payoutAccount({ preferredChannel: 'channel-a' }),
+    });
+    const service = makeService(prisma, {
+      registry: makeRegistry(['channel-a']),
+    });
+
+    await asTenant(() =>
+      service.set({
+        accountName: '张三',
+        bankName: '招商银行',
+        accountNo: '6225880000000000',
+        preferredChannel: '',
+      }),
+    );
+
+    const data = argsOf(prisma.merchantPayoutAccount.updateMany).data as Record<
+      string,
+      unknown
+    >;
+    // ⚠️ **键必须在、值是 null** —— 不传键是「保持原值」，两者语义不同。
+    expect(data).toHaveProperty('preferredChannel', null);
+  });
+
+  it('⚠️ 不传 preferredChannel → 更新 data 里没有这个键（保持原值）', async () => {
+    const prisma = fakePrisma({ account: payoutAccount() });
+    const service = makeService(prisma);
+
+    await asTenant(() =>
+      service.set({ accountName: '李四', bankName: '工商银行' }),
+    );
+
+    // ⚠️ **断言完整 data**：多出任何一个键都说明「不传」被当成了别的语义。
+    const data = argsOf(prisma.merchantPayoutAccount.updateMany).data as Record<
+      string,
+      unknown
+    >;
+    expect(data).toEqual({ accountName: '李四', bankName: '工商银行' });
+  });
+
+  it('合法渠道 → 归一化后写库', async () => {
+    const prisma = fakePrisma({ account: payoutAccount() });
+    const service = makeService(prisma, {
+      registry: makeRegistry(['channel-a']),
+    });
+
+    await asTenant(() =>
+      service.set({
+        accountName: '张三',
+        bankName: '招商银行',
+        accountNo: '6225880000000000',
+        preferredChannel: '  Channel-A  ',
+      }),
+    );
+
+    const data = argsOf(prisma.merchantPayoutAccount.updateMany).data as Record<
+      string,
+      unknown
+    >;
+    expect(data.preferredChannel).toBe('channel-a');
+  });
+
+  it('首次设置时也接受 preferredChannel', async () => {
+    const prisma = fakePrisma({
+      account: null,
+      created: payoutAccount({ preferredChannel: 'channel-a' }),
+    });
+    const service = makeService(prisma, {
+      registry: makeRegistry(['channel-a']),
+    });
+
+    await asTenant(() =>
+      service.set({
+        accountName: '张三',
+        bankName: '招商银行',
+        accountNo: '6225880000000000',
+        preferredChannel: 'channel-a',
+      }),
+    );
+
+    const data = argsOf(prisma.merchantPayoutAccount.create).data as Record<
+      string,
+      unknown
+    >;
+    expect(data.preferredChannel).toBe('channel-a');
   });
 });
 

@@ -8,6 +8,10 @@
  * 转换只在展示层做（见 `lib/money.ts`）。
  */
 
+// ⚠️ **本文件被客户端组件引用**（`apply-form.tsx` / `account-form.tsx`
+//    等都从这里取纯函数与类型）—— **不要在这里 import `api-client` / `auth`**：
+//    那会把 next-auth 整条依赖图带进浏览器包。服务端取数放在调用方（页面）里。
+//
 // ⚠️ **时间格式化复用 `lib/billing.ts` 的 `formatDateTime`**：
 //    两份实现迟早漂（时区格式会不一样）。
 import { formatDateTime } from '@/lib/billing';
@@ -238,6 +242,45 @@ export interface PayoutAccount {
   bankName: string;
   maskedAccountNo: string;
   updatedAt: string;
+}
+
+/**
+ * 商家收款账户的完整视图（阶段 6a Task 5 在 `PayoutAccount` 之外多出的
+ * 四个默认渠道字段）。
+ *
+ * ⚠️ **单独一个类型而不是往 `PayoutAccount` 上加字段**：`PayoutAccount`
+ *    还被「申请出款」页等不关心渠道的调用方使用，往它上面硬加必填字段
+ *    会逼那些调用方跟着改。
+ */
+export interface PayoutAccountView extends PayoutAccount {
+  /** 商家自己配的默认出款渠道；null = 没配（用平台默认） */
+  preferredChannel: string | null;
+  /** **实际会用的**出款渠道 */
+  effectiveChannel: string;
+  /** `effectiveChannel` 的来源 */
+  effectiveSource: 'MERCHANT' | 'PLATFORM';
+  /** 商家配的渠道已停用 → 新出款会失败，必须重新选择 */
+  preferredChannelUnavailable: boolean;
+}
+
+/** `effectiveSource` 的中文文案 */
+export const PAYOUT_CHANNEL_SOURCE_LABEL: Record<
+  PayoutAccountView['effectiveSource'],
+  string
+> = {
+  MERCHANT: '商家配置',
+  PLATFORM: '平台默认',
+};
+
+/** 可选的出款渠道（下拉用；后端已过滤未启用与 devOnly） */
+export interface PayoutChannelOption {
+  channel: string;
+  provider: string;
+}
+
+/** `GET /merchant/payout-channels` 的响应形状 */
+export interface PayoutChannelsResponse {
+  channels: PayoutChannelOption[];
 }
 
 /** 可申请的周期 */

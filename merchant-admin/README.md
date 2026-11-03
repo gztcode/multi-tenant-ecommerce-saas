@@ -34,7 +34,7 @@ curl -X POST http://localhost:3000/api/v1/auth/register/merchant \
 | `src/lib/api-client.ts` | 后端 API 封装：`apiFetch` / `apiFetchAuthed` / `ApiError` |
 | `src/lib/route-helpers.ts` | 中转路由的公共辅助：`readJson` / `toErrorResponse` / `unauthorizedResponse` |
 | `src/app/(auth)/login/` | 登录页 |
-| `src/app/(dashboard)/` | 概览、品类、商品（含导入）、库存、订单、营销、店铺设置、订阅与账单、结算单与出款、商家对账单 |
+| `src/app/(dashboard)/` | 概览、品类、商品（含导入）、库存、订单、营销、店铺设置、订阅与账单、结算单与出款、商家对账单、**收款账户（含默认出款渠道）** |
 | `src/app/api/` | 同源中转路由：商品、品类、订单、库存、营销、计费、出款、收款账户、媒体 |
 
 ## 关键约定
@@ -69,7 +69,7 @@ curl -X POST http://localhost:3000/api/v1/auth/register/merchant \
 ## 单元测试
 
 ```bash
-npm test          # 406 条 / 27 个文件
+npm test          # 413 条 / 27 个文件
 npm run test:watch   # watch 模式
 ```
 

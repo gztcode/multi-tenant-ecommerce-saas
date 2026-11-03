@@ -1,7 +1,6 @@
-import { BadRequestException, Inject, Injectable } from '@nestjs/common';
+import { ConflictException, Injectable } from '@nestjs/common';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
-import { PAYMENT_PROVIDERS } from './payment.constants';
-import type { PaymentProvider } from './payment-provider.interface';
+import { PaymentProviderRegistry } from './payment-provider.registry';
 
 /**
  * 商家的支付方式（自动续费的前提）。
@@ -16,8 +15,9 @@ import type { PaymentProvider } from './payment-provider.interface';
 export class PaymentMethodService {
   constructor(
     private readonly prisma: TenantPrismaService,
-    @Inject(PAYMENT_PROVIDERS)
-    private readonly providers: Map<string, PaymentProvider>,
+    // ⚠️ **渠道只从注册表取**（阶段 6a）：未注册 / 未启用 / 生产 devOnly
+    // 由注册表统一拒绝，不再直接读 `PAYMENT_PROVIDERS` 这个兼容 Map。
+    private readonly registry: PaymentProviderRegistry,
   ) {}
 
   /**
@@ -43,10 +43,17 @@ export class PaymentMethodService {
     createdAt: Date;
     updatedAt: Date;
   }> {
-    const provider = this.providers.get(channel);
-    if (!provider) {
-      throw new BadRequestException('未知的支付渠道');
+    const provider = this.registry.get(channel);
+
+    // ⚠️ **能力门控必须在调用渠道与落库之前**（阶段 6a）：
+    // 不支持绑卡的渠道拿不到授权凭证，调下去只会得到一个假 token——
+    // 之后自动续费会拿它去扣一笔根本不存在的授权，扣款必然失败。
+    if (!provider.capabilities.paymentMethod) {
+      throw new ConflictException(
+        `当前渠道 ${provider.channel} 不支持绑定支付方式`,
+      );
     }
+
     const { token } = await provider.createPaymentMethod({ type });
 
     // ⚠️ **默认的只有一个**：新绑的这个是默认，之前那个要让位。

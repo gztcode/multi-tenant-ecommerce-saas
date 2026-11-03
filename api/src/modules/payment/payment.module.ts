@@ -16,15 +16,21 @@ import { WebhookWorker } from './webhook.worker';
 import { CompensationService } from './compensation.service';
 import { CompensationWorker } from './compensation.worker';
 import { FakePaymentProvider } from './fake-payment.provider';
+import {
+  SandboxPaymentProvider,
+  isSandboxPaymentRegistrable,
+} from './sandbox-payment.provider';
 import { PayoutWorker } from './payout.worker';
 import { PayoutScanScheduler } from './payout-scan.scheduler';
+import { RefundScanScheduler } from './refund-scan.scheduler';
 import { PayoutReconciliationResolver } from './payout-reconciliation-resolver.service';
 import { PayoutReconciliationService } from './payout-reconciliation.service';
 import { PayoutReconcileScheduler } from './payout-reconcile.scheduler';
 import { PlatformPayoutReconciliationController } from './platform-payout-reconciliation.controller';
 import { FakePayoutController } from './fake-payout.controller';
 import { PaymentProvider } from './payment-provider.interface';
-import { PAYMENT_PROVIDERS } from './payment.constants';
+import { PaymentProviderRegistry } from './payment-provider.registry';
+import { PAYMENT_PROVIDER_LIST, PAYMENT_PROVIDERS } from './payment.constants';
 import { PayoutProvidersModule } from '../../common/payment/payout-providers.module';
 
 /**
@@ -100,6 +106,7 @@ import { PayoutProvidersModule } from '../../common/payment/payout-providers.mod
     CompensationService,
     CompensationWorker,
     FakePaymentProvider,
+    SandboxPaymentProvider,
     // ⚠️ **出款执行消费端**（阶段 5h-2）：`PayoutExecutionService`
     //    来自 `BillingModule`（已导出），依赖方向 `payment → billing` 单向。
     PayoutWorker,
@@ -107,6 +114,10 @@ import { PayoutProvidersModule } from '../../common/payment/payout-providers.mod
     //    `PayoutWorker` 只负责消费 `scan` job，没人往队列里投它的话
     //    `APPROVED` 救援路径就是死代码（审批后入队失败 → 单子永远停在已审批）。
     PayoutScanScheduler,
+    // ⚠️ **退款核实扫描的周期任务注册器**（阶段 6c）：
+    //    渠道回调会丢，没人扫的话 `REFUNDING` 的单永远没人核实。
+    //    真正的活由 `WebhookWorker` 的 `refund-scan` 分支做。
+    RefundScanScheduler,
     // ⚠️ **对账差异的处置**（阶段 5m Task 6）：A 类自动纠正 `PROCESSING → PAID`。
     //    B 类的人工处置在 billing 的 `PayoutExecutionService`（四道闸）。
     PayoutReconciliationResolver,
@@ -115,15 +126,31 @@ import { PayoutProvidersModule } from '../../common/payment/payout-providers.mod
     PayoutReconciliationService,
     PayoutReconcileScheduler,
     {
+      // ⚠️ 注册表要「一组实现」；Map 保留为兼容层。
+      provide: PAYMENT_PROVIDER_LIST,
+      useFactory: (
+        fake: FakePaymentProvider,
+        sandbox: SandboxPaymentProvider,
+      ): PaymentProvider[] => [
+        fake,
+        // ⚠️ **沙箱只在非生产且配了 SANDBOX_CHANNEL_URL 时注册**（第二道保险）。
+        ...(isSandboxPaymentRegistrable() ? [sandbox] : []),
+      ],
+      inject: [FakePaymentProvider, SandboxPaymentProvider],
+    },
+    PaymentProviderRegistry,
+    {
       provide: PAYMENT_PROVIDERS,
-      useFactory: (fake: FakePaymentProvider): Map<string, PaymentProvider> => {
-        const providers = new Map<string, PaymentProvider>();
-        providers.set(fake.channel, fake);
-        return providers;
-      },
-      inject: [FakePaymentProvider],
+      useFactory: (list: PaymentProvider[]): Map<string, PaymentProvider> =>
+        new Map(list.map((provider) => [provider.channel, provider])),
+      inject: [PAYMENT_PROVIDER_LIST],
     },
   ],
-  exports: [PaymentService, PaymentMethodService, RenewalService],
+  exports: [
+    PaymentService,
+    PaymentMethodService,
+    RenewalService,
+    PaymentProviderRegistry,
+  ],
 })
 export class PaymentModule {}

@@ -49,16 +49,31 @@ export class FakePayoutController {
   @ApiOperation({
     summary: '假出款网关：设定接下来 N 次打款的剧本（仅本地开发）',
   })
-  failNext(@Body() body: { times?: number; amountOffset?: number }): {
+  failNext(
+    @Body()
+    body: {
+      /**
+       * 接下来几次失败（**确定失败**，可安全重试）。
+       *
+       * ⚠️ **阶段 6b 起语义变了**：原来失败一律可重试；现在「可重试」对应
+       *    `definitive: true`。要造「结果未知（不能重试）」用 `unknownTimes`。
+       */
+      times?: number;
+      /** 接下来几次失败且**结果未知**（超时 / 网络中断，不能自动重试） */
+      unknownTimes?: number;
+      amountOffset?: number;
+    },
+  ): {
     remaining: number;
   } {
     if (!isFakePayoutEnabled()) {
       throw new NotFoundException('未知的支付渠道');
     }
     this.fake.armScenario({
-      failTimes: body.times ?? 1,
+      definitiveFailureTimes: body.times ?? 1,
+      failTimes: body.unknownTimes ?? 0,
       amountOffset: body.amountOffset ?? 0,
     });
-    return { remaining: this.fake.remainingFailures() };
+    return { remaining: this.fake.remainingDefinitiveFailures() };
   }
 }

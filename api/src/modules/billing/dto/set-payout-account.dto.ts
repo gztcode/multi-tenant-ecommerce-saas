@@ -33,4 +33,17 @@ export class SetPayoutAccountDto {
   @MinLength(4)
   @MaxLength(40)
   accountNo?: string;
+
+  // ⚠️ **默认出款渠道（阶段 6a Task 5）**：不传 = 不修改，空串 = 清除配置。
+  //    留空语义与 `accountNo` 一致，都由 service 层按「键在不在」区分。
+  @ApiProperty({
+    description:
+      '默认出款渠道。不传表示不修改；空串表示清除（改用平台默认渠道）',
+    required: false,
+    example: 'fake-payout',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  preferredChannel?: string;
 }

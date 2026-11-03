@@ -692,6 +692,13 @@ enum PaymentStatus {
   FAILED
   CLOSED
   REFUNDED
+  /// 退款已受理、结果未知（阶段 6c）。
+  ///
+  /// ⚠️ **唯一合法的「退款进行中」状态**：真实渠道的退款是异步的，
+  ///    受理不等于成功。只有渠道确认成功（`queryRefund` / 回调）才允许写 `REFUNDED`。
+  /// ⚠️ 与 `REFUNDED` 不是一回事：把 `REFUNDING` 当成已退款 =
+  ///    钱还没退回就给用户「已退款」的答复。
+  REFUNDING
 }
 
 model Payment {
@@ -715,6 +722,20 @@ model Payment {
   providerTxnId String?
   amount        Int
   rawResponse   Json          @default("{}")
+  /// 渠道侧的**退款交易号**（阶段 6c）。
+  ///
+  /// ⚠️ 它是 `queryRefund` 的唯一键 —— 没有它就只能等回调，
+  ///    渠道回调丢了这张单会永远停在 `REFUNDING`。
+  /// ⚠️ 与 `providerTxnId`（支付交易号）分开：两者是不同的交易。
+  refundTxnId String?
+  /// 最近一次发起退款的时刻（阶段 6c）—— 退款扫描按它判定「超时未确认」。
+  refundRequestedAt DateTime?
+  /// 最近一次退款失败的中文原因（阶段 6c）。
+  ///
+  /// ⚠️ 只有「渠道明确拒付」才写；结果未知不是失败，不要写这里。
+  refundFailureReason String?
+  /// 已发起退款的次数（阶段 6c）—— 重试预算用。
+  refundAttemptCount Int @default(0)
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
 
@@ -1226,6 +1247,12 @@ model MerchantPayoutAccount {
   ///    密钥配错时「解不开」会被误判成「没加密」，
   ///    迁移脚本就会用错密钥把原文覆盖掉，且不可恢复。
   encryptionVersion Int @default(0)
+  /// 商家偏好的默认出款渠道（阶段 6a）。
+  ///
+  /// ⚠️ **只影响新出款单**：已审批 / 处理中的单按 `payouts.payoutChannel` 走。
+  /// ⚠️ 为空 = 用平台默认渠道；配置了但渠道已停用 → 执行时 fail-closed，
+  ///    **不静默回落到平台默认**（钱打到哪家必须确定）。
+  preferredChannel String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1431,6 +1458,11 @@ enum PayoutOperationAction {
   UNSTUCK_TO_APPROVED
   /// 对账发现渠道已打款，本地是 PROCESSING → 自动纠正为 PAID（阶段 5m）
   RECONCILE_TO_PAID
+  /// CSV 账单来源的人工批量确认：渠道已打款、本地 PROCESSING → 人工纠正为 PAID（阶段 6a）
+  ///
+  /// ⚠️ 与 `RECONCILE_TO_PAID` 分开：自动纠正与人工确认在对账任务里的
+  ///    可信度不同，复盘时要能一眼区分「系统改的」和「人改的」。
+  RECONCILE_TO_PAID_BY_FILE
   /// 人工确认「渠道已打款」→ FAILED 纠正为 PAID（阶段 5m）
   MANUAL_CONFIRM_PAID
 }
@@ -1597,4 +1629,22 @@ model PayoutReconciliationItem {
   //    → 这个键上必须有索引，否则每次对账都全表扫。
   @@index([channelTxnId, type])
   @@map("payout_reconciliation_items")
+}
+
+/// 平台级设置（阶段 6a）。非租户作用域，**不要**登记到 `tenant-models.ts`。
+///
+/// 本阶段只承载一个 key：`payout.platformDefaultChannel`（平台默认出款渠道）。
+/// 通用设置中心留到后续，不在这里扩展任意 key-value 的 UI。
+model PlatformSetting {
+  id    String @id @default(uuid())
+  /// 设置键，例如 `payout.platformDefaultChannel`
+  key   String @unique
+  /// 设置值（JSONB；当前存 `{ "channel": "fake-payout" }`）
+  value Json
+  /// 最后修改人（平台超管用户 id）；留痕用
+  updatedBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("platform_settings")
 }

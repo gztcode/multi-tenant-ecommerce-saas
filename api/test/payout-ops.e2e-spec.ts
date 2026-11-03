@@ -399,8 +399,10 @@ describe('出款单的人工处置与失败原因口径 (e2e)', () => {
     payoutNo: string;
     amount: number;
   }): Promise<void> {
-    fakeProvider.armScenario({ failTimes: 1 });
-    await fakeProvider.execute({
+    // ⚠️ **阶段 6b：解卡闸只认「确定失败」** —— 结果未知的失败会被核实
+    //    服务判为「问不出结论」，解卡会被拒绝。
+    fakeProvider.armScenario({ definitiveFailureTimes: 1 });
+    await fakeProvider.submit({
       referenceId: options.payoutId,
       referenceNo: options.payoutNo,
       amount: options.amount,

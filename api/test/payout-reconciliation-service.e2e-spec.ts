@@ -165,7 +165,7 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
     });
 
     const call = (referenceNo: string, amount: number, attempt = 1) =>
-      fakeProvider.execute({
+      fakeProvider.submit({
         referenceId: referenceNo,
         referenceNo,
         amount,
@@ -180,7 +180,9 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
     await call(aPayout.payoutNo, aPayout.netAmount);
     await call(bPayout.payoutNo, bPayout.netAmount);
     await call(cPayout.payoutNo, cPayout.netAmount + 1); // 金额不同
-    fakeProvider.armScenario({ failTimes: 1 });
+    // ⚠️ **阶段 6b：F 类要「渠道确定 FAILED」** —— 结果未知的失败会被
+    //    核实服务判为「问不出结论」（fail-closed），产不出 F 类差异。
+    fakeProvider.armScenario({ definitiveFailureTimes: 1 });
     await call(fPayout.payoutNo, fPayout.netAmount);
     // D 类：只调渠道、不建本地单
     await call('PAY-NOT-OURS-001', 1234);

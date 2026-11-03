@@ -9,6 +9,14 @@ import type { PaymentProvider } from './payment-provider.interface';
  */
 export const PAYMENT_PROVIDERS = 'PAYMENT_PROVIDERS';
 
+/**
+ * 支付渠道**实现列表**的注入令牌（阶段 6a）。
+ *
+ * ⚠️ Map（`PAYMENT_PROVIDERS`）是兼容层；注册表要「一组实现」自己建索引。
+ *    新代码只依赖注册表。
+ */
+export const PAYMENT_PROVIDER_LIST = 'PAYMENT_PROVIDER_LIST';
+
 /** 渠道表的类型别名 */
 export type PaymentProviderMap = Map<string, PaymentProvider>;
 

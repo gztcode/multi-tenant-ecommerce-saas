@@ -1,10 +1,16 @@
 import { Global, Module } from '@nestjs/common';
 import { TenancyModule } from '../../modules/tenancy/tenancy.module';
+import { PlatformSettingsModule } from '../platform-settings/platform-settings.module';
 import { FakePayoutProvider } from './fake-payout.provider';
-import { PAYOUT_PROVIDERS } from './payout.constants';
+import { PAYOUT_PROVIDER_LIST, PAYOUT_PROVIDERS } from './payout.constants';
 import type { PayoutProvider } from './payout-provider.interface';
+import { PayoutProviderRegistry } from './payout-provider.registry';
 import { PAYOUT_VERIFICATION } from './payout-verification';
 import { PayoutVerificationService } from './payout-verification.service';
+import {
+  SandboxPayoutProvider,
+  isSandboxPayoutRegistrable,
+} from './sandbox-payout.provider';
 
 /**
  * 出款渠道与出款核实的**全局模块**（阶段 5m）。
@@ -37,24 +43,57 @@ import { PayoutVerificationService } from './payout-verification.service';
  */
 @Global()
 @Module({
-  imports: [TenancyModule],
+  // ⚠️ **阶段 6a：import 平台设置模块** —— 后续核实服务要注入
+  //    `PlatformSettingService` 读「平台默认渠道」做兜底。
+  //    `PlatformSettingsModule` 只依赖 `TenancyModule`、不 import 本模块，
+  //    所以**不构成环**。
+  imports: [TenancyModule, PlatformSettingsModule],
   providers: [
     FakePayoutProvider,
     {
-      provide: PAYOUT_PROVIDERS,
-      useFactory: (fake: FakePayoutProvider): Map<string, PayoutProvider> => {
-        const providers = new Map<string, PayoutProvider>();
-        providers.set(fake.channel, fake);
-        return providers;
-      },
-      inject: [FakePayoutProvider],
+      // ⚠️ **必须用工厂而不是类注册**（阶段 6b）：`SandboxPayoutProvider` 的
+      //    构造函数收一个 `number`（单次 HTTP 超时预算，带默认值）。
+      //    以类注册时 Nest 会反射构造参数，把 `Number` 当成一个待注入的
+      //    provider → 启动直接报「Nest can't resolve dependencies of the
+      //    SandboxPayoutProvider (?)」。用工厂则完全绕开反射。
+      provide: SandboxPayoutProvider,
+      useFactory: () => new SandboxPayoutProvider(),
     },
+    {
+      // ⚠️ 注册表要的是「一组实现」：它自己建索引、算描述符、做启用校验。
+      provide: PAYOUT_PROVIDER_LIST,
+      useFactory: (
+        fake: FakePayoutProvider,
+        sandbox: SandboxPayoutProvider,
+      ): PayoutProvider[] => [
+        fake,
+        // ⚠️ **沙箱只在非生产且配了 SANDBOX_CHANNEL_URL 时注册**（第二道保险；
+        //    第一道是启动校验与注册表的 devOnly 拦截）。没配地址就注册，
+        //    会在运行期第一笔调用才炸。
+        ...(isSandboxPayoutRegistrable() ? [sandbox] : []),
+      ],
+      inject: [FakePayoutProvider, SandboxPayoutProvider],
+    },
+    {
+      // ⚠️ 兼容层：存量调用方仍按 Map 读渠道表；新代码只依赖注册表。
+      provide: PAYOUT_PROVIDERS,
+      useFactory: (list: PayoutProvider[]): Map<string, PayoutProvider> =>
+        new Map(list.map((provider) => [provider.channel, provider])),
+      inject: [PAYOUT_PROVIDER_LIST],
+    },
+    PayoutProviderRegistry,
     PayoutVerificationService,
     {
       provide: PAYOUT_VERIFICATION,
       useExisting: PayoutVerificationService,
     },
   ],
-  exports: [FakePayoutProvider, PAYOUT_PROVIDERS, PAYOUT_VERIFICATION],
+  exports: [
+    FakePayoutProvider,
+    PAYOUT_PROVIDER_LIST,
+    PAYOUT_PROVIDERS,
+    PayoutProviderRegistry,
+    PAYOUT_VERIFICATION,
+  ],
 })
 export class PayoutProvidersModule {}

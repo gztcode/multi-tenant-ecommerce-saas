@@ -1021,10 +1021,10 @@ export class PayoutService {
       //    `to='APPROVED'` 直接重新入队；`to='FAILED'` 设 `failedBeforePayout: true`
       //    → 制造出一张「可安全重试」的单 → 之后能被 `retry` 重打。
       //
-      //    ⚠️⚠️ **渠道选取必须与打款 worker 一致** —— 本闸问的是
-      //    「第一个已注册渠道」（见 `common/payment/payout-verification.service.ts`
-      //    的 `pickProvider`），打款 worker 也是取「第一个已注册渠道」
-      //    （见 `modules/payment/payout.worker.ts` 的 `firstProvider`）。
+      //    ⚠️⚠️ **渠道选取必须与打款 worker 一致** —— 本闸把单子自己的
+      //    `payoutChannel` 传下去（阶段 6a），核实服务按它取实现；
+      //    打款 worker 也是按同一个 `payoutChannel` 取实现
+      //    （见 `modules/payment/payout.worker.ts`）。
       //    **两处必须一起改** —— 若一处改了另一处没改，就会出现
       //    「钱打到 A 渠道、核实查 B 渠道」→
       //    核实从 B 渠道问出「没打」，实际钱已经从 A 渠道打出去了
@@ -1033,6 +1033,8 @@ export class PayoutService {
         id: payout.id,
         payoutNo: payout.payoutNo,
         payoutTxnId: payout.payoutTxnId,
+        // ⚠️ **必须是库里读到的渠道** —— 调用方无权指定（防止核实别的渠道）
+        payoutChannel: payout.payoutChannel,
       });
       if (verdict.verdict === 'PAID') {
         // ⚠️ **渠道说钱已经打了** → 绝不能解卡
@@ -1760,13 +1762,20 @@ export class PayoutService {
    *    但**白名单之外的一律替换成通用措辞** —— `failureReason` 是
    *    调用方传进来的字符串，将来有人往这个桶里写进内部术语时，
    *    商家端不会跟着泄出去（**默认安全**）。
+   *
+   * ⚠️⚠️ **兜底措辞不能借用白名单里的某一条**（阶段 6b 修正）：
+   *    阶段 6b 起，「渠道明确拒付 + 重试预算用完」也会落进
+   *    `failedBeforePayout = true`，它的原文是渠道侧措辞（「假出款网关
+   *    模拟的失败（第 3 次尝试）」）。以前兜底会回落到白名单第一条
+   *    「收款账号信息异常…」—— 那是一句**说错原因**的话：商家会跑去改
+   *    收款账户，改完再申请还是同样的错。兜底必须是一句**不含原因**的中性话。
    */
   private merchantFailureReason(payout: Payout): string | null {
     if (!payout.failureReason) return null;
     if (payout.failedBeforePayout) {
       return MERCHANT_SAFE_FAILURE_REASONS.includes(payout.failureReason)
         ? payout.failureReason
-        : MERCHANT_SAFE_FAILURE_REASONS[0];
+        : MERCHANT_GENERIC_NOT_SENT_REASON;
     }
     return '出款未完成，请联系平台确认出款情况';
   }
@@ -1912,8 +1921,8 @@ export class PayoutService {
  * ⚠️ **「可能已打」那一桶不在这里** —— 那些值是渠道侧的原文
  *    （带主机名、请求 id、金额数字），商家端一律换成通用措辞。
  *
- * ⚠️ **第一条同时是兜底值** —— 白名单外的值（例如将来有人往这个桶里
- *    写进内部术语）会退回它，而不是把原文泄给商家。
+ * ⚠️ **白名单外的不在这里** —— 它们退回 `MERCHANT_GENERIC_NOT_SENT_REASON`
+ *    （一句不含原因的中性话），见 `merchantFailureReason`。
  */
 const MERCHANT_SAFE_FAILURE_REASONS: readonly string[] = [
   '收款账号信息异常，本次未打款，请更新收款账户后重新申请',
@@ -1921,6 +1930,16 @@ const MERCHANT_SAFE_FAILURE_REASONS: readonly string[] = [
   '没有可用的出款渠道',
   '出款单被平台人工标记为失败（钱未打出去），可重新申请或重试',
 ];
+
+/**
+ * 白名单之外的「确定没打钱」兜底措辞（阶段 6b）。
+ *
+ * ⚠️ **为什么必须是一句不含原因的中性话**：白名单外的值可能是渠道侧原文
+ *    （「假出款网关模拟的失败（第 3 次尝试）」），也可能来自将来新增的
+ *    拦截点。**猜原因比不说原因更糟** —— 商家会照着错的原因白跑一趟。
+ */
+const MERCHANT_GENERIC_NOT_SENT_REASON =
+  '出款未成功，本次未打款，请联系平台处理';
 
 /**
  * 生成出款单号。

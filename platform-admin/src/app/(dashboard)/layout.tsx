@@ -63,6 +63,9 @@ export default async function DashboardLayout({
             >
               渠道对账
             </Link>
+            <Link href="/settings" className="underline-offset-4 hover:underline">
+              设置
+            </Link>
           </nav>
         </div>
         <div className="flex items-center gap-4 text-sm">

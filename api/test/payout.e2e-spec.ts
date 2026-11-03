@@ -953,8 +953,15 @@ describe('出款 (e2e)', () => {
       .delete(`/api/v1/merchant/payouts/${requested.id}`)
       .set('authorization', `Bearer ${merchant.token}`)
       .expect(409);
-    // ⚠️ **错误消息要点明当前状态**，让人一眼看出「它已经批过了」
-    expect(errorText(response.body)).toContain('APPROVED');
+    // ⚠️ **错误消息要点明当前状态**，让人一眼看出「它已经批过了」。
+    //
+    // ⚠️ **不能只断言 `APPROVED`**（阶段 6b 实测偶发红）：审批后会自动入队，
+    //    worker 抢到单就把状态推到 `PROCESSING` —— 于是同一条护栏在快机器上
+    //    拿到的是「出款单当前是「PROCESSING」状态，不能撤回」。
+    //    这里要验的是「被拒 + 点明了当前状态」，不是某个具体状态。
+    expect(errorText(response.body)).toMatch(
+      /当前是「(APPROVED|PROCESSING|PAID)」状态，不能撤回/,
+    );
 
     // ⚠️ **状态不变**：仍是 APPROVED，不能被撤回改成 CANCELLED
     const after = await asPlatform(() =>

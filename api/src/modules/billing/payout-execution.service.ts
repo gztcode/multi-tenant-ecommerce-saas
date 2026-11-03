@@ -6,7 +6,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { PayoutStatus, SettlementStatus } from '@prisma/client';
+import { PayoutStatus, Prisma, SettlementStatus } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   platformScope,
@@ -17,6 +17,15 @@ import { PAYOUT_VERIFICATION } from '../../common/payment/payout-verification';
 //    带装饰器的构造器参数上（`emitDecoratorMetadata` + `isolatedModules`
 //    下，TS1272 要求装饰器签名里引用的类型必须是 type-only 导入）。
 import type { PayoutVerification } from '../../common/payment/payout-verification';
+import { PayoutProviderRegistry } from '../../common/payment/payout-provider.registry';
+// ⚠️ **必须 `import type`** —— 与 `PayoutVerification` 同理：它出现在带装饰器的
+//    构造器参数类型位置，且只用于 `typeof` 断言，不产生运行时引用。
+import type {
+  PayoutProvider,
+  PayoutQueryResult,
+} from '../../common/payment/payout-provider.interface';
+import { normalizeChannel } from '../../common/channel/channel-config';
+import { PlatformSettingService } from '../../common/platform-settings/platform-setting.service';
 import { PayoutCipherService } from './payout-cipher.service';
 
 /** 打款的结果（worker 传给本服务） */
@@ -80,6 +89,26 @@ export interface ExecutionClaim {
    * ⚠️ **null 且 `account` 非 null = 解密成功，账户可用**。
    */
   accountError: string | null;
+  /**
+   * 本次执行要用的**出款渠道名**（阶段 6a）。
+   *
+   * ⚠️ **非 null = 已解析好** → worker 用它 `registry.get(channel)`，
+   *    并把同一个渠道名写进 `payouts.payoutChannel`（`markPaid` / `recordChannel`）。
+   * ⚠️ **null 且 `channelError` 非 null = 渠道解析失败**（根因在 `channelError`）。
+   * ⚠️ **两处都为 null = 不应出现的状态**（代码 bug）→ worker 记 warn 后落 FAILED。
+   */
+  channel: string | null;
+  /**
+   * **渠道解析失败**时的中文原因（给运营看）。
+   *
+   * ⚠️ 形态与 `accountError` 一致：这里**只放原因、不抛异常**。
+   *
+   * ⚠️⚠️ **为什么解析失败不能抛异常**：抛出去会让抢单事务回滚 →
+   *    单子仍是 `APPROVED`，而 `markFailed` 只接受 `PROCESSING`
+   *    → 单子会**永远卡在 `APPROVED`**，兜底扫描每 5 分钟把它重新入队一次
+   *    （无限重投）。捕获后照常提交（单子进 `PROCESSING`），由 worker 落 FAILED。
+   */
+  channelError: string | null;
   /** 收款账户快照（**不是**实时查的） */
   account: {
     accountName: string;
@@ -87,6 +116,21 @@ export interface ExecutionClaim {
     accountNo: string;
   } | null;
 }
+
+/**
+ * 单张「卡在 PROCESSING」的单，本轮扫描的处置结论（阶段 6b）。
+ *
+ * - `HANDLED`：渠道给了终态，已补记 `PAID` / 已落 `FAILED`；
+ * - `INCONCLUSIVE`：**问了异步渠道，但它还没给终态**（`PROCESSING` / `UNKNOWN` /
+ *   查询异常）→ 状态不变，**下一轮继续问**，不能写 `stuckLoggedAt`；
+ * - `NOT_POLLED`：**没问成**（渠道取不到 / 同步渠道的 `PROCESSING`）→
+ *   视为异常，写 `stuckLoggedAt` 只告警一次。
+ *
+ * ⚠️ 为什么必须区分后两者：`scanStuck` 的查询条件是 `stuckLoggedAt: null`，
+ *    写了它就等于「以后不再捞这张单」。异步渠道的 `PROCESSING` 是正常中间态，
+ *    写掉告警标记会让「等渠道转终态」变成「永远不再问」。
+ */
+export type StuckPayoutPollOutcome = 'HANDLED' | 'INCONCLUSIVE' | 'NOT_POLLED';
 
 /**
  * 出款执行的状态落库服务（阶段 5h-2）。
@@ -111,6 +155,10 @@ export class PayoutExecutionService {
     //    按 token 注入（契约在 `common/`）→ **不产生 billing → payment 的模块边**。
     @Inject(PAYOUT_VERIFICATION)
     private readonly verification: PayoutVerification,
+    // ⚠️ **阶段 6a：抢单时解析本次出款渠道** —— 两个依赖都来自 `@Global()`
+    //    的 `PayoutProvidersModule` / `PlatformSettingsModule`，不产生模块边。
+    private readonly registry: PayoutProviderRegistry,
+    private readonly settings: PlatformSettingService,
   ) {}
 
   /**
@@ -135,20 +183,14 @@ export class PayoutExecutionService {
       //    「已改成 PROCESSING 但还没读回金额」这个窗口里，
       //    另一个 worker 读到的可能是旧值。
       return this.prisma.$transaction(async (tx) => {
-        const affected = await tx.payout.updateMany({
-          where: { id: payoutId, status: PayoutStatus.APPROVED },
-          data: {
-            status: PayoutStatus.PROCESSING,
-            processingAt: now,
-            attemptCount: { increment: 1 },
-          },
-        });
-        if (affected.count === 0) {
-          return null;
-        }
+        // ⚠️ **先读单子再抢** —— 解析渠道要用 `tenantId` 与已有的
+        //    `payoutChannel`，而解析结果要和「状态改 PROCESSING」写进
+        //    **同一个 `updateMany`**（否则中间有个「已 PROCESSING、渠道未定」的窗口）。
         const payout = await tx.payout.findFirst({
           where: { id: payoutId },
           select: {
+            tenantId: true,
+            payoutChannel: true,
             attemptCount: true,
             netAmount: true,
             payoutNo: true,
@@ -162,6 +204,48 @@ export class PayoutExecutionService {
         if (!payout) {
           return null;
         }
+
+        // ---- 解析本次出款渠道（阶段 6a）----
+        //
+        // ⚠️ **解析失败不抛** —— 抛错会让整个事务回滚，单子停在 `APPROVED`，
+        //    而 `markFailed` 只接受 `PROCESSING` → 单子会永远卡在 `APPROVED`，
+        //    兜底扫描每 5 分钟把它重新入队一次（无限重投）。
+        //    → 捕获原因放进 `channelError`，由 worker 落 FAILED。
+        let channel: string | null = null;
+        let channelError: string | null = null;
+        try {
+          channel = await this.resolvePayoutChannel(
+            // `$transaction` 传入的 tx 是「租户扩展版」客户端，其类型与
+            // `Prisma.TransactionClient` 不兼容（扩展式的查找参数），
+            // 这里按结构收窄 —— 本方法只用到只读 delegate。
+            tx as unknown as Prisma.TransactionClient,
+            payout,
+          );
+        } catch (error) {
+          channelError = error instanceof Error ? error.message : String(error);
+        }
+
+        const affected = await tx.payout.updateMany({
+          where: { id: payoutId, status: PayoutStatus.APPROVED },
+          data: {
+            status: PayoutStatus.PROCESSING,
+            processingAt: now,
+            attemptCount: { increment: 1 },
+            // ⚠️ **新一次执行必须清掉上一次的「已告警」标记**：
+            //    `scanStuck` 只捞 `stuckLoggedAt: null` 的 PROCESSING 单。
+            //    上一次执行没问出结论写了它，这张单失败后重试又进了 PROCESSING，
+            //    标记还在 → **永远不再被轮询**，异步渠道的终态只能靠人工发现。
+            stuckLoggedAt: null,
+            // ⚠️ **解析成功才写** —— 解析失败时写 `null` 会把「重试不换渠道」
+            //    的依据也抹掉（已有值的单子上更不该被覆盖）。
+            ...(channel ? { payoutChannel: channel } : {}),
+          },
+        });
+        if (affected.count === 0) {
+          return null;
+        }
+        const attemptCount = payout.attemptCount + 1;
+
         // ⚠️ **解密失败不抛错** —— 抛错会让整个事务回滚，单子停在
         //    `APPROVED` 且 `attemptCount` 一起被回滚 → 兜底扫描把它当成
         //    「审批后入队失败」重新入队 → **每 5 分钟无限循环**
@@ -196,14 +280,72 @@ export class PayoutExecutionService {
         }
 
         return {
-          attemptCount: payout.attemptCount,
+          attemptCount,
           netAmount: payout.netAmount,
           payoutNo: payout.payoutNo,
           accountError,
           account,
+          channel,
+          channelError,
         };
       });
     });
+  }
+
+  /**
+   * 解析本次执行要用的出款渠道（阶段 6a，设计 §4.4 / §6.4）。
+   *
+   * 顺序：单子已定 → 商家偏好 → 平台默认 → 抛中文 409（`resolveForPayout`）。
+   *
+   * ⚠️ **单子已有 `payoutChannel` 就沿用** —— 重试**不换渠道**：
+   *    上一次可能已经把钱打到那家渠道，换一家等于换个收款路径。
+   *
+   * ⚠️ **本方法跑在平台作用域**（`payouts` 在租户白名单里，队列消费不带租户上下文）
+   *    → 租户扩展**不附加任何过滤** → 查商家账户**必须显式带 `tenantId`**，
+   *    否则就是跨租户读（同 `confirmPaidAfterReconciliation` 的那类坑）。
+   */
+  private async resolvePayoutChannel(
+    tx: Prisma.TransactionClient,
+    payout: { tenantId: string; payoutChannel: string | null },
+  ): Promise<string> {
+    if (normalizeChannel(payout.payoutChannel ?? '').length > 0) {
+      // ⚠️ **重试沿用单子上已有的渠道** —— 不重读商家 / 平台配置
+      return this.registry.resolveForPayout({
+        payoutChannel: payout.payoutChannel,
+        merchantChannel: null,
+        platformChannel: null,
+      }).channel;
+    }
+
+    const account = await tx.merchantPayoutAccount.findFirst({
+      where: { tenantId: payout.tenantId },
+      select: { preferredChannel: true },
+    });
+    const merchantChannel = normalizeChannel(account?.preferredChannel ?? '');
+
+    // ⚠️ **商家配了就不再读平台默认渠道**（设计 §4.4 的顺序：已定 → 商家 → 平台）。
+    //    平台默认渠道可能在 DB 与 env 里都没配（首次部署 / 运维漏配），
+    //    那种情况下 `getPayoutDefaultChannel()` 会抛错。若在这里无条件调用，
+    //    「商家已经明确配了渠道」的单子会被平台配置缺失连坐 → 打不出钱。
+    //    只有真正需要兜底时才去读它。
+    if (merchantChannel.length > 0) {
+      return this.registry.resolveForPayout({
+        payoutChannel: null,
+        merchantChannel,
+        platformChannel: null,
+      }).channel;
+    }
+
+    // ⚠️ **平台默认渠道（DB → env）** —— 商家没配时才读。
+    //    平台设置坏了就响亮失败（channelError），不静默换一个收款路径。
+    const platformChannel = (await this.settings.getPayoutDefaultChannel())
+      .channel;
+
+    return this.registry.resolveForPayout({
+      payoutChannel: null,
+      merchantChannel: null,
+      platformChannel,
+    }).channel;
   }
 
   /**
@@ -212,10 +354,13 @@ export class PayoutExecutionService {
    * ⚠️ **为什么必须在「调渠道之前」写** —— 原来 `payoutChannel` 只有
    *    `markPaid` 才写 → 一张卡在 `PROCESSING` 的单渠道名是 `null`：
    *    ① `payout-reconciliation-resolver` 拿不到值，只能硬回落成 `'fake-payout'`；
-   *    ② 将来接第二家渠道时，`PROCESSING` 的单**定位不到渠道** ——
-   *    解卡核实闸（`pickProvider`）与打款 worker（`firstProvider`）都是
-   *    「取第一个注册的渠道」，将来要改成「按 `payouts.payoutChannel` 取」，
-   *    前提就是这里先把渠道名写上。
+   *    ② `PROCESSING` 的单**定位不到渠道** —— 解卡核实闸与打款 worker
+   *    都按 `payouts.payoutChannel` 取实现（阶段 6a），前提就是这里
+   *    先把渠道名写上。
+   *
+   * ⚠️ **阶段 6a 起抢单时已经解析并写入了 `payoutChannel`**（与状态改
+   *    `PROCESSING` 同一个 `updateMany`）→ 正常路径这里只是把同一个渠道名
+   *    再落一次（幂等）；保留它是因为「解析成功但写库没命中」时还需要补写。
    *
    * ⚠️ **只写 `payoutChannel` 一个字段** —— 状态机与重试预算由本服务独家管，
    *    越权写状态会绕开条件更新。`where` 带 `status: PROCESSING`：
@@ -530,10 +675,19 @@ export class PayoutExecutionService {
       //    由调用方传入 → 传别的单的号就能核实别的单 → **闸 ④ 被完全绕过**
       //    （渠道说「那单打了」→ 放行 → 这张单被改成已付款 → 重复付款）。
       //    → `input.payoutNo` 已从签名删除，核实对象不再受调用方影响。
+      // ⚠️ **核实对象一律取自库里读到的 `payout`**（阶段 5m 审查修正）
+      //    —— 之前这里是 `input.payoutNo ?? payout.payoutNo`，而 `input.payoutNo`
+      //    由调用方传入 → 传别的单的号就能核实别的单 → **闸 ④ 被完全绕过**
+      //    （渠道说「那单打了」→ 放行 → 这张单被改成已付款 → 重复付款）。
+      //    → `input.payoutNo` 已从签名删除，核实对象不再受调用方影响。
       const verdict = await this.verification.verify({
         id: payout.id,
         payoutNo: payout.payoutNo,
         payoutTxnId: payout.payoutTxnId,
+        // ⚠️ **阶段 6a：带上单子的渠道** —— 核实必须与打款取**同一渠道**，
+        //    否则「钱打到 A、核实查 B」→ B 说没打 → 放行解卡 → 重复打款。
+        //    （单子可能没有 `payoutChannel`：阶段 5m 之前的遗留单）
+        payoutChannel: payout.payoutChannel,
       });
       if (verdict.verdict !== 'PAID') {
         throw new ConflictException(
@@ -763,6 +917,9 @@ export class PayoutExecutionService {
     });
   }
 
+  /** `scanStuck` 单轮最多轮询的 `PROCESSING` 单数（设计 §6.3） */
+  private static readonly SCAN_STUCK_PROCESSING_LIMIT = 50;
+
   /**
    * 扫描卡住的出款单。
    *
@@ -770,13 +927,28 @@ export class PayoutExecutionService {
    *
    * | 状态 | 含义 | 处理 |
    * |------|------|------|
-   * | `PROCESSING` | 请求**可能已经打出去了**，只是回包丢了 | **只告警，绝不重试** |
+   * | `PROCESSING` | 请求**可能已经打出去了**，只是回包丢了 | **问渠道**；问不出结论只告警，**绝不重试** |
    * | `APPROVED` | **确定还没打**（还没进 `PROCESSING`） | **重新入队**（安全） |
    *
-   * ⚠️ **`PROCESSING` 绝不自动重试**（设计 §九·R3）：
+   * ## `PROCESSING`：先去问渠道（阶段 6b）
+   *
+   * 阶段 6b 起支持异步渠道：`submit` 返回 `PROCESSING` 是**正常中间态**，
+   * 终态要 `queryPayout` 去问。卡住的 `PROCESSING` 单按下面的规则处置：
+   *
+   * | 渠道回答 | 处置 |
+   * |---|---|
+   * | `SUCCESS` | `markPaid`（补记 `paidAt` / `payoutTxnId` / `payoutChannel`） |
+   * | `FAILED` 且 `definitive === true` | `markFailed(failedBeforePayout=true)`，允许运营重试 |
+   * | 其余（`PROCESSING` / `UNKNOWN` / `definitive !== true` / 查询抛异常） | **状态不变**，只写 `stuckLoggedAt` + 告警 |
+   *
+   * ⚠️ **问不出结论绝不重试**（设计 §九·R3）：
    *    卡在 `PROCESSING` 最可能的成因是「请求发出去了、回包丢了」——
    *    钱**可能已经打到商家账上**。退回 `APPROVED` 再入队 =
    *    **确定性地重复打款**。所以只标出来给人看。
+   *
+   * ⚠️ **只有 `capabilities.asyncPayout === true` 的渠道才问**：
+   *    同步渠道的 `submit` 不返回 `PROCESSING` —— 它的单卡在 `PROCESSING`
+   *    是**异常**，去问也问不出「终态之后的结果」，只记 warn 不调渠道。
    *
    * ⚠️ **`APPROVED` 必须救援**：审批后要入队，入队可能失败（Redis 抖动）。
    *    没有兜底的话，那张单会永远停在 `APPROVED` ——
@@ -798,26 +970,65 @@ export class PayoutExecutionService {
     return tenantContext.run(platformScope(), async () => {
       const threshold = new Date(now.getTime() - stuckThresholdMs);
 
-      // ---- ① PROCESSING 卡死：只告警，不改状态 ----
+      // ---- ① PROCESSING 卡死：先问渠道（阶段 6b） ----
       const stuck = await this.prisma.payout.findMany({
         where: {
           status: PayoutStatus.PROCESSING,
           processingAt: { lt: threshold },
           // ⚠️ **只捞还没告警过的** —— 不写 `stuckLoggedAt` 的话，
-          //    每 5 分钟就把同一张单捞出来再打一遍日志
+          //    每 5 分钟就把同一张单捞出来再打一遍日志。
+          //    ⚠️ **问出终态的单不改写它**（`stuckLoggedAt` 只在「仍无结论」时写），
+          //    已处置的单不会再被这里捞到（状态已离开 PROCESSING）。
           stuckLoggedAt: null,
         },
-        select: { id: true, payoutNo: true, attemptCount: true },
+        select: {
+          id: true,
+          payoutNo: true,
+          attemptCount: true,
+          payoutChannel: true,
+          // ⚠️ **补记已付款前要核对金额**（阶段 6 审查结论）：
+          //    渠道报的成功金额与出款单不一致时，绝不能记成「足额已付」。
+          netAmount: true,
+        },
+        // ⚠️ **单轮上限**（设计 §6.3）—— 避免一次扫全表；被截掉的单下一轮再处理
+        take: PayoutExecutionService.SCAN_STUCK_PROCESSING_LIMIT,
+        orderBy: { processingAt: 'asc' },
       });
-      if (stuck.length > 0) {
-        await this.markStuckLogged(
-          stuck.map((p) => p.id),
-          now,
-        );
+      // ⚠️ **再切片一次**（纵深防御）—— `take` 由数据库执行；若某天查询层
+      //    被替换成不认 `take` 的实现，这里仍能兜住「单轮上限」。
+      const stillStuck: string[] = [];
+      for (const payout of stuck.slice(
+        0,
+        PayoutExecutionService.SCAN_STUCK_PROCESSING_LIMIT,
+      )) {
+        // ⚠️ **单张处置异常不中断整轮**（DB 抖动等）—— 记 warn 后继续，
+        //    这张单本轮按「仍卡住」处理（写 `stuckLoggedAt`、下一轮再试）。
+        let outcome: StuckPayoutPollOutcome = 'NOT_POLLED';
+        try {
+          outcome = await this.pollStuckPayout(payout);
+        } catch (error) {
+          this.logger.warn(
+            `出款 ${payout.id}（${payout.payoutNo}）轮询处置失败：${
+              error instanceof Error ? error.message : String(error)
+            } —— 本轮按仍卡住处理，不自动重试`,
+          );
+        }
+        // ⚠️ **只有「根本没问成」的单才写 `stuckLoggedAt`**（见下方
+        //    `StuckPayoutPollOutcome` 的说明）：写了它这张单就再也不会被
+        //    本扫描捞到。异步渠道问出「还在处理中」时必须**下一轮继续问**，
+        //    否则一次 `PROCESSING` 就永久停止轮询，异步出款永远不会自动落终态。
+        if (outcome === 'NOT_POLLED') {
+          stillStuck.push(payout.id);
+        }
+      }
+      // ⚠️ **只对「问不出结论」的单写 `stuckLoggedAt`**（一次批量更新）——
+      //    问出终态的单已经离开了 `PROCESSING`，批量写的 `status: PROCESSING`
+      //    条件会自然跳过它们；这里也不浪费一次写库。
+      if (stillStuck.length > 0) {
+        await this.markStuckLogged(stillStuck, now);
         this.logger.warn(
-          `出款卡在 PROCESSING：${stuck.length} 张` +
-            `（${stuck.map((p) => p.payoutNo).join('、')}）——` +
-            '⚠️ 可能已打款，需人工核对，**不要自动重试**',
+          `出款卡在 PROCESSING：${stillStuck.length} 张 —— ` +
+            '渠道未给出终态，⚠️ 可能已打款，需人工核对，**不要自动重试**',
         );
       }
 
@@ -857,5 +1068,160 @@ export class PayoutExecutionService {
         attemptCount: p.attemptCount,
       }));
     });
+  }
+
+  /**
+   * 对一张卡在 `PROCESSING` 的单**主动问渠道**（阶段 6b，设计 §6.3）。
+   *
+   * ⚠️ **本方法绝不抛异常** —— 任何一张单出问题（渠道解析失败、查询超时）
+   *    都只会让**这一张**落到「只告警」，不能中断整轮扫描。
+   *
+   * ⚠️ **只有异步渠道才问**（`capabilities.asyncPayout === true`）：
+   *    同步渠道的 `PROCESSING` 是异常状态，问也白问，只记 warn。
+   *
+   * @returns `HANDLED` = 已按渠道结论处置；`INCONCLUSIVE` = 异步渠道还没给终态
+   *          （下一轮继续问）；`NOT_POLLED` = 没问成（只告警一次）。
+   */
+  private async pollStuckPayout(payout: {
+    id: string;
+    payoutNo: string;
+    attemptCount: number;
+    payoutChannel: string | null;
+    netAmount: number;
+  }): Promise<StuckPayoutPollOutcome> {
+    // ---- 解析渠道：单子上已有的 → 平台默认（存量单兜底） ----
+    // ⚠️ **任何一步取不到都只记 warn** —— 整轮扫描不能被一张单拖垮。
+    let provider: PayoutProvider;
+    try {
+      const channel =
+        payout.payoutChannel ??
+        (await this.settings.getPayoutDefaultChannel()).channel;
+      provider = this.registry.get(channel);
+    } catch (error) {
+      this.logger.warn(
+        `出款 ${payout.id}（${payout.payoutNo}）卡在 PROCESSING，` +
+          `但取不到可用的出款渠道：${
+            error instanceof Error ? error.message : String(error)
+          } —— 只告警，不自动重试`,
+      );
+      return 'NOT_POLLED';
+    }
+
+    // ---- 同步渠道的 PROCESSING 是异常：不调用，只告警 ----
+    // ⚠️ **必须显式挡掉** —— 同步渠道的 `submit` 不会返回 `PROCESSING`，
+    //    它出现在这里说明是 bug 或历史脏数据；对同步渠道调 `queryPayout`
+    //    问不出「终态之后」的结果，只会制造噪声。
+    if (provider.capabilities.asyncPayout !== true) {
+      this.logger.warn(
+        `出款 ${payout.id}（${payout.payoutNo}）卡在 PROCESSING，` +
+          `但渠道 ${provider.channel} 声明为同步出款（asyncPayout=false）—— ` +
+          '视为异常，只告警，不轮询渠道、不自动重试',
+      );
+      return 'NOT_POLLED';
+    }
+
+    // ---- 问渠道 ----
+    // ⚠️ **用 `referenceNo`（`payoutNo`），不是 `payoutTxnId`** ——
+    //    `PROCESSING` 的单没有交易号（它是 `markPaid` 才写的）。
+    let result: PayoutQueryResult;
+    try {
+      result = await provider.queryPayout({ referenceNo: payout.payoutNo });
+    } catch (error) {
+      // ⚠️ **查询异常 = 问不出结论**，不是「渠道说没打」——
+      //    钱可能已经打出去，绝不落 FAILED、绝不重试。
+      this.logger.warn(
+        `出款 ${payout.id}（${payout.payoutNo}）查询渠道状态失败：${
+          error instanceof Error ? error.message : String(error)
+        } —— 状态不变，只告警，不自动重试`,
+      );
+      return 'INCONCLUSIVE';
+    }
+
+    // ---- 渠道说 SUCCESS：补记已付款（渠道是权威） ----
+    if (result.status === 'SUCCESS') {
+      // ⚠️ **必须带 `providerTxnId`** —— 它会被 `markPaid` 写进 `payoutTxnId`，
+      //    没有交易号的话这张单事后无法在渠道侧定位。
+      if (!result.providerTxnId) {
+        this.logger.warn(
+          `出款 ${payout.id}（${payout.payoutNo}）渠道返回 SUCCESS 但没给交易号 —— ` +
+            '不据此补记已付款，只告警（下一轮继续问）',
+        );
+        return 'INCONCLUSIVE';
+      }
+      // ⚠️ **`paidAt` 用数据库时钟**（约束：落库时刻一律 `databaseNow()`）——
+      //    渠道返回的时刻只做展示 / 对账字段，不写进 `paidAt` 的落库时刻。
+      const paidAt = await this.prisma.databaseNow();
+      // ⚠️ **金额核对必须在补记之前**（阶段 6 审查结论）：
+      //    与 `payout.worker.ts` 的护栏 X3 保持同一口径 —— 渠道报的金额
+      //    与出款单的 `netAmount` 不一致时，既不能记成「足额已付」，
+      //    也不能当成功放行；按「结果未知」落 FAILED 且**不允许自动重试**
+      //    （钱可能已经出去了，但金额不对，必须人工查）。
+      if (result.amount !== undefined && result.amount !== payout.netAmount) {
+        this.logger.error(
+          `出款 ${payout.id}（${payout.payoutNo}）渠道回报金额与出款单不一致：` +
+            `应付 ${payout.netAmount}，渠道报 ${result.amount} —— 落 FAILED，禁止自动重试`,
+        );
+        const failedAt = await this.prisma.databaseNow();
+        await this.markFailed(payout.id, {
+          reason: `渠道回报的出款金额与出款单不一致（应付 ${payout.netAmount}，渠道报 ${result.amount}）`,
+          failedAt,
+          failedBeforePayout: false,
+          providerTxnId: result.providerTxnId,
+        });
+        return 'HANDLED';
+      }
+      const ok = await this.markPaid(payout.id, {
+        providerTxnId: result.providerTxnId,
+        channel: provider.channel,
+        paidAt,
+      });
+      if (!ok) {
+        // ⚠️ **`markPaid` 没命中 = 状态已被别人改过**（对账纠正 / 人工处置）——
+        //    不是错误，但**也不能再写 `stuckLoggedAt`**（状态已不是 `PROCESSING`，
+        //    写了也会被条件更新挡掉）→ 留痕后直接返回。
+        this.logger.warn(
+          `出款 ${payout.id}（${payout.payoutNo}）渠道说已打款，` +
+            '但状态已变（可能已被对账纠正或人工处理），未补记',
+        );
+      }
+      return 'HANDLED';
+    }
+
+    // ---- 渠道说失败且确定：落 FAILED，允许运营重试 ----
+    // ⚠️ **只有 `definitive === true` 才是「渠道明确说没打」** ——
+    //    `definitive: false` / 缺省都是「结果未知」，落 FAILED 会让运营
+    //    误以为可以重试 → 重复打款。
+    if (result.status === 'FAILED' && result.definitive === true) {
+      const failedAt = await this.prisma.databaseNow();
+      const ok = await this.markFailed(payout.id, {
+        reason: result.failureReason?.trim()
+          ? `渠道查询确认失败：${result.failureReason}`
+          : '渠道查询确认失败（渠道明确拒付）',
+        failedAt,
+        // ⚠️ **钱确定没打出去** —— 渠道对已受理的那次 `submit` 给出终态失败，
+        //    允许运营重试。
+        failedBeforePayout: true,
+        // ⚠️ **只在渠道给了交易号时才传**（`undefined` 不写，不覆盖已有值）
+        providerTxnId: result.providerTxnId,
+      });
+      if (!ok) {
+        this.logger.warn(
+          `出款 ${payout.id}（${payout.payoutNo}）渠道说已失败（确定），` +
+            '但状态已变（可能已被对账纠正或人工处理），未落 FAILED',
+        );
+      }
+      return 'HANDLED';
+    }
+
+    // ---- 其余（`PROCESSING` / `UNKNOWN` / `definitive !== true`）：状态不变 ----
+    this.logger.warn(
+      `出款 ${payout.id}（${payout.payoutNo}）卡在 PROCESSING，` +
+        `渠道状态：${result.status}` +
+        (result.status === 'FAILED'
+          ? '（结果未知，definitive !== true）'
+          : '') +
+        ' —— 可能已打款，需人工核对，**不要自动重试**（下一轮继续问）',
+    );
+    return 'INCONCLUSIVE';
   }
 }
