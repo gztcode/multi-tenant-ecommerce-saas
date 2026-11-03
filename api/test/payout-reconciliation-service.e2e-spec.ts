@@ -97,6 +97,35 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
   }
 
   /**
+   * 触发一次对账并**同步跑完**（阶段 6 审查修复）。
+   *
+   * ⚠️ **为什么需要这个 helper** —— 手动对账改成**异步入队**了
+   *    （同步执行会被网关 60 秒超时砍掉，而后台还在跑）。
+   *    `trigger` 只建任务行并入队，主体在 worker 里跑；
+   *    e2e 不想等队列，**直接调执行端**。
+   *
+   * @returns 对账主体的结果（含差异数）
+   */
+  async function triggerAndRun(
+    channel: string,
+    from: Date,
+    to: Date,
+    operatorId: string,
+  ): Promise<{
+    id: string;
+    status: string;
+    diffCount: number;
+    matchedCount: number;
+  }> {
+    const service = app.get(PayoutReconciliationService);
+    const queued = await service.trigger({ channel, from, to, operatorId });
+    return service.executeReconciliation({
+      reconciliationId: queued.id,
+      channel,
+    });
+  }
+
+  /**
    * 造一批差异项（只填必填字段）。
    *
    * ⚠️ **差异类型随便填 `STATUS_MISMATCH`** —— 统计端点只按
@@ -189,9 +218,7 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
 
     const from = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const to = new Date(Date.now() + 24 * 60 * 60 * 1000);
-    const result = await app
-      .get(PayoutReconciliationService)
-      .trigger({ channel: 'fake-payout', from, to, operatorId: 'admin-1' });
+    const result = await triggerAndRun('fake-payout', from, to, 'admin-1');
 
     const items = await asPlatform(() =>
       prisma.payoutReconciliationItem.findMany({
@@ -336,7 +363,14 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
       .expect(200);
     const triggered = trigger.body as { id: string; status: string };
     expect(triggered.id).toBeTruthy();
-    expect(triggered.status).toBe('COMPLETED');
+    // ⚠️ **异步入队**（阶段 6 审查修复）—— 接口立刻返回「已入队」，
+    //    差异数要等 worker 跑完才有。
+    expect(triggered.status).toBe('RUNNING');
+    // ⚠️ **测试里不等队列**，直接跑执行端
+    await app.get(PayoutReconciliationService).executeReconciliation({
+      reconciliationId: triggered.id,
+      channel: 'fake-payout',
+    });
 
     // ---- 详情 ----
     const detail = await http(app)
@@ -416,6 +450,11 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
       .send({ channel: 'fake-payout', from, to })
       .expect(200);
     const reconId = (trigger.body as { id: string }).id;
+    // ⚠️ **异步入队**（阶段 6 审查修复）—— 跑完执行端才有差异项
+    await app.get(PayoutReconciliationService).executeReconciliation({
+      reconciliationId: reconId,
+      channel: 'fake-payout',
+    });
 
     const detail = await http(app)
       .get(`/api/v1/platform/payout-reconciliations/${reconId}`)

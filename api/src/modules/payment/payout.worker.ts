@@ -15,6 +15,14 @@ export interface PayoutJob {
   payoutId: string;
   /** 渠道名（`'reconcile'` job） */
   channel?: string;
+  /**
+   * 对账任务 id（`'reconcile-run'` job，阶段 6 审查修复）。
+   *
+   * ⚠️ **与 `channel` 分开** —— `'reconcile'` 是「定时对账的触发」
+   *    （跑昨天那个窗口），`'reconcile-run'` 是「执行某笔已建好的对账任务」
+   *    （手动触发时入队的就是它）。
+   */
+  reconciliationId?: string;
 }
 
 /**
@@ -94,6 +102,12 @@ export class PayoutWorker extends WorkerHost {
     if (job.name === 'reconcile') {
       // ⚠️ **定时对账**（阶段 5m）
       await this.runReconcile(job.data.channel);
+      return;
+    }
+    if (job.name === 'reconcile-run') {
+      // ⚠️ **执行一笔已入队的对账任务**（阶段 6 审查修复）——
+      //    手动触发的对账不再同步跑（会被 Nginx 60 秒超时砍掉）。
+      await this.runReconcileTask(job.data.reconciliationId, job.data.channel);
       return;
     }
     if (job.name !== 'execute') {
@@ -514,6 +528,46 @@ export class PayoutWorker extends WorkerHost {
    * ⚠️ **失败不抛到 BullMQ** —— 抛出去会让 BullMQ 把它记成失败 job，
    *    而对账服务**自己已经**把任务落成了 `FAILED` 并写了原因。
    */
+  /**
+   * 执行一笔已入队的对账任务（阶段 6 审查修复）。
+   *
+   * ⚠️ **失败不重试** —— 对账任务自己的状态机会把失败落进任务行
+   *    （`FAILED` + `errorMessage`），运营在任务列表里能看到并重新触发。
+   *    BullMQ 自己的重试会让同一个窗口被对好几遍。
+   */
+  private async runReconcileTask(
+    reconciliationId: string | undefined,
+    channel: string | undefined,
+  ): Promise<void> {
+    if (!reconciliationId || !channel) {
+      // ⚠️ **不能静默跳过** —— 缺参数只可能是代码 bug，
+      //    静默 return 会让这个 bug 永远查不出来，
+      //    而且这笔对账永远停在 `RUNNING`（运营以为在跑）。
+      this.logger.error(
+        `对账任务 job 缺少参数（reconciliationId=${reconciliationId ?? '缺'}，` +
+          `channel=${channel ?? '缺'}），跳过`,
+      );
+      return;
+    }
+    if (!this.reconciliation) {
+      return;
+    }
+    try {
+      await this.reconciliation.executeReconciliation({
+        reconciliationId,
+        channel,
+      });
+    } catch (error) {
+      // ⚠️ **日志要带上渠道与任务 id** —— 这个窗口没对成，
+      //    没人会自动再触发它 → 漏了哪一天必须查得到。
+      this.logger.error(
+        `渠道对账失败（渠道 ${channel}，任务 ${reconciliationId}）：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   private async runReconcile(channel: string | undefined): Promise<void> {
     if (!channel) {
       // ⚠️ **不能静默跳过** —— `channel` 缺失只可能是代码 bug

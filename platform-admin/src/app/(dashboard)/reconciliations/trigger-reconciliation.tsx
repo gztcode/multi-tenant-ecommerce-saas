@@ -15,13 +15,17 @@ import { Button } from '@/components/ui/button';
  *    原因与时间窗这类参数用 `prompt()` 收集是既有约定
  *    （见 `payout-actions.tsx` 的说明）。
  *
- * ⚠️ **对账是同步执行的**（后端上限 30 秒）→ 必须给「正在对账」的反馈，
- *    否则运营会以为按钮没生效，连点好几次。
+ * ⚠️ **对账是异步入队的**（阶段 6 审查修复）—— 接口立刻返回，
+ *    真正的对账在 worker 里跑（原先同步执行会被网关 60 秒超时砍掉，
+ *    而后台还在跑 → 运营以为失败、连点几次）。
+ *    → 按钮的文案是「已提交」而不是「对账中」；
+ *    **必须提示去哪看结果**，否则运营会以为没生效。
  */
 export function TriggerReconciliation() {
   const router = useRouter();
   const busyRef = useRef(false);
   const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
 
   async function trigger() {
@@ -29,6 +33,7 @@ export function TriggerReconciliation() {
     busyRef.current = true;
     setBusy(true);
     setFailure(null);
+    setNotice(null);
 
     try {
       // ⚠️ **默认值给全** —— 运营最常见的是「就查昨天」，
@@ -67,6 +72,9 @@ export function TriggerReconciliation() {
         setFailure(payload.message ?? '触发对账失败');
         return;
       }
+      // ⚠️ **必须说清「已提交，结果在列表里看」** —— 异步入队后
+      //    接口立刻就返回了，运营看不到任何「在跑」的迹象。
+      setNotice('已提交对账任务，稍后刷新列表查看结果。');
       router.refresh();
     } catch {
       setFailure('触发对账失败');
@@ -79,8 +87,11 @@ export function TriggerReconciliation() {
   return (
     <div className="flex flex-col items-end gap-1">
       <Button type="button" onClick={trigger} disabled={busy}>
-        {busy ? '对账中…' : '立即对账'}
+        {busy ? '提交中…' : '立即对账'}
       </Button>
+      {notice ? (
+        <p className="text-sm text-muted-foreground">{notice}</p>
+      ) : null}
       {failure ? (
         <p role="alert" className="text-sm text-destructive">
           {failure}

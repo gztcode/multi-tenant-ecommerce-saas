@@ -153,6 +153,16 @@ cd infra && docker compose up -d --build
   → 平台默认渠道（`platform_settings` 的 `payout.platformDefaultChannel`，超管后台 `/settings`）
   → 都没有则 **fail-closed**（不回落 env、不猜）。商家配了就**不再读平台默认值**。
   `PAYOUT_PLATFORM_DEFAULT_CHANNEL` 只是 DB 没有这行时的兜底。
+- ⚠️ **渠道在「审批时」锁定**（不是执行时）：`PayoutService.approve()` 解析渠道并写进
+  `payouts.payoutChannel`（与状态改 `APPROVED` 同一个 `updateMany`）。
+  审批之后改商家偏好或平台默认，**已审批的单一律走审批时锁定的渠道**；
+  渠道已停用 / 平台未配置 → **409 且不审批**（不产出打不出钱的单）。
+  执行路径（`claimForExecution`）只在**存量单**（`payoutChannel` 为 null）时才兜底解析。
+- ⚠️ **手动对账是异步入队**：`POST /platform/payout-reconciliations` 只建任务行并投
+  `'reconcile-run'` job，主体在 `PayoutWorker` 里跑（`executeReconciliation`）。
+  **接口立刻返回「已入队」，`diffCount` 恒为 0** —— 差异数要等跑完，在任务详情里看。
+  理由：总预算可达 630 秒，同步执行会被网关 60 秒超时砍掉，而后台还在跑 →
+  运营以为失败、连点几次。定时对账（`'reconcile'` job）**直接执行**，不再二次入队。
 - **假出款网关的剧本接口语义**：`POST /api/v1/pay/fake-payout/fail-next` 的 `times` 是
   **渠道明确拒付**（`definitive: true`，可安全重试，用完重试预算后落 `FAILED` +
   `failedBeforePayout = true`）；**结果未知**用 `unknownTimes`（`definitive: false`，

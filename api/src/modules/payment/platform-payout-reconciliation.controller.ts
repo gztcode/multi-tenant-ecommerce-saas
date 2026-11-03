@@ -101,8 +101,12 @@ export class PlatformPayoutReconciliationController {
   @ApiOperation({
     summary: '手动触发渠道对账',
     description:
-      '同步执行。⚠️ **不查幂等** —— 手动重跑是有意行为。' +
-      '时间窗跨度上限 31 天，渠道记录数上限 10000 条，执行超时 30 秒。',
+      '⚠️ **异步入队** —— 接口立刻返回「已入队」，真正的对账在 worker 里跑。' +
+      '原因：对账的总预算（页数 × 单页超时）可达 630 秒，' +
+      '同步执行会被网关的 60 秒超时砍掉，而后台还在跑 → 运营以为失败、连点几次。' +
+      '⚠️ **不查幂等** —— 手动重跑是有意行为。' +
+      '时间窗跨度上限 31 天，渠道记录数上限 10000 条。' +
+      '进度与差异数在「对账任务列表」里看。',
   })
   async trigger(@Body() dto: TriggerReconciliationDto) {
     const operatorId = this.currentOperatorId();

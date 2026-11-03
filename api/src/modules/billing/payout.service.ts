@@ -20,6 +20,12 @@ import { PAYOUT_VERIFICATION } from '../../common/payment/payout-verification';
 //    下，TS1272 要求装饰器签名里引用的类型必须是 type-only 导入）。
 import type { PayoutVerification } from '../../common/payment/payout-verification';
 import { PAYOUT_QUEUE } from '../../common/queue/queue.constants';
+// ⚠️ **阶段 6 审查修复：审批时锁定出款渠道** —— 需要注册表与平台设置。
+//    两者都来自 `@Global()` 的模块，**不产生 billing → payment 的模块边**
+//    （与 `PayoutExecutionService` 注入它们的方式完全一致）。
+import { PayoutProviderRegistry } from '../../common/payment/payout-provider.registry';
+import { normalizeChannel } from '../../common/channel/channel-config';
+import { PlatformSettingService } from '../../common/platform-settings/platform-setting.service';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   getTenantContext,
@@ -222,6 +228,11 @@ export class PayoutService {
     //    按 token 注入（契约在 `common/`）→ **不产生 billing → payment 的模块边**。
     @Inject(PAYOUT_VERIFICATION)
     private readonly verification: PayoutVerification,
+    // ⚠️ **阶段 6 审查修复：审批时锁定出款渠道** —— 见 `resolveChannelForApproval`。
+    //    两个依赖都来自 `@Global()` 的 `PayoutProvidersModule` /
+    //    `PlatformSettingsModule`，不产生模块依赖边。
+    private readonly registry: PayoutProviderRegistry,
+    private readonly platformSettings: PlatformSettingService,
   ) {}
 
   /**
@@ -492,6 +503,52 @@ export class PayoutService {
    * ⚠️ **按 `kind` 分支**（阶段 5h-2，护栏 X13）：补差单**绝不能**调
    *    `computeAmounts` —— 那会把整期佣金再扣一遍。
    */
+  /**
+   * 解析这张出款单**审批时**要用的出款渠道（阶段 6 审查修复）。
+   *
+   * 顺序与执行时完全一致（设计 §4.4）：商家偏好 → 平台默认 → fail-closed。
+   *
+   * ⚠️ **为什么要在审批时锁定**（而不是等 worker 抢单时再解析）：
+   *    原先渠道在 `claimForExecution` 里解析 —— 审批与 worker 抢单之间
+   *    若改了平台默认渠道（或商家改了偏好），**同一张已审批的单会走另一家渠道**。
+   *    钱打到哪家渠道必须是**审批那一刻就定死**的事：
+   *    审批人看到的是 A 渠道的可用性，钱的路径也必须是 A。
+   *
+   * ⚠️ **商家配了就不再读平台默认** —— 与执行路径同一套规则，
+   *    否则「审批时走商家渠道、执行时走平台渠道」会分裂。
+   *
+   * ⚠️ **解析失败不静默** —— 抛中文 409，审批人当场就知道
+   *    「这家商家现在打不出钱」，而不是审批完等 worker 落 FAILED。
+   */
+  private async resolveChannelForApproval(tenantId: string): Promise<string> {
+    // ⚠️ **必须显式带 `tenantId`**：`approve` 跑在**平台作用域**下 →
+    //    租户扩展不附加 tenantId → 不带就是跨租户读。
+    const account = await this.prisma.merchantPayoutAccount.findFirst({
+      where: { tenantId },
+      select: { preferredChannel: true },
+    });
+    const merchantChannel = normalizeChannel(account?.preferredChannel ?? '');
+
+    // ⚠️ **商家配了就不再读平台默认渠道**（与执行路径同款理由）。
+    if (merchantChannel.length > 0) {
+      return this.registry.resolveForPayout({
+        payoutChannel: null,
+        merchantChannel,
+        platformChannel: null,
+      }).channel;
+    }
+
+    const platformChannel = (
+      await this.platformSettings.getPayoutDefaultChannel()
+    ).channel;
+
+    return this.registry.resolveForPayout({
+      payoutChannel: null,
+      merchantChannel: null,
+      platformChannel,
+    }).channel;
+  }
+
   async approve(payoutId: string): Promise<PlatformPayoutView> {
     const context = getTenantContext();
     const userId = context.userId;
@@ -563,6 +620,14 @@ export class PayoutService {
         );
       }
 
+      // ⚠️ **审批时锁定出款渠道**（阶段 6 审查修复）——
+      //    解析放在事务**外面**：它要读商家账户与平台设置，可能抛错
+      //    （渠道已停用 / 平台未配置）。放事务里会让整个事务回滚，
+      //    报错信息被事务异常覆盖，审批人看不到「为什么打不出钱」。
+      const payoutChannel = await this.resolveChannelForApproval(
+        payout.tenantId,
+      );
+
       const now = await this.prisma.databaseNow();
       const updated = await this.prisma.$transaction(async (tx) => {
         const affected = await tx.payout.updateMany({
@@ -571,6 +636,9 @@ export class PayoutService {
             status: PayoutStatus.APPROVED,
             approvedBy: userId,
             approvedAt: now,
+            // ⚠️ **渠道在这里定死** —— 审批之后任何配置变更都不再影响这张单。
+            //    重试也沿用它（执行路径「单子已有渠道就沿用」）。
+            payoutChannel,
             // ⚠️ **锁定的是重算后的值**：`requestedAmount` 保留申请时的预估，
             // 两者的差异由审批人自己判断（不设阈值、不强制填原因）。
             receiptAmount: amounts.receiptAmount,
