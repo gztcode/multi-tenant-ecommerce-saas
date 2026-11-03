@@ -711,16 +711,107 @@ function fakeVerification(verdict: 'PAID' | 'FAILED' | 'UNKNOWN' = 'FAILED') {
  * ⚠️ **阶段 5m：再注入一个核实服务** —— 解卡重打前要问渠道「这笔打没打」
  *    （防重复打款）。默认给「渠道明确说没打」→ 闸放行，老用例行为不变。
  */
+/**
+ * ⚠️ **阶段 6 审查修复：审批时锁定出款渠道** —— `approve()` 现在要
+ *    解析渠道（商家偏好 → 平台默认），所以服务要多注入注册表与平台设置。
+ *
+ * ⚠️ **默认给「商家配了 `fake-payout`」** —— 绝大多数老用例只关心金额，
+ *    渠道解析对它们是透明的；真正测渠道口径的用例再显式传配置。
+ */
+function fakeRegistry(
+  options: {
+    /** 已注册的渠道名 */
+    enabled?: string[];
+    /** 商家偏好渠道 */
+    preferredChannel?: string | null;
+  } = {},
+) {
+  const enabled = options.enabled ?? ['fake-payout'];
+  const providers = enabled.map((channel) => ({
+    channel,
+    provider: channel,
+    devOnly: false,
+    capabilities: {
+      submit: true,
+      query: true,
+      list: true,
+      refund: false,
+    },
+  }));
+  return {
+    resolveForPayout: jest.fn(
+      (input: {
+        payoutChannel?: string | null;
+        merchantChannel?: string | null;
+        platformChannel?: string | null;
+      }) => {
+        const pick =
+          (input.payoutChannel ?? '').trim() ||
+          (input.merchantChannel ?? '').trim() ||
+          (input.platformChannel ?? '').trim();
+        if (!pick) {
+          throw new ConflictException('无法确定出款渠道');
+        }
+        const found = providers.find((p) => p.channel === pick);
+        if (!found) {
+          throw new ConflictException(`出款渠道 ${pick} 未注册`);
+        }
+        return found;
+      },
+    ),
+    get: jest.fn((channel: string) => {
+      const found = providers.find((p) => p.channel === channel);
+      if (!found) {
+        throw new ConflictException(`出款渠道 ${channel} 未注册`);
+      }
+      return found;
+    }),
+    descriptor: jest.fn(
+      (channel: string) => providers.find((p) => p.channel === channel) ?? null,
+    ),
+    list: jest.fn(() => providers),
+    timeoutMs: jest.fn(() => 30_000),
+    registeredChannels: jest.fn(() => providers.map((p) => p.channel)),
+  };
+}
+
+/** 假的平台设置服务（只读默认渠道） */
+function fakePlatformSettings(channel: string | null = 'fake-payout') {
+  return {
+    getPayoutDefaultChannel: jest.fn(() =>
+      channel === null
+        ? Promise.reject(new ConflictException('平台未配置默认出款渠道'))
+        : Promise.resolve({ channel, source: 'DATABASE' as const }),
+    ),
+    readPayoutDefaultChannel: jest.fn(() =>
+      Promise.resolve(
+        channel === null
+          ? { channel: null, source: 'NONE' as const }
+          : { channel, source: 'DATABASE' as const },
+      ),
+    ),
+    setPayoutDefaultChannel: jest.fn(() =>
+      Promise.resolve({ channel: channel ?? '', source: 'DATABASE' as const }),
+    ),
+  };
+}
+
 function makeService(
   prisma: ReturnType<typeof fakePrisma>,
   queues: ReturnType<typeof fakeQueues> = fakeQueues(),
   verification: ReturnType<typeof fakeVerification> = fakeVerification(),
+  registry: ReturnType<typeof fakeRegistry> = fakeRegistry(),
+  platformSettings: ReturnType<
+    typeof fakePlatformSettings
+  > = fakePlatformSettings(),
 ): PayoutService {
   return new PayoutService(
     prisma as unknown as never,
     queues as unknown as never,
     new LedgerService(prisma as unknown as never),
     verification,
+    registry as unknown as never,
+    platformSettings as unknown as never,
   );
 }
 
@@ -1151,6 +1242,115 @@ describe('审批：必须重算金额（护栏 P5）', () => {
 });
 
 describe('approve（阶段 5h-2）', () => {
+  describe('审批时锁定出款渠道（阶段 6 审查修复）', () => {
+    it('⚠️ 审批时把解析出的渠道写进 payoutChannel（与状态改 APPROVED 同一个 updateMany）', async () => {
+      const prisma = fakePrisma({
+        payout: payout({ kind: PayoutKind.NORMAL }),
+        statement: statement({ netAmount: 2000 }),
+        receipts: [receipt({ id: 'r-1', amount: 5000 })],
+        account: { ...payoutAccount(), preferredChannel: 'channel-b' } as never,
+      });
+      const registry = fakeRegistry({ enabled: ['channel-a', 'channel-b'] });
+      const service = makeService(
+        prisma,
+        fakeQueues(),
+        fakeVerification(),
+        registry,
+        fakePlatformSettings('channel-a'),
+      );
+
+      await asPlatform(async () => {
+        await service.approve('payout-a');
+      });
+
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        status: string;
+        payoutChannel: string;
+      };
+      expect(data.status).toBe(PayoutStatus.APPROVED);
+      // ⚠️ **商家配的渠道优先于平台默认** —— 审批那一刻定死。
+      expect(data.payoutChannel).toBe('channel-b');
+    });
+
+    it('商家没配渠道 → 用平台默认渠道', async () => {
+      const prisma = fakePrisma({
+        payout: payout({ kind: PayoutKind.NORMAL }),
+        statement: statement({ netAmount: 2000 }),
+        receipts: [receipt({ id: 'r-1', amount: 5000 })],
+        account: { ...payoutAccount(), preferredChannel: null } as never,
+      });
+      const registry = fakeRegistry({ enabled: ['channel-a'] });
+      const service = makeService(
+        prisma,
+        fakeQueues(),
+        fakeVerification(),
+        registry,
+        fakePlatformSettings('channel-a'),
+      );
+
+      await asPlatform(async () => {
+        await service.approve('payout-a');
+      });
+
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        payoutChannel: string;
+      };
+      expect(data.payoutChannel).toBe('channel-a');
+    });
+
+    it('⚠️ 商家配的渠道已停用 → 409 且不审批（不当场打不出钱）', async () => {
+      const prisma = fakePrisma({
+        payout: payout({ kind: PayoutKind.NORMAL }),
+        statement: statement({ netAmount: 2000 }),
+        receipts: [receipt({ id: 'r-1', amount: 5000 })],
+        account: {
+          ...payoutAccount(),
+          preferredChannel: 'channel-gone',
+        } as never,
+      });
+      const registry = fakeRegistry({ enabled: ['channel-a'] });
+      const service = makeService(
+        prisma,
+        fakeQueues(),
+        fakeVerification(),
+        registry,
+        fakePlatformSettings('channel-a'),
+      );
+
+      await expect(
+        asPlatform(async () => {
+          await service.approve('payout-a');
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      // ⚠️ **状态没被改成 APPROVED** —— 渠道解析在事务**外面**，
+      //    解析失败时事务压根没开，单子还留在 REQUESTED。
+      expect(prisma.tx()).toBeNull();
+    });
+
+    it('⚠️ 平台没配默认渠道且商家也没配 → 409（fail-closed，不猜渠道）', async () => {
+      const prisma = fakePrisma({
+        payout: payout({ kind: PayoutKind.NORMAL }),
+        statement: statement({ netAmount: 2000 }),
+        receipts: [receipt({ id: 'r-1', amount: 5000 })],
+        account: { ...payoutAccount(), preferredChannel: null } as never,
+      });
+      const service = makeService(
+        prisma,
+        fakeQueues(),
+        fakeVerification(),
+        fakeRegistry({ enabled: ['channel-a'] }),
+        fakePlatformSettings(null),
+      );
+
+      await expect(
+        asPlatform(async () => {
+          await service.approve('payout-a');
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+  });
+
   it('补差单审批时**不调 computeAmounts**：佣金恒为 0（护栏 X13）', async () => {
     const prisma = fakePrisma({
       payout: payout({ kind: PayoutKind.SUPPLEMENT }),

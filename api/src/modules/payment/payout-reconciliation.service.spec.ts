@@ -1,4 +1,8 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import {
   PayoutOperationAction,
   ReconciliationDiffType,
@@ -182,8 +186,23 @@ function fakePrisma(
   const payouts: FakePayoutRow[] = options.payouts ? [...options.payouts] : [];
   const reconciliation =
     options.reconciliation === undefined
-      ? { id: 'rec-1', channel: FAKE_PAYOUT_CHANNEL, status: 'COMPLETED' }
-      : options.reconciliation;
+      ? {
+          id: 'rec-1',
+          channel: FAKE_PAYOUT_CHANNEL,
+          status: 'COMPLETED',
+          // ⚠️ **时间窗必须有**（阶段 6 审查修复）—— worker 消费端
+          //    从任务行里读窗口（`executeReconciliation`）。
+          //    没有它就会 `undefined.getTime()` 崩掉。
+          windowFrom: FROM,
+          windowTo: TO,
+        }
+      : {
+          // ⚠️ **补齐时间窗** —— 调用方只关心 channel / source / status 时
+          //    不必自己写窗口；这里兜底成 `FROM` / `TO`。
+          windowFrom: FROM,
+          windowTo: TO,
+          ...options.reconciliation,
+        };
   const reconciliationChannels = options.reconciliationChannels ?? {};
   const defaultChannelSetting = options.defaultChannelSetting;
 
@@ -544,6 +563,33 @@ function emptyProvider(): PayoutProvider {
 }
 
 /**
+ * 造第二家渠道的实现（阶段 6 审查修复）。
+ *
+ * ⚠️ **渠道名不是 `fake-payout`** —— 它要证明「在册的非假网关渠道
+ *    也能走 API 对账」，而不是假网关换个名字。
+ */
+function otherProvider(
+  channel: string,
+  listPayouts: jest.Mock<Promise<ChannelPayoutRecord[]>, [ListPayoutsArgs]>,
+): PayoutProvider {
+  return {
+    channel,
+    provider: channel,
+    capabilities: {
+      refund: false,
+      asyncRefund: false,
+      asyncPayout: true,
+      queryByReferenceNo: true,
+      authorizedCharge: false,
+      paymentMethod: false,
+    },
+    submit: jest.fn(),
+    queryPayout: jest.fn(),
+    listPayouts,
+  };
+}
+
+/**
  * 造一只真实的处置服务（阶段 6a Task 7 起，服务与处置共用同一层假 Prisma）。
  *
  * ⚠️ **不再用假 resolver** —— 「批量确认后差异项变 `RESOLVED`」「成功后留痕
@@ -579,22 +625,95 @@ function realResolver(prisma: unknown): PayoutReconciliationResolver {
   return new PayoutReconciliationResolver(execution as never, prisma as never);
 }
 
+/**
+ * ⚠️ **假队列**（阶段 6 审查修复）—— 对账改成异步入队后，
+ *    `trigger` 不再同步跑主体，而是把任务投进队列。
+ *
+ * ⚠️ **`onJob` 可以是异步的** —— 假队列会**等它跑完**再 resolve。
+ *    否则 `await service.trigger(...)` 返回时主体还没开始，
+ *    断言「渠道被调了几次」会看到 0 次。
+ */
+function fakeQueues(
+  onJob?: (data: {
+    reconciliationId?: string;
+    channel?: string;
+  }) => void | Promise<void>,
+) {
+  return {
+    addWithOptions: jest.fn(
+      async (
+        _queue: string,
+        _jobName: string,
+        data: { reconciliationId?: string; channel?: string },
+      ) => {
+        await onJob?.(data);
+      },
+    ),
+    add: jest.fn(() => Promise.resolve()),
+    addDelayed: jest.fn(() => Promise.resolve()),
+    addRepeating: jest.fn(() => Promise.resolve()),
+  };
+}
+
 function makeService(
   prisma: ReturnType<typeof fakePrisma>,
   provider: PayoutProvider,
   resolver: unknown = realResolver(prisma),
   alerts?: ChannelAlertSink,
+  /**
+   * ⚠️ **额外的渠道（阶段 6 审查修复）** —— 默认只注册 `fake-payout`。
+   *    测「第二家渠道也能对账」时要把它加上。
+   */
+  extraProviders: PayoutProvider[] = [],
+  queues?: ReturnType<typeof fakeQueues>,
 ): PayoutReconciliationService {
   const settings = new PlatformSettingService(prisma as unknown as never);
-  return new PayoutReconciliationService(
+  const providers = new Map<string, PayoutProvider>([
+    [FAKE_PAYOUT_CHANNEL, provider],
+    ...extraProviders.map((p) => [p.channel, p] as const),
+  ]);
+  const service = new PayoutReconciliationService(
     prisma as unknown as never,
-    new Map<string, PayoutProvider>([[FAKE_PAYOUT_CHANNEL, provider]]),
+    providers,
     resolver as never,
     settings,
     // 注册表留空：单测走「provider 自己的 timeoutMs → 默认值」的兜底
     undefined,
     alerts,
+    queues as unknown as never,
   );
+  return service;
+}
+
+/**
+ * 造一个「入队即执行」的服务。
+ *
+ * ⚠️ **这是老用例的默认行为** —— 原来的 `trigger` 同步跑完主体，
+ *    现在入队；单测要断言主体行为，就让假队列收到 job 时直接执行。
+ */
+function makeServiceExecuting(
+  prisma: ReturnType<typeof fakePrisma>,
+  provider: PayoutProvider,
+  resolver: unknown = realResolver(prisma),
+  alerts?: ChannelAlertSink,
+  extraProviders: PayoutProvider[] = [],
+): PayoutReconciliationService {
+  let service: PayoutReconciliationService | null = null;
+  const queues = fakeQueues(async (data) => {
+    await service?.executeReconciliation({
+      reconciliationId: data.reconciliationId ?? '',
+      channel: data.channel ?? '',
+    });
+  });
+  service = makeService(
+    prisma,
+    provider,
+    resolver,
+    alerts,
+    extraProviders,
+    queues,
+  );
+  return service;
 }
 
 /** 造一条渠道流水 */
@@ -769,7 +888,7 @@ describe('PayoutReconciliationService', () => {
         );
       });
       const prisma = fakePrisma();
-      const service = makeService(prisma, fakeProvider(listPayouts));
+      const service = makeServiceExecuting(prisma, fakeProvider(listPayouts));
 
       await service.trigger({
         channel: FAKE_PAYOUT_CHANNEL,
@@ -806,7 +925,7 @@ describe('PayoutReconciliationService', () => {
         return Promise.resolve(page3);
       });
       const prisma = fakePrisma();
-      const service = makeService(prisma, fakeProvider(listPayouts));
+      const service = makeServiceExecuting(prisma, fakeProvider(listPayouts));
 
       await service.trigger({
         channel: FAKE_PAYOUT_CHANNEL,
@@ -828,7 +947,7 @@ describe('PayoutReconciliationService', () => {
         Promise.resolve(args.page === 1 ? page1 : []),
       );
       const prisma = fakePrisma();
-      const service = makeService(prisma, fakeProvider(listPayouts));
+      const service = makeServiceExecuting(prisma, fakeProvider(listPayouts));
 
       await service.trigger({
         channel: FAKE_PAYOUT_CHANNEL,
@@ -852,7 +971,7 @@ describe('PayoutReconciliationService', () => {
         ),
       );
       const prisma = fakePrisma();
-      const service = makeService(prisma, fakeProvider(listPayouts));
+      const service = makeServiceExecuting(prisma, fakeProvider(listPayouts));
 
       const error = await service
         .trigger({
@@ -919,11 +1038,11 @@ describe('PayoutReconciliationService', () => {
         const prisma = fakePrisma();
         const service = makeService(prisma, fakeProvider(listPayouts));
 
-        const pending = service.trigger({
+        // ⚠️ **直接调执行端**（阶段 6 审查修复）—— `trigger` 现在只入队，
+        //    主体在 worker 里跑；这个用例要断言的是「主体能跑完」。
+        const pending = service.executeReconciliation({
+          reconciliationId: 'rec-1',
           channel: FAKE_PAYOUT_CHANNEL,
-          from: FROM,
-          to: TO,
-          operatorId: 'admin-1',
         });
 
         // ⚠️ **只推进 50 秒**（约 21 页 × 2 秒），远小于 21 × 30 秒的预算
@@ -955,11 +1074,9 @@ describe('PayoutReconciliationService', () => {
         );
 
         const pending = service
-          .trigger({
+          .executeReconciliation({
+            reconciliationId: 'rec-1',
             channel: FAKE_PAYOUT_CHANNEL,
-            from: FROM,
-            to: TO,
-            operatorId: 'admin-1',
           })
           .then(
             () => null,
@@ -998,6 +1115,159 @@ describe('PayoutReconciliationService', () => {
    *    **真实的 resolver**（而不是 mock）—— 渠道隔离、CSV 自动纠正闸、
    *    批量确认都靠它落库，mock 会让「where 写错」的缺陷静默通过。
    */
+  describe('阶段 6 审查修复：异步入队', () => {
+    it('⚠️ trigger 只建任务行并入队，不跑主体（避免被网关 60 秒超时砍掉）', async () => {
+      const listPayouts = jest.fn<
+        Promise<ChannelPayoutRecord[]>,
+        [ListPayoutsArgs]
+      >(() => Promise.resolve([]));
+      const prisma = fakePrisma();
+      const enqueued: Array<{ name: string; data: unknown }> = [];
+      const queues = {
+        addWithOptions: jest.fn(
+          (_queue: string, name: string, data: unknown) => {
+            enqueued.push({ name, data });
+            return Promise.resolve();
+          },
+        ),
+      };
+      const service = makeService(
+        prisma,
+        fakeProvider(listPayouts),
+        realResolver(prisma),
+        undefined,
+        [],
+        queues as never,
+      );
+
+      const result = await service.trigger({
+        channel: FAKE_PAYOUT_CHANNEL,
+        from: FROM,
+        to: TO,
+        operatorId: 'admin-1',
+      });
+
+      // ⚠️ **主体没跑** —— 渠道一次都没被调
+      expect(listPayouts).not.toHaveBeenCalled();
+      // ⚠️ **入队了一个 job** —— jobId 带任务 id，attempts 1
+      expect(enqueued).toHaveLength(1);
+      expect(enqueued[0].name).toBe('reconcile-run');
+      expect(queues.addWithOptions).toHaveBeenCalledWith(
+        expect.anything(),
+        'reconcile-run',
+        expect.objectContaining({
+          reconciliationId: result.id,
+          channel: FAKE_PAYOUT_CHANNEL,
+        }),
+        `payout-reconcile-run-${result.id}`,
+        expect.objectContaining({ attempts: 1 }),
+      );
+      // ⚠️ **返回「已入队」** —— 差异数要等跑完
+      expect(result.status).toBe('RUNNING');
+      expect(result.diffCount).toBe(0);
+    });
+
+    it('⚠️ 没有队列服务 → 503 且任务落 FAILED（不留永远 RUNNING 的行）', async () => {
+      const prisma = fakePrisma();
+      const service = makeService(prisma, emptyProvider());
+
+      await expect(
+        service.trigger({
+          channel: FAKE_PAYOUT_CHANNEL,
+          from: FROM,
+          to: TO,
+          operatorId: 'admin-1',
+        }),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    });
+  });
+
+  describe('阶段 6 审查修复：渠道可用性', () => {
+    it('⚠️ 第二家渠道（在册且已启用）也能走 API 对账', async () => {
+      const prisma = fakePrisma({
+        payouts: [
+          makePayoutRow({
+            id: 'p-1',
+            payoutChannel: 'sandbox',
+            status: 'PROCESSING',
+            processingAt: new Date('2026-03-01T09:00:00.000Z'),
+          }),
+        ],
+        reconciliation: {
+          id: 'rec-1',
+          channel: 'sandbox',
+          source: ReconciliationSource.API,
+          status: 'COMPLETED',
+        },
+      });
+      const listPayouts = jest.fn<
+        Promise<ChannelPayoutRecord[]>,
+        [ListPayoutsArgs]
+      >(() =>
+        Promise.resolve([
+          channelRecord({
+            providerTxnId: 'txn-1',
+            referenceNo: 'PO-p-1',
+            amount: 1000,
+            status: 'SUCCESS',
+          }),
+        ]),
+      );
+      const service = makeServiceExecuting(
+        prisma,
+        fakeProvider(listPayouts),
+        realResolver(prisma),
+        undefined,
+        [otherProvider('sandbox', listPayouts)],
+      );
+
+      // ⚠️ **之前这里会 409** —— 可用性判断写死了「只认 fake-payout」。
+      await expect(
+        service.trigger({
+          channel: 'sandbox',
+          from: FROM,
+          to: TO,
+          operatorId: 'admin-1',
+        }),
+      ).resolves.toBeDefined();
+      expect(listPayouts).toHaveBeenCalled();
+    });
+
+    it('⚠️ 未注册的渠道 → 409 且文案说清「未注册或未启用」', async () => {
+      const prisma = fakePrisma();
+      const service = makeService(prisma, emptyProvider());
+
+      await expect(
+        service.trigger({
+          channel: 'not-registered',
+          from: FROM,
+          to: TO,
+          operatorId: 'admin-1',
+        }),
+      ).rejects.toThrow(/未注册或未启用/);
+    });
+
+    it('⚠️ 假网关开关关掉 → 409（安全边界不被绕过）', async () => {
+      const saved = process.env.FAKE_PAYOUT_ENABLED;
+      delete process.env.FAKE_PAYOUT_ENABLED;
+      try {
+        const prisma = fakePrisma();
+        const service = makeService(prisma, emptyProvider());
+
+        await expect(
+          service.trigger({
+            channel: FAKE_PAYOUT_CHANNEL,
+            from: FROM,
+            to: TO,
+            operatorId: 'admin-1',
+          }),
+        ).rejects.toThrow(/当前不可用/);
+      } finally {
+        process.env.FAKE_PAYOUT_ENABLED = saved;
+      }
+    });
+  });
+
   describe('阶段 6a：对账渠道隔离', () => {
     /** 一条渠道流水（匹配到本地单的 `payoutNo`） */
     function matchedRecord(
@@ -1254,7 +1524,7 @@ describe('PayoutReconciliationService', () => {
           }),
         ]),
       );
-      const service = makeService(prisma, fakeProvider(listPayouts));
+      const service = makeServiceExecuting(prisma, fakeProvider(listPayouts));
 
       await service.trigger({
         channel: FAKE_PAYOUT_CHANNEL,

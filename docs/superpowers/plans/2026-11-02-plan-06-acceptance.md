@@ -72,14 +72,30 @@
 
 ### 1.4 审查后仍然保留的已知限制
 
-- **出款单的渠道在「执行时」解析并在 `claimForExecution` 里写死**。审批与 worker 抢单之间
-  若改了平台默认渠道，这张单会走新渠道。窗口很短（审批即入队，兜底扫描 10 分钟）；
-  要彻底消除得在 `approve()` 里锁渠道，会牵连一批 e2e，留到下一阶段。
-  界面文案已改成「一旦开始执行就写死渠道」，不再说「已审批的单不会换渠道」。
-- **API 对账只适配了 `fake-payout`**；`sandbox` 只能走 CSV 账单导入。
-  对账的定时任务也只注册 `fake-payout`。
-- **对账仍是同步 HTTP**（翻页预算合计 630s），Nginx 默认 60s 会先 504 而任务在后台继续跑。
-  改成队列任务随「告警系统落地」一起做。
+- ~~**出款单的渠道在「执行时」解析并在 `claimForExecution` 里写死**~~ ——
+  **已在 PR #25 修掉**：`approve()` 现在就解析并锁定渠道（商家偏好 → 平台默认 → fail-closed），
+  渠道写进 `payouts.payoutChannel` 与状态改 `APPROVED` 同一个 `updateMany`。
+  审批之后任何配置变更都不再影响这张单；重试沿用它。
+  渠道解析失败（渠道已停用 / 平台未配置）→ **409 且不审批**，审批人当场知道打不出钱。
+- ~~**API 对账只适配了 `fake-payout`**~~ ——
+  **已在 PR #25 修掉**：可用性判断改成「在册 + 已启用 + 非生产 devOnly」，
+  **任何实现了 `listPayouts` 的渠道都能对账**；
+  假出款网关额外受 `FAKE_PAYOUT_ENABLED` 约束（安全边界不绕过）。
+  定时对账改成**按注册表逐个渠道注册**（`jobSchedulerId` 带渠道名，各渠道互不覆盖）。
+- ~~**对账仍是同步 HTTP**~~ ——
+  **已在 PR #25 修掉**：手动对账改成**异步入队**
+  （`POST` 只建任务行并投 `'reconcile-run'` job，主体在 worker 里跑）。
+  接口立刻返回「已入队」，不受网关 60 秒超时约束；
+  进度与差异数在「对账任务列表」里看。
+
+仍然遗留：
+
+- **告警系统落地**：只留 `ChannelAlertSink` 钩子，没有真正的告警通道。
+- **跨副本分布式锁**：周期任务靠 BullMQ `jobSchedulerId` 去重，
+  「同一时间只允许一个对账任务」这类跨副本互斥没做。
+  手动对账是「入队 + jobId 带任务 id」，同一笔不会被重复入队，
+  但**窗口重叠**（运维手动触发 + 定时任务撞上）仍可能跑两遍 ——
+  `runScheduled` 的幂等检查已加上 `RUNNING` 状态来挡。
 
 ---
 
@@ -87,7 +103,7 @@
 
 | 层 | 命令 | 结果 |
 |----|------|------|
-| 单测（后端） | `cd api && npx jest --passWithNoTests` | **46 suites / 871 tests**（868 passed + 3 skipped）全绿 |
+| 单测（后端） | `cd api && npx jest --passWithNoTests` | **47 suites / 889 tests**（886 passed + 3 skipped）全绿 |
 | e2e（后端全量，串行） | `cd api && npm run test:e2e` | **40 suites / 657 tests** 全绿 |
 | 单测（商家后台） | `cd merchant-admin && npm test` | 27 files / **413 tests** 全绿 |
 | 单测（平台后台） | `cd platform-admin && npm test` | 18 files / **427 tests** 全绿 |
@@ -163,6 +179,8 @@ cd api && npx prisma migrate status   # 29 migrations found / Database schema is
    再尝试保存一个未启用的渠道 → 应报中文 409，且不写库。
 3. 商家后台「收款账户」页：不配 `preferredChannel` 时应显示「来源：平台」；
    配置后显示「来源：商家」，且不再受平台配置影响。
+   ⚠️ **改完 `preferredChannel` 后，已经审批的出款单仍走审批时锁定的渠道** ——
+   在出款单详情里能看到那个渠道名。
 4. 发起一笔退款（假网关）：默认剧本应直接成功；把 `FAKE_*` 剧本改成退款
    `processing` 后，接口应返回 `REFUNDING`（不是 `REFUNDED`），
    扫描/回调确认后才变 `REFUNDED`。

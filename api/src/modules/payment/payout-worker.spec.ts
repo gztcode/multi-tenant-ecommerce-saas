@@ -1192,6 +1192,84 @@ describe('PayoutWorker 的 scan', () => {
   });
 });
 
+describe('对账任务消费端（阶段 6 审查修复）', () => {
+  /** 假的对账服务 */
+  function fakeReconciliation() {
+    return {
+      executeReconciliation: jest.fn(() =>
+        Promise.resolve({
+          id: 'rec-1',
+          status: 'COMPLETED',
+          diffCount: 0,
+          matchedCount: 0,
+        }),
+      ),
+      runScheduled: jest.fn(() => Promise.resolve()),
+    };
+  }
+
+  it("'reconcile-run' job → 调 executeReconciliation（带任务 id 与渠道）", async () => {
+    const reconciliation = fakeReconciliation();
+    const worker = new PayoutWorker(
+      fakeExecution(claim) as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      fakeRegistry(),
+      reconciliation as unknown as never,
+    );
+
+    await worker.process({
+      name: 'reconcile-run',
+      data: { reconciliationId: 'rec-1', channel: 'fake-payout' },
+    } as never);
+
+    expect(reconciliation.executeReconciliation).toHaveBeenCalledWith({
+      reconciliationId: 'rec-1',
+      channel: 'fake-payout',
+    });
+  });
+
+  it("'reconcile-run' job 缺参数 → 记 error 且不执行（不静默跳过）", async () => {
+    const reconciliation = fakeReconciliation();
+    const worker = new PayoutWorker(
+      fakeExecution(claim) as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      fakeRegistry(),
+      reconciliation as unknown as never,
+    );
+
+    await worker.process({
+      name: 'reconcile-run',
+      data: { channel: 'fake-payout' },
+    } as never);
+
+    // ⚠️ **缺任务 id 就是代码 bug** —— 静默跳过会让这笔对账永远停在 RUNNING
+    expect(reconciliation.executeReconciliation).not.toHaveBeenCalled();
+  });
+
+  it('对账执行失败 → 记 error 但不抛出（不让 BullMQ 把它记成失败 job）', async () => {
+    const reconciliation = fakeReconciliation();
+    reconciliation.executeReconciliation.mockRejectedValue(
+      new Error('渠道超时'),
+    );
+    const worker = new PayoutWorker(
+      fakeExecution(claim) as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      fakeRegistry(),
+      reconciliation as unknown as never,
+    );
+
+    await expect(
+      worker.process({
+        name: 'reconcile-run',
+        data: { reconciliationId: 'rec-1', channel: 'fake-payout' },
+      } as never),
+    ).resolves.toBeUndefined();
+  });
+});
+
 describe('payoutRetryDelayMs', () => {
   it('退避 = 基数 × 尝试次数（线性，不指数）', () => {
     const original = process.env.PAYOUT_RETRY_BASE_DELAY_MS;

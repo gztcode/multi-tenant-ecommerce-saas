@@ -6,6 +6,7 @@ import {
   Logger,
   NotFoundException,
   Optional,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import {
   PayoutOperationAction,
@@ -29,7 +30,11 @@ import {
   PAYOUT_PROVIDERS,
 } from '../../common/payment/payout.constants';
 import { DEFAULT_CHANNEL_TIMEOUT_MS } from '../../common/channel/channel.types';
-import { normalizeChannel } from '../../common/channel/channel-config';
+import {
+  isChannelEnabled,
+  isProduction,
+  normalizeChannel,
+} from '../../common/channel/channel-config';
 import {
   CHANNEL_ALERT_SINK,
   type ChannelAlert,
@@ -45,6 +50,8 @@ import {
   isFakePayoutEnabled,
 } from '../../common/payment/fake-payout.provider';
 import { PlatformSettingService } from '../../common/platform-settings/platform-setting.service';
+import { PAYOUT_QUEUE } from '../../common/queue/queue.constants';
+import { QueueService } from '../queue/queue.service';
 import {
   LocalPayoutForReconcile,
   ReconcileDiff,
@@ -185,6 +192,11 @@ export class PayoutReconciliationService {
     @Optional()
     @Inject(CHANNEL_ALERT_SINK)
     private readonly alerts: ChannelAlertSink = new LoggingChannelAlertSink(),
+    // ⚠️ **阶段 6 审查修复：手动对账改异步入队** —— 需要队列服务。
+    //    `@Optional` 让现有直接 `new` 的单测不必改构造参数；
+    //    没有队列时 `trigger` 会响亮失败（不能静默同步跑）。
+    @Optional()
+    private readonly queues?: QueueService,
   ) {}
 
   /**
@@ -225,12 +237,22 @@ export class PayoutReconciliationService {
   }
 
   /**
-   * 手动触发一次对账（同步执行）。
+   * 手动触发一次对账（**异步入队**，阶段 6 审查修复）。
    *
-   * ⚠️ **三道上限**：窗口跨度 ≤ 31 天；渠道记录数 ≤ 10000；
-   *    执行 ≤ 页数 × 单页超时（阶段 6b 起不再是固定 30 秒）。
-   *    超限一律把任务落 `FAILED` 并写明原因，**不做静默截断** ——
-   *    截断出来的对账结论是错的。
+   * ⚠️ **为什么改成异步入队**（原来是同步执行）：
+   *    对账的总预算是「页数 × 单页超时」= 21 × 30s = **630 秒**，
+   *    而 Nginx 默认 **60 秒**就会 504 —— 运营看到的是「网关超时」，
+   *    但**后台那笔对账还在跑**，继续拉渠道流水、继续写差异项。
+   *    → 运营以为失败、连点几次，同一个窗口被对了好几遍。
+   *
+   *    改成入队后：HTTP 立刻返回「已入队」，真正的执行在 worker 里跑，
+   *    **不受 HTTP 超时约束**；进度在「对账任务列表」里看。
+   *
+   * ⚠️ **三道上限仍然在**（窗口跨度 ≤ 31 天；渠道记录数 ≤ 10000；
+   *    执行 ≤ 页数 × 单页超时）—— 只是移到 worker 里生效。
+   *    超限一律把任务落 `FAILED` 并写明原因，**不做静默截断**。
+   *
+   * @returns 任务 id 与「已入队」的状态（**不含差异数** —— 差异要等跑完）
    */
   async trigger(input: {
     channel: string;
@@ -259,10 +281,108 @@ export class PayoutReconciliationService {
       }),
     );
 
+    // ⚠️ **入队失败要把任务落 `FAILED`** —— 否则留下一条永远
+    //    `RUNNING` 的任务行，运营以为对账在跑，实际从没开始。
+    if (!this.queues) {
+      // ⚠️ **没有队列服务 → 响亮失败**，绝不退回同步执行 ——
+      //    同步执行会被 Nginx 的 60 秒超时砍掉，而后台还在跑。
+      const message = '对账队列不可用，无法入队';
+      await tenantContext.run(platformScope(), async () => {
+        await this.prisma.payoutReconciliation.updateMany({
+          where: {
+            id: reconciliation.id,
+            status: ReconciliationStatus.RUNNING,
+          },
+          data: {
+            status: ReconciliationStatus.FAILED,
+            finishedAt: await this.prisma.databaseNow(),
+            errorMessage: message,
+          },
+        });
+      });
+      throw new ServiceUnavailableException(message);
+    }
+    try {
+      await this.queues.addWithOptions(
+        PAYOUT_QUEUE,
+        'reconcile-run',
+        {
+          reconciliationId: reconciliation.id,
+          channel: input.channel,
+        },
+        // ⚠️ **jobId 带任务 id** —— 同一笔对账不会被重复入队。
+        `payout-reconcile-run-${reconciliation.id}`,
+        // ⚠️ **attempts: 1** —— 重试由对账任务自己的状态机管
+        //    （失败的任务行会留在列表里，运营可以重新触发），
+        //    BullMQ 自己的重试会让同一笔对账跑好几遍。
+        { attempts: 1, removeOnComplete: true },
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await tenantContext.run(platformScope(), async () => {
+        await this.prisma.payoutReconciliation.updateMany({
+          where: {
+            id: reconciliation.id,
+            status: ReconciliationStatus.RUNNING,
+          },
+          data: {
+            status: ReconciliationStatus.FAILED,
+            finishedAt: await this.prisma.databaseNow(),
+            errorMessage: `对账任务入队失败：${message}`,
+          },
+        });
+      });
+      throw error;
+    }
+
+    // ⚠️ **返回 `diffCount: 0` 而不是 null** —— 前端与 e2e 的响应类型
+    //    是固定的数字。差异数要等跑完，在任务详情里看。
+    return {
+      id: reconciliation.id,
+      status: ReconciliationStatus.RUNNING,
+      diffCount: 0,
+      matchedCount: 0,
+    };
+  }
+
+  /**
+   * 执行一笔已入队的对账任务（**worker 消费端**，阶段 6 审查修复）。
+   *
+   * ⚠️ **与原来的 `trigger` 同步执行的区别**：现在超时不再让
+   *    HTTP 504，而是把任务落 `FAILED` —— 后台不会再有「跑到一半
+   *    的对账」（`withTimeout` 是 `Promise.race`，不取消底层）。
+   *
+   * ⚠️ **`Promise.race` 的竞态仍在** —— 超时落 `FAILED` 之后，
+   *    底层的 `run()` 可能还会跑完并试图改成 `COMPLETED`。
+   *    → 两边都带 `RUNNING` 守卫，**先落终态的赢**。
+   */
+  async executeReconciliation(input: {
+    reconciliationId: string;
+    channel: string;
+  }): Promise<{
+    id: string;
+    status: string;
+    diffCount: number;
+    matchedCount: number;
+  }> {
+    const { reconciliationId, channel } = input;
+
+    // ⚠️ **时间窗从任务行里读** —— worker 只拿到 id，
+    //    窗口是 `trigger` 时定的（不允许 worker 自己另选一个）。
+    const window = await tenantContext.run(platformScope(), async () =>
+      this.prisma.payoutReconciliation.findFirst({
+        where: { id: reconciliationId },
+        select: { windowFrom: true, windowTo: true },
+      }),
+    );
+    if (!window) {
+      throw new NotFoundException('对账任务不存在');
+    }
+
     // ⚠️ **预算 = 页数 × 单页超时**（阶段 6b Task 13）——
     //    不再是固定 30 秒：真渠道 20 页 × 单页 2 秒就要 40 秒，
     //    固定 30 秒会把**正常完成**的对账判成超时。
-    const pageTimeoutMs = this.pageTimeoutMs(input.channel);
+    const pageTimeoutMs = this.pageTimeoutMs(channel);
     const budgetMs = reconciliationTimeoutBudget(
       RECONCILIATION_MAX_PAGES,
       pageTimeoutMs,
@@ -270,11 +390,11 @@ export class PayoutReconciliationService {
     const startedAt = Date.now();
     try {
       return await withTimeout(
-        this.run(reconciliation.id, input.channel, input.from, input.to),
+        this.run(reconciliationId, channel, window.windowFrom, window.windowTo),
         budgetMs,
         // ⚠️ **文案仍走 `TimeoutError` 的中文格式**（与现有一致），
         //    括号里补上渠道名与页数，运营才知道该查哪个渠道、扫了多少页。
-        `渠道对账（渠道 ${input.channel}，最多 ${RECONCILIATION_MAX_PAGES} 页）`,
+        `渠道对账（渠道 ${channel}，最多 ${RECONCILIATION_MAX_PAGES} 页）`,
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -282,9 +402,8 @@ export class PayoutReconciliationService {
         // ⚠️ **只多一条结构化告警，不改变原有行为** —— 任务仍落 FAILED、
         //    错误仍原样抛出。
         this.emitAlert({
-          channel: input.channel,
-          provider:
-            this.providers.get(input.channel)?.provider ?? input.channel,
+          channel,
+          provider: this.providers.get(channel)?.provider ?? channel,
           operation: 'reconcile',
           elapsedMs: Date.now() - startedAt,
           definitive: false,
@@ -301,7 +420,7 @@ export class PayoutReconciliationService {
         //    → 那个窗口**永远不会再被对账**，那批出款单的差异静默丢失。
         const affected = await this.prisma.payoutReconciliation.updateMany({
           where: {
-            id: reconciliation.id,
+            id: reconciliationId,
             status: ReconciliationStatus.RUNNING,
           },
           data: {
@@ -314,7 +433,7 @@ export class PayoutReconciliationService {
           // ⚠️ **任务行已被别人改过终态** —— 说明不是超时这条路径，
           //    静默即可，但留一行日志便于排查。
           this.logger.warn(
-            `对账任务 ${reconciliation.id} 未落 FAILED（状态已被其他路径改过）`,
+            `对账任务 ${reconciliationId} 未落 FAILED（状态已被其他路径改过）`,
           );
         }
       });
@@ -339,27 +458,52 @@ export class PayoutReconciliationService {
     );
     const from = new Date(to.getTime() - 24 * 60 * 60 * 1000);
 
-    // ⚠️ **幂等**：同一天重复跑 → 已有 `COMPLETED` 任务就跳过
+    // ⚠️ **幂等**：同一天重复跑 → 已有 `COMPLETED` 任务就跳过。
+    //
+    // ⚠️ **也要看 `RUNNING` 的**（阶段 6 审查修复）：对账改成异步入队后，
+    //    上一轮可能**还在跑**（`RUNNING`）。只看 `COMPLETED` 的话，
+    //    窗口重叠触发（比如运维手动触发 + 定时任务撞上）会同时跑两遍，
+    //    两遍都在写差异项 → 同一个差异出现两条 `PENDING` 记录。
     const existing = await tenantContext.run(platformScope(), async () =>
       this.prisma.payoutReconciliation.findFirst({
         where: {
           channel,
           windowFrom: from,
           windowTo: to,
-          status: ReconciliationStatus.COMPLETED,
+          status: {
+            in: [ReconciliationStatus.COMPLETED, ReconciliationStatus.RUNNING],
+          },
         },
       }),
     );
     if (existing) {
-      this.logger.log(`渠道对账跳过（该窗口已有完成的任务 ${existing.id}）`);
+      this.logger.log(
+        `渠道对账跳过（该窗口已有任务 ${existing.id}，状态 ${existing.status}）`,
+      );
       return;
     }
 
-    await this.trigger({
+    // ⚠️ **定时对账直接执行，不再入队**（阶段 6 审查修复）——
+    //    定时任务本身**已经在 worker 里跑**（scheduler 投的 `'reconcile'` job），
+    //    再走 `trigger` 入队就是「队列套队列」：
+    //    worker 等一个 job，那个 job 又入队另一个 job，多一跳、多一次
+    //    「任务行建好了但还没跑」的窗口。
+    const reconciliation = await tenantContext.run(platformScope(), async () =>
+      this.prisma.payoutReconciliation.create({
+        data: {
+          channel,
+          source: ReconciliationSource.API,
+          windowFrom: from,
+          windowTo: to,
+          status: ReconciliationStatus.RUNNING,
+          triggeredBy: 'system:scheduler',
+        },
+      }),
+    );
+
+    await this.executeReconciliation({
+      reconciliationId: reconciliation.id,
       channel,
-      from,
-      to,
-      operatorId: 'system:scheduler',
     });
   }
 
@@ -808,34 +952,54 @@ export class PayoutReconciliationService {
   /**
    * 校验渠道可用。
    *
-   * ⚠️ **文案不要写成「该渠道不支持批量查单」** —— 那暗示是渠道能力问题，
-   *    运营看到会以为系统坏了；实际原因是「本地假网关没开」。
+   * ⚠️ **口径（阶段 6 审查修复）**：**任何在册且已启用的渠道都能对账**，
+   *    只有「本地假出款网关」额外受 `FAKE_PAYOUT_ENABLED` 开关约束
+   *    （它是安全边界，不是便利开关）。
+   *
+   * ⚠️ **之前只认 `fake-payout`** —— 第二家渠道（`sandbox`）明明实现了
+   *    `listPayouts`，却永远进不了 API 对账，A 类差异只能靠 CSV 导入兜。
+   *    那不是「渠道没适配」，是「判断写死了」。
    */
   private assertChannelAvailable(channel: string, throwOnFail = true): boolean {
     const provider = this.providers.get(channel);
-    const available = !!provider && this.isFakeChannelUsable(channel);
+    const available = !!provider && this.isChannelUsable(channel);
     if (!available && throwOnFail) {
       // ⚠️ **区分两种「不可用」**（阶段 6 审查结论）：
-      //    渠道在册但还没适配 API 对账（例如 `sandbox`）时，说「假网关没启用」
-      //    会把运营引到 `FAKE_PAYOUT_ENABLED` 上，永远查不到真因。
-      if (provider && !this.isFakeChannelUsable(channel)) {
+      //    渠道在册但开关没开 vs 渠道压根没注册 —— 后者要说清「没适配」。
+      if (provider) {
         throw new ConflictException(
-          `渠道「${channel}」暂不支持 API 对账（当前仅本地假出款网关支持）：` +
-            '请改用 CSV 账单导入。',
+          `渠道「${channel}」当前不可用（${FAKE_PAYOUT_UNAVAILABLE_MESSAGE}），无法执行渠道对账`,
         );
       }
       throw new ConflictException(
-        `该渠道当前不可用（${FAKE_PAYOUT_UNAVAILABLE_MESSAGE}），无法执行渠道对账`,
+        `渠道「${channel}」未注册或未启用，无法执行渠道对账：` +
+          '请检查 PAYOUT_ENABLED_CHANNELS 与部署的渠道实现。',
       );
     }
     return available;
   }
 
-  /** 假网关是否可用（开关开着且 provider 在册） */
-  private isFakeChannelUsable(channel: string): boolean {
-    // ⚠️ **当前只有一个渠道** —— 用假网关自己的开关判断
-    //    （渠道名要匹配假网关，将来接了真渠道不能拿假网关的开关说它可用）
-    return channel === FAKE_PAYOUT_CHANNEL && isFakePayoutEnabled();
+  /**
+   * 渠道「能不能真的用」：在册 + 已启用 + （生产环境）非 devOnly。
+   *
+   * ⚠️ **假出款网关额外看它自己的开关** —— `FAKE_PAYOUT_ENABLED`
+   *    是安全边界（生产环境硬失败），不能因为「渠道在册」就绕过去。
+   *    其它渠道（`sandbox` 等）不受这个开关约束。
+   */
+  private isChannelUsable(channel: string): boolean {
+    if (channel === FAKE_PAYOUT_CHANNEL && !isFakePayoutEnabled()) {
+      return false;
+    }
+    const descriptor = this.registry?.descriptor(channel);
+    if (descriptor) {
+      // ⚠️ **注册表在册** —— 按描述符判「已启用 + 非生产 devOnly」。
+      return (
+        isChannelEnabled('PAYOUT', descriptor.channel) &&
+        !(isProduction() && descriptor.devOnly)
+      );
+    }
+    // ⚠️ **注册表不可用**（单测里只给了渠道 Map）→ 退回到「在册即可用」。
+    return true;
   }
 
   /** 对账任务列表（分页） */
