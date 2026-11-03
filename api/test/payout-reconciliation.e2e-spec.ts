@@ -123,7 +123,7 @@ describe('渠道对账 (e2e)', () => {
     });
 
     // 造渠道流水（成功）
-    await fakeProvider.execute({
+    await fakeProvider.submit({
       referenceId: payout.id,
       referenceNo: payout.payoutNo,
       amount: payout.netAmount,
@@ -153,6 +153,8 @@ describe('渠道对账 (e2e)', () => {
         },
       ],
       'recon-test-1',
+      // ⚠️ 阶段 6a：A 类自动纠正只对「渠道接口」来源生效；CSV 来源要人工确认。
+      'API',
     );
 
     expect(resolved).toBe(1);

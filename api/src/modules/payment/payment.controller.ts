@@ -64,8 +64,13 @@ export class PaymentController {
   @Roles(UserRole.MERCHANT_OWNER)
   @ApiOperation({ summary: '整单退款（不回补库存）' })
   async refund(@Param('orderNo') orderNo: string, @Body() dto: RefundOrderDto) {
-    await this.paymentService.refund(orderNo, dto.reason ?? '商家发起退款');
-    return { refunded: true };
+    const result = await this.paymentService.refund(
+      orderNo,
+      dto.reason ?? '商家发起退款',
+    );
+    // ⚠️ **前端只认 `status`，不解析渠道私有字段**（阶段 6c）：
+    //    `REFUNDING` = 已受理、结果待渠道确认 —— 绝不能回「已退款」。
+    return { refunded: result.status === 'REFUNDED', status: result.status };
   }
 
   /**

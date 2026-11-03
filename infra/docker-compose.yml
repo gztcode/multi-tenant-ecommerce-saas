@@ -129,6 +129,16 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-ecommerce}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-ecommerce-minio-secret}
       MEDIA_MAX_SIZE: ${MEDIA_MAX_SIZE:-5242880}
+      # ---- 支付 / 出款渠道（阶段 6a）----
+      # ⚠️ 这里**故意不设置** PAYMENT_ENABLED_CHANNELS / PAYOUT_ENABLED_CHANNELS：
+      #    NODE_ENV=production 时启用 fake / fake-payout 会让 api 启动即失败
+      #    （假网关是安全边界，不是便利开关）。本机开发要用假网关时，
+      #    在 `npm run start:dev` 的 api/.env 里设置即可，不要写到这里。
+      # 生产部署必须显式给出真实渠道的启用列表，并保证每个渠道都有已部署实现，
+      # 否则启动校验会点名变量与渠道名硬失败。
+      # 平台默认出款渠道优先读 platform_settings（平台后台），
+      # PAYOUT_PLATFORM_DEFAULT_CHANNEL 只是 DB 无行时的兜底，生产允许不设。
+      # CHANNEL_MODE=sandbox 在生产环境同样会拒绝启动。
     ports:
       - '${API_PORT:-3000}:3000'
     healthcheck:

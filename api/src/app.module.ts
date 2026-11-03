@@ -14,6 +14,7 @@ import { OrderModule } from './modules/order/order.module';
 import { PaymentModule } from './modules/payment/payment.module';
 import { CouponModule } from './modules/coupon/coupon.module';
 import { BillingModule } from './modules/billing/billing.module';
+import { PlatformSettingsApiModule } from './modules/platform-settings/platform-settings.module';
 
 // TenantPrismaService 由全局的 TenancyModule 提供并导出，
 // 这里不再重复声明，避免出现两个实例（两个连接池）。
@@ -39,6 +40,8 @@ import { BillingModule } from './modules/billing/billing.module';
     PaymentModule,
     CouponModule,
     BillingModule,
+    // 平台默认渠道设置接口（阶段 6a Task 4）
+    PlatformSettingsApiModule,
   ],
 })
 export class AppModule {}

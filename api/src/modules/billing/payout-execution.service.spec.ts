@@ -3,6 +3,7 @@ import { PayoutStatus, SettlementStatus } from '@prisma/client';
 import { PayoutExecutionService } from './payout-execution.service';
 import { PayoutCipherService } from './payout-cipher.service';
 import type { PayoutVerificationTarget } from '../../common/payment/payout-verification';
+import type { PayoutProviderRegistry } from '../../common/payment/payout-provider.registry';
 
 /**
  * 出款执行状态落库服务的单元测试。
@@ -54,9 +55,15 @@ interface FakeTx {
     updateMany: jest.Mock;
     findFirst: jest.Mock;
   };
-  payoutEntry: { deleteMany: jest.Mock; findMany: jest.Mock; createMany: jest.Mock };
+  payoutEntry: {
+    deleteMany: jest.Mock;
+    findMany: jest.Mock;
+    createMany: jest.Mock;
+  };
   settlementStatement: { updateMany: jest.Mock };
   payoutOperation: { create: jest.Mock };
+  /** ⚠️ **阶段 6a：抢单时读商家偏好渠道**（在事务里，与抢单同一快照） */
+  merchantPayoutAccount: { findFirst: jest.Mock };
 }
 
 /**
@@ -121,6 +128,8 @@ function fakePrisma(
     statement?: { status: string } | null;
     /** 顶层 `payoutEntry.findMany` 返回的占用明细（闸 ③ 用） */
     occupiedEntries?: unknown[];
+    /** 顶层 `merchantPayoutAccount.findFirst` 返回的商家偏好渠道行（阶段 6a） */
+    preferredAccount?: { preferredChannel: string | null } | null;
   } = {},
 ) {
   let tx: FakeTx | null = null;
@@ -180,6 +189,16 @@ function fakePrisma(
             Promise.resolve({ count: options.statementCount ?? 1 }),
           ),
         },
+        // ⚠️ **阶段 6a：抢单事务里读商家偏好渠道**
+        merchantPayoutAccount: {
+          findFirst: jest.fn<Promise<unknown>, [unknown]>(() =>
+            Promise.resolve(
+              options.preferredAccount === undefined
+                ? null
+                : options.preferredAccount,
+            ),
+          ),
+        },
         // ⚠️ **B 类人工处置用** —— 写留痕（`payoutOperation.create`）。
         payoutOperation: {
           create: jest.fn<Promise<unknown>, [unknown]>(() =>
@@ -211,6 +230,16 @@ function fakePrisma(
           options.topPayout === undefined
             ? defaultTopPayout()
             : options.topPayout,
+        ),
+      ),
+    },
+    // ⚠️ **阶段 6a：`claimForExecution` 读商家偏好渠道**（顶层，平台作用域）
+    merchantPayoutAccount: {
+      findFirst: jest.fn<Promise<unknown>, [unknown]>(() =>
+        Promise.resolve(
+          options.preferredAccount === undefined
+            ? null
+            : options.preferredAccount,
         ),
       ),
     },
@@ -258,8 +287,100 @@ function fakeVerification(verdict: 'PAID' | 'FAILED' | 'UNKNOWN' = 'FAILED') {
   return {
     // ⚠️ **带参数类型** —— 用例要断言「核实对象是谁」（闸 ④ 的回归测试），
     //    参数不声明的话 `mock.calls[0][0]` 是 `undefined`，TS 直接报错。
-    verify: jest.fn((_target: PayoutVerificationTarget) =>
-      Promise.resolve({ verdict, source: 'REALTIME' as const }),
+    verify: jest.fn((target: PayoutVerificationTarget) => {
+      void target;
+      return Promise.resolve({ verdict, source: 'REALTIME' as const });
+    }),
+  };
+}
+
+/**
+ * 假的出款渠道注册表（阶段 6a）。
+ *
+ * ⚠️ **模拟真实的 `resolveForPayout` 顺序**：已定 → 商家 → 平台 → 抛中文 409。
+ *    「已启用渠道」用 `enabled` 集合控制，不在其中的渠道抛 409（与真实注册表同口径）。
+ *
+ * ⚠️ **阶段 6b：`get()` 返回的渠道带能力声明与 `queryPayout`** ——
+ *    `scanStuck` 用 `capabilities.asyncPayout` 决定要不要轮询。
+ */
+function fakeRegistry(
+  options: {
+    enabled: string[];
+    /**
+     * 渠道是否声明为**异步出款**（阶段 6b）。
+     *
+     * ⚠️ **默认 `false`（同步）** —— 老用例的 `PROCESSING` 单按「只告警」处置，
+     *    行为与阶段 6a 一致。
+     */
+    asyncPayout?: boolean;
+    /** 渠道的 `queryPayout` 实现（默认返回 `PROCESSING`） */
+    queryPayout?: jest.Mock;
+  } = { enabled: [] },
+) {
+  const enabled = new Set(options.enabled);
+  const queryPayout =
+    options.queryPayout ??
+    jest.fn<Promise<unknown>, [unknown]>(() =>
+      Promise.resolve({ status: 'PROCESSING' }),
+    );
+  const get = (channel: string) => {
+    if (!enabled.has(channel)) {
+      throw new ConflictException(
+        `出款渠道 ${channel} 未注册：请检查 PAYOUT_ENABLED_CHANNELS 与部署的渠道实现。`,
+      );
+    }
+    return {
+      channel,
+      capabilities: {
+        refund: false,
+        asyncRefund: false,
+        asyncPayout: options.asyncPayout === true,
+        queryByReferenceNo: true,
+        authorizedCharge: false,
+        paymentMethod: false,
+      },
+      queryPayout,
+    };
+  };
+  return {
+    get: jest.fn(get),
+    get queryPayout() {
+      return queryPayout;
+    },
+    resolveForPayout: jest.fn(
+      (input: {
+        payoutChannel?: string | null;
+        merchantChannel?: string | null;
+        platformChannel?: string | null;
+      }) => {
+        const picked =
+          [input.payoutChannel, input.merchantChannel, input.platformChannel]
+            .map((v) => (v ?? '').trim())
+            .find((v) => v.length > 0) ?? '';
+        if (!picked) {
+          throw new ConflictException(
+            '无法确定出款渠道：商家未配置默认渠道，平台也未配置默认渠道。',
+          );
+        }
+        return get(picked);
+      },
+    ),
+    descriptor: jest.fn(() => null),
+    list: jest.fn(() => []),
+    registeredChannels: jest.fn(() => Array.from(enabled)),
+  } as unknown as PayoutProviderRegistry & {
+    resolveForPayout: jest.Mock;
+    get: jest.Mock;
+    /** ⚠️ **阶段 6b：所有渠道共用的 `queryPayout`**（用例断言「调了几次」） */
+    queryPayout: jest.Mock;
+  };
+}
+
+/** 假的平台设置服务（阶段 6a）—— 平台默认渠道可配置 */
+function fakeSettings(channel = 'fake-payout') {
+  return {
+    getPayoutDefaultChannel: jest.fn(() =>
+      Promise.resolve({ channel, source: 'DATABASE' as const }),
     ),
   };
 }
@@ -267,11 +388,17 @@ function fakeVerification(verdict: 'PAID' | 'FAILED' | 'UNKNOWN' = 'FAILED') {
 function makeService(
   prisma: ReturnType<typeof fakePrisma>,
   verification: ReturnType<typeof fakeVerification> = fakeVerification(),
+  registry: ReturnType<typeof fakeRegistry> = fakeRegistry({
+    enabled: ['fake-payout'],
+  }),
+  settings: ReturnType<typeof fakeSettings> = fakeSettings(),
 ): PayoutExecutionService {
   return new PayoutExecutionService(
     prisma as unknown as never,
     new PayoutCipherService(),
     verification,
+    registry,
+    settings as never,
   );
 }
 
@@ -291,7 +418,7 @@ describe('PayoutExecutionService', () => {
       const plain = '6222000000000000';
       const prisma = fakePrisma({
         payout: {
-          attemptCount: 1,
+          attemptCount: 0,
           netAmount: 8500,
           payoutNo: 'PAY202508010000000001',
           snapshotAccountName: '张三',
@@ -322,6 +449,212 @@ describe('PayoutExecutionService', () => {
       });
     });
 
+    it('⚠️ 新一次执行清掉上一次的 stuckLoggedAt（否则永不再被轮询）', async () => {
+      const prisma = fakePrisma();
+      const service = makeService(prisma);
+
+      await service.claimForExecution('payout-a', new Date());
+
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        stuckLoggedAt?: unknown;
+        status: string;
+      };
+      expect(data.status).toBe(PayoutStatus.PROCESSING);
+      // ⚠️ **`scanStuck` 只捞 `stuckLoggedAt: null`** —— 上一次执行留下的
+      //    告警标记不清掉，这张单重试后再卡住就永远不会被轮询。
+      expect(data.stuckLoggedAt).toBeNull();
+    });
+
+    it('⚠️ 新单：商家配置了偏好渠道 → 解析出该渠道，与状态改 PROCESSING 同一个 updateMany', async () => {
+      const prisma = fakePrisma({
+        payout: { attemptCount: 0, netAmount: 8500, payoutNo: 'PAY1' },
+        preferredAccount: { preferredChannel: 'channel-a' },
+      });
+      const registry = fakeRegistry({ enabled: ['channel-a', 'fake-payout'] });
+      const settings = fakeSettings('fake-payout');
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        settings,
+      );
+
+      const claim = await service.claimForExecution('payout-a', new Date());
+
+      expect(claim!.channel).toBe('channel-a');
+      expect(claim!.channelError).toBeNull();
+      // ⚠️ **商家优先于平台默认** —— resolveForPayout 的顺序：单 > 商家 > 平台
+      // ⚠️ 假注册表按 Mock 断言（属性形态），不受 unbound-method 约束
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(registry.resolveForPayout).toHaveBeenCalledWith({
+        payoutChannel: null,
+        merchantChannel: 'channel-a',
+        platformChannel: null,
+      });
+      // ⚠️ **商家配了就不该再去读平台默认** —— 平台配置缺失不该连坐这张单
+
+      expect(settings.getPayoutDefaultChannel).not.toHaveBeenCalled();
+      // ⚠️ **解析结果与状态改 PROCESSING 同一次 updateMany** ——
+      //    分开写会出现「单子进 PROCESSING、渠道还没解析」的窗口
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        status: string;
+        payoutChannel: string | null;
+      };
+      expect(data.status).toBe(PayoutStatus.PROCESSING);
+      expect(data.payoutChannel).toBe('channel-a');
+    });
+
+    it('⚠️ 新单：商家没配 → 用平台默认渠道', async () => {
+      const prisma = fakePrisma({
+        payout: { attemptCount: 0, netAmount: 8500, payoutNo: 'PAY1' },
+        preferredAccount: { preferredChannel: null },
+      });
+      const registry = fakeRegistry({ enabled: ['channel-b', 'fake-payout'] });
+      const settings = fakeSettings('channel-b');
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        settings,
+      );
+
+      const claim = await service.claimForExecution('payout-a', new Date());
+
+      expect(claim!.channel).toBe('channel-b');
+      expect(claim!.channelError).toBeNull();
+      // ⚠️ 假注册表按 Mock 断言（属性形态），不受 unbound-method 约束
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(registry.resolveForPayout).toHaveBeenCalledWith({
+        payoutChannel: null,
+        merchantChannel: null,
+        platformChannel: 'channel-b',
+      });
+    });
+
+    it('⚠️ 新单：商家配置与平台默认都没 → channel=null + 中文 channelError，不抛异常', async () => {
+      const prisma = fakePrisma({
+        payout: { attemptCount: 0, netAmount: 8500, payoutNo: 'PAY1' },
+        preferredAccount: { preferredChannel: null },
+      });
+      const registry = fakeRegistry({ enabled: [] });
+      const settings = fakeSettings();
+      settings.getPayoutDefaultChannel.mockRejectedValue(
+        new ConflictException(
+          '平台未配置默认出款渠道：请在超管后台设置，或配置环境变量 PAYOUT_PLATFORM_DEFAULT_CHANNEL。',
+        ),
+      );
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        settings,
+      );
+
+      // ⚠️ **绝不能抛** —— 抛错会回滚事务，单子停在 `APPROVED`，
+      //    而 `markFailed` 只接受 `PROCESSING` → 单子永远卡在那里，
+      //    兜底扫描每 5 分钟把它重新入队一次（无限重投）。
+      const claim = await service.claimForExecution('payout-a', new Date());
+
+      expect(claim).not.toBeNull();
+      expect(claim!.channel).toBeNull();
+      expect(claim!.channelError).toContain('平台未配置默认出款渠道');
+    });
+
+    it('⚠️ 新单：商家配了渠道、平台默认未配置 → 仍能解析（平台配置缺失不连坐）', async () => {
+      // ⚠️ **只会发生在「商家已明确配置」的单上** —— 平台默认渠道读到没配
+      //    时应该抛错，但那是「需要兜底」的场景；商家已经给了渠道，
+      //    就不该因为平台配置缺失把这张单打成 FAILED。
+      const prisma = fakePrisma({
+        payout: { attemptCount: 0, netAmount: 8500, payoutNo: 'PAY1' },
+        preferredAccount: { preferredChannel: 'channel-a' },
+      });
+      const registry = fakeRegistry({ enabled: ['channel-a'] });
+      const settings = fakeSettings();
+      settings.getPayoutDefaultChannel.mockRejectedValue(
+        new ConflictException('平台未配置默认出款渠道'),
+      );
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        settings,
+      );
+
+      const claim = await service.claimForExecution('payout-a', new Date());
+
+      expect(claim!.channel).toBe('channel-a');
+      expect(claim!.channelError).toBeNull();
+
+      expect(settings.getPayoutDefaultChannel).not.toHaveBeenCalled();
+    });
+
+    it('⚠️ 新单：商家配置已停用 → channelError 带可读原因（不静默回落平台默认）', async () => {
+      // ⚠️ **fail-closed，绝不静默切到平台默认** —— 钱打到哪家必须确定。
+      const prisma = fakePrisma({
+        payout: { attemptCount: 0, netAmount: 8500, payoutNo: 'PAY1' },
+        preferredAccount: { preferredChannel: 'channel-x' },
+      });
+      const registry = fakeRegistry({ enabled: ['channel-b'] });
+      const settings = fakeSettings('channel-b');
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        settings,
+      );
+
+      const claim = await service.claimForExecution('payout-a', new Date());
+
+      expect(claim!.channel).toBeNull();
+      expect(claim!.channelError).toContain('channel-x');
+      expect(claim!.channelError).toContain('未注册');
+      // ⚠️ **回落了平台默认** 的话，resolveForPayout 里的 merchantChannel 仍是 channel-x
+      // ⚠️ 假注册表按 Mock 断言（属性形态），不受 unbound-method 约束
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(registry.resolveForPayout).toHaveBeenCalledWith({
+        payoutChannel: null,
+        merchantChannel: 'channel-x',
+        platformChannel: null,
+      });
+    });
+
+    it('⚠️ 已有 payoutChannel 的重试：直接沿用，不重查商家偏好与平台默认', async () => {
+      const prisma = fakePrisma({
+        payout: {
+          attemptCount: 1,
+          netAmount: 8500,
+          payoutNo: 'PAY1',
+          payoutChannel: 'channel-a',
+        },
+      });
+      const registry = fakeRegistry({ enabled: ['channel-a', 'fake-payout'] });
+      const settings = fakeSettings('fake-payout');
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        settings,
+      );
+
+      const claim = await service.claimForExecution('payout-a', new Date());
+
+      // ⚠️ **重试不换渠道** —— 上一次已经写进 `payouts.payoutChannel` 的那家
+      expect(claim!.channel).toBe('channel-a');
+      // ⚠️ 假注册表按 Mock 断言（属性形态），不受 unbound-method 约束
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(registry.resolveForPayout).toHaveBeenCalledWith({
+        payoutChannel: 'channel-a',
+        merchantChannel: null,
+        platformChannel: null,
+      });
+      // ⚠️ **不重读默认渠道** —— 重试必须按单子上已有的渠道打
+      expect(settings.getPayoutDefaultChannel).not.toHaveBeenCalled();
+      // ⚠️ **商家的 `preferredChannel` 不参与**（`account` 为 null 表示没读）
+      expect(
+        prisma.tx()!.merchantPayoutAccount.findFirst,
+      ).not.toHaveBeenCalled();
+    });
+
     it('条件更新影响 0 行 → 返回 null（抢不到就静默返回）', async () => {
       const prisma = fakePrisma({ updateManyCount: 0 });
       const service = makeService(prisma);
@@ -334,7 +667,7 @@ describe('PayoutExecutionService', () => {
     it('快照账号为空 → account 为 null（worker 据此落 FAILED）', async () => {
       const prisma = fakePrisma({
         payout: {
-          attemptCount: 1,
+          attemptCount: 0,
           netAmount: 8500,
           payoutNo: 'PAY1',
           snapshotAccountName: null,
@@ -360,7 +693,7 @@ describe('PayoutExecutionService', () => {
       //    `decryptVersioned` 照样抛带中文原因的错，worker 只把它记进日志。
       const prisma = fakePrisma({
         payout: {
-          attemptCount: 1,
+          attemptCount: 0,
           netAmount: 8500,
           payoutNo: 'PAY1',
           snapshotAccountName: '张三',
@@ -387,7 +720,7 @@ describe('PayoutExecutionService', () => {
       const plain = '6222000000000000';
       const prisma = fakePrisma({
         payout: {
-          attemptCount: 1,
+          attemptCount: 0,
           netAmount: 8500,
           payoutNo: 'PAY1',
           snapshotAccountName: '张三',
@@ -407,6 +740,87 @@ describe('PayoutExecutionService', () => {
         bankName: '测试银行',
         accountNo: plain,
       });
+    });
+  });
+
+  describe('claimForExecution 的渠道解析落库', () => {
+    it('⚠️ 解析出的渠道写进 payoutChannel（与状态改 PROCESSING 同一个 updateMany）', async () => {
+      const prisma = fakePrisma();
+      const registry = fakeRegistry({ enabled: ['channel-a'] });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('channel-a'),
+      );
+
+      await service.claimForExecution('payout-a', new Date());
+
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        status: string;
+        payoutChannel: string | null;
+      };
+      expect(data.status).toBe(PayoutStatus.PROCESSING);
+      expect(data.payoutChannel).toBe('channel-a');
+    });
+
+    it('⚠️ 解析失败时不写 payoutChannel（只改状态），且 channelError 带中文原因', async () => {
+      const prisma = fakePrisma({
+        preferredAccount: { preferredChannel: null },
+      });
+      const registry = fakeRegistry({ enabled: [] });
+      const settings = fakeSettings();
+      settings.getPayoutDefaultChannel.mockRejectedValue(
+        new ConflictException('平台未配置默认出款渠道'),
+      );
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        settings,
+      );
+
+      const claim = await service.claimForExecution('payout-a', new Date());
+
+      expect(claim).not.toBeNull();
+      expect(claim!.channel).toBeNull();
+      expect(claim!.channelError).toContain('平台未配置默认出款渠道');
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        status: string;
+        payoutChannel: string | null;
+      };
+      // ⚠️ **失败时不写渠道名** —— 连 `payoutChannel: null` 都不写，
+      //    避免把已有值覆盖掉（重试不换渠道的依据）
+      expect(data).not.toHaveProperty('payoutChannel');
+    });
+
+    it('⚠️ 商家的偏好渠道查询必须显式带 tenantId（平台作用域下不会被自动过滤）', async () => {
+      // ⚠️ **同 `confirmPaidAfterReconciliation` 的同一类坑**：
+      //    `MerchantPayoutAccount` 在租户白名单里，但本服务跑在**平台作用域**
+      //    → 租户扩展**不附加任何过滤** → 不显式带 `tenantId` 就是跨租户读。
+      const prisma = fakePrisma({
+        payout: {
+          attemptCount: 0,
+          netAmount: 8500,
+          payoutNo: 'PAY1',
+          tenantId: 'tenant-a',
+        },
+      });
+      const registry = fakeRegistry({ enabled: ['channel-a', 'fake-payout'] });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('fake-payout'),
+      );
+
+      await service.claimForExecution('payout-a', new Date());
+
+      const where = argsOf(prisma.tx()!.merchantPayoutAccount.findFirst)
+        .where as {
+        tenantId?: string;
+      };
+      expect(where.tenantId).toBe('tenant-a');
     });
   });
 
@@ -849,11 +1263,350 @@ describe('PayoutExecutionService', () => {
     });
   });
 
+  describe('scanStuck 轮询异步渠道（阶段 6b）', () => {
+    /** 一张卡住的 `PROCESSING` 单（`findMany` 第 ① 次返回） */
+    function stuckRow(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'payout-a',
+        payoutNo: 'PAY1',
+        attemptCount: 1,
+        payoutChannel: 'channel-a',
+        // ⚠️ **补记已付款前要核对金额** —— 与下面渠道回报的 8500 一致
+        netAmount: 8500,
+        ...overrides,
+      };
+    }
+
+    /** 让两张查询（① PROCESSING、② APPROVED）都只返回给定的一批 PROCESSING 单 */
+    function findManyWith(stuck: unknown[]) {
+      return {
+        findManyResults: ([] as unknown[][]).concat([stuck, []]),
+      };
+    }
+
+    it('⚠️ 渠道说 SUCCESS → 单子变 PAID，写 paidAt / payoutTxnId / payoutChannel', async () => {
+      const prisma = fakePrisma(findManyWith([stuckRow()]));
+      const dbNow = new Date('2025-08-20T00:00:00.000Z');
+      prisma.databaseNow.mockResolvedValue(dbNow);
+      const queryPayout = jest.fn(() =>
+        Promise.resolve({
+          status: 'SUCCESS' as const,
+          providerTxnId: 'txn-9',
+          amount: 8500,
+          paidAt: new Date('2025-08-19T23:00:00.000Z'),
+        }),
+      );
+      const registry = fakeRegistry({
+        enabled: ['channel-a'],
+        asyncPayout: true,
+        queryPayout,
+      });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('channel-a'),
+      );
+
+      const rescues = await service.scanStuck(new Date());
+
+      // ⚠️ **PROCESSING 的单不进返回值** —— 绝不自动重试（设计 §九·R3）
+      expect(rescues).toEqual([]);
+      // ⚠️ **用 referenceNo（payoutNo）查** —— PROCESSING 的单没有 payoutTxnId
+      expect(queryPayout).toHaveBeenCalledWith({ referenceNo: 'PAY1' });
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        status: string;
+        paidAt: Date;
+        payoutTxnId: string;
+        payoutChannel: string;
+      };
+      expect(data.status).toBe(PayoutStatus.PAID);
+      // ⚠️ **落库时刻用数据库时钟**，不是渠道返回的时刻，也不是 `new Date()`
+      expect(data.paidAt).toBe(dbNow);
+      expect(data.payoutTxnId).toBe('txn-9');
+      expect(data.payoutChannel).toBe('channel-a');
+      // ⚠️ **已补记账，不再去写 stuckLoggedAt**
+      expect(prisma.payout.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('⚠️ 渠道说 SUCCESS 但金额与出款单不一致 → FAILED 且禁止自动重试', async () => {
+      const prisma = fakePrisma(findManyWith([stuckRow()]));
+      prisma.databaseNow.mockResolvedValue(
+        new Date('2025-08-20T00:00:00.000Z'),
+      );
+      const queryPayout = jest.fn(() =>
+        Promise.resolve({
+          status: 'SUCCESS' as const,
+          providerTxnId: 'txn-9',
+          // ⚠️ 应付出款净额是 8500，渠道只报了 8000
+          amount: 8000,
+        }),
+      );
+      const registry = fakeRegistry({
+        enabled: ['channel-a'],
+        asyncPayout: true,
+        queryPayout,
+      });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('channel-a'),
+      );
+
+      await service.scanStuck(new Date());
+
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        status: string;
+        failedBeforePayout: boolean;
+        failureReason: string;
+      };
+      expect(data.status).toBe(PayoutStatus.FAILED);
+      // ⚠️ **钱可能已经出去了** —— 绝不能允许运营一键重试（会重复打款）
+      expect(data.failedBeforePayout).toBe(false);
+      expect(data.failureReason).toMatch(/金额与出款单不一致/);
+    });
+
+    it('⚠️ 渠道说 FAILED 且 definitive=true → FAILED + failedBeforePayout=true', async () => {
+      const prisma = fakePrisma(findManyWith([stuckRow()]));
+      const dbNow = new Date('2025-08-20T00:00:00.000Z');
+      prisma.databaseNow.mockResolvedValue(dbNow);
+      const queryPayout = jest.fn(() =>
+        Promise.resolve({
+          status: 'FAILED' as const,
+          definitive: true,
+          providerTxnId: 'txn-9',
+          failureReason: '渠道拒付',
+        }),
+      );
+      const registry = fakeRegistry({
+        enabled: ['channel-a'],
+        asyncPayout: true,
+        queryPayout,
+      });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('channel-a'),
+      );
+
+      await service.scanStuck(new Date());
+
+      const data = argsOf(prisma.tx()!.payout.updateMany).data as {
+        status: string;
+        failedAt: Date;
+        failedBeforePayout: boolean;
+        failureReason: string;
+        payoutTxnId: string;
+      };
+      expect(data.status).toBe(PayoutStatus.FAILED);
+      // ⚠️ **钱确定没打出去 → 可安全重试**
+      expect(data.failedBeforePayout).toBe(true);
+      expect(data.failedAt).toBe(dbNow);
+      expect(data.failureReason).toContain('渠道拒付');
+      // ⚠️ **渠道给了交易号就要存**（事后去渠道定位靠它）
+      expect(data.payoutTxnId).toBe('txn-9');
+      expect(prisma.payout.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('⚠️⚠️ 渠道说 FAILED 但 definitive=false → 状态不变，且**不写** stuckLoggedAt（下一轮继续问）', async () => {
+      // ⚠️ **「结果未知」落 FAILED = 运营以为可以重试 → 重复打款**
+      const prisma = fakePrisma(findManyWith([stuckRow()]));
+      const queryPayout = jest.fn(() =>
+        Promise.resolve({ status: 'FAILED' as const, definitive: false }),
+      );
+      const registry = fakeRegistry({
+        enabled: ['channel-a'],
+        asyncPayout: true,
+        queryPayout,
+      });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('channel-a'),
+      );
+
+      await service.scanStuck(new Date());
+
+      // ⚠️ **绝不碰状态机** —— 不写 PAID、不写 FAILED
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      // ⚠️ **也不能写 stuckLoggedAt** —— `scanStuck` 只捞 `stuckLoggedAt: null`
+      //    的单，写了就等于「以后再也不问这张单」；异步渠道的中间态必须继续轮询。
+      expect(prisma.payout.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('⚠️ 渠道说 UNKNOWN → 状态不变，且不写 stuckLoggedAt（下一轮继续问）', async () => {
+      const prisma = fakePrisma(findManyWith([stuckRow()]));
+      const queryPayout = jest.fn(() =>
+        Promise.resolve({ status: 'UNKNOWN' as const }),
+      );
+      const registry = fakeRegistry({
+        enabled: ['channel-a'],
+        asyncPayout: true,
+        queryPayout,
+      });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('channel-a'),
+      );
+
+      await service.scanStuck(new Date());
+
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      // 问不出结论 ≠ 不再问：保留 `stuckLoggedAt = null` 让下一轮继续轮询
+      expect(prisma.payout.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('⚠️ 渠道查询抛异常（超时）→ 状态不变、下一轮继续问，不中断整轮', async () => {
+      const prisma = fakePrisma(
+        findManyWith([
+          stuckRow(),
+          stuckRow({ id: 'payout-b', payoutNo: 'PAY2' }),
+        ]),
+      );
+      const queryPayout = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('渠道超时'))
+        .mockResolvedValueOnce({ status: 'UNKNOWN' as const });
+      const registry = fakeRegistry({
+        enabled: ['channel-a'],
+        asyncPayout: true,
+        queryPayout,
+      });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('channel-a'),
+      );
+
+      // ⚠️ **不抛** —— 第一张抛出后，第二张照样要被处理
+      await expect(service.scanStuck(new Date())).resolves.toEqual([]);
+      expect(queryPayout).toHaveBeenCalledTimes(2);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      // ⚠️ **两张都不写 stuckLoggedAt** —— 下一轮还要继续问；
+      //    一张超时也不能连累另一张（第二张照样被问过）。
+      expect(prisma.payout.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('⚠️⚠️ 同步渠道（asyncPayout=false）的 PROCESSING → 不调用 queryPayout（0 次）', async () => {
+      // ⚠️ **同步渠道的 submit 不会返回 PROCESSING** —— 它出现在这里是异常，
+      //    去问渠道只会制造噪声；必须显式挡掉。
+      const prisma = fakePrisma(findManyWith([stuckRow()]));
+      const queryPayout = jest.fn(() =>
+        Promise.resolve({ status: 'SUCCESS' as const, providerTxnId: 't' }),
+      );
+      const registry = fakeRegistry({
+        enabled: ['channel-a'],
+        asyncPayout: false,
+        queryPayout,
+      });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('channel-a'),
+      );
+
+      await service.scanStuck(new Date());
+
+      expect(queryPayout).toHaveBeenCalledTimes(0);
+      const args = argsOf(prisma.payout.updateMany) as {
+        data: Record<string, unknown>;
+      };
+      expect(Object.keys(args.data)).toEqual(['stuckLoggedAt']);
+    });
+
+    it('单轮超过 50 张 → 只轮询 50 张', async () => {
+      const rows = Array.from({ length: 60 }, (_, i) =>
+        stuckRow({ id: `payout-${i}`, payoutNo: `PAY${i}` }),
+      );
+      const prisma = fakePrisma(findManyWith(rows));
+      const queryPayout = jest.fn(() =>
+        Promise.resolve({ status: 'PROCESSING' as const }),
+      );
+      const registry = fakeRegistry({
+        enabled: ['channel-a'],
+        asyncPayout: true,
+        queryPayout,
+      });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('channel-a'),
+      );
+
+      await service.scanStuck(new Date());
+
+      // ⚠️ **单轮上限 50**（设计 §6.3）—— 被截掉的单下一轮再处理
+      expect(queryPayout).toHaveBeenCalledTimes(50);
+      const queryArgs = argsOf(prisma.payout.findMany) as {
+        take?: number;
+      };
+      expect(queryArgs.take).toBe(50);
+    });
+
+    it('⚠️ 单子没有 payoutChannel → 用平台默认渠道查（存量单前向兼容）', async () => {
+      const prisma = fakePrisma(
+        findManyWith([stuckRow({ payoutChannel: null })]),
+      );
+      const queryPayout = jest.fn(() =>
+        Promise.resolve({ status: 'UNKNOWN' as const }),
+      );
+      const registry = fakeRegistry({
+        enabled: ['channel-b'],
+        asyncPayout: true,
+        queryPayout,
+      });
+      const settings = fakeSettings('channel-b');
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        settings,
+      );
+
+      await service.scanStuck(new Date());
+
+      expect(settings.getPayoutDefaultChannel).toHaveBeenCalled();
+      // ⚠️ 假注册表按 Mock 断言（属性形态），不受 unbound-method 约束
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(registry.get).toHaveBeenCalledWith('channel-b');
+    });
+
+    it('⚠️ 取不到渠道（已停用 / 未配置）→ 只记 warn，不中断整轮', async () => {
+      const prisma = fakePrisma(
+        findManyWith([stuckRow({ payoutChannel: 'channel-x' })]),
+      );
+      const registry = fakeRegistry({
+        enabled: [],
+        asyncPayout: true,
+      });
+      const service = makeService(
+        prisma,
+        fakeVerification(),
+        registry,
+        fakeSettings('channel-a'),
+      );
+
+      await expect(service.scanStuck(new Date())).resolves.toEqual([]);
+      expect(registry.queryPayout).not.toHaveBeenCalled();
+      // ⚠️ **取不到渠道也照样告警去重**
+      const args = argsOf(prisma.payout.updateMany) as {
+        data: Record<string, unknown>;
+      };
+      expect(Object.keys(args.data)).toEqual(['stuckLoggedAt']);
+    });
+  });
+
   describe('confirmPaidAfterReconciliation', () => {
     /** 一份「四闸全过」的默认配置 —— 各用例只覆盖自己关心的那一项 */
-    function bClassOptions(
-      overrides: Parameters<typeof fakePrisma>[0] = {},
-    ) {
+    function bClassOptions(overrides: Parameters<typeof fakePrisma>[0] = {}) {
       return {
         // ⚠️ **金额自洽** —— 闸 ② 要「明细合计 == receiptAmount」
         //    「笔数 == entryCount」「净额 == 货款 − 佣金」
@@ -895,7 +1648,7 @@ describe('PayoutExecutionService', () => {
       });
 
       // ⚠️ **核实用的必须是本单的号** —— 不能是被替换的别的单号
-      const target = verification.verify.mock.calls[0]![0];
+      const target = verification.verify.mock.calls[0][0];
       expect(target.payoutNo).toBe('PAY202508200000000001');
       expect(target.payoutNo).not.toBe('PAY-OTHER-TENANT-999');
       expect(target.id).toBe('payout-a');

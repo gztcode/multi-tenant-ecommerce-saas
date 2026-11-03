@@ -265,6 +265,23 @@ export class CompensationService implements OnModuleInit {
       referenceNo,
       amount,
       success,
+      // ⚠️ **退款事件重放必须带上类型与状态**（阶段 6c）：
+      //    少了它们，退款事件会被当成支付事件重投 —— 查不到订单，
+      //    这笔退款就永远停在 `REFUNDING`。
+      ...(payload.eventType === 'REFUND'
+        ? { eventType: 'REFUND' as const }
+        : {}),
+      ...(typeof payload.refundTxnId === 'string'
+        ? { refundTxnId: payload.refundTxnId }
+        : {}),
+      ...(payload.refundStatus === 'SUCCESS' ||
+      payload.refundStatus === 'FAILED' ||
+      payload.refundStatus === 'PROCESSING'
+        ? { refundStatus: payload.refundStatus }
+        : {}),
+      ...(typeof payload.definitive === 'boolean'
+        ? { definitive: payload.definitive }
+        : {}),
     };
   }
 }

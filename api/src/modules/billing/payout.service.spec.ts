@@ -16,6 +16,7 @@ import { ApplyPayoutDto } from './dto/apply-payout.dto';
 import { LedgerService } from './ledger.service';
 import { PayoutService } from './payout.service';
 import { PayoutCipherService } from './payout-cipher.service';
+import type { PayoutVerificationTarget } from '../../common/payment/payout-verification';
 
 /**
  * 出款单服务的**分支级**单元测试。
@@ -693,9 +694,10 @@ function fakeQueues() {
  */
 function fakeVerification(verdict: 'PAID' | 'FAILED' | 'UNKNOWN' = 'FAILED') {
   return {
-    verify: jest.fn(() =>
-      Promise.resolve({ verdict, source: 'REALTIME' as const }),
-    ),
+    verify: jest.fn((_target: PayoutVerificationTarget) => {
+      void _target;
+      return Promise.resolve({ verdict, source: 'REALTIME' as const });
+    }),
   };
 }
 
@@ -2772,7 +2774,32 @@ describe('平台端解除卡单（阶段 5l）', () => {
       id: 'payout-a',
       payoutNo: 'PAY202508010000009999',
       payoutTxnId: null,
+      payoutChannel: null,
     });
+  });
+
+  it('⚠️ 核实对象带上库里的 payoutChannel（与 worker 取同一渠道）', async () => {
+    // ⚠️ **两处取不同渠道 = 重复打款** —— 打款走 A、核实却查默认渠道 B
+    //    → B 说「没打」→ 放行解卡 → 钱从 A 又打一次。
+    const prisma = fakePrisma({
+      payoutSequence: [
+        payout({
+          status: PayoutStatus.PROCESSING,
+          netAmount: 8000,
+          processingAt: new Date(Date.now() - 60 * 60 * 1000),
+          payoutChannel: 'channel-a',
+        }),
+      ],
+    });
+    const verification = fakeVerification('FAILED');
+    const service = makeService(prisma, fakeQueues(), verification);
+
+    await asPlatform(() =>
+      service.unstick('payout-a', { to: 'FAILED', reason: '渠道确认没打' }),
+    );
+
+    const target = verification.verify.mock.calls[0][0];
+    expect(target.payoutChannel).toBe('channel-a');
   });
 
   it('⚠️ 闸在「未超过卡住阈值」检查之后 —— 阈值没过就不该去问渠道', async () => {
@@ -2840,6 +2867,10 @@ describe('失败原因的口径（阶段 5l）', () => {
     expect(view.failureReason).toContain('本次未打款');
     expect(view.failureReason).not.toContain('尚未加密');
     expect(view.failureReason).not.toContain('版本 0');
+    // ⚠️ **兜底不能说错原因**（阶段 6b）：以前回落白名单第一条
+    //    「收款账号信息异常…」→ 商家去改收款账户，改完再申请还是同样的错。
+    expect(view.failureReason).not.toContain('收款账号信息异常');
+    expect(view.failureReason).toContain('请联系平台处理');
   });
 
   it('⚠️ 商家端视图：可能已打 → 通用措辞（不含渠道原文）', async () => {

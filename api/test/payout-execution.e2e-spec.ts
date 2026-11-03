@@ -368,13 +368,14 @@ describe('出款执行 (e2e)', () => {
   /** 设定接下来 N 次打款的剧本（假网关；只有平台超管能调） */
   async function armScenario(
     adminToken: string,
-    options: { times?: number; amountOffset?: number },
+    options: { times?: number; unknownTimes?: number; amountOffset?: number },
   ): Promise<void> {
     await http(app)
       .post('/api/v1/pay/fake-payout/fail-next')
       .set('authorization', `Bearer ${adminToken}`)
       .send({
         times: options.times ?? 0,
+        unknownTimes: options.unknownTimes ?? 0,
         amountOffset: options.amountOffset ?? 0,
       })
       .expect(200);
@@ -797,7 +798,9 @@ describe('出款执行 (e2e)', () => {
       commissionAmount: 1000,
     });
 
-    // ⚠️ **让 3 次打款都失败** → 正好用满重试上限
+    // ⚠️ **让 3 次打款都失败** → 正好用满重试上限。
+    //    `times` = **渠道明确拒付**（`definitive: true`）→ 可以安全重试；
+    //    「结果未知」用 `unknownTimes`，那条路径根本不重试（见下面 X7b）。
     await armScenario(adminToken, { times: 3 });
 
     const applied = await apply(merchant.token, period.label);
@@ -812,10 +815,17 @@ describe('出款执行 (e2e)', () => {
     expect(failed!.attemptCount).toBe(3);
     // ⚠️ **阶段 5l：商家端只看业务口径** —— 渠道的原文（「假出款网关模拟的失败
     //    （第 3 次尝试）」）不泄给商家；原文在平台端的 `failureDetail`。
-    expect(failed!.failureReason).toContain('请联系平台确认出款情况');
+    //
+    // ⚠️ **阶段 6b 修正文案**：`definitive: true` = 渠道明确说没打 →
+    //    `failedBeforePayout = true`（钱确定没出去）。白名单外的原文会退回
+    //    **中性兜底话**，不能回落「收款账号信息异常」—— 那是说错原因
+    //    （商家会去改收款账户，改完再申请还是同样的错）。
+    expect(failed!.failureReason).toContain('本次未打款');
+    expect(failed!.failureReason).toContain('请联系平台处理');
+    expect(failed!.failureReason).not.toContain('收款账号信息异常');
     expect(failed!.failureReason).not.toContain('模拟的失败');
-    // ⚠️ **渠道调过了 → 钱可能已打出去** → 不能重试
-    expect(failed!.failedBeforePayout).toBe(false);
+    // ⚠️ **渠道明确拒付 → 钱确定没打出去** → 平台端可以安全重试
+    expect(failed!.failedBeforePayout).toBe(true);
 
     const platformDetail = await http(app)
       .get(`/api/v1/platform/payouts/${applied.id}`)
@@ -823,6 +833,45 @@ describe('出款执行 (e2e)', () => {
       .expect(200);
     const platformBody = platformDetail.body as PayoutBody;
     expect(platformBody.failureDetail).toContain('模拟的失败');
+  });
+
+  // ============================================================
+  // X7b：结果未知 → 不自动重试（阶段 6b）
+  // ============================================================
+
+  it('X7b：渠道结果未知（definitive=false）→ 一次就落 FAILED，绝不自动重试', async () => {
+    const adminToken = await loginPlatformAdmin();
+    // ⚠️ 用**已结束的月份**：结算单只允许对上个月及更早出账（当月 400）
+    const period = month('2026-10');
+    const { merchant } = await setupMerchantWithPeriod(adminToken, period, {
+      receiptAmount: 10000,
+      commissionAmount: 1000,
+    });
+
+    // ⚠️ **`unknownTimes` = 结果未知**（超时 / 网络中断的语义）——
+    //    钱**可能已经打出去**，再自动重试就是确定性重复打款。
+    await armScenario(adminToken, { unknownTimes: 1 });
+
+    const applied = await apply(merchant.token, period.label);
+    await approve(adminToken, applied.id);
+
+    const failed = await waitForStatus(
+      merchant.token,
+      applied.id,
+      PayoutStatus.FAILED,
+    );
+    expect(failed).not.toBeNull();
+    // ⚠️ **一次就落终态** —— 进了重试预算就说明「结果未知」被当成可重试了
+    expect(failed!.attemptCount).toBe(1);
+    expect(failed!.failedBeforePayout).toBe(false);
+    expect(failed!.failureReason).toContain('请联系平台确认出款情况');
+    expect(failed!.failureReason).not.toContain('模拟的失败');
+
+    // ⚠️ **等一小会儿确认没有第二次尝试**（重试是延迟入队的，不是同步的）
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const again = await fetchMerchantDetail(merchant.token, applied.id);
+    expect(again.status).toBe(PayoutStatus.FAILED);
+    expect(again.attemptCount).toBe(1);
   });
 
   it('X12：渠道失败时落 APPROVED（等重试）并记 failureReason', async () => {

@@ -235,3 +235,104 @@ describe('收款账户中转：请求体白名单', () => {
     expect(apiFetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe('收款账户中转：默认出款渠道（阶段 6a Task 5）', () => {
+  it('未传 preferredChannel → 后端收到的 body 正好只有三个键（白名单完整重建）', async () => {
+    await accountPut(
+      putRequest('http://localhost/api/merchant/payout-account', {
+        accountName: '张三',
+        bankName: '招商银行',
+        tenantId: 'other-tenant',
+      }),
+    );
+
+    const [, options] = apiFetchMock.mock.calls[0];
+    const body = options?.body as Record<string, unknown>;
+    // ⚠️ **`toEqual` 完整 body**：未知字段（tenantId）必须被丢弃，
+    //    多一个键就是「绕过了白名单」。
+    expect(body).toEqual({ accountName: '张三', bankName: '招商银行' });
+  });
+
+  it('有值 preferredChannel → 原样进白名单（trim 后）', async () => {
+    await accountPut(
+      putRequest('http://localhost/api/merchant/payout-account', {
+        accountName: '张三',
+        bankName: '招商银行',
+        preferredChannel: '  fake-payout  ',
+      }),
+    );
+
+    const [, options] = apiFetchMock.mock.calls[0];
+    const body = options?.body as Record<string, unknown>;
+    expect(body.preferredChannel).toBe('fake-payout');
+  });
+
+  it('⚠️ 空串 → 保留为 ""（= 清除配置），不转成「不修改」', async () => {
+    await accountPut(
+      putRequest('http://localhost/api/merchant/payout-account', {
+        accountName: '张三',
+        bankName: '招商银行',
+        preferredChannel: '',
+      }),
+    );
+
+    const [, options] = apiFetchMock.mock.calls[0];
+    const body = options?.body as Record<string, unknown>;
+    // ⚠️ **键必须存在、值必须是空串**：后端按「键在不在」区分
+    //    「不修改」与「清除」，丢掉这个键会让商家以为清空成功了。
+    expect(body).toHaveProperty('preferredChannel', '');
+  });
+
+  it('⚠️ 非字符串（数字）→ 400 且不调后端', async () => {
+    const response = await accountPut(
+      putRequest('http://localhost/api/merchant/payout-account', {
+        accountName: '张三',
+        bankName: '招商银行',
+        preferredChannel: 123,
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('⚠️ 非字符串（对象）→ 400 且不调后端', async () => {
+    const response = await accountPut(
+      putRequest('http://localhost/api/merchant/payout-account', {
+        accountName: '张三',
+        bankName: '招商银行',
+        preferredChannel: { channel: 'fake-payout' },
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('超长 → 400 且不调后端（与后端 @MaxLength(40) 对齐）', async () => {
+    const response = await accountPut(
+      putRequest('http://localhost/api/merchant/payout-account', {
+        accountName: '张三',
+        bankName: '招商银行',
+        preferredChannel: 'a'.repeat(41),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('恰好 40 个字符 → 放行', async () => {
+    await accountPut(
+      putRequest('http://localhost/api/merchant/payout-account', {
+        accountName: '张三',
+        bankName: '招商银行',
+        preferredChannel: 'a'.repeat(40),
+      }),
+    );
+
+    const [, options] = apiFetchMock.mock.calls[0];
+    const body = options?.body as Record<string, unknown>;
+    expect(body.preferredChannel).toBe('a'.repeat(40));
+  });
+});

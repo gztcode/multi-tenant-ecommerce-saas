@@ -179,6 +179,16 @@ export interface Reconciliation {
    * ⚠️ **只有详情接口有**（列表接口不查差异项）。
    */
   itemsTotal?: number;
+  /**
+   * 该任务下**可批量确认**的差异条数（阶段 6a）。
+   *
+   * 口径：`resolution = PENDING` + `type = CHANNEL_PENDING_LOCAL` + 有 `payoutId`。
+   * ⚠️ **只有账单文件（`FILE`）来源才会大于 0** —— 渠道接口（`API`）来源的
+   *    A 类差异在导入时已经自动纠正了。
+   * ⚠️ **「确认全部（N 条）」的 N 就用它** —— 前端不要自己数当前页，
+   *    当前页只有 200 条，而可确认项可能多得多。
+   */
+  actionableCount?: number;
 }
 
 /** 列表接口的信封 */

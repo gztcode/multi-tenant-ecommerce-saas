@@ -17,6 +17,14 @@ export interface PayoutVerificationTarget {
   payoutNo: string;
   /** 渠道交易号（⚠️ `PAID` 的单才有；`PROCESSING` 的单没有） */
   payoutTxnId: string | null;
+  /**
+   * 这张单**实际要走的出款渠道**（阶段 6a）。
+   *
+   * ⚠️ **必须与打款 worker 取同一个渠道** —— 两处不一致 =
+   *    「钱打到 A、核实查 B」→ B 说没打 → 放行解卡 → **重复打款**。
+   * ⚠️ **`null` 的存量单**（阶段 5m 之前还没写 `payoutChannel`）→ 核实服务回落平台默认渠道。
+   */
+  payoutChannel: string | null;
 }
 
 /** 核实的结论 */

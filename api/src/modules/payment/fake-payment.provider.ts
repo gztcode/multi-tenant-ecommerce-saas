@@ -13,6 +13,7 @@ import {
   NormalizedWebhookEvent,
   PaymentProvider,
   QueryPaymentResult,
+  RefundQueryResult,
   RefundResult,
 } from './payment-provider.interface';
 
@@ -70,6 +71,19 @@ export class FakePaymentProvider implements PaymentProvider {
   readonly provider = FAKE_PROVIDER;
 
   /**
+   * 假网关支持：在线退款、自动扣款、绑卡、按 `providerTxnId` 查单。
+   * 退款是**同步**的（本阶段 6a 仍是旧契约），`asyncRefund` 为 false。
+   */
+  readonly capabilities = {
+    refund: true,
+    asyncRefund: true,
+    asyncPayout: false,
+    queryByReferenceNo: false,
+    authorizedCharge: true,
+    paymentMethod: true,
+  };
+
+  /**
    * 发起支付。
    *
    * ⚠️ 开关没开时直接抛错——不是「返回一个假 URL」，
@@ -102,6 +116,12 @@ export class FakePaymentProvider implements PaymentProvider {
     return Promise.resolve({ status: providerTxnId ? 'PENDING' : 'UNKNOWN' });
   }
 
+  /**
+   * 退款（阶段 6c：契约已能吃下异步）。
+   *
+   * ⚠️ 默认仍是**同步成功**：本地没有真的资金通道。
+   *    需要验证异步分支时用 `armRefundScenario("processing")`。
+   */
   refund(
     paymentId: string,
     amount: number,
@@ -110,14 +130,73 @@ export class FakePaymentProvider implements PaymentProvider {
     if (!isFakePaymentEnabled()) {
       throw new ServiceUnavailableException('本地假支付网关未启用');
     }
-    // 假网关的退款是「立即成功」的：本地环境没有真的资金通道。
     // ⚠️ 参数照收不用——真实渠道要用它们（退款单号、金额、原因），
     // 这里记一笔免得 IDE 报「未使用」。
-    void paymentId;
     void amount;
     void reason;
-    return Promise.resolve({ status: 'REFUNDED' });
+
+    const refundTxnId = `fake-refund-${paymentId}`;
+    // 剧本是「一次性」的：用完就恢复默认，避免后续用例莫名走进异步分支
+    const scenario = this.refundScenario;
+    this.refundScenario = 'success';
+
+    switch (scenario) {
+      case 'processing':
+        // 记下这笔「处理中」的退款，`queryRefund` 据此返回终态
+        this.processingRefunds.set(refundTxnId, Date.now());
+        return Promise.resolve({ status: 'PROCESSING', refundTxnId });
+      case 'reject':
+        return Promise.resolve({
+          status: 'FAILED',
+          definitive: true,
+          refundTxnId,
+          failureReason: '假网关模拟退款被拒付',
+        });
+      case 'unknown':
+        return Promise.resolve({
+          status: 'FAILED',
+          definitive: false,
+          refundTxnId,
+          failureReason: '假网关模拟退款结果未知',
+        });
+      case 'success':
+      default:
+        return Promise.resolve({ status: 'SUCCESS', refundTxnId });
+    }
   }
+
+  /**
+   * 查退款状态（阶段 6c）。
+   *
+   * ⚠️ **查无此单 → `UNKNOWN`** —— 绝不冒充 `FAILED`。
+   * ⚠️ 「处理中」的退款在**下一次查询**时返回成功（模拟渠道异步完成）。
+   */
+  queryRefund(refundTxnId: string): Promise<RefundQueryResult> {
+    if (this.processingRefunds.has(refundTxnId)) {
+      this.processingRefunds.delete(refundTxnId);
+      return Promise.resolve({ status: 'SUCCESS', refundTxnId });
+    }
+    return Promise.resolve({ status: 'UNKNOWN', refundTxnId });
+  }
+
+  /**
+   * 布置下一笔退款的剧本（一次性）。
+   *
+   * ⚠️ 只影响**下一次** `refund()` 调用 —— 与 `armScenario`（出款/支付）同样的
+   *    「显式、可断言」原则，不做按金额猜测的隐式约定。
+   */
+  armRefundScenario(
+    scenario: 'success' | 'processing' | 'reject' | 'unknown',
+  ): void {
+    this.refundScenario = scenario;
+  }
+
+  /** 下一笔退款的剧本（默认 `success`） */
+  private refundScenario: 'success' | 'processing' | 'reject' | 'unknown' =
+    'success';
+
+  /** 处于「处理中」的退款（`queryRefund` 下一次查询返回成功） */
+  private readonly processingRefunds = new Map<string, number>();
 
   /**
    * 用已授权的支付方式扣款（自动续费）。
@@ -218,6 +297,54 @@ export class FakePaymentProvider implements PaymentProvider {
     // 只是**归一化后**的字段改名成 `referenceNo`。
     const referenceNo = readString(payload, 'orderNo');
     const amount = readNumber(payload, 'amount');
+
+    // ---- 事件类型（阶段 6c）----
+    // ⚠️ **缺省按 `PAYMENT`** —— 存量回调不带这个字段，升级期间必须继续可用。
+    // ⚠️ `readString` 对「缺字段」与「空串」都返回 `null` —— 两者都按缺省处理。
+    const rawEventType = readString(payload, 'eventType');
+    const eventType =
+      rawEventType === null || rawEventType === 'PAYMENT'
+        ? ('PAYMENT' as const)
+        : rawEventType === 'REFUND'
+          ? ('REFUND' as const)
+          : null;
+    if (eventType === null) {
+      // ⚠️ **未知事件类型不猜** —— 猜错会走到错误的处理分支
+      throw new BadRequestException(`未知的支付回调事件类型：${rawEventType}`);
+    }
+
+    if (eventType === 'REFUND') {
+      // 退款回调：支付交易号可以缺（退款是按退款单走的）
+      const refundTxnId = readString(payload, 'refundTxnId');
+      const rawRefundStatus = readString(payload, 'refundStatus');
+      const refundStatus =
+        rawRefundStatus === 'SUCCESS' ||
+        rawRefundStatus === 'FAILED' ||
+        rawRefundStatus === 'PROCESSING'
+          ? rawRefundStatus
+          : null;
+      if (!eventId || !referenceNo || !refundTxnId || refundStatus === null) {
+        throw new BadRequestException('退款回调缺少必要字段');
+      }
+      if (amount === null || !Number.isInteger(amount) || amount < 0) {
+        throw new BadRequestException('退款回调的金额不合法');
+      }
+      return {
+        provider: this.provider,
+        channel: this.channel,
+        eventId,
+        // ⚠️ 退款回调可能不带支付交易号 —— 归一化层用空串表示「没有」，
+        //    不引入可空字段（调用方按「空串 = 未知」处理）。
+        providerTxnId: providerTxnId ?? '',
+        referenceNo,
+        amount,
+        success: refundStatus === 'SUCCESS',
+        eventType: 'REFUND',
+        refundTxnId,
+        refundStatus,
+      };
+    }
+
     const success = payload.success === true;
 
     if (!eventId || !providerTxnId || !referenceNo) {
@@ -235,6 +362,7 @@ export class FakePaymentProvider implements PaymentProvider {
       referenceNo,
       amount,
       success,
+      eventType: 'PAYMENT',
     };
   }
 }

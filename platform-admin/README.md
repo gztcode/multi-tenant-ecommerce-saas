@@ -45,6 +45,7 @@ admin@platform.test / Admin12345!
 | `src/lib/route-helpers.ts` | 中转路由的公共辅助：`readJson` / `toErrorResponse` / `unauthorizedResponse` |
 | `src/lib/tenant.ts` | 商家类型、状态枚举与展示辅助 |
 | `src/lib/reconciliation.ts` | 渠道对账的差异分类与展示口径 |
+| `src/lib/settings.ts` | 平台设置（默认出款渠道）的类型与服务端取数 |
 | `src/app/(auth)/login/page.tsx` | 登录页 |
 | `src/app/(dashboard)/layout.tsx` | 受保护区：未登录跳 `/login`，含顶栏与登出 |
 | `src/app/(dashboard)/page.tsx` | 概览 |
@@ -55,7 +56,8 @@ admin@platform.test / Admin12345!
 | `src/app/(dashboard)/reports/` | 平台收入报表 |
 | `src/app/(dashboard)/settlements/` | 结算单列表与详情、重算、确认 / 取消确认 |
 | `src/app/(dashboard)/payouts/` | 出款单列表与详情、审批 / 拒绝 / 重试 / 解卡 |
-| `src/app/(dashboard)/reconciliations/` | 渠道对账：列表、详情、差异处置、CSV 导入 |
+| `src/app/(dashboard)/reconciliations/` | 渠道对账：列表、详情、差异处置、CSV 导入、**批量确认**（勾选 / 全选筛选结果） |
+| `src/app/(dashboard)/settings/` | **平台设置**：默认出款渠道（阶段 6 新增） |
 | `src/app/api/` | 同源中转路由 |
 | `src/app/api/auth/[...nextauth]/route.ts` | NextAuth 路由处理器 |
 
@@ -96,7 +98,7 @@ admin@platform.test / Admin12345!
 ## 单元测试
 
 ```bash
-npm test          # 395 条 / 16 个文件
+npm test          # 427 条 / 18 个文件
 npm run test:watch   # watch 模式
 ```
 

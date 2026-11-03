@@ -33,6 +33,7 @@ import {
   parseCsvToChannelRecords,
 } from './payout-reconciliation-csv';
 import { ImportReconciliationDto } from './dto/payout-reconciliation-import.dto';
+import { BatchConfirmReconciliationDto } from './dto/batch-confirm-reconciliation.dto';
 
 /**
  * 平台侧的渠道对账接口（阶段 5m）。
@@ -196,6 +197,49 @@ export class PlatformPayoutReconciliationController {
     //    → 前端 `response.json()` 直接抛「Unexpected token t」。
     //    → 一律返回对象。
     return { resolved: true };
+  }
+
+  /**
+   * 批量确认 CSV 来源的 A 类差异（阶段 6a Task 7）。
+   *
+   * ⚠️ **与 `:id/items/:itemId/resolve` 不冲突** —— 段数相同，但最后一段
+   *    是字面量 `batch-confirm` 而不是 `resolve`，Express 只按完整路径匹配。
+   *
+   * ⚠️ **允许部分成功** —— 响应里的 `failed` 不能丢：运营要能看见
+   *    哪几条需要单独处理（已处置 / 类型不符 / 出款单状态已变）。
+   * ⚠️ **非 FILE 任务 → 409**（服务层抛），文案是「只有账单文件导入的
+   *    对账任务支持批量确认」。
+   */
+  @Post(':id/items/batch-confirm')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: '批量确认 CSV 来源的 A 类差异',
+    description:
+      'mode=IDS 按勾选的差异项确认；mode=FILTER 按游标分批确认全部可确认项，' +
+      '单批上限 200 条。每条仍复核来源 / 类型 / 状态 / 归属，允许部分成功。',
+  })
+  async batchConfirm(
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body() dto: BatchConfirmReconciliationDto,
+  ) {
+    const operatorId = this.currentOperatorId();
+    if (dto.mode === 'IDS') {
+      return this.reconciliations.batchConfirm({
+        reconciliationId: id,
+        mode: 'IDS',
+        itemIds: dto.itemIds ?? [],
+        note: dto.note,
+        operatorId,
+      });
+    }
+    return this.reconciliations.batchConfirm({
+      reconciliationId: id,
+      mode: 'FILTER',
+      cursor: dto.cursor,
+      limit: dto.limit,
+      note: dto.note,
+      operatorId,
+    });
   }
 
   @Post('payouts/:payoutId/confirm-paid')

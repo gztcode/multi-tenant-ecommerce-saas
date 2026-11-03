@@ -11,6 +11,15 @@ import type { PayoutProvider } from './payout-provider.interface';
  */
 export const PAYOUT_PROVIDERS = 'PAYOUT_PROVIDERS';
 
+/**
+ * 出款渠道**实现列表**的注入令牌（阶段 6a）。
+ *
+ * ⚠️ 与 `PAYOUT_PROVIDERS`（Map）并存：Map 是给存量调用方读的兼容层，
+ *    注册表要的是「一组实现」，由它自己建索引、算描述符。
+ *    新代码只依赖注册表，不再直接用 Map。
+ */
+export const PAYOUT_PROVIDER_LIST = 'PAYOUT_PROVIDER_LIST';
+
 /** 出款渠道表的类型别名 */
 export type PayoutProviderMap = Map<string, PayoutProvider>;
 

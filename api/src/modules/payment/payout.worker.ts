@@ -1,15 +1,12 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import type { Job } from 'bullmq';
 import { PAYOUT_QUEUE } from '../../common/queue/queue.constants';
 import { QueueService } from '../queue/queue.service';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { PayoutExecutionService } from '../billing/payout-execution.service';
-import {
-  PayoutExecuteResult,
-  PayoutProvider,
-} from '../../common/payment/payout-provider.interface';
-import { PAYOUT_PROVIDERS } from '../../common/payment/payout.constants';
+import { PayoutSubmitResult } from '../../common/payment/payout-provider.interface';
+import { PayoutProviderRegistry } from '../../common/payment/payout-provider.registry';
 import { PayoutReconciliationService } from './payout-reconciliation.service';
 
 /** 出款队列任务的数据 */
@@ -78,8 +75,9 @@ export class PayoutWorker extends WorkerHost {
     private readonly execution: PayoutExecutionService,
     private readonly prisma: TenantPrismaService,
     private readonly queues: QueueService,
-    @Inject(PAYOUT_PROVIDERS)
-    private readonly providers: Map<string, PayoutProvider>,
+    // ⚠️ **阶段 6a：按 `claim.channel` 取渠道** —— 不再「取第一个」。
+    //    注册表来自 `@Global()` 的 `PayoutProvidersModule`。
+    private readonly registry: PayoutProviderRegistry,
     // ⚠️ **加在末尾且可选** —— `payout-worker.spec.ts` 用位置参数构造 worker，
     //    必填的话那个 spec 的 20 处构造都要补参数（超出本 Task 的改动范围）。
     //    可选 → 现有用例一行不用改。
@@ -152,6 +150,26 @@ export class PayoutWorker extends WorkerHost {
       return;
     }
 
+    // ⚠️ **渠道解析失败必须在 `checkGates` 之前判**（阶段 6a）——
+    //    否则会被「账户缺失」之类的闸把真实原因盖掉。
+    //
+    // ⚠️ **为什么是「落 FAILED」而不是「抛异常」**：抢单事务已经提交
+    //    （单子在 `PROCESSING`），抛出去既不会回滚成 `APPROVED`，
+    //    还不会有人调用 `markFailed` → 单子卡在 `PROCESSING`，只能人工介入。
+    //    而渠道**从未被调用** → 钱确定没打出去 → 落 FAILED 且可安全重试。
+    if (claim.channelError) {
+      this.logger.warn(
+        `出款 ${payoutId} 无法确定出款渠道：${claim.channelError}`,
+      );
+      await this.execution.markFailed(payoutId, {
+        reason: claim.channelError,
+        failedAt: await this.prisma.databaseNow(),
+        // ⚠️ **渠道从未被调用** → 钱确定没打出去 → 可安全重试
+        failedBeforePayout: true,
+      });
+      return;
+    }
+
     // ⚠️ **都不调渠道**：不满足条件就不该打钱。
     const gateFailure = this.checkGates(claim);
     if (gateFailure) {
@@ -165,15 +183,39 @@ export class PayoutWorker extends WorkerHost {
     }
 
     // ---- STEP 2：调渠道 ----
-    // ⚠️ **本阶段只有一个出款渠道**（假网关），所以直接取第一个。
-    //    ⚠️ **将来接真渠道时这里要改成按 `payouts.payoutChannel` 取** ——
-    //    取「第一个」的话，加了第二家之后所有出款都会打到第一家。
-    const provider = this.firstProvider();
-    if (!provider) {
+    //
+    // ⚠️ **按抢单时解析好的渠道取实现**（阶段 6a）—— 不再「取第一个」：
+    //    注册两家之后，「取第一个」会让所有出款都打到第一家，
+    //    而核实服务按 `payoutChannel` 查 → 两处不一致 = 重复打款。
+    if (!claim.channel) {
+      // ⚠️ **正常路径不该走到这里**（`channelError` 会先拦住）——
+      //    只有代码 bug 才会「抢到单却既没渠道也没错误」→ 留痕才好排查。
+      this.logger.warn(
+        `出款 ${payoutId} 没有可用的出款渠道（抢单结果既无 channel 也无 channelError）`,
+      );
       await this.execution.markFailed(payoutId, {
         reason: '没有可用的出款渠道',
         failedAt: await this.prisma.databaseNow(),
         // ⚠️ **渠道压根没被调用** → 钱确定没打出去 → 可安全重试
+        failedBeforePayout: true,
+      });
+      return;
+    }
+
+    let provider;
+    try {
+      provider = this.registry.get(claim.channel);
+    } catch (error) {
+      // ⚠️ **审批后渠道被停用 / 未注册**（运营改了配置）——
+      //    渠道从未被调用，钱确定没打出去 → 落 FAILED 可重试，
+      //    绝不能抛出去把单子留在 `PROCESSING`、钱没打也没人重试。
+      const reason = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `出款 ${payoutId} 取不到渠道 ${claim.channel}：${reason}`,
+      );
+      await this.execution.markFailed(payoutId, {
+        reason,
+        failedAt: await this.prisma.databaseNow(),
         failedBeforePayout: true,
       });
       return;
@@ -194,9 +236,9 @@ export class PayoutWorker extends WorkerHost {
       );
     }
 
-    let result: PayoutExecuteResult;
+    let result: PayoutSubmitResult;
     try {
-      result = await provider.execute({
+      result = await provider.submit({
         referenceId: payoutId,
         referenceNo: claim.payoutNo,
         amount: claim.netAmount,
@@ -204,13 +246,15 @@ export class PayoutWorker extends WorkerHost {
         attempt: claim.attemptCount,
       });
     } catch (error) {
-      // ⚠️ **渠道抛异常 = 这次打款失败**，走重试路径
-      //    （不能让它冒到 BullMQ —— `attempts: 1` 时它会进 failed 集合，
-      //    而且我们自己的重试逻辑就永远不会跑）
+      // ⚠️ **渠道抛异常 = 结果未知**（阶段 6b）—— 超时 / 网络中断时钱**可能**
+      //    已经打出去 → `definitive: false` → 不自动重试，只能人工核对。
+      //    不能让它冒到 BullMQ —— `attempts: 1` 时它会进 failed 集合，
+      //    而且我们自己的重试逻辑就永远不会跑。
       result = {
-        providerTxnId: '',
+        providerTxnId: undefined,
         status: 'FAILED',
         amount: claim.netAmount,
+        definitive: false,
         failureReason: error instanceof Error ? error.message : String(error),
       };
     }
@@ -255,7 +299,17 @@ export class PayoutWorker extends WorkerHost {
    * 打款之后的三条路。
    *
    * ⚠️ **X3 金额核对**：渠道返回的金额必须等于请求金额，
-   *    不等就是**渠道打错了**（打 100 块、账上记 1000 块）→ 落 `FAILED`。
+   *    不等就是**渠道打错了**（打 100 块、账上记 1000 块）→ 落 `FAILED`，
+   *    `failedBeforePayout: false`（钱可能已按错误金额打出）、**不自动重试**。
+   *
+   * ## 阶段 6b：按 `submit` 的三种状态分流（设计 §6.2）
+   *
+   * - `SUCCESS` → `markPaid`
+   * - `FAILED` + `definitive: true` → `failedBeforePayout: true`，进现有重试预算
+   * - `FAILED` + `definitive: false` → `failedBeforePayout: false`，**不自动重试**
+   * - `PROCESSING` → **保持 `PROCESSING`**，不落失败、不投重试 job，
+   *   交给 `scanStuck` 轮询
+   * - `submit` 抛异常 → 落 `FAILED`、`failedBeforePayout: false`、**不自动重试**
    *
    * @param channel 本次实际调用的渠道名（**由调用方传进来**，
    *                不在这里重新取 —— 两次取可能取到不同的渠道）
@@ -263,21 +317,53 @@ export class PayoutWorker extends WorkerHost {
   private async settle(
     payoutId: string,
     attemptCount: number,
-    result: PayoutExecuteResult,
+    result: PayoutSubmitResult,
     requestedAmount: number,
     channel: string,
   ): Promise<void> {
     const now = await this.prisma.databaseNow();
 
-    if (result.status !== 'SUCCESS') {
-      const reason = result.failureReason ?? '渠道返回失败';
-      await this.handleFailure(
+    if (result.status === 'PROCESSING') {
+      // ⚠️ **`PROCESSING` 不是失败**（阶段 6b，设计 §6.2）——
+      //    异步渠道第一次只返回 `PROCESSING`（钱可能已打出去）。
+      //    → **保持 `PROCESSING`**，不落 `FAILED`、不投重试 job，
+      //      交给 `scanStuck` 轮询渠道。
+
+      // ⚠️ **不在这里写 `processingAt`** —— `claimForExecution` 抢单时
+      //    已经与状态改 `PROCESSING` 写进同一个 `updateMany` 了。
+      //    重复写只会覆盖成更晚的时刻，把「卡住多久」的判据弄歪。
+
+      // ⚠️ **`payoutChannel` 也不在这里写** —— 调渠道之前已经调过
+      //    `recordChannel`（按 `status: PROCESSING` 守卫），这里再写是重复动作。
+
+      // ⚠️ **必须有日志** —— 否则运营看到一张单停在 `PROCESSING`，
+      //    无从判断是渠道慢、还是 worker 漏了就走了。
+      this.logger.warn(
+        `出款 ${payoutId} 的渠道返回 PROCESSING（交易号 ${result.providerTxnId ?? '无'}），` +
+          `保持 PROCESSING，交给 scanStuck 轮询结果`,
+      );
+      return;
+    }
+
+    if (result.status === 'FAILED') {
+      // ⚠️ **`definitive` 决定能不能自动重试**（阶段 6b，设计 §6.2）：
+      //    - `true`：渠道明确说没打 → 钱确定没出去 → 进现有重试预算；
+      //    - `false`：结果未知 → 钱可能已经打出去 → 落了就不能自动重试。
+      if (result.definitive) {
+        await this.handleFailure(
+          payoutId,
+          attemptCount,
+          result.failureReason ?? '渠道返回失败',
+          now,
+          result.providerTxnId,
+        );
+        return;
+      }
+      const reason = `${result.failureReason ?? '渠道返回失败'}（结果未知，需人工核对）`;
+      await this.settleUnknownFailure(
         payoutId,
-        attemptCount,
         reason,
         now,
-        // ⚠️ **渠道交易号一路带下来** —— `handleFailure` 拿不到 `result`
-        //    就只能传空字符串，「实时核实」对 `FAILED` 的单就成了死代码
         result.providerTxnId,
       );
       return;
@@ -303,24 +389,56 @@ export class PayoutWorker extends WorkerHost {
   }
 
   /**
-   * 失败后的两条路（护栏 X7）。
+   * 「结果未知」的失败：直接落 `FAILED`，**不进重试预算**。
+   *
+   * ⚠️ **为什么不能走 `handleFailure`**：那条路在未达上限时会退回 `APPROVED`
+   *    并延迟重投 —— 对「钱可能已经打出去」的单，这等于确定性重复打款。
+   *    这里一律 `failedBeforePayout: false`，只能走人工核对。
+   */
+  private async settleUnknownFailure(
+    payoutId: string,
+    reason: string,
+    now: Date,
+    providerTxnId: string | undefined,
+  ): Promise<void> {
+    await this.execution.markFailed(payoutId, {
+      reason,
+      failedAt: now,
+      // ⚠️ **渠道已经调过了** → 钱**可能**已经打出去 → 不能重试
+      failedBeforePayout: false,
+      // ⚠️ **有交易号就带上** —— 「实时核实」对 FAILED 的单靠它
+      providerTxnId,
+    });
+  }
+
+  /**
+   * **确定失败**后的两条路（护栏 X7）。
+   *
+   * ⚠️ **只处理 `definitive: true` 的失败** —— 结果未知的失败由
+   *    `settleUnknownFailure` 直接落库，**不走这里**（不能自动重试）。
+   *    渠道抛异常也按「结果未知」走 `settleUnknownFailure`（阶段 6b）。
    *
    * - 未超上限 → 退回 `APPROVED`，**延迟后重新入队**
-   * - 达到上限 → 落 `FAILED`（并释放明细占用）
+   * - 达到上限 → 落 `FAILED`（并释放明细占用），
+   *   `failedBeforePayout: true` —— 渠道明确说没打，钱确定没出去
+   *
+   * ⚠️ **重试预算只对 `definitive: true` 生效**（阶段 6b，设计 §6.2）。
    */
   private async handleFailure(
     payoutId: string,
     attemptCount: number,
     reason: string,
     now: Date,
-    providerTxnId: string,
+    providerTxnId: string | undefined,
   ): Promise<void> {
     if (attemptCount >= PAYOUT_MAX_ATTEMPTS) {
       await this.execution.markFailed(payoutId, {
         reason,
         failedAt: now,
-        // ⚠️ **渠道已经调过了** → 钱**可能**已经打出去 → 不能重试
-        failedBeforePayout: false,
+        // ⚠️ **`definitive: true` = 渠道明确说没打** → 钱确定没出去
+        //    → 可人工重试（平台端的「重试」按钮只对 true 的单出现）。
+        //    ⚠️ 这里**不能**写 false —— 那会让一张确定没打钱的单只能人工处理。
+        failedBeforePayout: true,
         // ⚠️ **新增**（阶段 5m）：渠道失败时也会给交易号 → 存下来才能核实
         providerTxnId,
       });
@@ -418,13 +536,5 @@ export class PayoutWorker extends WorkerHost {
         }`,
       );
     }
-  }
-
-  /** 取第一个已注册的渠道（假网关只有一家） */
-  private firstProvider(): PayoutProvider | undefined {
-    for (const provider of this.providers.values()) {
-      return provider;
-    }
-    return undefined;
   }
 }

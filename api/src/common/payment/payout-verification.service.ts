@@ -1,9 +1,9 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ReconciliationDiffType } from '@prisma/client';
 import { TenantPrismaService } from '../tenant/tenant-prisma.service';
 import { platformScope, tenantContext } from '../tenant/tenant-context';
-import { PAYOUT_PROVIDERS } from './payout.constants';
-import type { PayoutProvider } from './payout-provider.interface';
+import { PayoutProviderRegistry } from './payout-provider.registry';
+import { PlatformSettingService } from '../platform-settings/platform-setting.service';
 import {
   PayoutVerification,
   PayoutVerificationTarget,
@@ -66,7 +66,8 @@ const RECONCILIATION_TRUSTED_TYPES: ReconciliationDiffType[] = [
  * 第 1 层：实时渠道核实
  *   → provider.queryPayout({ referenceNo: payout.payoutNo })
  *   → 渠道说 SUCCESS → 拒绝解卡（并纠正为 PAID）
- *   → 渠道说 FAILED  → 允许解卡（渠道明确说没打）
+ *   → 渠道说 FAILED 且 definitive === true → 允许解卡（渠道明确说没打）
+ *   → 渠道说 FAILED 但结果未知（definitive !== true）→ 第 2 层
  *   → 核实不可用 → 第 2 层
  *
  * 第 2 层：查该单最近一次对账结果
@@ -89,9 +90,13 @@ export class PayoutVerificationService implements PayoutVerification {
   private readonly logger = new Logger(PayoutVerificationService.name);
 
   constructor(
-    @Inject(PAYOUT_PROVIDERS)
-    private readonly providers: Map<string, PayoutProvider>,
+    // ⚠️ **阶段 6a：按出款单的渠道取实现** —— 与打款 worker 同一个注册表实例
+    //    （`PayoutProvidersModule` 是 `@Global()`，两处注入的是同一个实例）。
+    private readonly registry: PayoutProviderRegistry,
     private readonly prisma: TenantPrismaService,
+    // ⚠️ **存量单（`payoutChannel` 为 null）才用它兜底** —— 与抢单时解析
+    //    「平台默认渠道」是同一套规则（DB → env）。
+    private readonly settings: PlatformSettingService,
   ) {}
 
   async verify(
@@ -112,11 +117,15 @@ export class PayoutVerificationService implements PayoutVerification {
   private async verifyRealtime(
     target: PayoutVerificationTarget,
   ): Promise<PayoutVerificationVerdict | null> {
-    const provider = this.pickProvider();
-    if (!provider) {
-      return null;
-    }
     try {
+      // ⚠️ **必须用单子自己的渠道**（阶段 6a）—— 与打款 worker 取同一渠道，
+      //    否则「钱打到 A、核实查 B」→ B 说没打 → 放行解卡 → 重复打款。
+      // ⚠️ **`payoutChannel` 为 null 的存量单**才回落平台默认渠道。
+      const channel =
+        target.payoutChannel ??
+        (await this.settings.getPayoutDefaultChannel()).channel;
+      const provider = this.registry.get(channel);
+
       // ⚠️ **用 referenceNo（payoutNo），不是 providerTxnId** ——
       //    `PROCESSING` 的单**没有** `payoutTxnId`（Task 3 起只有落 `FAILED`
       //    时才写它，落 `PAID` 时由 `markPaid` 写），所以 `referenceNo`
@@ -132,7 +141,9 @@ export class PayoutVerificationService implements PayoutVerification {
           paidAt: result.paidAt,
         };
       }
-      if (result.status === 'FAILED') {
+      // ⚠️ **`FAILED` 必须 `definitive === true` 才算结论**（阶段 6b）——
+      //    只有渠道**明确说没打**才能放行解卡；「结果未知」放行 = 重复打款。
+      if (result.status === 'FAILED' && result.definitive === true) {
         return { verdict: 'FAILED', source: 'REALTIME' };
       }
       // ⚠️ **渠道非终态 → 问不出结论** → 交给下一层
@@ -141,7 +152,9 @@ export class PayoutVerificationService implements PayoutVerification {
       );
       return null;
     } catch (error) {
-      // ⚠️ **渠道不可用（抛错）→ 不是「渠道说没打」** → 交给下一层
+      // ⚠️ **渠道不可用 / 取不到渠道（抛错）→ 不是「渠道说没打」** → 交给下一层
+      //    ⚠️ **绝不抛给调用方** —— 抛出去会把「问不出结论」变成 500，
+      //    而正确处置是 fail-closed（第 2 / 3 层）。
       this.logger.warn(
         `出款 ${target.id} 的渠道核实失败：${
           error instanceof Error ? error.message : String(error)
@@ -209,28 +222,5 @@ export class PayoutVerificationService implements PayoutVerification {
       return { verdict: 'FAILED', source: 'RECONCILIATION' };
     }
     return null;
-  }
-
-  /**
-   * 取渠道实现。
-   *
-   * ⚠️ **本阶段只有一个渠道（本地假网关）→ 取第一个**。
-   * ⚠️ **将来接第二家时这里要改成按 `payouts.payoutChannel` 取** ——
-   *    取「第一个」的话，加了第二家之后会查错渠道。
-   *    ⚠️ 注意 `PROCESSING` 的单**还没有 `payoutChannel`**（那是 markPaid 写的）
-   *    → 将来需要用 `payoutNo` 前缀或别的约定来定位渠道。
-   *
-   * ⚠️⚠️ **解卡核实闸与打款 worker 必须查同一个渠道 —— 两处要一起改**
-   *    （打款 worker 见 `modules/payment/payout.worker.ts` 的 `firstProvider`）。
-   *    两者若一个改了另一个没改，就会出现
-   *    **「钱打到 A 渠道、核实查 B 渠道」** ——
-   *    核实从 B 渠道问出「没打」，实际钱已经从 A 渠道打出去了 → **重复打款**。
-   *    → 改渠道选择逻辑时，**核实服务与 worker 必须一起改、一起验**。
-   */
-  private pickProvider(): PayoutProvider | undefined {
-    for (const provider of this.providers.values()) {
-      return provider;
-    }
-    return undefined;
   }
 }

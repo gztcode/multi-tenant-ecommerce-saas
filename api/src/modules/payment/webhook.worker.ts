@@ -6,6 +6,7 @@ import { PAYMENT_WEBHOOK_QUEUE } from '../../common/queue/queue.constants';
 import { runForTenant } from '../../common/tenant/tenant-context';
 import { PaymentService } from './payment.service';
 import { NormalizedWebhookEvent } from './payment-provider.interface';
+import { REFUND_SCAN_JOB } from './refund-scan.scheduler';
 
 /** webhook 队列任务的数据 */
 export interface PaymentWebhookJob {
@@ -30,6 +31,14 @@ export interface PaymentWebhookJob {
   referenceNo: string;
   amount: number;
   success: boolean;
+  /** 事件类型（阶段 6c）：缺省按 `PAYMENT` */
+  eventType?: 'PAYMENT' | 'REFUND';
+  /** 退款事件的渠道受理号 */
+  refundTxnId?: string;
+  /** 退款事件的渠道退款状态 */
+  refundStatus?: 'SUCCESS' | 'FAILED' | 'PROCESSING';
+  /** 退款失败是否确定（仅退款事件有意义） */
+  definitive?: boolean;
 }
 
 /**
@@ -60,6 +69,13 @@ export class WebhookWorker extends WorkerHost {
   }
 
   async process(job: Job<PaymentWebhookJob>): Promise<void> {
+    if (job.name === REFUND_SCAN_JOB) {
+      // ⚠️ **退款扫描没有租户**：它是跨租户的，由 `scanRefunding`
+      //    自己按每张单的租户重建上下文。
+      const handled = await this.paymentService.scanRefunding();
+      this.logger.debug(`退款扫描完成：本轮向渠道核实 ${handled} 张`);
+      return;
+    }
     if (job.name !== 'payment') {
       return;
     }
@@ -77,7 +93,20 @@ export class WebhookWorker extends WorkerHost {
         referenceNo: data.referenceNo,
         amount: data.amount,
         success: data.success,
+        // ⚠️ **退款事件必须把类型与状态带进状态机**：少了它们
+        //    消费端会把它当成支付事件去反查订单，静默丢掉这笔退款。
+        eventType: data.eventType,
+        refundTxnId: data.refundTxnId,
+        refundStatus: data.refundStatus,
+        definitive: data.definitive,
       };
+
+      if ((data.eventType ?? 'PAYMENT') === 'REFUND') {
+        // ⚠️ **退款事件走退款状态机**：`PROCESSING` 不改状态，
+        //    `SUCCESS` 才落 `REFUNDED`。
+        await this.paymentService.applyRefundEvent(event, data.tenantId);
+        return;
+      }
 
       // ⚠️ **第 2~5 步在同一个事务里**：订单转 PAID 与记 DEDUCT 流水分属
       // 两个事务的话，会出现「订单已支付但流水没记」的账目缺口。

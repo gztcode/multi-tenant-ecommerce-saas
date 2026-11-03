@@ -20,6 +20,7 @@
  * 幂等去重按 `provider` 走：同一笔交易在服务商模式下会**同时**收到
  * 「服务商」与「直连」两个渠道的通知，只有按 provider 才能识别成同一笔。
  */
+import type { ChannelCapabilities } from '../../common/channel/channel.types';
 
 /** 发起支付时要传给渠道的信息 */
 export interface CreatePaymentInput {
@@ -82,10 +83,40 @@ export interface QueryPaymentResult {
   status: string;
 }
 
-/** 退款的结果 */
-export interface RefundResult {
-  /** 渠道侧的退款状态 */
-  status: string;
+/** 退款状态（阶段 6c：真实渠道退款是异步的） */
+export type RefundStatus = 'SUCCESS' | 'PROCESSING' | 'FAILED';
+
+/**
+ * 退款的结果。
+ *
+ * ⚠️ **`PROCESSING` 不是失败，也不是成功** —— 它表示「渠道已受理、结果未知」。
+ *    把它当成功 = 钱还没退回就告诉用户「已退款」；当失败 = 用户重复申请退款。
+ *    唯一正确的处置是落 `REFUNDING`，等 `queryRefund` / 回调确认。
+ *
+ * ⚠️ **`definitive` 只对 `FAILED` 有意义**：
+ *    `true` = 渠道明确拒付（钱确定没退出去）→ 可以安全重试；
+ *    `false` = 结果未知（超时 / 网关错误）→ **绝不能自动重试**。
+ */
+export type RefundResult =
+  | { status: 'SUCCESS'; refundTxnId?: string }
+  | { status: 'PROCESSING'; refundTxnId?: string }
+  | {
+      status: 'FAILED';
+      definitive: boolean;
+      refundTxnId?: string;
+      failureReason?: string;
+    };
+
+/** 查退款的结果（`queryRefund`） */
+export interface RefundQueryResult {
+  /**
+   * ⚠️ **`UNKNOWN` 表示「查不到 / 问不出结论」**，调用方必须按「状态不变、
+   *    只告警」处理 —— 绝不能冒充 `FAILED`（那会让运营重试 → 重复退款）。
+   */
+  status: 'SUCCESS' | 'FAILED' | 'PROCESSING' | 'UNKNOWN';
+  refundTxnId?: string;
+  definitive?: boolean;
+  failureReason?: string;
 }
 
 /**
@@ -114,6 +145,25 @@ export interface NormalizedWebhookEvent {
   amount: number;
   /** 这次回调表示「支付成功」还是「支付失败」 */
   success: boolean;
+  /**
+   * 事件类型（阶段 6c）。
+   *
+   * ⚠️ **缺省按 `PAYMENT` 处理** —— 存量渠道（假网关的支付回调）不带这个字段，
+   *    升级期间不能因为少了它就把老回调判成非法。
+   * ⚠️ **未知类型必须 400 且不落库**（由 webhook 端点判定）。
+   */
+  eventType?: 'PAYMENT' | 'REFUND';
+  /** 退款交易号（`eventType === 'REFUND'` 时给） */
+  refundTxnId?: string;
+  /** 渠道侧的退款状态（`eventType === 'REFUND'` 时给） */
+  refundStatus?: RefundStatus;
+  /**
+   * 退款失败是否**确定**（`refundStatus === 'FAILED'` 时有意义）。
+   *
+   * ⚠️ **缺省按未知（`false`）处理**：拿不到明确声明时宁可保持 `REFUNDING`，
+   *    也不要当成「渠道明确拒付」而允许重试 —— 重试可能变成重复退款。
+   */
+  definitive?: boolean;
 }
 
 /**
@@ -128,6 +178,17 @@ export interface PaymentProvider {
   readonly channel: string;
   /** 服务提供方名 */
   readonly provider: string;
+  /**
+   * 能力声明（阶段 6a）。
+   *
+   * ⚠️ **必填**：退款 / 自动扣款 / 绑卡前都要先看它；
+   *    不支持的动作必须显式 409，不能调下去再假装成功。
+   */
+  readonly capabilities: ChannelCapabilities;
+  /** 是否仅限非生产环境；生产环境注册表直接拒绝 */
+  readonly devOnly?: boolean;
+  /** 单次调用超时预算（毫秒），不写用默认值 */
+  readonly timeoutMs?: number;
 
   /** 发起支付，返回支付页面所需的数据 */
   createPayment(input: CreatePaymentInput): Promise<CreatePaymentResult>;
@@ -147,6 +208,15 @@ export interface PaymentProvider {
     amount: number,
     reason: string,
   ): Promise<RefundResult>;
+
+  /**
+   * 查一笔退款的状态（阶段 6c）。
+   *
+   * @param refundTxnId 渠道侧的退款交易号（`refund()` 返回的 `refundTxnId`）
+   *
+   * ⚠️ **查无此单返回 `UNKNOWN`**，不要抛、也不要返回 `FAILED`。
+   */
+  queryRefund(refundTxnId: string): Promise<RefundQueryResult>;
 
   /**
    * 用**已授权的支付方式**直接扣款（自动续费用）。

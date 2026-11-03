@@ -13,7 +13,11 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { ApiError } from '@/lib/api-client';
-import type { PayoutAccount } from '@/lib/payout';
+import {
+  PAYOUT_CHANNEL_SOURCE_LABEL,
+  type PayoutAccountView,
+  type PayoutChannelOption,
+} from '@/lib/payout';
 
 /**
  * 收款账户表单。
@@ -24,13 +28,20 @@ import type { PayoutAccount } from '@/lib/payout';
  */
 export function PayoutAccountForm({
   initial,
+  channels,
 }: {
-  initial: PayoutAccount | null;
+  initial: PayoutAccountView | null;
+  channels: PayoutChannelOption[];
 }) {
   const router = useRouter();
   const [accountName, setAccountName] = useState(initial?.accountName ?? '');
   const [bankName, setBankName] = useState(initial?.bankName ?? '');
   const [accountNo, setAccountNo] = useState('');
+  // ⚠️ **空串 = 使用平台默认**：与「不传 = 不修改」区分开 ——
+  //    下拉永远带这个键，用户把选项改回第一项就是要「清除自己的配置」。
+  const [preferredChannel, setPreferredChannel] = useState(
+    initial?.preferredChannel ?? '',
+  );
   const [pending, setPending] = useState(false);
   const [success, setSuccess] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -47,7 +58,12 @@ export function PayoutAccountForm({
       const response = await fetch('/api/merchant/payout-account', {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ accountName, bankName, accountNo }),
+        body: JSON.stringify({
+          accountName,
+          bankName,
+          accountNo,
+          preferredChannel,
+        }),
       });
 
       if (!response.ok) {
@@ -131,6 +147,55 @@ export function PayoutAccountForm({
             <p className="text-xs text-muted-foreground">
               出于安全考虑，页面不显示完整账号；留空表示不修改原账号。
             </p>
+          </div>
+          <div className="flex flex-col gap-1">
+            <Label htmlFor="preferredChannel">默认出款渠道</Label>
+            <select
+              id="preferredChannel"
+              value={preferredChannel}
+              onChange={(event) => setPreferredChannel(event.target.value)}
+              className="h-9 rounded-md border border-input bg-transparent px-3 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+            >
+              <option value="">不选（使用平台默认）</option>
+              {/* ⚠️ **当前配置的渠道可能不在可选列表里**（已停用 / 被过滤掉）。
+                  不补这一项的话，下拉会显示成第一项 —— 商家以为自己用的是平台
+                  默认，保存一次就把自己的配置清掉了。
+                  ⚠️ **文案按 `preferredChannelUnavailable` 区分**：渠道其实可用、
+                  只是列表没取到时，标成「不可用」会误导商家去改一个好配置。 */}
+              {initial?.preferredChannel &&
+                !channels.some((o) => o.channel === initial.preferredChannel) && (
+                  <option value={initial.preferredChannel}>
+                    {initial.preferredChannel}
+                    {initial.preferredChannelUnavailable
+                      ? '（当前配置，不可用）'
+                      : '（当前配置）'}
+                  </option>
+                )}
+              {channels.map((option) => (
+                <option key={option.channel} value={option.channel}>
+                  {option.channel}（{option.provider}）
+                </option>
+              ))}
+            </select>
+            {/* ⚠️ **文案要说准「只影响新单」**：出款单一旦开始执行就写死了
+                `payoutChannel`，之后不再换渠道（设计 §4.4）。 */}
+            <p className="text-xs text-muted-foreground">
+              只影响新出款单；已经开始执行的单不会换渠道。
+              {initial && (
+                <>
+                  {' '}
+                  当前生效渠道：{initial.effectiveChannel || '（平台尚未配置）'}（
+                  {PAYOUT_CHANNEL_SOURCE_LABEL[initial.effectiveSource]}）。
+                </>
+              )}
+            </p>
+            {/* ⚠️ **停用不回落**：后端执行时会 fail-closed，所以这里必须醒目提示
+                「新出款会失败」，而不是静默展示平台默认渠道。 */}
+            {initial?.preferredChannelUnavailable && (
+              <p role="alert" className="text-sm font-medium text-destructive">
+                当前配置的渠道已停用，新出款会失败，请重新选择。
+              </p>
+            )}
           </div>
           {error && (
             <p role="alert" className="text-sm text-destructive">

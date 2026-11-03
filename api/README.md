@@ -21,8 +21,8 @@ npm run start:dev
 ## 测试
 
 ```bash
-npm test              # 单元测试（628 条 / 32 个套件）
-npm run test:e2e      # 端到端测试（646 条 / 39 个套件）
+npm test              # 单元测试（868 条 / 46 个套件）
+npm run test:e2e      # 端到端测试（657 条 / 40 个套件，串行）
 npm run test:cov      # 单元测试覆盖率
 npm run test:cov:e2e  # e2e 覆盖率
 npm run lint          # 静态检查
@@ -40,7 +40,7 @@ npm run check:ledger             # 校验账目一致性
 npm run migrate:payout-encryption   # 收款账户明文 → 密文的存量迁移
 ```
 
-## 本地假网关
+## 本地假网关与沙箱
 
 `FAKE_PAYMENT_ENABLED` / `FAKE_PAYOUT_ENABLED` **默认关闭**，且**只在非生产环境存在**：
 
@@ -48,7 +48,23 @@ npm run migrate:payout-encryption   # 收款账户明文 → 密文的存量迁�
 - 假出款网关会模拟「打款失败」。
 
 它们是**安全边界**，不是便利开关。`NODE_ENV=production` 且任一开关为 `true` 时，
-进程**硬失败**（`assert-secure-config.ts`）。两个开关**相互独立**，不要合并。
+进程**硬失败**（`assert-secure-config.ts`）。两个开关**相互独立**，不要合并
+（支付假网关的渠道名是 `fake`，出款是 `fake-payout`）。
+
+沙箱渠道（`sandbox`）走 HTTP mock 服务，**仅开发环境可见**，
+用 `SANDBOX_*` 环境变量指向它（见根目录 `AGENTS.md` 的「渠道配置与默认渠道」）。
+
+## 渠道适配层（阶段 6）
+
+| 路径 | 说明 |
+| --- | --- |
+| `src/common/channel/` | 渠道描述符、配置解析（`channel-config.ts` 是 devOnly 名单的**唯一事实来源**）与告警钩子 |
+| `src/common/payment/` | 出款渠道契约（`submit` / `queryPayout`）、渠道注册表与假出款网关实现 |
+| `src/modules/payment/` | 支付侧渠道注册表、退款状态机（`REFUNDING`）、渠道对账引擎 |
+| `src/common/platform-settings/` | 平台默认出款渠道的读写（DB 优先、环境变量兜底、未配置时 fail-closed） |
+
+⚠️ **新渠道接入必须先过 `test/channel-contract/` 的共享契约**，
+契约不过 = 不允许接入（见 `AGENTS.md` 的「新渠道准入」）。
 
 ## 目录
 
@@ -56,6 +72,8 @@ npm run migrate:payout-encryption   # 收款账户明文 → 密文的存量迁�
 | --- | --- |
 | `src/common/tenant/` | 租户隔离的核心：Prisma query extension、租户上下文、三张白名单表 |
 | `src/common/payment/` | 出款渠道与核实契约的下沉区。**`common/` 下唯一持有 `@Module` 的目录**——因为 `billing` 不能 import `payment`（成环） |
+| `src/common/channel/` | 渠道描述符、配置解析与告警钩子（阶段 6 新增） |
+| `src/common/platform-settings/` | 平台默认出款渠道设置（阶段 6 新增） |
 | `src/common/queue/` | BullMQ 队列名常量 |
 | `src/common/crypto/` | 字段级加密（AES-256-GCM） |
 | `src/modules/` | 业务模块：auth / catalog / cart / order / payment / coupon / billing / theme / media / inventory / stores / tenants / tenancy / queue |

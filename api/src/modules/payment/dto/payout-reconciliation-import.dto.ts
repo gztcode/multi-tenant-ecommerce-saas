@@ -1,4 +1,10 @@
-import { IsDateString, IsOptional, IsString, MinLength } from 'class-validator';
+import {
+  IsDateString,
+  IsOptional,
+  IsString,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 
 /**
  * CSV 账单导入的入参。
@@ -17,6 +23,9 @@ export class ImportReconciliationDto {
   @IsOptional()
   @IsString()
   @MinLength(1)
+  // ⚠️ **长度上限与平台设置一致**：渠道名会原样落进对账任务行的 `channel`，
+  //    前端下拉最长 40；超长值只可能是手工构造 / 脏数据。
+  @MaxLength(40)
   channel?: string;
 
   /**
