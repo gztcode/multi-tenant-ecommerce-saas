@@ -156,8 +156,12 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public
-      DATABASE_URL_TEST: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public
+      # ⚠️ **必须显式放大连接池**：GitHub 2 核 runner 的 Prisma 默认池只有 5
+      #    （CPU×2+1）。5 个并发下单各占一条事务连接，事务内的
+      #    `this.prisma.databaseNow()` 又要再借一条 → 池被打满互相等 → P2024。
+      #    本地核多（池 ~21）所以复现不出来。
+      DATABASE_URL: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public&connection_limit=20&pool_timeout=20
+      DATABASE_URL_TEST: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public&connection_limit=20&pool_timeout=20
       REDIS_URL: redis://localhost:16380
       BULLMQ_PREFIX: bull-e2e
       # CI 的 2 核 runner 上，5 个并发下单会在同一行 SKU 锁上排队，
