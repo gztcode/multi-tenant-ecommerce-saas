@@ -581,7 +581,7 @@ export class CouponService {
   // ============================================================
 
   /**
-   * 当前可领取的券。
+   * 当前可领取的券（分页）。
    *
    * ⚠️ **时间判定用数据库的 now()**（M15）：
    * `startsAt <= dbNow AND endsAt > dbNow`（左闭右开，
@@ -593,35 +593,80 @@ export class CouponService {
    * 不把它列出来的话，用户在领券中心根本看不到平台券。
    * 所以额外走一次 `platformScope()`，**where 里必须带
    * `scope: PLATFORM`**——不加的话就是「把别家店的券也列出来」（M3）。
+   *
+   * ⚠️ **店铺券 + 平台券两个来源**，按 `createdAt desc`（同刻用 id）合并后分页。
+   *    精确跨来源分页需要各取 `skip + pageSize` 的窗口；窗口设硬上限，
+   *    避免 `page` 很大时退化成无界查询（总数用独立 count，仍然准确）。
+   *    ⚠️ **窗口之外的条目不可达**：`skip >= 上限` 时返回空 items，
+   *    但 `total` 仍准确（前端按 `pageSize=100` 取第一页，不会碰到）。
    */
-  async listAvailable(): Promise<{ items: Coupon[]; total: number }> {
+  async listAvailable(params?: { page?: number; pageSize?: number }): Promise<{
+    items: Coupon[];
+    total: number;
+    page: number;
+    pageSize: number;
+  }> {
     const tenantId = this.currentTenantId();
     const dbNow = await this.databaseNow(this.prisma);
+    const { page, pageSize } = clampPagination(params?.page, params?.pageSize);
+    const skip = (page - 1) * pageSize;
+    // 合并窗口上限：超过它的深页返回空 items（total 仍准确）。
+    // ⚠️ 与 MAX_PAGE_SIZE（100）是两回事：这里限制的是「各来源取多少行
+    //    再在内存里合并」，不是单页条数。
+    const MAX_MERGE_WINDOW = 1000;
+    const take = Math.min(skip + pageSize, MAX_MERGE_WINDOW);
 
-    const shopCoupons = await this.prisma.coupon.findMany({
-      where: {
-        tenantId,
-        status: CouponStatus.ACTIVE,
-        startsAt: { lte: dbNow },
-        endsAt: { gt: dbNow },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+    const shopWhere = {
+      tenantId,
+      // ⚠️ 显式限定 SHOP：平台券挂在平台租户下，正常不会与店铺券重叠，
+      //    但数据异常时不能靠「tenantId 不同」这种隐式假设去重。
+      scope: CouponScope.SHOP,
+      status: CouponStatus.ACTIVE,
+      startsAt: { lte: dbNow },
+      endsAt: { gt: dbNow },
+    };
+    const platformWhere = {
+      scope: CouponScope.PLATFORM,
+      status: CouponStatus.ACTIVE,
+      startsAt: { lte: dbNow },
+      endsAt: { gt: dbNow },
+    };
 
-    const platformCoupons = await tenantContext.run(platformScope(), async () =>
-      this.prisma.coupon.findMany({
-        where: {
-          scope: CouponScope.PLATFORM,
-          status: CouponStatus.ACTIVE,
-          startsAt: { lte: dbNow },
-          endsAt: { gt: dbNow },
-        },
-        orderBy: { createdAt: 'desc' },
-      }),
+    const [shopCoupons, platformCoupons, shopTotal, platformTotal] =
+      await Promise.all([
+        this.prisma.coupon.findMany({
+          where: shopWhere,
+          // ⚠️ 同一 createdAt 时用 id 兜底，保证两次查询与内存合并的次序稳定；
+          //    否则跨页可能重复或漏项。
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take,
+        }),
+        tenantContext.run(platformScope(), async () =>
+          this.prisma.coupon.findMany({
+            where: platformWhere,
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take,
+          }),
+        ),
+        this.prisma.coupon.count({ where: shopWhere }),
+        tenantContext.run(platformScope(), async () =>
+          this.prisma.coupon.count({ where: platformWhere }),
+        ),
+      ]);
+
+    const merged = [...shopCoupons, ...platformCoupons].sort(
+      (a, b) =>
+        b.createdAt.getTime() - a.createdAt.getTime() ||
+        b.id.localeCompare(a.id),
     );
+    const items = merged.slice(skip, skip + pageSize);
 
-    const items = [...shopCoupons, ...platformCoupons];
-    return { items, total: items.length };
+    return {
+      items,
+      total: shopTotal + platformTotal,
+      page,
+      pageSize,
+    };
   }
 
   /**

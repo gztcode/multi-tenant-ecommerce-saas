@@ -27,9 +27,7 @@ function fakePrisma(options: {
   const tx = {
     productMedia: {
       deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
-      findMany: jest
-        .fn()
-        .mockResolvedValue(options.existingProductMedia ?? []),
+      findMany: jest.fn().mockResolvedValue(options.existingProductMedia ?? []),
       createMany,
       updateMany,
     },
@@ -75,7 +73,7 @@ describe('ProductsService.setMedia（批量化）', () => {
     await runForTenant(() => service.setMedia('p1', ['a', 'b']));
 
     expect(createMany).toHaveBeenCalledTimes(1);
-    expect(createMany.mock.calls[0][0]).toEqual({
+    expect(createMany).toHaveBeenCalledWith({
       data: [{ tenantId: 't1', productId: 'p1', mediaId: 'b' }],
     });
   });
@@ -105,9 +103,7 @@ describe('ProductsService.setMedia（批量化）', () => {
 
     await expect(
       runForTenant(() => service.setMedia('p1', ['a', 'ghost'])),
-    ).rejects.toThrow(
-      new BadRequestException('媒体不存在或不可用：ghost'),
-    );
+    ).rejects.toThrow(new BadRequestException('媒体不存在或不可用：ghost'));
     // 校验失败发生在事务之前：不应有任何写操作
     expect(createMany).not.toHaveBeenCalled();
     expect(updateMany).not.toHaveBeenCalled();

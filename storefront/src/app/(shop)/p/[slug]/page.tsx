@@ -1,5 +1,7 @@
 import { headers } from 'next/headers';
+import Link from 'next/link';
 import { notFound } from 'next/navigation';
+import { ApiError } from '@/lib/api-client';
 import { resolveTenantSubdomain } from '@/lib/tenant';
 import { fetchPublicProduct } from '@/lib/catalog';
 import { SpecSelector } from '@/components/product/spec-selector';
@@ -15,12 +17,31 @@ export default async function ProductPage({
   const subdomain = resolveTenantSubdomain(headerList);
 
   let product: Awaited<ReturnType<typeof fetchPublicProduct>> | null = null;
+  let error: string | null = null;
   try {
     product = await fetchPublicProduct(subdomain, slug);
-  } catch {
+  } catch (cause) {
     // 商品不存在、还是草稿、还是店铺被暂停，后端一律回 404。
     // 对匿名访客来说这几种情况没有区别，都渲染 404 页面。
-    notFound();
+    // 但只有 404 才是「商品不存在」；后端故障不能伪装成 404。
+    if (cause instanceof ApiError && cause.status === 404) {
+      notFound();
+    }
+    error = cause instanceof Error ? cause.message : '商品加载失败';
+  }
+
+  if (error || !product) {
+    return (
+      <main className="mx-auto flex min-h-screen max-w-5xl flex-col items-start gap-4 p-6">
+        <p className="text-sm text-destructive">{error ?? '商品加载失败'}</p>
+        <Link href={`/p/${slug}`} className="underline">
+          重试
+        </Link>
+        <Link href="/" className="text-sm text-muted-foreground underline">
+          返回首页
+        </Link>
+      </main>
+    );
   }
 
   const gallery = product.media.map((m) => m.media);

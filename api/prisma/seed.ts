@@ -51,7 +51,10 @@ async function seedPlatformAdmin(): Promise<void> {
   } catch (error) {
     // 平台超管邮箱由部分唯一索引 users_platform_admin_email_key 兜底，
     // 并发执行 seed 时后到的一方会撞唯一约束，此时同样视为幂等成功。
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === 'P2002'
+    ) {
       console.log(`平台超管已存在（并发创建），跳过：${email}`);
       return;
     }
@@ -78,7 +81,8 @@ async function seedDemoStore(): Promise<void> {
   const merchantEmail = (
     process.env.SEED_DEMO_MERCHANT_EMAIL ?? 'owner@demo.platform.test'
   ).toLowerCase();
-  const merchantPassword = process.env.SEED_DEMO_MERCHANT_PASSWORD ?? 'Demo12345!';
+  const merchantPassword =
+    process.env.SEED_DEMO_MERCHANT_PASSWORD ?? 'Demo12345!';
 
   const existingTenant = await prisma.tenant.findUnique({
     where: { subdomain: DEMO_SUBDOMAIN },
@@ -124,7 +128,12 @@ async function seedDemoStore(): Promise<void> {
 
   // ---- 三层品类树 ----
   // sort 按写入顺序递增：公开接口的品类树按 sort 升序返回，排序即展示顺序。
-  const category = async (name: string, slug: string, sort: number, parentId: string | null) =>
+  const category = async (
+    name: string,
+    slug: string,
+    sort: number,
+    parentId: string | null,
+  ) =>
     prisma.category.create({
       data: { tenantId, name, slug, sort, parentId },
     });
@@ -190,7 +199,10 @@ async function seedDemoStore(): Promise<void> {
       values: string[];
     }>;
   }) => {
-    const p = await product({ ...opts, minPrice: Math.min(...opts.skus.map((s) => s.price)) });
+    const p = await product({
+      ...opts,
+      minPrice: Math.min(...opts.skus.map((s) => s.price)),
+    });
 
     const valueIdByText = new Map<string, string>();
     for (const [dimIndex, dim] of opts.dims.entries()) {
@@ -226,7 +238,9 @@ async function seedDemoStore(): Promise<void> {
           opts.dims.find((d) => d.values.includes(value))?.name ?? '';
         const valueId = valueIdByText.get(`${specName}:${value}`);
         if (!valueId) {
-          throw new Error(`种子数据内部错误：SKU ${index + 1} 的取值「${value}」未找到`);
+          throw new Error(
+            `种子数据内部错误：SKU ${index + 1} 的取值「${value}」未找到`,
+          );
         }
         await prisma.skuSpecValue.create({
           data: { tenantId, skuId: sku.id, valueId },
@@ -370,7 +384,9 @@ async function seedDemoStore(): Promise<void> {
     `已创建示例店铺：${DEMO_SUBDOMAIN}.platform.test，` +
       `店主 ${merchantEmail} / ${merchantPassword}`,
   );
-  console.log('  3 层品类树（服饰 / T恤 / 纯棉T恤、鞋靴、清仓专区[已软删]、手机数码）');
+  console.log(
+    '  3 层品类树（服饰 / T恤 / 纯棉T恤、鞋靴、清仓专区[已软删]、手机数码）',
+  );
   console.log('  4 个商品（3 个已上架含规格矩阵、1 个草稿、1 个软删除示例）');
 }
 
@@ -467,7 +483,10 @@ async function seedDemoCustomer(): Promise<void> {
     // WHERE role IN (CUSTOMER, MERCHANT_STAFF)。若这里用大小写敏感的精确匹配，
     // 库里已有 customer@demo.platform.test 时，查 CUSTOMER@DEMO.PLATFORM.TEST
     // 会查不到而走插入分支，然后被 lower(email) 索引拦下抛 P2002。
-    where: { email: { equals: email, mode: 'insensitive' }, role: UserRole.CUSTOMER },
+    where: {
+      email: { equals: email, mode: 'insensitive' },
+      role: UserRole.CUSTOMER,
+    },
   });
   if (existing) {
     console.log(`示例消费者已存在，跳过：${email}`);
@@ -495,7 +514,10 @@ async function seedDemoCustomer(): Promise<void> {
   } catch (error) {
     // 邮箱由部分唯一索引 users_customer_email_ci_key 兜底，
     // 并发执行 seed 时后到的一方会撞唯一约束，此时同样视为幂等成功。
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === 'P2002'
+    ) {
       console.log(`示例消费者已存在（并发创建），跳过：${email}`);
       return;
     }

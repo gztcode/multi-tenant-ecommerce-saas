@@ -29,7 +29,7 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { NestFactory } from '@nestjs/core';
-import { CommissionEntryType, OrderStatus, ReceiptType } from '@prisma/client';
+import { CommissionEntryType, ReceiptType } from '@prisma/client';
 
 import { AppModule } from '../src/app.module';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';

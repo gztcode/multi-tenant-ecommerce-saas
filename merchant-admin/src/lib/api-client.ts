@@ -9,6 +9,8 @@ const shared = createApiClient({
   // 注意：商家后台不带 x-tenant-subdomain——中心域名没有「当前店铺」，
   // 租户身份完全由 accessToken 里的 tenantId 决定。
   tenantSubdomain: null,
+  // 后台没有游客购物车，明确不转发 Cookie。
+  forwardCookie: false,
   auth,
 });
 

@@ -12,6 +12,7 @@ import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { CurrentUserPayload } from '../../common/decorators/current-user.decorator';
+import { toIntOr } from '../../common/http/pagination';
 import { CouponService } from './coupon.service';
 import { ClaimCouponDto } from './dto/claim-coupon.dto';
 import { PreviewCouponDto } from './dto/preview-coupon.dto';
@@ -29,9 +30,15 @@ export class CouponController {
   constructor(private readonly couponService: CouponService) {}
 
   @Get('available')
-  @ApiOperation({ summary: '当前可领取的券' })
-  available() {
-    return this.couponService.listAvailable();
+  @ApiOperation({ summary: '当前可领取的券（分页）' })
+  available(
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+  ) {
+    return this.couponService.listAvailable({
+      page: toIntOr(page, undefined),
+      pageSize: toIntOr(pageSize, undefined),
+    });
   }
 
   @Get('mine')

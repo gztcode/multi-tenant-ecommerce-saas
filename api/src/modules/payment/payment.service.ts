@@ -526,7 +526,20 @@ export class PaymentService {
       data: { providerTxnId: result.providerTxnId },
     });
 
-    if (result.status !== 'SUCCESS') {
+    if (result.status === 'SUCCESS') {
+      // ⚠️ **成功也必须落状态**：不落的话「已有成功扣款」这个事实无法从
+      // 本地识别，下一轮扫描会对同一账期重复扣款。
+      // 条件更新只把 PENDING/FAILED 推进到 SUCCESS，不覆盖已有的终态；
+      // 真正的重复扣款防护靠渠道按 referenceId 的幂等（支付单与
+      // providerTxnId 不重置）—— 单副本假设，跨副本并发扫描未加锁。
+      await this.prisma.payment.updateMany({
+        where: {
+          id: payment.id,
+          status: { in: [PaymentStatus.PENDING, PaymentStatus.FAILED] },
+        },
+        data: { status: PaymentStatus.SUCCESS },
+      });
+    } else {
       // ⚠️ **扣款没成功 → 支付单置 FAILED**。
       //
       // 不落这个状态的话，支付单永远停在 `PENDING`：
@@ -1969,11 +1982,16 @@ export class PaymentService {
     //
     // 覆盖之所以安全，是因为上面已经查过冲突了：这一笔渠道交易
     // 没有落到别的订单上。
+    let updated: { count: number };
     try {
-      await this.prisma.payment.updateMany({
+      updated = await this.prisma.payment.updateMany({
         where: {
           orderId: order.id,
           channel: event.channel,
+          // ⚠️ **必须带 provider**：预检查按 (provider, providerTxnId) 判冲突，
+          //    写入却不带 provider 的话，另一个渠道的同号交易会把
+          //    「这次绑定」当成成功，实际写错了行 / 一行都没写。
+          provider: event.provider,
           status: PaymentStatus.PENDING,
         },
         data: { providerTxnId: event.providerTxnId },
@@ -1982,8 +2000,7 @@ export class PaymentService {
       if (!isUniqueViolation(error)) {
         throw error;
       }
-      // ⚠️ 并发撞唯一索引：这里**不在业务事务里**，所以事务没有被
-      // abort，重查一次就能判断到底冲不冲突。
+      // ⚠️ 并发撞唯一索引：不在业务事务里，重查一次判断是否真冲突。
       const stillConflicting = await this.prisma.payment.findFirst({
         where: {
           provider: event.provider,
@@ -1996,8 +2013,24 @@ export class PaymentService {
           `渠道交易 ${event.providerTxnId} 已落到另一个订单的支付单上，` +
             `拒绝流转订单 ${order.orderNo}（事件 ${event.eventId}）`,
         );
-        return false;
+      } else {
+        this.logger.warn(
+          `渠道交易 ${event.providerTxnId} 绑定时撞唯一索引但查不到冲突方，` +
+            `拒绝流转订单 ${order.orderNo}（事件 ${event.eventId}）`,
+        );
       }
+      // ⚠️ 无论哪种情况都不返回 true —— 静默成功会让订单在缺少
+      //    providerTxnId 的情况下继续流转，后续对账只能靠金额猜。
+      return false;
+    }
+
+    if (updated.count === 0) {
+      // 订单不处于 PENDING 或渠道不匹配 —— 这笔绑定没有落地。
+      this.logger.warn(
+        `渠道交易 ${event.providerTxnId} 未写入支付单（订单 ${order.orderNo}` +
+          ` 不处于待支付或渠道不匹配，事件 ${event.eventId}）`,
+      );
+      return false;
     }
     return true;
   }

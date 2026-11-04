@@ -5,8 +5,7 @@ import {
   normalizeChannel,
 } from '../channel/channel-config';
 import type { ChannelKind } from '../channel/channel.types';
-
-const PLACEHOLDER_SECRET = 'change-me-in-production-at-least-32-chars-long';
+import { isPlaceholderSecret } from './placeholder-secrets';
 
 /** 参与启动校验的两个渠道用途（顺序即报错优先级） */
 const KNOWN_KINDS: readonly ChannelKind[] = ['PAYMENT', 'PAYOUT'];
@@ -78,9 +77,9 @@ function assertJwtSecret(): void {
     );
   }
 
-  if (process.env.NODE_ENV === 'production' && secret === PLACEHOLDER_SECRET) {
+  if (process.env.NODE_ENV === 'production' && isPlaceholderSecret(secret)) {
     throw new Error(
-      '生产环境禁止使用 .env.example 里的 JWT_SECRET 占位符，请换成真实密钥。',
+      '生产环境禁止使用示例/默认的 JWT_SECRET 占位符（含 docker-compose 内置默认值），请换成真实密钥。',
     );
   }
 }

@@ -1348,22 +1348,12 @@ export class PayoutService {
 
     const now = await this.prisma.databaseNow();
 
-    // ⚠️ **只查已结束的周期**：`occurredAt < now` 的月份才可能已结束。
-    // ⚠️ **不手写 tenantId**：商家侧靠租户作用域扩展自动附加。
-    const receipts = await this.prisma.merchantReceipt.findMany({
-      where: { occurredAt: { lt: now } },
-      orderBy: { occurredAt: 'desc' },
-      select: { occurredAt: true },
-    });
-
-    // ⚠️ **按月分组**：流水是逐笔的，周期是月的。
-    //    这里只要**周期清单**（金额由聚合统一算，
-    //    不复用这里的求和 —— 两处口径漂了账就错了）。
-    const periodLabels = new Set<string>();
-    for (const receipt of receipts) {
-      periodLabels.add(formatPeriodLabel(receipt.occurredAt));
-    }
-
+    // ⚠️ **DB 端 DISTINCT 归期**：原来把本租户全部流水拉回内存取月份
+    //    ——无界查询。复用 7b 的 `merchantReceiptPeriods(tenantId)`，
+    //    每月只回一行字符串。
+    // ⚠️ 这里**不按 now 过滤**：未结束的周期在下面的 `resolved.to > now`
+    //    判断里跳过（保留原有语义）。
+    const periodLabels = await this.prisma.merchantReceiptPeriods(tenantId);
     const periods = [...periodLabels].sort((a, b) => b.localeCompare(a));
 
     // ⚠️ **一次聚合所有期**（固定 6 次查询，与期数无关）——

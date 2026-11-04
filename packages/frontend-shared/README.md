@@ -4,5 +4,5 @@
 
 用 npm `file:` 协议引用（`"file:../packages/frontend-shared"`）而非根 workspace，是为了不动三端既有的 install/test/build 命令形态。
 
-注意：`session-sync-component.tsx` 依赖各端 `@/lib/session-sync` alias（有意的设计——纯逻辑留在端内），本包因此不可独立安装使用。
+注意：`session-sync-component.tsx` 通过工厂 `createSessionSyncComponent(createSessionSync)` 注入各端逻辑，包内**不再依赖** `@/` 别名；本包可独立 `npx tsc --noEmit`（CI 有 shared job）。三端薄壳 `components/session/session-sync.tsx` 只负责把本端 `@/lib/session-sync` 传进工厂。
 

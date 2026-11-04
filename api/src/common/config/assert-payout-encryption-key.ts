@@ -1,3 +1,5 @@
+import { isPlaceholderSecret } from './placeholder-secrets';
+
 /**
  * 账目加密密钥的启动校验（阶段 5j）。
  *
@@ -8,9 +10,6 @@
  * ⚠️ **规则逐条照抄 `JWT_SECRET`**：
  *    长度不足任何环境都失败；占位符只在 production 失败。
  */
-const PLACEHOLDER_KEY =
-  'change-me-in-production-payout-key-at-least-32-chars-long';
-
 export function assertPayoutEncryptionKey(): void {
   const secret = process.env.PAYOUT_ACCOUNT_ENCRYPTION_KEY ?? '';
 
@@ -22,10 +21,10 @@ export function assertPayoutEncryptionKey(): void {
     );
   }
 
-  if (process.env.NODE_ENV === 'production' && secret === PLACEHOLDER_KEY) {
+  if (process.env.NODE_ENV === 'production' && isPlaceholderSecret(secret)) {
     throw new Error(
-      '生产环境禁止使用 .env.example 里的 PAYOUT_ACCOUNT_ENCRYPTION_KEY 占位符，' +
-        '请换成真实密钥。',
+      '生产环境禁止使用示例/默认的 PAYOUT_ACCOUNT_ENCRYPTION_KEY 占位符' +
+        '（含 docker-compose 内置默认值），请换成真实密钥。',
     );
   }
 }

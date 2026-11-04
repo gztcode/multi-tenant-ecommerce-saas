@@ -1,5 +1,11 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsIn, IsNotEmpty, IsOptional, IsString, MaxLength } from 'class-validator';
+import {
+  IsIn,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  MaxLength,
+} from 'class-validator';
 
 /**
  * 平台端人工操作出款单的请求体（阶段 5l）。

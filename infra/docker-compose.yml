@@ -277,6 +277,18 @@ services:
     volumes:
       - ./nginx/platform.test.conf:/etc/nginx/conf.d/default.conf:ro
     logging: *default-logging
+    healthcheck:
+      # ⚠️ 必须带 Host：默认 server 块对未知 Host 直接 return 444，
+      #    不带 Host 的探活会被判失败。实测带 Host 返回可接受状态。
+      test:
+        [
+          'CMD-SHELL',
+          "wget -q -O /dev/null --header='Host: demo.platform.test' http://127.0.0.1/ || exit 1",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     mem_limit: 256m
 
 volumes:

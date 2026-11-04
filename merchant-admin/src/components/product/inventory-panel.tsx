@@ -1,7 +1,7 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 interface SkuRow {
   skuId: string;
@@ -57,7 +57,12 @@ export function InventoryPanel({ skus }: { skus: SkuRow[] }) {
   const [message, setMessage] = useState<string | null>(null);
   const [movementsHint, setMovementsHint] = useState<string | null>(null);
 
+  // 请求序号：每次拉流水自增；响应回来时序号不等于最新值就丢弃。
+  // 切 SKU 很快时，旧请求的响应可能晚于新请求到达。
+  const reqSeq = useRef(0);
+
   const loadMovements = useCallback(async (targetSkuId: string) => {
+    const seq = ++reqSeq.current;
     if (!targetSkuId) {
       setMovements([]);
       setMovementsHint('没有商品参数，先从商品编辑页进来才能看某个 SKU 的流水。');
@@ -67,17 +72,24 @@ export function InventoryPanel({ skus }: { skus: SkuRow[] }) {
       const response = await fetch(
         `/api/inventory/movements?skuId=${encodeURIComponent(targetSkuId)}&pageSize=50`,
       );
+      // ⚠️ 旧响应：用户已经切到别的 SKU，丢弃，不覆盖新选择。
+      if (seq !== reqSeq.current) return;
       if (!response.ok) {
         // 流水拉不到不阻塞调整操作：调整台账是主任务，流水是附带的。
-        setMovementsHint(
-          (await readResponse(response, '流水加载失败')) ?? '流水加载失败',
-        );
+        const hint =
+          (await readResponse(response, '流水加载失败')) ?? '流水加载失败';
+        // ⚠️ 读响应体期间用户可能又切了 SKU —— 再校验一次序号。
+        if (seq !== reqSeq.current) return;
+        setMovementsHint(hint);
         return;
       }
       const payload = (await response.json()) as { items?: Movement[] };
+      // ⚠️ 解析响应体同样是异步窗口，落地前再校验一次。
+      if (seq !== reqSeq.current) return;
       setMovements(payload.items ?? []);
       setMovementsHint(null);
     } catch {
+      if (seq !== reqSeq.current) return;
       setMovementsHint('流水加载失败');
     }
   }, []);

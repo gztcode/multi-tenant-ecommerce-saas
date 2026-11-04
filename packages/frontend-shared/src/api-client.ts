@@ -4,7 +4,7 @@
  * 实现体以 storefront 版为超集搬运：
  * - `request()` 分层（序列化在 try 外 / 网络错误收敛成 ApiError / 错误体解析兜底）
  * - 204 与空响应体的处理（空 body 当 null，不抛 JSON 解析错）
- * - 子域名头与 cookie 转发（storefront 专用能力，其余端传 null 明确不发）
+ * - 子域名头与 cookie 转发（storefront 专用能力，其余端显式传 false 不发）
  *
  * 各端的 `API_BASE_URL` 环境变量解析、NextAuth 的 `auth()` 都留在本端薄壳里，
  * 通过 `createApiClient` 的参数注入。
@@ -74,8 +74,13 @@ export interface SharedApiClientOptions {
   baseUrl: string;
   /** storefront 按请求传 subdomain（这里留 null）；merchant/platform 明确不发 */
   tenantSubdomain?: string | null;
-  /** storefront 透传 cookie（cart_token）；其余端不传 */
-  forwardCookie?: boolean;
+  /**
+   * 是否转发 Cookie 头。
+   *
+   * ⚠️ **必填**：漏配会静默降级成「不转发」，游客购物车因此丢车。
+   *    三端显式传 `true`（storefront）/ `false`（两个后台）。
+   */
+  forwardCookie: boolean;
   /**
    * 本端 NextAuth 的 `auth()`，供 apiFetchAuthed 取 accessToken。
    * 必须由本端注入：共享包不依赖任何一端的 `@/auth`。
@@ -216,10 +221,18 @@ export function createApiClient(
     req: ApiFetchAuthedOptions = {},
   ): Promise<T> {
     const session = await options.auth();
+    // ⚠️ **没有令牌就显式 401**，不要发匿名请求：
+    //    匿名请求会被后端按「游客」处理，写操作落到错误的身份上，
+    //    而且界面拿到的是 403/404 这类误导性错误。
+    // ⚠️ `UNAUTHENTICATED` 是**客户端本地错误码**（后端没有这个 code，
+    //    后端 401 是 `UNAUTHORIZED`）；不要拿它去匹配后端错误码。
+    if (!session?.accessToken) {
+      throw new ApiError(401, 'UNAUTHENTICATED', '未登录或登录已过期');
+    }
     return apiFetch<T>(path, {
       ...req,
       validate: req.validate as ((data: unknown) => T) | undefined,
-      token: session?.accessToken,
+      token: session.accessToken,
     });
   }
 

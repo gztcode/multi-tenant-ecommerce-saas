@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { SessionSync } from "@/components/session/session-sync";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -35,6 +36,9 @@ export default function RootLayout({
     >
       <body className="antialiased">
         {children}
+        {/* 会话同步：把刷新后的会话 cookie 送回浏览器，并协调多标签页。
+            挂在根 layout 上，所以**每个页面**都会跑一次。 */}
+        <SessionSync />
       </body>
     </html>
   );

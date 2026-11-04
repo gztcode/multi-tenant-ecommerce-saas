@@ -400,6 +400,19 @@ function fakePrisma(options: {
         Promise.resolve(options.receipts ?? []),
       ),
     },
+    /**
+     * ⚠️ **归期走 DB 端 DISTINCT**（阶段 8c）：`availablePeriods` 不再拉流水，
+     *    而是调这个 wrapper。从配置的流水里现算月份，保持老用例的语义。
+     */
+    merchantReceiptPeriods: jest.fn<Promise<string[]>, [string]>(() =>
+      Promise.resolve([
+        ...new Set(
+          (options.receipts ?? []).map((r) =>
+            r.occurredAt.toISOString().slice(0, 7),
+          ),
+        ),
+      ]),
+    ),
     settlementStatement: {
       findFirst: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
         Promise.resolve(
@@ -2232,6 +2245,25 @@ describe('可申请周期列表：不能因为某期结算单没确认就整个�
     const views = await asTenant(() => service.availablePeriods());
 
     expect(views).toHaveLength(0);
+  });
+
+  it('归期走 DB 端 DISTINCT，不再全量拉流水', async () => {
+    const prisma = Object.assign(
+      fakePrisma({ receipts: [receipt({ id: 'r-1' })] }),
+      {
+        merchantReceiptPeriods: jest
+          .fn<Promise<string[]>, [string]>()
+          .mockResolvedValue(['2025-07']),
+      },
+    );
+
+    const service = makeService(prisma);
+
+    const views = await asTenant(() => service.availablePeriods());
+
+    expect(views).toHaveLength(1);
+    expect(views[0].period).toBe('2025-07');
+    expect(prisma.merchantReceiptPeriods).toHaveBeenCalledWith('tenant-a');
   });
 });
 

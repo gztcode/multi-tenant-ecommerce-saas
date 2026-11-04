@@ -1,5 +1,9 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { InvoiceStatus, SubscriptionStatus } from '@prisma/client';
+import {
+  InvoiceStatus,
+  PaymentStatus,
+  SubscriptionStatus,
+} from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   platformScope,
@@ -82,11 +86,21 @@ export class RenewalService implements OnModuleInit {
     );
 
     for (const subscription of due) {
-      // ⚠️ **写操作回到租户作用域** —— 租户 id 来自库里（可信源），
-      // 不是客户端提交的
-      await runForTenant(subscription.tenantId, async () => {
-        await this.renewOne(subscription.id);
-      });
+      try {
+        // ⚠️ **写操作回到租户作用域** —— 租户 id 来自库里（可信源），
+        // 不是客户端提交的
+        await runForTenant(subscription.tenantId, async () => {
+          await this.renewOne(subscription.id);
+        });
+      } catch (error) {
+        // ⚠️ **单个租户失败不能中断整批**：否则当天其余所有租户的续费
+        // 都不再执行。只记订阅 id 与异常类名，不打原始 message。
+        this.logger.error(
+          `订阅 ${subscription.id} 续费失败：${
+            error instanceof Error ? error.constructor.name : typeof error
+          }`,
+        );
+      }
     }
   }
 
@@ -167,6 +181,18 @@ export class RenewalService implements OnModuleInit {
       invoice.status !== InvoiceStatus.OPEN &&
       invoice.status !== InvoiceStatus.FAILED
     ) {
+      await this.expireIfNeeded(subscription.id, now);
+      return;
+    }
+
+    // ⚠️ **幂等键命中：该账单已有成功支付单** —— 覆盖「扣款成功但结算失败」
+    //    的恢复路径（账单仍是 OPEN，但钱已经扣过了）。
+    //    不查这一步的话，下一轮扫描会复用支付单再扣一次。
+    const settled = await this.prisma.payment.findFirst({
+      where: { invoiceId: invoice.id, status: PaymentStatus.SUCCESS },
+    });
+    if (settled) {
+      await this.invoices.markInvoicePaid(invoice.id);
       await this.expireIfNeeded(subscription.id, now);
       return;
     }

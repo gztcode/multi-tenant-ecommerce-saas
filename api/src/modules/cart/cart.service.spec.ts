@@ -26,7 +26,7 @@ function accountCart(): Cart {
     guestToken: null,
     createdAt: new Date(),
     updatedAt: new Date(),
-  } as unknown as Cart;
+  };
 }
 
 function guestCart(): Cart {
@@ -37,7 +37,7 @@ function guestCart(): Cart {
     guestToken: 'guest-token',
     createdAt: new Date(),
     updatedAt: new Date(),
-  } as unknown as Cart;
+  };
 }
 
 /** 假 Prisma 的查询参数（只要能读出 `where` / `data` 就够断言了） */
@@ -102,7 +102,11 @@ function fakePrisma(options: FakeOptions = {}) {
       findFirst: jest.fn<Promise<unknown>, [args?: QueryArgs]>(
         (args?: QueryArgs) =>
           Promise.resolve(
-            args?.where?.customerId ? accountCart() : options.guestCartFound === false ? null : guestCart(),
+            args?.where?.customerId
+              ? accountCart()
+              : options.guestCartFound === false
+                ? null
+                : guestCart(),
           ),
       ),
       create: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
@@ -136,16 +140,15 @@ function fakePrisma(options: FakeOptions = {}) {
         (args?: QueryArgs) => {
           const ids = (args?.where?.id as { in?: string[] })?.in ?? [];
           return Promise.resolve(
-            ids
-              .filter((id) => sellable.has(id))
-              .map((id) => ({ id })),
+            ids.filter((id) => sellable.has(id)).map((id) => ({ id })),
           );
         },
       ),
     },
-    $transaction: jest.fn<Promise<unknown>, [cb: (tx: unknown) => Promise<unknown>]>(
-      (cb) => cb(tx),
-    ),
+    $transaction: jest.fn<
+      Promise<unknown>,
+      [cb: (tx: unknown) => Promise<unknown>]
+    >((cb) => cb(tx)),
   };
 
   return { prisma, tx };

@@ -8,9 +8,17 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   api:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16-alpine
@@ -51,13 +59,21 @@ jobs:
         run: docker exec ${{ job.services.postgres.id }} psql -U ecommerce -d ecommerce -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;'
       - run: npm ci
         working-directory: api
+      # ⚠️ 先显式生成 Prisma Client，再类型检查：
+      #    npm ci 时 @prisma/client 的 postinstall 可能生成，
+      #    但那是隐式行为，干净检出时不能依赖。
       - run: npx prisma generate
+        working-directory: api
+      - run: npx tsc --noEmit
+        working-directory: api
+      - run: npm run lint
         working-directory: api
       - run: npm test
         working-directory: api
 
   storefront:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -85,6 +101,7 @@ jobs:
 
   merchant-admin:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -110,6 +127,7 @@ jobs:
 
   platform-admin:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -132,3 +150,18 @@ jobs:
         env:
           AUTH_SECRET: ci-only-secret-ci-only-secret-ci-32
           AUTH_TRUST_HOST: 'true'
+
+  shared:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/frontend-shared/package-lock.json
+      - run: npm ci
+        working-directory: packages/frontend-shared
+      - run: npx tsc --noEmit
+        working-directory: packages/frontend-shared

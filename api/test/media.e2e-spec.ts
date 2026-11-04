@@ -418,6 +418,79 @@ describe('媒体上传 (e2e)', () => {
     expect(mediaListBody(response).total).toBe(2);
   });
 
+  it('畸形分页参数不 500：page=abc、pageSize=0', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const response = await http(app)
+      .get('/api/v1/media?page=abc&pageSize=0')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(200);
+
+    const body = mediaListBody(response);
+    // ⚠️ `page=abc` 解析失败落回 1；`pageSize=0` 被夹到下限 1
+    //    （与订单列表等其它列表接口共用 `clampPagination` 的同一套规则）。
+    expect(body.page).toBe(1);
+    expect(body.pageSize).toBe(1);
+    expect(body.items).toEqual([]);
+  });
+
+  it('mediaIds 重复时不 500，且去重后只建一条关联', async () => {
+    const merchant = await createMerchant(app, prisma);
+
+    // 造两张 READY 的媒体（直接落库，跳过真实上传）
+    const [a, b] = await Promise.all(
+      ['a.jpg', 'b.jpg'].map((filename, index) =>
+        asTenant(merchant.tenantId, () =>
+          prisma.media.create({
+            data: {
+              key: `t/dup-${index}-${Date.now()}.jpg`,
+              url: `http://localhost:19000/ecommerce-media/t/${filename}`,
+              mime: 'image/jpeg',
+              size: 100,
+              status: 'READY',
+              uploadedBy: 'tester',
+            } as never,
+          }),
+        ),
+      ),
+    );
+
+    const created = await http(app)
+      .post('/api/v1/catalog/products')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ name: '重复媒体商品', slug: `dup-media-${Date.now()}` })
+      .expect(201);
+
+    const productId = (created.body as { id: string }).id;
+
+    // ⚠️ 带重复 id 的覆盖式替换不能撞唯一约束（那会是 500）
+    await http(app)
+      .put(`/api/v1/catalog/products/${productId}/media`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ mediaIds: [b.id, a.id, b.id] })
+      .expect(200);
+
+    // ⚠️ 断言走**读接口**而不是写接口的响应体：
+    //    `setMedia` 的响应体顺序与 sort 的对应关系存在既有缺陷
+    //    （Task 7 范围外，另行报告），不能拿它当断言依据。
+    const detail = await http(app)
+      .get(`/api/v1/catalog/products/${productId}`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(200);
+
+    const media = (
+      detail.body as {
+        media?: Array<{ mediaId: string; sort: number }>;
+      }
+    ).media;
+    const rows = media ?? [];
+    // 去重后两条。sort 按 id **最后出现**的位置编号
+    // （A 最后在 1、B 最后在 2）——这是现有实现口径，不是按首次出现编号。
+    const byId = new Map(rows.map((row) => [row.mediaId, row.sort]));
+    expect(rows).toHaveLength(2);
+    expect(byId.get(a.id)).toBe(1);
+    expect(byId.get(b.id)).toBe(2);
+  });
+
   it('不允许传 key / url / status / tenantId 等服务端维护的字段', async () => {
     const merchant = await createMerchant(app, prisma);
 

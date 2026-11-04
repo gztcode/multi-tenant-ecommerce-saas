@@ -346,27 +346,53 @@ export class CartService {
       throw new BadRequestException('商品不可售或不存在');
     }
 
-    // 同一个 SKU 已经在车里 → 累加数量（但不超过上限）
-    const existing = await this.prisma.cartItem.findFirst({
+    // 原子自增：把「读-改-写」压成一条 UPDATE。
+    // 条件带上限，数量用 increment —— 并发请求各自 +N，不会互相覆盖。
+    const updated = await this.prisma.cartItem.updateMany({
+      where: {
+        cartId: cart.id,
+        skuId,
+        quantity: { lte: MAX_CART_QUANTITY - quantity },
+      },
+      data: { quantity: { increment: quantity } },
+    });
+    if (updated.count === 1) {
+      return;
+    }
+
+    // 0 行：要么行不存在，要么会超上限 —— 查一次区分这两种情况。
+    const exists = await this.prisma.cartItem.findFirst({
       where: { cartId: cart.id, skuId },
     });
-    if (existing) {
-      const next = existing.quantity + quantity;
-      if (next > MAX_CART_QUANTITY) {
+    if (exists) {
+      throw new BadRequestException(
+        `同一商品的加购总量不能超过 ${MAX_CART_QUANTITY}`,
+      );
+    }
+
+    try {
+      await this.prisma.cartItem.create({
+        data: { tenantId: cart.tenantId, cartId: cart.id, skuId, quantity },
+      });
+    } catch (error) {
+      if (!isUniqueViolation(error)) {
+        throw error;
+      }
+      // 并发插入：另一个请求刚建了行 → 重试一次自增（此时行一定存在）
+      const retried = await this.prisma.cartItem.updateMany({
+        where: {
+          cartId: cart.id,
+          skuId,
+          quantity: { lte: MAX_CART_QUANTITY - quantity },
+        },
+        data: { quantity: { increment: quantity } },
+      });
+      if (retried.count === 0) {
         throw new BadRequestException(
           `同一商品的加购总量不能超过 ${MAX_CART_QUANTITY}`,
         );
       }
-      await this.prisma.cartItem.updateMany({
-        where: { id: existing.id },
-        data: { quantity: next },
-      });
-      return;
     }
-
-    await this.prisma.cartItem.create({
-      data: { tenantId: cart.tenantId, cartId: cart.id, skuId, quantity },
-    });
   }
 
   /** 改购物车条目的数量 */

@@ -15,6 +15,7 @@ import {
   CurrentUser,
   type CurrentUserPayload,
 } from '../../common/decorators/current-user.decorator';
+import { clampPagination, toIntOr } from '../../common/http/pagination';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { MediaService } from './media.service';
 import { UploadUrlDto } from './dto/upload-url.dto';
@@ -45,10 +46,11 @@ export class MediaController {
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'pageSize', required: false, type: Number })
   list(@Query('page') page?: string, @Query('pageSize') pageSize?: string) {
-    return this.mediaService.list(
-      page ? Number(page) : 1,
-      Math.min(100, pageSize ? Number(pageSize) : 20),
+    const { page: safePage, pageSize: safePageSize } = clampPagination(
+      toIntOr(page, undefined),
+      toIntOr(pageSize, undefined),
     );
+    return this.mediaService.list(safePage, safePageSize);
   }
 
   @Delete(':id')

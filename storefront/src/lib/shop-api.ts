@@ -199,7 +199,8 @@ export async function fetchAvailableCoupons(): Promise<{
 
   try {
     const payload = await apiFetch<{ items: AvailableCoupon[] }>(
-      '/coupons/available',
+      // ⚠️ 后端分页上限 100；券页一次取满，避免第 21 张起静默消失。
+      '/coupons/available?pageSize=100',
       { subdomain, token },
     );
     return { coupons: payload.items ?? [], error: null };

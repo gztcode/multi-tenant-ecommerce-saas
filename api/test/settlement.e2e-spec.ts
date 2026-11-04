@@ -1478,7 +1478,10 @@ describe('平台侧的结算单 (e2e)', () => {
     const body = await generate(adminToken, '2024-09', merchant.tenantId);
     const id = body.items[0].id;
 
-    const first = await fetchEntries(adminToken, id, { page: '1', pageSize: '2' });
+    const first = await fetchEntries(adminToken, id, {
+      page: '1',
+      pageSize: '2',
+    });
     const second = await fetchEntries(adminToken, id, {
       page: '2',
       pageSize: '2',

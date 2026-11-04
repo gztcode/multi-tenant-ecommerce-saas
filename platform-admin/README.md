@@ -42,7 +42,7 @@ admin@platform.test / Admin12345!
 
 | 路径 | 说明 |
 |------|------|
-| `src/auth.ts` | NextAuth 配置。`scope` 固定为 `'PLATFORM'`。`jwt` / `session` 回调内联（超管不刷新令牌） |
+| `src/auth.ts` | NextAuth 配置（函数形式）。`scope` 固定为 `'PLATFORM'`；`jwt` / `session` 回调走共享包的刷新链路（阶段 8a 起） |
 | `src/lib/api-client.ts` | 薄壳：调共享包 `createApiClient(...)`。`apiFetch` / `apiFetchAuthed` / `ApiError`，**不发** `x-tenant-subdomain` |
 | `src/lib/route-helpers.ts` | 中转路由的公共辅助（再导出 `@ecom/frontend-shared/route-helpers`）：`readJson` / `toErrorResponse` / `unauthorizedResponse` |
 | `src/lib/tenant.ts` | 商家类型、状态枚举与展示辅助 |

@@ -2,7 +2,10 @@
 
 import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import { createSessionSync } from '@/lib/session-sync';
+import type {
+  SessionSync as SessionSyncInstance,
+  SessionSyncOptions,
+} from './session-sync';
 
 /**
  * 客户端的会话同步器。
@@ -19,7 +22,7 @@ import { createSessionSync } from '@/lib/session-sync';
  * 这个组件在页面挂载时打一次同源的 `/api/auth/session`
  * （NextAuth 自带的 Route Handler），那条路径**能把刷新后的 cookie 送回浏览器**。
  * 多个标签页之间用 `BroadcastChannel` + `localStorage` 协调，
- * **同一时刻只让一个标签页去刷**（详见 `@/lib/session-sync.ts`）。
+ * **同一时刻只让一个标签页去刷**（详见 `./session-sync.ts`）。
  *
  * ⚠️ **这是缓解，不是根治**：后端的宽限期改造（RFC 9700）仍然必要，
  * 多浏览器 / 多设备场景前端救不了。
@@ -33,27 +36,42 @@ import { createSessionSync } from '@/lib/session-sync';
  * ⚠️ 只在**真的刷新了**的时候才 refresh——`skipped`（别的标签页刚刷过）
  * 与 `failed` 都不需要，白白 refresh 只会多打一次服务端渲染。
  */
-export function SessionSync() {
-  const router = useRouter();
+export type CreateSessionSync = (
+  options?: SessionSyncOptions,
+) => SessionSyncInstance;
 
-  useEffect(() => {
-    const sync = createSessionSync({
-      onSynced: () => {
-        // 别的标签页刷完了 → 我们的 cookie 也变了 → 重新渲染一次。
-        router.refresh();
-      },
-    });
+/**
+ * 造一个 SessionSync 组件。
+ *
+ * ⚠️ **刷新实现由调用方注入**：共享包不能 import 各端的 `@/lib/session-sync`
+ *    ——那会让共享包依赖各端 tsconfig 的路径别名，无法独立 `tsc`。
+ *    三端薄壳各自把本端的 `createSessionSync` 传进来。
+ */
+export function createSessionSyncComponent(
+  createSessionSync: CreateSessionSync,
+) {
+  return function SessionSync() {
+    const router = useRouter();
 
-    void sync.start().then((outcome) => {
-      if (outcome === 'refreshed') {
-        router.refresh();
-      }
-    });
+    useEffect(() => {
+      const sync = createSessionSync({
+        onSynced: () => {
+          // 别的标签页刷完了 → 我们的 cookie 也变了 → 重新渲染一次。
+          router.refresh();
+        },
+      });
 
-    return () => {
-      sync.stop();
-    };
-  }, [router]);
+      void sync.start().then((outcome) => {
+        if (outcome === 'refreshed') {
+          router.refresh();
+        }
+      });
 
-  return null;
+      return () => {
+        sync.stop();
+      };
+    }, [router]);
+
+    return null;
+  };
 }

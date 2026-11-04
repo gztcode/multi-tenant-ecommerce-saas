@@ -12,7 +12,9 @@ import { CouponService } from './coupon.service';
  */
 
 /** 造一个带 `meta.target` 的 P2002（唯一约束冲突） */
-function uniqueViolation(target: unknown): Error & { code: string; meta: Record<string, unknown> } {
+function uniqueViolation(
+  target: unknown,
+): Error & { code: string; meta: Record<string, unknown> } {
   return Object.assign(new Error('Unique constraint failed'), {
     code: 'P2002',
     meta: { target },
@@ -26,10 +28,7 @@ function coupon(id: string) {
 
 /** 构造被测服务：prisma 用配置驱动的假对象，quota 在这些路径上不会被碰到 */
 function buildService(prisma: Record<string, unknown>): CouponService {
-  return new CouponService(
-    prisma as never,
-    {} as never,
-  );
+  return new CouponService(prisma as never, {} as never);
 }
 
 describe('CouponService.listCoupons（分页）', () => {
@@ -48,12 +47,14 @@ describe('CouponService.listCoupons（分页）', () => {
 
     expect(result).toEqual({ items: rows, total: 22 });
     expect(findMany).toHaveBeenCalledTimes(1);
-    expect(findMany.mock.calls[0][0]).toMatchObject({
-      where: { tenantId: 'tenant-a' },
-      orderBy: { createdAt: 'desc' },
-      skip: 10,
-      take: 10,
-    });
+    expect(findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { tenantId: 'tenant-a' },
+        orderBy: { createdAt: 'desc' },
+        skip: 10,
+        take: 10,
+      }),
+    );
     expect(count).toHaveBeenCalledWith({ where: { tenantId: 'tenant-a' } });
   });
 
@@ -69,7 +70,109 @@ describe('CouponService.listCoupons（分页）', () => {
       async () => service.listCoupons(),
     );
 
-    expect(findMany.mock.calls[0][0]).toMatchObject({ skip: 0, take: 20 });
+    expect(findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ skip: 0, take: 20 }),
+    );
+  });
+});
+
+describe('CouponService.listAvailable（分页）', () => {
+  it('listAvailable 分页：page/pageSize 夹取且 total 来自 count', async () => {
+    const prisma = {
+      coupon: {
+        findMany: jest
+          .fn()
+          .mockResolvedValueOnce([]) // 店铺券
+          .mockResolvedValueOnce([]), // 平台券
+        count: jest.fn().mockResolvedValueOnce(7).mockResolvedValueOnce(5),
+      },
+      $queryRaw: jest
+        .fn()
+        .mockResolvedValue([{ now: new Date('2026-11-04T00:00:00Z') }]),
+    };
+    const service = buildService(prisma);
+
+    const result = await tenantContext.run(
+      { tenantId: 'tenant-a', userId: null, role: null },
+      async () => service.listAvailable({ page: 0, pageSize: 999 }),
+    );
+
+    expect(result).toMatchObject({ total: 12, page: 1, pageSize: 100 });
+
+    // 店铺条件显式限定 SHOP；排序用 id 兜底；取窗口 = skip + pageSize。
+    const dbNow = new Date('2026-11-04T00:00:00Z');
+    expect(prisma.coupon.findMany).toHaveBeenNthCalledWith(1, {
+      where: {
+        tenantId: 'tenant-a',
+        scope: 'SHOP',
+        status: 'ACTIVE',
+        startsAt: { lte: dbNow },
+        endsAt: { gt: dbNow },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 100,
+    });
+    expect(prisma.coupon.findMany).toHaveBeenNthCalledWith(2, {
+      where: {
+        scope: 'PLATFORM',
+        status: 'ACTIVE',
+        startsAt: { lte: dbNow },
+        endsAt: { gt: dbNow },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 100,
+    });
+  });
+
+  it('listAvailable 畸形分页不 500', async () => {
+    const prisma = {
+      coupon: {
+        findMany: jest.fn().mockResolvedValue([]),
+        count: jest.fn().mockResolvedValue(0),
+      },
+      $queryRaw: jest.fn().mockResolvedValue([{ now: new Date() }]),
+    };
+    const service = buildService(prisma);
+
+    const result = await tenantContext.run(
+      { tenantId: 'tenant-a', userId: null, role: null },
+      async () =>
+        service.listAvailable({
+          page: Number.NaN,
+          pageSize: Number.POSITIVE_INFINITY,
+        }),
+    );
+
+    expect(result.page).toBe(1);
+    expect(result.pageSize).toBe(20);
+  });
+
+  it('深页超过合并窗口 → items 为空但 total 仍准确', async () => {
+    const prisma = {
+      coupon: {
+        findMany: jest.fn().mockResolvedValue([]),
+        count: jest.fn().mockResolvedValueOnce(7).mockResolvedValueOnce(5),
+      },
+      $queryRaw: jest.fn().mockResolvedValue([{ now: new Date() }]),
+    };
+    const service = buildService(prisma);
+
+    const result = await tenantContext.run(
+      { tenantId: 'tenant-a', userId: null, role: null },
+      async () => service.listAvailable({ page: 20, pageSize: 100 }),
+    );
+
+    expect(result.items).toEqual([]);
+    expect(result.total).toBe(12);
+    // 深页也不能无界：两个来源各取到窗口上限 1000 为止。
+    expect(prisma.coupon.findMany).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ take: 1000 }),
+    );
+    expect(prisma.coupon.findMany).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ take: 1000 }),
+    );
   });
 });
 
@@ -98,7 +201,11 @@ describe('CouponService.claim（P2002 收窄）', () => {
     const { service, claimInTx } = setup();
     claimInTx
       .mockRejectedValueOnce(
-        uniqueViolation(['couponId', 'customerId', 'coupon_claims_coupon_customer_uniq']),
+        uniqueViolation([
+          'couponId',
+          'customerId',
+          'coupon_claims_coupon_customer_uniq',
+        ]),
       )
       .mockResolvedValueOnce({ couponId: 'c1', quantity: 1 });
 

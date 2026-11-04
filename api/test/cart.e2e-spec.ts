@@ -340,6 +340,78 @@ describe('购物车与地址簿 (e2e)', () => {
     expect(response.status).toBeLessThan(500);
   });
 
+  it('并发加购同一 SKU 两次：数量累加为 2，不丢增量', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const skuId = await publishSku(merchant.token, '并发加购的商品');
+    const { token } = await registerCustomer(merchant.subdomain);
+
+    // 账号购物车还没有这条 SKU。两个请求并发发起：无论都走 create
+    // （后者撞 @@unique([cartId, skuId]) 后重试自增），还是一先一后走
+    // updateMany 自增，最终数量都必须是 2。
+    const results = await Promise.all([
+      http(app)
+        .post('/api/v1/cart/items')
+        .set('authorization', `Bearer ${token}`)
+        .set('x-tenant-subdomain', merchant.subdomain)
+        .send({ skuId, quantity: 1 }),
+      http(app)
+        .post('/api/v1/cart/items')
+        .set('authorization', `Bearer ${token}`)
+        .set('x-tenant-subdomain', merchant.subdomain)
+        .send({ skuId, quantity: 1 }),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual([201, 201]);
+
+    const final = await http(app)
+      .get('/api/v1/cart')
+      .set('authorization', `Bearer ${token}`)
+      .set('x-tenant-subdomain', merchant.subdomain)
+      .expect(200);
+    expect(cartBody(final).items).toHaveLength(1);
+    expect(cartBody(final).items[0].quantity).toBe(2);
+  });
+
+  it('并发加购撞上限：一个成功一个 400（不是 500）', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const skuId = await publishSku(merchant.token, '上限并发的商品');
+    const { token } = await registerCustomer(merchant.subdomain);
+
+    // 先加到 98（上限 99），再并发各加 1
+    await http(app)
+      .post('/api/v1/cart/items')
+      .set('authorization', `Bearer ${token}`)
+      .set('x-tenant-subdomain', merchant.subdomain)
+      .send({ skuId, quantity: 98 })
+      .expect(201);
+
+    const results = await Promise.all([
+      http(app)
+        .post('/api/v1/cart/items')
+        .set('authorization', `Bearer ${token}`)
+        .set('x-tenant-subdomain', merchant.subdomain)
+        .send({ skuId, quantity: 1 }),
+      http(app)
+        .post('/api/v1/cart/items')
+        .set('authorization', `Bearer ${token}`)
+        .set('x-tenant-subdomain', merchant.subdomain)
+        .send({ skuId, quantity: 1 }),
+    ]);
+
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses).toEqual([201, 400]);
+    const rejected = results.find((r) => r.status === 400);
+    expect(rejected?.body).toMatchObject({
+      message: '同一商品的加购总量不能超过 99',
+    });
+
+    const final = await http(app)
+      .get('/api/v1/cart')
+      .set('authorization', `Bearer ${token}`)
+      .set('x-tenant-subdomain', merchant.subdomain)
+      .expect(200);
+    expect(cartBody(final).items[0].quantity).toBe(99);
+  });
+
   // ---- 登录合并（护栏 1 / 2 / 3）----
 
   it('登录合并：同一 SKU 的数量取 max 而不是累加', async () => {

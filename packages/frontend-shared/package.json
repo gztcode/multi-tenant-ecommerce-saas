@@ -9,10 +9,12 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@types/node": "^22.20.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "next": "15.5.28",
     "react": "19.1.0",
-    "react-dom": "19.1.0"
+    "react-dom": "19.1.0",
+    "typescript": "^5.9.3"
   }
 }

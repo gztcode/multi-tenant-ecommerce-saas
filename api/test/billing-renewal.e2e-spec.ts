@@ -1127,4 +1127,124 @@ describe('账单、续费与订阅付款 (e2e)', () => {
     expect(all).toHaveLength(1);
     expect(all[0].amount).toBe(9900);
   });
+
+  it('支付单已 SUCCESS、账单仍 OPEN → 下一轮扫描不重复扣款并结清', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const planId = await createPlan({ price: 9900, periodDays: 30 });
+    await subscribe(merchant.token, planId);
+
+    await http(app)
+      .post('/api/v1/billing/payment-methods')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ type: 'CARD', channel: FAKE_CHANNEL })
+      .expect(201);
+
+    const periodStart = new Date(Date.now() + DAY_MS);
+    await asTenant(merchant.tenantId, () =>
+      prisma.subscription.updateMany({
+        where: { tenantId: merchant.tenantId },
+        data: { currentPeriodEnd: periodStart },
+      }),
+    );
+
+    // 第一轮：正常扣款成功（支付单落 SUCCESS、账单 PAID、周期延长）
+    await renewal.scan();
+    const [invoice] = await readInvoices(merchant.tenantId);
+    expect(invoice.status).toBe('PAID');
+
+    // 人为制造「扣款成功但结算失败」：账单回 OPEN、周期回退到同一期
+    await asTenant(merchant.tenantId, async () => {
+      await prisma.invoice.updateMany({
+        where: { id: invoice.id },
+        data: { status: 'OPEN' },
+      });
+      await prisma.subscription.updateMany({
+        where: { tenantId: merchant.tenantId },
+        data: { currentPeriodEnd: periodStart },
+      });
+    });
+
+    const chargeSpy = jest.spyOn(fakeProvider, 'chargeAuthorized');
+    try {
+      await renewal.scan();
+
+      // 幂等键命中：不再调渠道，但账单要结清
+      expect(chargeSpy).not.toHaveBeenCalled();
+      const after = await readInvoices(merchant.tenantId);
+      expect(after[0].status).toBe('PAID');
+    } finally {
+      chargeSpy.mockRestore();
+    }
+  });
+
+  it('单个租户续费抛异常：其余租户照常处理（不中断整批）', async () => {
+    const failing = await createMerchant(app, prisma);
+    const healthy = await createMerchant(app, prisma);
+    const planId = await createPlan({ price: 9900, periodDays: 30 });
+
+    await subscribe(failing.token, planId);
+    await subscribe(healthy.token, planId);
+
+    await http(app)
+      .post('/api/v1/billing/payment-methods')
+      .set('authorization', `Bearer ${failing.token}`)
+      .send({ type: 'CARD', channel: FAKE_CHANNEL })
+      .expect(201);
+    await http(app)
+      .post('/api/v1/billing/payment-methods')
+      .set('authorization', `Bearer ${healthy.token}`)
+      .send({ type: 'CARD', channel: FAKE_CHANNEL })
+      .expect(201);
+
+    const periodStart = new Date(Date.now() + DAY_MS);
+    for (const tenantId of [failing.tenantId, healthy.tenantId]) {
+      await asTenant(tenantId, () =>
+        prisma.subscription.updateMany({
+          where: { tenantId },
+          data: { currentPeriodEnd: periodStart },
+        }),
+      );
+    }
+
+    // 先为两家各生成账单，拿到账单号
+    for (const merchant of [failing, healthy]) {
+      const subscription = await asTenant(merchant.tenantId, () =>
+        prisma.subscription.findFirst({
+          where: { tenantId: merchant.tenantId },
+        }),
+      );
+      await asTenant(merchant.tenantId, () =>
+        invoices.generateInvoice({
+          subscriptionId: subscription!.id,
+          tenantId: merchant.tenantId,
+          planId,
+          periodStart,
+          periodEnd: new Date(periodStart.getTime() + 30 * DAY_MS),
+          dueAt: periodStart,
+        }),
+      );
+    }
+
+    const [failingInvoice] = await readInvoices(failing.tenantId);
+    const original = fakeProvider.chargeAuthorized.bind(fakeProvider);
+    const spy = jest
+      .spyOn(fakeProvider, 'chargeAuthorized')
+      .mockImplementation((request) => {
+        if (request.referenceNo === failingInvoice.number) {
+          throw new Error('渠道炸了');
+        }
+        return original(request);
+      });
+
+    try {
+      await expect(renewal.scan()).resolves.toBeUndefined();
+
+      const failingAfter = await readInvoices(failing.tenantId);
+      expect(failingAfter[0].status).toBe('OPEN');
+      const healthyAfter = await readInvoices(healthy.tenantId);
+      expect(healthyAfter[0].status).toBe('PAID');
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });

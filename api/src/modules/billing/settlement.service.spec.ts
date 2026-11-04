@@ -1147,7 +1147,10 @@ describe('明细分页（阶段 5l）', () => {
     });
 
     const service = makeService(prisma);
-    const result = await service.listEntries('stmt-a', { page: 1, pageSize: 50 });
+    const result = await service.listEntries('stmt-a', {
+      page: 1,
+      pageSize: 50,
+    });
 
     // ⚠️ **顺序必须是 e-1、e-5、e-2、e-4、e-3**（按 occurredAt 升序：
     //    10 日 → 15 日 → 20 日 → 25 日 → 30 日）：
@@ -1172,7 +1175,10 @@ describe('明细分页（阶段 5l）', () => {
 
     const service = makeService(prisma);
     const first = await service.listEntries('stmt-a', { page: 1, pageSize: 2 });
-    const second = await service.listEntries('stmt-a', { page: 2, pageSize: 2 });
+    const second = await service.listEntries('stmt-a', {
+      page: 2,
+      pageSize: 2,
+    });
     const third = await service.listEntries('stmt-a', { page: 3, pageSize: 2 });
 
     const ids = [
@@ -1200,7 +1206,10 @@ describe('明细分页（阶段 5l）', () => {
     });
 
     const service = makeService(prisma);
-    const result = await service.listEntries('stmt-a', { page: 99, pageSize: 2 });
+    const result = await service.listEntries('stmt-a', {
+      page: 99,
+      pageSize: 2,
+    });
 
     expect(result.items).toEqual([]);
     expect(result.total).toBe(5);
@@ -1248,7 +1257,10 @@ describe('明细分页（阶段 5l）', () => {
     });
 
     const service = makeService(prisma);
-    const result = await service.listEntries('stmt-a', { page: 1, pageSize: 50 });
+    const result = await service.listEntries('stmt-a', {
+      page: 1,
+      pageSize: 50,
+    });
 
     // ⚠️ **崩掉整页比少显示一行糟得多**
     expect(result.items.map((item) => item.entryId)).toEqual(['e-1']);
@@ -1259,7 +1271,10 @@ describe('明细分页（阶段 5l）', () => {
     const prisma = fakePrisma({
       entries: [
         entry({ id: 'e-1', occurredAt: new Date('2024-06-10T00:00:00.000Z') }),
-        entry({ id: 'e-other', occurredAt: new Date('2024-06-11T00:00:00.000Z') }),
+        entry({
+          id: 'e-other',
+          occurredAt: new Date('2024-06-11T00:00:00.000Z'),
+        }),
       ],
       statement: statement({ entryCount: 1 }),
       linkedRows: [
@@ -1269,7 +1284,10 @@ describe('明细分页（阶段 5l）', () => {
     });
 
     const service = makeService(prisma);
-    const result = await service.listEntries('stmt-a', { page: 1, pageSize: 50 });
+    const result = await service.listEntries('stmt-a', {
+      page: 1,
+      pageSize: 50,
+    });
 
     // ⚠️ **只返回这张单纳入的流水**
     expect(result.items.map((item) => item.entryId)).toEqual(['e-1']);

@@ -135,3 +135,37 @@ describe('api-client 的错误收口', () => {
     await expect(apiFetch('/stores/me')).resolves.toEqual({ id: 'store-1' });
   });
 });
+
+describe('无会话时的受保护请求', () => {
+  it('session 为空 → 抛 401 ApiError，且不调后端', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    // 受保护请求的导出名与其它导出一致（薄壳里 `export const <名字> = shared.<名字>`）
+    const { apiFetchAuthed } = await import('@/lib/api-client');
+    await expect(apiFetchAuthed('/me')).rejects.toMatchObject({
+      status: 401,
+      code: 'UNAUTHENTICATED',
+      message: '未登录或登录已过期',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('session 存在但 accessToken 为空 → 同样抛 401，且不调后端', async () => {
+    // 与首页注释同因：jwt 回调刷新失败时会把空令牌兜底成 ''，
+    // 此时 session 非空但同样不可发请求。
+    const { auth } = await import('@/auth');
+    vi.mocked(auth).mockResolvedValueOnce({ accessToken: '' } as never);
+
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { apiFetchAuthed } = await import('@/lib/api-client');
+    await expect(apiFetchAuthed('/me')).rejects.toMatchObject({
+      status: 401,
+      code: 'UNAUTHENTICATED',
+      message: '未登录或登录已过期',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

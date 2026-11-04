@@ -1,4 +1,5 @@
 import { headers } from 'next/headers';
+import Link from 'next/link';
 import { resolveTenantSubdomain } from '@/lib/tenant';
 import { fetchPublicProducts } from '@/lib/catalog';
 import { ProductCard } from '@/components/product/product-card';
@@ -13,11 +14,19 @@ export default async function SearchPage({
   const headerList = await headers();
   const subdomain = resolveTenantSubdomain(headerList);
 
-  const products = q
-    ? await fetchPublicProducts(subdomain, { keyword: q, pageSize: 48 }).catch(
-        () => null,
-      )
-    : null;
+  let products: Awaited<ReturnType<typeof fetchPublicProducts>> | null = null;
+  let error: string | null = null;
+  if (q) {
+    try {
+      products = await fetchPublicProducts(subdomain, {
+        keyword: q,
+        pageSize: 48,
+      });
+    } catch (cause) {
+      // 后端故障要和「搜到了 0 件」区分开，不能都显示「没有找到」。
+      error = cause instanceof Error ? cause.message : '商品加载失败';
+    }
+  }
 
   return (
     <main className="mx-auto flex min-h-screen max-w-6xl flex-col gap-6 p-6">
@@ -36,7 +45,18 @@ export default async function SearchPage({
           搜索
         </button>
       </form>
-      {products && products.items.length === 0 && (
+      {error && (
+        <div className="flex flex-col gap-2">
+          <p className="text-sm text-destructive">{error}</p>
+          <Link
+            href={`/search?q=${encodeURIComponent(q ?? '')}`}
+            className="underline"
+          >
+            重试
+          </Link>
+        </div>
+      )}
+      {!error && products && products.items.length === 0 && (
         <p className="text-muted-foreground">没有找到相关商品。</p>
       )}
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">

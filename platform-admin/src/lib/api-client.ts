@@ -17,6 +17,8 @@ const shared = createApiClient({
   // 注意：平台超管后台不带 x-tenant-subdomain——中心域名没有「当前店铺」，
   // 超管令牌本身就是跨租户的（tenantId 为 null）。
   tenantSubdomain: null,
+  // 后台没有游客购物车，明确不转发 Cookie。
+  forwardCookie: false,
   auth,
 });
 

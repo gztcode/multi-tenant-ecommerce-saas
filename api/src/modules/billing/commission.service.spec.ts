@@ -96,9 +96,11 @@ describe('台账的聚合与分页', () => {
       ]),
     },
     tenant: {
-      findMany: jest.fn().mockResolvedValue([
-        { id: 'tenant-1', name: '商家一', subdomain: 'merchant-one' },
-      ]),
+      findMany: jest
+        .fn()
+        .mockResolvedValue([
+          { id: 'tenant-1', name: '商家一', subdomain: 'merchant-one' },
+        ]),
     },
   });
 
@@ -148,8 +150,8 @@ describe('台账的聚合与分页', () => {
   it('from >= to 仍抛 BadRequestException', async () => {
     const service = new CommissionService(makePrisma() as never);
 
-    await expect(
-      service.ledger({ from: to, to: from }),
-    ).rejects.toBeInstanceOf(BadRequestException);
+    await expect(service.ledger({ from: to, to: from })).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
   });
 });

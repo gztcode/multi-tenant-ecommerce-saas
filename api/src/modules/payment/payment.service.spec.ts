@@ -742,3 +742,99 @@ describe('PaymentService 退款状态机（阶段 6c）', () => {
     });
   });
 });
+
+describe('渠道交易号绑定（阶段 8b）', () => {
+  type AttachFn = (
+    order: { id: string; orderNo: string },
+    event: NormalizedWebhookEvent,
+  ) => Promise<boolean>;
+
+  function setupAttach() {
+    const prisma = prismaMock();
+    const { service } = buildService(
+      provider('fake', FAKE_CAPABILITIES),
+      prisma,
+    );
+    const attach = (
+      service as unknown as { attachProviderTxnId: AttachFn }
+    ).attachProviderTxnId.bind(service);
+    return { prisma, attach };
+  }
+
+  function event(
+    over: Partial<NormalizedWebhookEvent> = {},
+  ): NormalizedWebhookEvent {
+    return {
+      provider: 'fake',
+      channel: 'fake',
+      eventId: 'evt-1',
+      providerTxnId: 'txn-1',
+      referenceNo: 'SO-1',
+      amount: 1000,
+      success: true,
+      eventType: 'PAYMENT',
+      ...over,
+    };
+  }
+
+  it('写入时 where 带上 provider', async () => {
+    const { prisma, attach } = setupAttach();
+    prisma.payment.findFirst.mockResolvedValue(null);
+    prisma.payment.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(
+      attach({ id: 'order-1', orderNo: 'SO-1' }, event()),
+    ).resolves.toBe(true);
+
+    expect(prisma.payment.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          orderId: 'order-1',
+          channel: 'fake',
+          provider: 'fake',
+          status: PaymentStatus.PENDING,
+        }) as unknown,
+      }),
+    );
+  });
+
+  it('updateMany 命中 0 行 → 返回 false（不再静默成功）', async () => {
+    const { prisma, attach } = setupAttach();
+    prisma.payment.findFirst.mockResolvedValue(null);
+    prisma.payment.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      attach({ id: 'order-1', orderNo: 'SO-1' }, event()),
+    ).resolves.toBe(false);
+  });
+
+  it('provider 不匹配导致 0 行 → 返回 false', async () => {
+    const { prisma, attach } = setupAttach();
+    prisma.payment.findFirst.mockResolvedValue(null);
+    prisma.payment.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      attach(
+        { id: 'order-1', orderNo: 'SO-1' },
+        event({ provider: 'sandbox', channel: 'fake' }),
+      ),
+    ).resolves.toBe(false);
+
+    // 写入条件必须用事件里的 provider，而不是写死当前渠道
+    expect(prisma.payment.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ provider: 'sandbox' }) as unknown,
+      }),
+    );
+  });
+
+  it('渠道交易已落到别的订单 → 返回 false 且不写库', async () => {
+    const { prisma, attach } = setupAttach();
+    prisma.payment.findFirst.mockResolvedValue({ id: 'payment-other' });
+
+    await expect(
+      attach({ id: 'order-1', orderNo: 'SO-1' }, event()),
+    ).resolves.toBe(false);
+    expect(prisma.payment.updateMany).not.toHaveBeenCalled();
+  });
+});

@@ -6,6 +6,9 @@ describe('requireTenantId（service 层的租户上下文校验）', () => {
   it('上下文里有 tenantId → 原样返回', async () => {
     const tenantId = await tenantContext.run(
       { tenantId: 't1', userId: 'u1', role: null },
+      // ⚠️ 回调必须是 async（tenantContext 的约定）；这里同步返回结果，
+      //    所以显式豁免 require-await。
+      // eslint-disable-next-line @typescript-eslint/require-await
       async () => requireTenantId(),
     );
     expect(tenantId).toBe('t1');
@@ -15,6 +18,9 @@ describe('requireTenantId（service 层的租户上下文校验）', () => {
     await expect(
       tenantContext.run(
         { tenantId: null, userId: 'u1', role: null },
+        // ⚠️ 回调必须是 async（tenantContext 的约定）；这里同步返回结果，
+        //    所以显式豁免 require-await。
+        // eslint-disable-next-line @typescript-eslint/require-await
         async () => requireTenantId(),
       ),
     ).rejects.toThrow(new ForbiddenException('无法确定店铺'));
