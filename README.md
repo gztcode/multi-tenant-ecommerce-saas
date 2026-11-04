@@ -59,8 +59,8 @@ cd infra && docker compose up -d
 
 八个服务一起起来：`postgres` / `minio` / `redis` / `api` / `storefront` / `merchant-admin` / `platform-admin` / `nginx`。
 
-- 后端健康检查：<http://localhost/api/v1/health>
-- 接口文档：<http://localhost/api/docs>
+- 后端健康检查：<http://localhost:3000/api/v1/health>（api 端口仅绑定本机回环；经 Nginx 访问时用 `Host: api.platform.test`）
+- 接口文档：<http://localhost:3000/api/docs>
 - 店铺前台：<http://localhost/> （用 `Host` 头指定店铺，如 `Host: demo.platform.test`）
 
 子域名本地调试：把 `127.0.0.1 *.platform.test` 写进 `/etc/hosts`。
@@ -191,6 +191,10 @@ cd platform-admin && npm test   # 427 条：计费与对账中转路由的白名
 
 e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物理隔离。
 
+> CI（`.github/workflows/ci.yml`）只跑单测 + 构建检查；e2e（657 条串行）仍在
+> 本地跑（`npm run test:e2e`），首期不进 CI——云端跑一遍要完整迁移 + seed，
+> 时长远超单测，收益不匹配。
+
 ### 数据库迁移
 
 ```bash
@@ -207,6 +211,21 @@ cd api && npm run prisma:deploy
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 ```
+
+### 数据备份
+
+```bash
+cd infra && ./backup.sh    # PostgreSQL 主库全量 + MinIO 数据卷 → infra/backups/<时间戳>/
+```
+
+定时备份挂 crontab（示例为每天 03:00）。⚠️ cron 的 PATH 常不含 docker，开头补一行
+`PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`：
+
+```
+0 3 * * * cd /path/to/电商项目/infra && ./backup.sh >> backup.log 2>&1
+```
+
+`infra/backups/` 已加入 `.gitignore`；恢复命令见 `infra/backup.sh` 头部注释。
 
 ---
 

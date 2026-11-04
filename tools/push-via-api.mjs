@@ -46,7 +46,7 @@ function gh(endpoint, payload) {
   const out = execFileSync(
     'gh',
     ['api', '--method', 'POST', `repos/${REPO}/${endpoint}`, '--input', '-'],
-    { input: JSON.stringify(payload), maxBuffer: 64 * 1024 * 10264 },
+    { input: JSON.stringify(payload), maxBuffer: 64 * 1024 * 1024 },
   );
   return JSON.parse(out.toString());
 }

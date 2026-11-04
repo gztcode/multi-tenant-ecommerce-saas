@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -9,7 +15,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-ecommerce}
     ports:
       # 宿主机端口默认 15432：本机 5432 已被另一个项目的 postgres 容器占用
-      - '${POSTGRES_PORT:-15432}:5432'
+      # 绑回环：本机开发（api/.env、e2e、psql）都走 localhost，局域网不可见
+      - '127.0.0.1:${POSTGRES_PORT:-15432}:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
       # 首次初始化时以超级用户装 pg_trgm 等扩展。
@@ -21,22 +28,31 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    logging: *default-logging
+    mem_limit: 1g
 
   redis:
     image: redis:7-alpine
     container_name: ecommerce-redis
     restart: unless-stopped
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-ecommerceRedis163}
+    environment:
+      # healthcheck 的 redis-cli 要用同一把密码（容器内读）
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-ecommerceRedis163}
     ports:
       # 宿主机端口 16380：本机标准端口 6379 已被其他项目栈占用
-      - '${REDIS_PORT:-16380}:6379'
+      # 绑回环：宿主机侧脚本与本地 api 直连走 localhost；防护为 requirepass + 仅本机可达
+      - '127.0.0.1:${REDIS_PORT:-16380}:6379'
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      # $$ 是 compose 转义：这里还原成容器内的字面 $
+      test: ['CMD-SHELL', 'redis-cli -a "$$REDIS_PASSWORD" ping | grep PONG']
       interval: 10s
       timeout: 3s
       retries: 10
+    logging: *default-logging
+    mem_limit: 256m
 
   minio:
     # ⚠️ 为什么不是官方的 minio/minio：
@@ -62,8 +78,8 @@ services:
     ports:
       # 宿主机端口 19000：本机标准端口已被其他项目栈占用
       - '${MINIO_PORT:-19000}:9000'
-      # 控制台端口，与 API 端口不同
-      - '${MINIO_CONSOLE_PORT:-19001}:9001'
+      # 控制台端口，与 API 端口不同（只绑本机回环）
+      - '127.0.0.1:${MINIO_CONSOLE_PORT:-19001}:9001'
     volumes:
       # 必须挂 volume：不挂时 /data 在容器可写层上，MinIO 启动会报
       # "Rename across devices not allowed"（.minio.sys/tmp 跨设备重命名）。
@@ -77,6 +93,8 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+    logging: *default-logging
+    mem_limit: 1g
 
   api:
     build:
@@ -96,7 +114,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-ecommerce}:${POSTGRES_PASSWORD:-ecommerce}@postgres:5432/${POSTGRES_DB:-ecommerce}?schema=public
       DATABASE_URL_TEST: postgresql://${POSTGRES_USER:-ecommerce}:${POSTGRES_PASSWORD:-ecommerce}@postgres:5432/ecommerce_test?schema=public
       # Redis（BullMQ 队列）。容器内走服务名 redis，与宿主机映射的 16380 无关。
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:-ecommerceRedis163}@redis:6379
       NODE_ENV: production
       PORT: '3000'
       API_PREFIX: api/v1
@@ -109,7 +127,7 @@ services:
       # 收款账户与出款单快照的字段加密密钥。
       # ⚠️ 必须是**固定值**：每次 up 都换密钥的话，
       # 之前签发的出款单快照就全解不开了（与 JWT_SECRET 同款理由）。
-      PAYOUT_ACCOUNT_ENCRYPTION_KEY: local-dev-only-payout-encryption-key-at-least-32-chars
+      PAYOUT_ACCOUNT_ENCRYPTION_KEY: ${PAYOUT_ACCOUNT_ENCRYPTION_KEY:-local-dev-only-payout-encryption-key-at-least-32-chars}
       JWT_EXPIRES_IN: 2h
       REFRESH_TOKEN_TTL_DAYS: '30'
       # MinIO（媒体上传）。三个 endpoint 各管各的，含义见 api/.env.example。
@@ -140,7 +158,7 @@ services:
       # PAYOUT_PLATFORM_DEFAULT_CHANNEL 只是 DB 无行时的兜底，生产允许不设。
       # CHANNEL_MODE=sandbox 在生产环境同样会拒绝启动。
     ports:
-      - '${API_PORT:-3000}:3000'
+      - '127.0.0.1:${API_PORT:-3000}:3000'
     healthcheck:
       # 用 node 自带的 fetch 探活：运行阶段没有 curl / wget，
       # node 22 的 fetch 不需要额外依赖。
@@ -151,6 +169,8 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
+    logging: *default-logging
+    mem_limit: 1g
 
   storefront:
     build:
@@ -171,6 +191,16 @@ services:
       AUTH_TRUST_HOST: 'true'
     ports:
       - '${STOREFRONT_PORT:-3001}:3000'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - node -e "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging: *default-logging
+    mem_limit: 512m
 
   merchant-admin:
     build:
@@ -187,6 +217,16 @@ services:
       AUTH_TRUST_HOST: 'true'
     ports:
       - '${MERCHANT_ADMIN_PORT:-3002}:3000'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - node -e "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging: *default-logging
+    mem_limit: 512m
 
   platform-admin:
     build:
@@ -203,20 +243,36 @@ services:
       AUTH_TRUST_HOST: 'true'
     ports:
       - '${PLATFORM_ADMIN_PORT:-3003}:3000'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - node -e "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging: *default-logging
+    mem_limit: 512m
 
   nginx:
     image: nginx:1.27-alpine
     container_name: ecommerce-nginx
     restart: unless-stopped
     depends_on:
-      - api
-      - storefront
-      - merchant-admin
-      - platform-admin
+      api:
+        condition: service_healthy
+      storefront:
+        condition: service_healthy
+      merchant-admin:
+        condition: service_healthy
+      platform-admin:
+        condition: service_healthy
     ports:
       - '${NGINX_PORT:-80}:80'
     volumes:
       - ./nginx/platform.test.conf:/etc/nginx/conf.d/default.conf:ro
+    logging: *default-logging
+    mem_limit: 256m
 
 volumes:
   pgdata:
