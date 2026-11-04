@@ -27,8 +27,10 @@
 
 1. **回环绑定统一到了全部宿主机端口**（超出计划列的 api / minio-console 两个）：
    批次 B 的 quality 审查指出 postgres 15432 与批次 A 的口径不一致——既然「不暴露
-   局域网」是设计意图，redis 16380 与 postgres 15432 也一并绑 `127.0.0.1`
-   （本机开发走 localhost 不受影响，实测 api health 与 e2e 全绿）。
+   局域网」是设计意图，redis 16380 与 postgres 15432 也一并绑 `127.0.0.1`；
+   终审又抓到三个前端端口（3001/3002/3003）是漏网之鱼，同批补绑。
+   最终仅 MinIO API 19000 保持全网卡（浏览器直传要用）。
+   本机开发走 localhost 不受影响，实测 api health 与 e2e 全绿。
 2. **Git Data API 推送不产生 push 事件**——CI 靠 push 触发的假设不成立。
    `ci.yml` 加了 `workflow_dispatch` 入口；实际首跑由 PR #26 的
    `pull_request` 事件触发（创建 / 重开 PR 都会触发）。**以后更新 PR 分支后
@@ -64,7 +66,7 @@
 | 单测（后端） | `cd api && npm test` | **47 suites / 889 tests**（886 passed + 3 skipped）全绿 |
 | e2e（后端全量） | `cd api && npm run test:e2e` | **40 suites / 657 tests** 全绿 |
 | compose 部署形态 | `docker compose up -d --wait && docker compose ps` | 8 服务全部 `(healthy)`（nginx 无 healthcheck，Up） |
-| 端口回环 | `lsof -nP -iTCP:{15432,16380,3000,19001} -sTCP:LISTEN` | 全部 `127.0.0.1`；19000（MinIO API）仍全网卡（浏览器直传要用） |
+| 端口回环 | `lsof -nP -iTCP:{3000,3001,3002,3003,15432,16380,19001} -sTCP:LISTEN` | 全部 `127.0.0.1`；19000（MinIO API）仍全网卡（浏览器直传要用） |
 | Redis 密码链路 | `redis-cli -a "$REDIS_PASSWORD" ping` / 无密码 ping | `PONG` / `NOAUTH`（双向确认） |
 | api health | `curl localhost:3000/api/v1/health` | `{"redis":true,"database":true}` |
 | nginx 收口 | 未知 Host / 安全头 / 三域名回归 | `000`（444）/ 三头齐全 / 200·307 正常 |
