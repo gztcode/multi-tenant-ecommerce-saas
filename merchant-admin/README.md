@@ -74,7 +74,7 @@ curl -X POST http://localhost:3000/api/v1/auth/register/merchant \
 ## 单元测试
 
 ```bash
-npm test          # 417 条 / 27 个文件
+npm test          # 428 条 / 29 个文件
 npm run test:watch   # watch 模式
 ```
 

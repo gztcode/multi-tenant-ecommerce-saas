@@ -168,6 +168,9 @@ function fakePrisma(options: {
       updateMany: jest.fn(() =>
         Promise.resolve({ count: options.affectedCount ?? 1 }),
       ),
+      // ⚠️ **出单路径要它**：没有 `create` 的话「新建成功」那条分支
+      //    在假 Prisma 里根本走不完（`create` 之后还要 `createMany` 明细）。
+      create: jest.fn(() => Promise.resolve(options.statement ?? null)),
       // ⚠️ **列表页用**：按 `where` 过滤（本 spec 只用到 `periodStart` 精确匹配）。
       findMany: jest.fn((args?: { where?: { periodStart?: Date } }) => {
         const rows = options.statements?.filter(Boolean) ?? [];
@@ -339,26 +342,15 @@ function fakePrisma(options: {
     },
     $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => {
       calls.push('$transaction');
-      const tx = {
-        settlementStatementEntry: {
-          deleteMany: jest.fn(() => Promise.resolve({ count: 1 })),
-          createMany: jest.fn(() => {
-            calls.push('createMany');
-            if (options.createManyThrows) {
-              return Promise.reject(uniqueViolation());
-            }
-            return Promise.resolve({ count: 1 });
-          }),
-        },
-        settlementStatement: {
-          // ⚠️ **出单路径要它**：没有 `create` 的话「新建成功」那条分支
-          //    在假 Prisma 里根本走不完（`create` 之后还要 `createMany` 明细）。
-          create: jest.fn(() => Promise.resolve(options.statement ?? null)),
-          updateMany: jest.fn(() =>
-            Promise.resolve({ count: options.affectedCount ?? 1 }),
-          ),
-          findFirst: jest.fn(() => Promise.resolve(options.statement ?? null)),
-        },
+      // ⚠️ **显式注解断开类型环**：`tx` 引用 `prisma` 自身，
+      //    不注解会让 `prisma` 的推断绕回自己（TS7022）。
+      const tx: Record<string, unknown> = {
+        // ⚠️ **事务内复用同一批 mock**：`unconfirm` 要在事务里回查状态、
+        //    查引用、条件更新 —— 与事务外的查询共用计数器，
+        //    `statements` 序列才能表达「事务内读到的先后两份状态」。
+        settlementStatement: prisma.settlementStatement,
+        payout: prisma.payout,
+        settlementStatementEntry: prisma.settlementStatementEntry,
       };
       return fn(tx);
     }),
@@ -470,6 +462,22 @@ describe('重算：当期没有流水时不能抹成空单', () => {
 });
 
 describe('取消确认：必须检查 updateMany 的 affected.count', () => {
+  it('取消确认在同一个事务里完成回查与更新', async () => {
+    // ⚠️ **回查与条件更新必须在同一个事务里**：
+    //    分两步做的话，中间新建的、引用这张结算单的出款单看不见 ——
+    //    闸放行、状态更新成功，已批出款单的佣金快照就失真了。
+    const prisma = fakePrisma({
+      statements: [statement({ status: SettlementStatus.CONFIRMED })],
+      affectedCount: 1,
+    });
+
+    const service = makeService(prisma);
+
+    await service.unconfirm('stmt-a');
+
+    expect(prisma.calls).toContain('$transaction');
+  });
+
   it('affected.count = 0（并发下已被别人改过）→ 409', async () => {
     // ⚠️ **第一次读到 CONFIRMED**（够格取消确认），
     //    **第二次读到 PAID**（并发下已被别人改成已出款），

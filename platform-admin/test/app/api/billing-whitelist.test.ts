@@ -733,4 +733,24 @@ describe('计费中转：未登录不碰后端', () => {
     expect(response.status).toBe(401);
     expect(apiFetchMock).not.toHaveBeenCalled();
   });
+
+  it('session 存在但 accessToken 为空：GET 套餐列表 → 401 且不调后端', async () => {
+    authMock.mockResolvedValue({ accessToken: '' } as never);
+
+    const response = await plansGet();
+
+    expect(response.status).toBe(401);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('session 存在但 accessToken 为空：POST 创建套餐 → 401 且不调后端', async () => {
+    authMock.mockResolvedValue({ accessToken: '' } as never);
+
+    const response = await createPlanPost(
+      postRequest('http://localhost/api/billing/plans', {}),
+    );
+
+    expect(response.status).toBe(401);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
 });

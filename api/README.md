@@ -15,14 +15,17 @@ npm run prisma:deploy && npm run prisma:seed
 npm run start:dev
 ```
 
+迁移报 `migration have been modified` 时，用 `npm run db:fix-legacy-checksum` 修正校验和；
+不要用 `prisma migrate dev`（会要求清库）。
+
 服务默认监听 `http://localhost:3000`，API 前缀 `/api/v1`，
 接口文档 `http://localhost:3000/api/docs`。
 
 ## 测试
 
 ```bash
-npm test              # 单元测试（907 条 / 51 个套件）
-npm run test:e2e      # 端到端测试（657 条 / 40 个套件，串行）
+npm test              # 单元测试（947 条 / 57 个套件，3 条跳过）
+npm run test:e2e      # 端到端测试（663 条 / 40 个套件，串行）
 npm run test:cov      # 单元测试覆盖率
 npm run test:cov:e2e  # e2e 覆盖率
 npm run lint          # 静态检查
@@ -35,9 +38,11 @@ npm run lint          # 静态检查
 ## 账目运维脚本
 
 ```bash
-npm run backfill:ledger          # 回填抽佣流水（幂等，可重复跑）
+npm run backfill:ledger          # 回填抽佣流水（幂等；已出款周期默认拒绝，--force 跳过）
 npm run check:ledger             # 校验账目一致性
 npm run migrate:payout-encryption   # 收款账户明文 → 密文的存量迁移
+npm run payout:retry-pre-payout  # 批量重试「确定未打款」的失败出款单
+npm run db:fix-legacy-checksum   # 迁移 checksum 修正（仅报 modified 时）
 ```
 
 ## 本地假网关与沙箱

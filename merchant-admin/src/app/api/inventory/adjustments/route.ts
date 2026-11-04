@@ -15,7 +15,7 @@ const ADJUSTMENT_TYPES = ['ADJUST_IN', 'ADJUST_OUT', 'CHECK'] as const;
 
 export async function POST(request: Request) {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     return unauthorizedResponse();
   }
 

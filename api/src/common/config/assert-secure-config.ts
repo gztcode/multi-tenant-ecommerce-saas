@@ -64,7 +64,67 @@ export function assertSecureConfig(): void {
   //    优先级 —— 三种都是**启动期硬失败**，先后顺序只影响「先看到哪一条」。
   assertJwtSecret();
   assertFakeToggles();
+  assertProductionCredentials();
   assertChannelConfig();
+}
+
+/** docker-compose 内置的默认数据库密码 */
+const COMPOSE_DEFAULT_DB_PASSWORD = 'ecommerce';
+
+/** docker-compose 内置的默认 MinIO 密码 */
+const COMPOSE_DEFAULT_MINIO_PASSWORD = 'ecommerce-minio-secret';
+
+/**
+ * 生产环境的凭据守卫（阶段 9）。
+ *
+ * ⚠️ 只检查**本进程能看到的环境变量**：
+ *    `AUTH_SECRET` 由 Next 进程读取，不在这里检查（见共享包的 `assertAuthSecret`）。
+ * ⚠️ 非生产环境一律放行：本机 compose 与开发脚本本来就复用默认值。
+ * ⚠️ URL 解析失败按「没有密码」处理（fail-closed），不吞异常后放行。
+ */
+function assertProductionCredentials(): void {
+  if (process.env.NODE_ENV !== 'production') {
+    return;
+  }
+
+  const dbPassword = readUrlPassword(process.env.DATABASE_URL ?? '');
+  if (!dbPassword || dbPassword === COMPOSE_DEFAULT_DB_PASSWORD) {
+    throw new Error(
+      '生产环境禁止使用默认/空的数据库密码：请设置 POSTGRES_PASSWORD，并同步更新 DATABASE_URL。',
+    );
+  }
+
+  const redisPassword = readUrlPassword(process.env.REDIS_URL ?? '');
+  if (!redisPassword) {
+    throw new Error(
+      '生产环境禁止使用无密码的 Redis：请在 REDIS_URL 中写入密码（redis://:密码@主机:端口）。',
+    );
+  }
+
+  const minioCandidates = [
+    process.env.MINIO_ROOT_PASSWORD,
+    process.env.MINIO_SECRET_KEY,
+  ].filter((value): value is string => !!value);
+  if (
+    minioCandidates.length === 0 ||
+    minioCandidates.every((value) => value === COMPOSE_DEFAULT_MINIO_PASSWORD)
+  ) {
+    throw new Error(
+      '生产环境禁止使用默认/空的 MinIO 密码：请设置 MINIO_ROOT_PASSWORD / MINIO_SECRET_KEY。',
+    );
+  }
+}
+
+/** 从连接串里取密码；非法 URL 或没有 userinfo 时返回空串。 */
+function readUrlPassword(raw: string): string {
+  if (!raw) {
+    return '';
+  }
+  try {
+    return new URL(raw).password;
+  } catch {
+    return '';
+  }
 }
 
 function assertJwtSecret(): void {

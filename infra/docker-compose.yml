@@ -64,8 +64,9 @@ services:
     #
     # 这里用 Chainguard 从源码重建的 MinIO：API 与数据格式兼容，
     # 无 shell 之外无多余依赖，S3 接口一致。
-    # 该 registry 只有 latest 一个 tag，当前 digest 记录在 .env.example 里备查。
-    image: cgr.dev/chainguard/minio:latest
+    # 该 registry 只有 latest 一个 tag；用 digest 锁定到当前验证过的构建。
+    # digest 来源：2026-11-04 `docker image inspect` 的 RepoDigests。
+    image: cgr.dev/chainguard/minio@sha256:ad134b2dd572ae0d989d6807c3e45516cc75a34883a8021db2ff04be5d1d496a
     container_name: ecommerce-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -76,8 +77,8 @@ services:
       # 多个来源用英文逗号分隔；实测该变量对预检请求生效。
       MINIO_CORS_ALLOW_ORIGIN: ${MINIO_CORS_ALLOW_ORIGIN:-http://localhost:3001,http://localhost:3002,http://localhost:3003,http://localhost}
     ports:
-      # 宿主机端口 19000：本机标准端口已被其他项目栈占用
-      - '${MINIO_PORT:-19000}:9000'
+      # 默认只绑本机回环；局域网访问显式设置 BIND_HOST=0.0.0.0
+      - '${BIND_HOST:-127.0.0.1}:${MINIO_PORT:-19000}:9000'
       # 控制台端口，与 API 端口不同（只绑本机回环）
       - '127.0.0.1:${MINIO_CONSOLE_PORT:-19001}:9001'
     volumes:
@@ -123,7 +124,7 @@ services:
       # 同时受两项约束：长度 ≥ 32 字符；不能等于 .env.example 里的占位符
       # （api/src/common/config/assert-secure-config.ts 会在启动时拒绝）。
       # 这里的值只服务于本机开发，真实部署必须换成随机密钥。
-      JWT_SECRET: local-dev-only-jwt-secret-at-least-32-chars-long
+      JWT_SECRET: ${JWT_SECRET:-local-dev-only-jwt-secret-at-least-32-chars-long}
       # 收款账户与出款单快照的字段加密密钥。
       # ⚠️ 必须是**固定值**：每次 up 都换密钥的话，
       # 之前签发的出款单快照就全解不开了（与 JWT_SECRET 同款理由）。
@@ -189,7 +190,7 @@ services:
     environment:
       # 容器内走服务名，不走宿机的 localhost:3000。
       API_BASE_URL: http://api:3000/api/v1
-      AUTH_SECRET: local-dev-only-auth-secret-at-least-32-chars
+      AUTH_SECRET: ${AUTH_SECRET:-local-dev-only-auth-secret-at-least-32-chars}
       AUTH_URL: http://localhost:3001
       AUTH_TRUST_HOST: 'true'
     ports:
@@ -216,7 +217,7 @@ services:
       - api
     environment:
       API_BASE_URL: http://api:3000/api/v1
-      AUTH_SECRET: local-dev-only-auth-secret-at-least-32-chars
+      AUTH_SECRET: ${AUTH_SECRET:-local-dev-only-auth-secret-at-least-32-chars}
       AUTH_URL: http://localhost:3002
       AUTH_TRUST_HOST: 'true'
     ports:
@@ -243,7 +244,7 @@ services:
       - api
     environment:
       API_BASE_URL: http://api:3000/api/v1
-      AUTH_SECRET: local-dev-only-auth-secret-at-least-32-chars
+      AUTH_SECRET: ${AUTH_SECRET:-local-dev-only-auth-secret-at-least-32-chars}
       AUTH_URL: http://localhost:3003
       AUTH_TRUST_HOST: 'true'
     ports:
@@ -273,7 +274,7 @@ services:
       platform-admin:
         condition: service_healthy
     ports:
-      - '${NGINX_PORT:-80}:80'
+      - '${BIND_HOST:-127.0.0.1}:${NGINX_PORT:-80}:80'
     volumes:
       - ./nginx/platform.test.conf:/etc/nginx/conf.d/default.conf:ro
     logging: *default-logging

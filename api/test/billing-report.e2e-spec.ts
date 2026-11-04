@@ -952,11 +952,14 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
     //
     // ⚠️ **回填跑在平台作用域下**（抽佣流水是跨租户的），
     // `CommissionService.backfill()` 内部自己 `tenantContext.run(platformScope())`。
-    const firstRun = await commission.backfill();
+    // ⚠️ **必须带 `force`**：e2e 共用一个测试库，别的套件会留下活跃出款单，
+    //    回填闸会（按设计）整批拒绝。本用例验证的是回填幂等与报表口径，
+    //    不是闸本身 —— 闸的行为由 `backfill-guard.spec.ts` 覆盖。
+    const firstRun = await commission.backfill({ force: true });
 
     // ⚠️ **回填是幂等的**（护栏 N6）：再跑一遍，行数不变。
     const before = await asPlatform(() => prisma.commissionEntry.count());
-    const secondRun = await commission.backfill();
+    const secondRun = await commission.backfill({ force: true });
     const after = await asPlatform(() => prisma.commissionEntry.count());
     expect(after).toBe(before);
     // ⚠️ **第二遍什么都不该新建**：第一遍建过的行原样保留。

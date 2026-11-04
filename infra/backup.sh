@@ -24,9 +24,12 @@ fi
 PG_USER="${POSTGRES_USER:-ecommerce}"
 PG_DB="${POSTGRES_DB:-ecommerce}"
 
-# 保留天数必须是正整数：非数字会让下面的 find -mtime 在备份做完后才报错。
-if ! [[ "$BACKUP_KEEP_DAYS" =~ ^[0-9]+$ ]]; then
-  echo "[backup] BACKUP_KEEP_DAYS 必须是非负整数：$BACKUP_KEEP_DAYS" >&2
+# 缺失卷的默认行为：失败退出。cron 场景需要显式选择才跳过。
+ALLOW_MISSING_VOLUMES="${ALLOW_MISSING_VOLUMES:-0}"
+
+# 保留天数必须是正整数：0 会让 `-mtime +0` 删掉所有超过 1 天的备份。
+if ! [[ "$BACKUP_KEEP_DAYS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[backup] BACKUP_KEEP_DAYS 必须是正整数：$BACKUP_KEEP_DAYS" >&2
   exit 1
 fi
 
@@ -37,7 +40,7 @@ docker compose up -d --wait postgres
 
 # 1) PostgreSQL 逻辑备份（pg_dump 版本与容器一致，直接用服务内执行）
 echo "[backup] postgres: $PG_DB"
-docker compose exec -T postgres pg_dump -U "$PG_USER" "$PG_DB" \
+docker compose exec -T postgres pg_dump -U "$PG_USER" --clean --if-exists "$PG_DB" \
   | gzip > "$DEST/postgres-$PG_DB.sql.gz"
 # ⚠️ 备份后立即校验 gzip 完整性：损坏的备份比没有备份更危险。
 #    校验失败立即删掉损坏文件并非零退出，避免被当成「有一份备份」。
@@ -57,25 +60,45 @@ VOLUMES="$(docker volume ls --format '{{.Name}}')"
 # 这里只放行「确实没有该卷」，不放行 docker 本身的失败（上面已先执行）。
 MINIO_VOL="$(printf '%s\n' "$VOLUMES" | grep -E 'minio-data$' | head -n1 || true)"
 if [ -z "$MINIO_VOL" ]; then
-  echo "[backup] 找不到 minio-data 卷，跳过 MinIO 备份" >&2
+  echo "[backup] 找不到 minio-data 卷" >&2
+  if [ "$ALLOW_MISSING_VOLUMES" != "1" ]; then
+    exit 1
+  fi
+  echo "[backup] ALLOW_MISSING_VOLUMES=1，跳过 MinIO 备份" >&2
 else
   echo "[backup] minio volume: $MINIO_VOL"
   docker run --rm \
     -v "$MINIO_VOL":/data:ro \
     -v "$(cd "$DEST" && pwd)":/backup \
     alpine tar czf "/backup/minio-data.tgz" -C /data .
+  if ! tar tzf "$DEST/minio-data.tgz" >/dev/null; then
+    echo "[backup] MinIO 备份校验失败，删除损坏文件" >&2
+    rm -f "$DEST/minio-data.tgz"
+    exit 1
+  fi
+  echo "[backup] MinIO 备份校验通过"
 fi
 
 # 3) Redis 数据卷热备（AOF 可能有写入中的不一致，本机开发够用）
 REDIS_VOL="$(printf '%s\n' "$VOLUMES" | grep -E 'redis-data$' | head -n1 || true)"
 if [ -z "$REDIS_VOL" ]; then
-  echo "[backup] 找不到 redis-data 卷，跳过 Redis 备份" >&2
+  echo "[backup] 找不到 redis-data 卷" >&2
+  if [ "$ALLOW_MISSING_VOLUMES" != "1" ]; then
+    exit 1
+  fi
+  echo "[backup] ALLOW_MISSING_VOLUMES=1，跳过 Redis 备份" >&2
 else
   echo "[backup] redis volume: $REDIS_VOL"
   docker run --rm \
     -v "$REDIS_VOL":/data:ro \
     -v "$(cd "$DEST" && pwd)":/backup \
     alpine tar czf "/backup/redis-data.tgz" -C /data .
+  if ! tar tzf "$DEST/redis-data.tgz" >/dev/null; then
+    echo "[backup] Redis 备份校验失败，删除损坏文件" >&2
+    rm -f "$DEST/redis-data.tgz"
+    exit 1
+  fi
+  echo "[backup] Redis 备份校验通过"
 fi
 
 # 4) 保留策略：删除超过 N 天的备份目录（当前这次刚创建，不会被删）

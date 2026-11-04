@@ -8,6 +8,7 @@ import {
   ParseUUIDPipe,
   Post,
   Query,
+  StreamableFile,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { UserRole } from '@prisma/client';
@@ -57,6 +58,19 @@ export class PlatformSettlementController {
     return this.settlements.generate({
       period: body.period,
       tenantId: body.tenantId,
+    });
+  }
+
+  // ⚠️ **必须放在 `@Get('settlements/:id')` 之前**，否则 `export` 会被
+  //    `:id` 吞掉并触发 UUID 校验 400。
+  @Get('settlements/export')
+  @ApiOperation({ summary: '导出结算单 CSV（最多 100 条）' })
+  async export(@Query() query: SettlementListQueryDto) {
+    const csv = await this.settlements.exportCsv({ period: query.period });
+
+    return new StreamableFile(Buffer.from(`\uFEFF${csv}`, 'utf8'), {
+      type: 'text/csv; charset=utf-8',
+      disposition: `attachment; filename="settlements-${query.period ?? 'all'}.csv"`,
     });
   }
 

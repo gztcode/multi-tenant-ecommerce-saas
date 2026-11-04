@@ -252,6 +252,12 @@ export class AuthService {
   async refresh(refreshToken: string): Promise<AuthResult> {
     const tokenHash = hashRefreshToken(refreshToken);
 
+    // ⚠️ **整次刷新只取一次时钟，且用数据库时钟**。
+    //    原来的 `new Date()` 与 `databaseNow()` 不是同一个时钟：
+    //    多副本/容器时钟偏几秒时，宽限期判定会与清理任务不一致
+    //    → 既被判定在宽限期、密文又被清理掉，最后吊销整族。
+    const now = await this.prisma.databaseNow();
+
     const stored = await this.prisma.refreshToken.findFirst({
       where: { tokenHash },
       include: { user: true },
@@ -263,10 +269,10 @@ export class AuthService {
 
     // 这枚令牌已经被吊销过，又被再次使用。
     if (stored.revokedAt) {
-      return this.handleRevokedToken(stored);
+      return this.handleRevokedToken(stored, now);
     }
 
-    if (stored.expiresAt < new Date()) {
+    if (stored.expiresAt < now) {
       throw new UnauthorizedException('刷新令牌无效或已过期');
     }
 
@@ -287,23 +293,18 @@ export class AuthService {
       this.createRefreshToken();
 
     const rotated = await this.prisma.$transaction(async (tx) => {
-      // ⚠️ **同一次轮换只取一次时钟**。
-      // 原来 `revokedAt` 与 `graceExpiresAt` 各自调了一次 `new Date()`，
-      // 两次读之间跨过毫秒边界就会让「宽限期 = 60001ms」——
-      // e2e 断言的是**精确相等**，实测失败率约 10%。
-      const rotateNow = new Date();
+      // ⚠️ **沿用入口那一次时钟**：事务内再取一次会让
+      //    revokedAt 与 graceExpiresAt 跨过毫秒边界（阶段 5c 已修过一次）。
       const count = await tx.refreshToken.updateMany({
         where: { id: stored.id, revokedAt: null },
         data: {
-          revokedAt: rotateNow,
+          revokedAt: now,
           revokedReason: RefreshTokenRevokedReason.ROTATED,
           // ⚠️ **宽限记录**：新令牌的**密文**。
           // 存密文而不是明文 —— 这张表经常被备份与只读分析。
           rotatedToToken: encryptToken(newRefreshToken, this.graceKey),
           // ⚠️ **一次定死，不因重放而延长**。
-          graceExpiresAt: new Date(
-            rotateNow.getTime() + REFRESH_GRACE_PERIOD_MS,
-          ),
+          graceExpiresAt: new Date(now.getTime() + REFRESH_GRACE_PERIOD_MS),
         },
       });
 
@@ -331,7 +332,7 @@ export class AuthService {
       if (!current) {
         throw new UnauthorizedException('刷新令牌无效或已过期');
       }
-      return this.handleRevokedToken(current);
+      return this.handleRevokedToken(current, now);
     }
 
     return {
@@ -361,6 +362,7 @@ export class AuthService {
    */
   private async handleRevokedToken(
     stored: Prisma.RefreshTokenGetPayload<{ include: { user: true } }>,
+    now: Date,
   ): Promise<AuthResult> {
     // ① 登出后误用：用户只是误用了自己刚登出的旧令牌。
     // 把它当成泄露处理会把手机、电脑等其它设备的登录一起踢掉。
@@ -377,7 +379,7 @@ export class AuthService {
     if (
       stored.revokedReason === RefreshTokenRevokedReason.ROTATED &&
       stored.graceExpiresAt &&
-      new Date() < stored.graceExpiresAt
+      now < stored.graceExpiresAt
     ) {
       const restored =
         stored.rotatedToToken === null

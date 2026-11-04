@@ -14,7 +14,7 @@ export async function POST(
 ) {
   const { id, itemId } = await params;
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     return unauthorizedResponse();
   }
 

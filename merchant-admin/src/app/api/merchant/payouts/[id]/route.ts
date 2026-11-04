@@ -14,7 +14,7 @@ export async function DELETE(
   context: { params: Promise<{ id: string }> },
 ) {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     return unauthorizedResponse();
   }
 

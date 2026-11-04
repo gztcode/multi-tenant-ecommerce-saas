@@ -26,7 +26,7 @@ const LIST_QUERY_KEYS = ['page', 'pageSize', 'keyword', 'categoryId', 'status'] 
  */
 export async function GET(request: Request) {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     return unauthorizedResponse();
   }
 
@@ -60,7 +60,7 @@ export async function GET(request: Request) {
  */
 export async function POST(request: Request) {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     return unauthorizedResponse();
   }
 

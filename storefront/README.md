@@ -57,7 +57,7 @@ npm run dev              # http://localhost:3001（固定 3001，3000 留给 api
 ## 单元测试
 
 ```bash
-npm test          # 209 条 / 24 个文件
+npm test          # 228 条 / 30 个文件
 npm run test:watch   # watch 模式
 ```
 

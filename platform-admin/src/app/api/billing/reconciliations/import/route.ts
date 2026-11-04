@@ -12,7 +12,7 @@ import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
  */
 export async function POST(request: Request) {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     return unauthorizedResponse();
   }
 

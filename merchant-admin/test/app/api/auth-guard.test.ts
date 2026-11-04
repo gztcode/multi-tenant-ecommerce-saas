@@ -108,3 +108,28 @@ describe('护栏 1：未登录的中转路由', () => {
     expect(body.message).toBe('未登录或登录已过期');
   });
 });
+
+describe('护栏 1 补强：session 存在但 accessToken 为空', () => {
+  beforeEach(() => {
+    authMock.mockResolvedValue({ accessToken: '' } as never);
+  });
+
+  it('GET /api/categories → 401 且不调后端', async () => {
+    const response = await categoriesGet();
+
+    expect(response.status).toBe(401);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /api/products/batch → 401 且不调后端', async () => {
+    const response = await batchPost(
+      postRequest('http://localhost/api/products/batch', {
+        ids: ['a'],
+        action: 'PUBLISH',
+      }),
+    );
+
+    expect(response.status).toBe(401);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+});

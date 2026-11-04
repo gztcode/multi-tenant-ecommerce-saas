@@ -190,7 +190,7 @@ describe('结算单列表页：周期来自 URL', () => {
     const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
     // ⚠️ **精确匹配而不是 `toContain`**：`toContain('/platform/settlements')`
     //    连 `/platform/settlementsXYZ` 也放得过，路径写歪了照样绿。
-    expect(path).toBe('/platform/settlements?pageSize=200');
+    expect(path).toBe('/platform/settlements?pageSize=100');
   });
 
   it('给了周期 → 路径里带 period', async () => {
@@ -199,23 +199,23 @@ describe('结算单列表页：周期来自 URL', () => {
     const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
     // ⚠️ **精确匹配**：参数顺序与编码方式都锁死 ——
     //    顺序一变后端解析结果可能变，编码漏了则含特殊字符的周期会被截断。
-    expect(path).toBe('/platform/settlements?period=2026-01&pageSize=200');
+    expect(path).toBe('/platform/settlements?period=2026-01&pageSize=100');
   });
 
-  it('⚠️ 两种路径都带 pageSize=200（后端 pageSize 上限就是 200）', async () => {
+  it('⚠️ 两种路径都带 pageSize=100（后端 pageSize 上限就是 100）', async () => {
     // ⚠️ 少了这个参数 → 后端退回默认页大小 → 单据多时被静默截断，
     //    页面看上去「只有这些单据」→ 平台据此算账会少算。
-    // ⚠️ **必须精确匹配**：写成 `toContain('pageSize=200')` 时，
-    //    `pageSize=2000` 也能匹配过去 —— 那会被后端截断或直接报错。
+    // ⚠️ **必须精确匹配**：写成 `toContain('pageSize=100')` 时，
+    //    `pageSize=1000` 也能匹配过去 —— 那会被后端截断或直接报错。
     await renderPage();
     const [withoutPeriod] = apiFetchAuthedMock.mock.calls[0] as [string];
-    expect(withoutPeriod).toBe('/platform/settlements?pageSize=200');
+    expect(withoutPeriod).toBe('/platform/settlements?pageSize=100');
 
     apiFetchAuthedMock.mockClear();
     await renderPage({ period: '2026-01' });
     const [withPeriod] = apiFetchAuthedMock.mock.calls[0] as [string];
     expect(withPeriod).toBe(
-      '/platform/settlements?period=2026-01&pageSize=200',
+      '/platform/settlements?period=2026-01&pageSize=100',
     );
   });
 

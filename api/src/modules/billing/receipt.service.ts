@@ -7,6 +7,7 @@ import {
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
+import { guardBackfill } from './backfill-guard';
 import type { CommissionOrderSnapshot } from './commission.service';
 
 /**
@@ -224,7 +225,9 @@ export class ReceiptService {
    * （抽佣看 `commissionAmount`、货款看 `totalAmount`），
    * 零额抽佣的订单**有货款、无抽佣** → 货款必须单独回填。
    */
-  async backfill(): Promise<ReceiptBackfillResult> {
+  async backfill(
+    options: { force?: boolean } = {},
+  ): Promise<ReceiptBackfillResult> {
     const result: ReceiptBackfillResult = {
       receiptCreated: 0,
       reversalCreated: 0,
@@ -233,6 +236,9 @@ export class ReceiptService {
     };
 
     await tenantContext.run(platformScope(), async () => {
+      // ⚠️ **闸必须在订单查询之前**：先挡住「已经出过款的周期」。
+      await guardBackfill(this.prisma, options.force === true);
+
       // ⚠️ **只查 `paidAt` 非空的订单**：没付过钱的订单没有货款。
       const orders = await this.prisma.order.findMany({
         where: { paidAt: { not: null } },

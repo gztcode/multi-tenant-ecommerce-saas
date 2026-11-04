@@ -100,7 +100,7 @@ admin@platform.test / Admin12345!
 ## 单元测试
 
 ```bash
-npm test          # 429 条 / 18 个文件
+npm test          # 475 条 / 23 个文件
 npm run test:watch   # watch 模式
 ```
 

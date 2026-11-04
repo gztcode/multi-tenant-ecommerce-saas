@@ -23,7 +23,7 @@ export const KNOWN_PLACEHOLDER_SECRETS: ReadonlySet<string> = new Set([
   // 3) infra/docker-compose.yml 的 ${JWT_SECRET:-...} 默认值
   'local-dev-only-jwt-secret-at-least-32-chars-long',
   // 4) infra/docker-compose.yml 的 ${PAYOUT_ACCOUNT_ENCRYPTION_KEY:-...} 默认值
-  '-local-dev-only-payout-encryption-key-at-least-32-chars',
+  'local-dev-only-payout-encryption-key-at-least-32-chars',
 ]);
 
 /** 该值是否是已知的示例/默认密钥 */

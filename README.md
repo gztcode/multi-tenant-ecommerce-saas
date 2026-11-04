@@ -2,7 +2,28 @@
 
 前后端完全分离的多租户电商底座。一个实例服务多个商家：每个商家有自己的店铺、商品、订单与客户。
 
-**当前进度：阶段 8「部署韧性、鉴权与资金正确性」已完成并验收通过。**
+**当前进度：阶段 9「历史技术债清理」已完成并验收通过。**
+
+阶段 9 按四批清历史遗留：
+
+- **A 安全与部署**：生产环境拒绝默认/空的 PostgreSQL、Redis、MinIO 凭据；
+  三端 `AUTH_SECRET` 启动守卫（含 compose 默认值与 `.env.example` 占位值，
+  `next build` 阶段放行）；compose 密钥可被环境变量覆盖、端口默认只绑回环、
+  MinIO 镜像钉 digest。
+- **B 运维与 CI**：备份缺卷默认失败并校验归档完整性，新增 `infra/restore.sh`
+  与 `crontab.example`；CI 三前端合并为 matrix 并补 `lint`，新增 e2e job；
+  回填脚本遇到活跃出款单默认拒绝（`--force` 显式跳过）。
+- **C 资金与并发**：取消确认在事务内回查与更新；刷新令牌统一使用数据库时钟；
+  宽限密文清理同时删除超保留期的过期行；结算单 CSV 导出（含公式注入防护）；
+  新增批量重试「确定未打款」失败单的脚本。
+- **D 前端与文档**：70 处中转路由改为 `!session?.accessToken`；storefront
+  四个页面补齐 loading 骨架；删除未使用的 `@nestjs/config` 与共享包
+  `react-dom`；文档口径统一。
+
+阶段 9 的设计文档见
+[`docs/superpowers/specs/2026-11-04-plan-09-tech-debt-cleanup-design.md`](docs/superpowers/specs/2026-11-04-plan-09-tech-debt-cleanup-design.md)；
+验收记录见
+[`docs/superpowers/plans/2026-11-04-plan-09-acceptance.md`](docs/superpowers/plans/2026-11-04-plan-09-acceptance.md)。
 
 阶段 8 修的是「部署能跑但会打架、并发下会丢钱」的高危问题：
 
@@ -140,6 +161,9 @@ cd platform-admin && npm install && cp .env.example .env && npm run dev   # :300
 > `packages/frontend-shared` 必须先单独 `npm install`，否则三端的构建与测试
 > 会报共享包里的 `zod` / `react` 解析不到。CI 的三个前端 job 都有这一步。
 
+> Node/npm 基线：Node 22 + npm 11（见仓库根 `.nvmrc`；本机 Node 26 也可用）。
+> CI 与 Docker 镜像统一 npm 11；`package.json` 的 `engines` 只做提示，不作为安装闸。
+
 ### 本机端口
 
 本机标准端口被其他项目占用，本项目统一用：
@@ -210,14 +234,15 @@ PAYOUT_PLATFORM_DEFAULT_CHANNEL=fake-payout
 
 ```bash
 cd api
-npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，927 条 / 52 套件，3 条跳过）
+npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，947 条 / 57 套件，3 条跳过）
 npm run test:e2e      # 端到端（663 条 / 40 个套件，串行）
 npm run test:cov:e2e  # 项目真实覆盖率
 ```
 
 > ✅ **跑 e2e 不需要停 api 容器**（阶段 5c 实测更正）。队列前缀隔离
 > （`BULLMQ_PREFIX=bull-e2e`）与每轮清库早已实现，**容器 api 全程在跑**的情况下
-> 阶段 6 实测 657/657、阶段 8 实测 663/663 全绿。若仍遇到**随机的假失败**，再 `docker compose stop api` 排除。
+> 阶段 6 实测 657/657、阶段 8 实测 663/663、阶段 9 实测 663/663 全绿。
+> 若仍遇到**随机的假失败**，再 `docker compose stop api` 排除。
 > 历史背景见
 > [阶段 3 验收记录 §一](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md)。
 
@@ -225,9 +250,9 @@ npm run test:cov:e2e  # 项目真实覆盖率
 **三个前端都有单元测试**（Vitest）：
 
 ```bash
-cd merchant-admin  && npm test   # 421 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费白名单 + 令牌刷新 + jwt 回调的决策逻辑 + 出款/收款账户组件测试
-cd storefront     && npm test   # 223 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）+ jwt 回调的决策逻辑
-cd platform-admin && npm test   # 465 条：计费与对账中转路由的白名单 + 页面级测试 + 套餐表单 / 平台默认渠道设置的组件测试
+cd merchant-admin  && npm test   # 428 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费白名单 + 令牌刷新 + jwt 回调的决策逻辑 + 出款/收款账户组件测试
+cd storefront     && npm test   # 228 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）+ jwt 回调的决策逻辑
+cd platform-admin && npm test   # 475 条：计费与对账中转路由的白名单 + 页面级测试 + 套餐表单 / 平台默认渠道设置的组件测试
 ```
 
 > ✅ **三个前端都有组件测试基建**（`vitest.config.ts` + `test/setup.ts`）：
@@ -242,10 +267,10 @@ cd platform-admin && npm test   # 465 条：计费与对账中转路由的白名
 
 e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物理隔离。
 
-> CI（`.github/workflows/ci.yml`）有 api / storefront / merchant-admin /
-> platform-admin / shared 五个 job（单测 + 构建检查）；e2e（663 条串行）仍在
-> 本地跑（`npm run test:e2e`），首期不进 CI——云端跑一遍要完整迁移 + seed，
-> 时长远超单测，收益不匹配。
+> CI（`.github/workflows/ci.yml`）分六个 job：`api`（tsc + lint + 单测）、
+> `frontend` matrix（storefront / merchant-admin / platform-admin 各自 tsc + 单测 +
+> lint + build）、`shared`（tsc）与 `e2e`（串行跑 `test:e2e`，排除依赖 MinIO 的
+> media 套件）。
 
 ### 数据库迁移
 
@@ -264,20 +289,23 @@ cd api && npm run prisma:deploy
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 ```
 
-### 数据备份
+### 数据备份与恢复
 
 ```bash
-cd infra && ./backup.sh    # PostgreSQL 主库全量 + MinIO 数据卷 → infra/backups/<时间戳>/
+cd infra && ./backup.sh    # PostgreSQL 全量 + MinIO 数据卷 + Redis 数据卷 → infra/backups/<时间戳>/
 ```
 
-定时备份挂 crontab（示例为每天 03:00）。⚠️ cron 的 PATH 常不含 docker，开头补一行
-`PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`：
+定时备份见 `infra/crontab.example`。恢复前先确认目标：
 
-```
-0 3 * * * cd /path/to/电商项目/infra && ./backup.sh >> backup.log 2>&1
+```bash
+cd infra
+./restore.sh postgres ./backups/<时间戳>/postgres-ecommerce.sql.gz   # 先看计划，不执行
+./restore.sh postgres ./backups/<时间戳>/postgres-ecommerce.sql.gz --yes
+./restore.sh minio    ./backups/<时间戳>/minio-data.tgz --yes
+./restore.sh redis    ./backups/<时间戳>/redis-data.tgz --yes
 ```
 
-`infra/backups/` 已加入 `.gitignore`；恢复命令见 `infra/backup.sh` 头部注释。
+`infra/backups/` 已加入 `.gitignore`。
 
 ---
 
@@ -327,6 +355,13 @@ node tools/push-via-api.mjs <本地分支> <远端分支>
 
 它通过 Git Data API 手工构造 tree / commit / ref，效果与 `git push` 等价。
 
+中文分支名会让 `gh api` 的参数编码出错（422 / 打印字节数组），此时改用 curl 版：
+
+```bash
+export GH_TOKEN=$(gh auth token)
+node tools/push-via-api-curl.mjs <本地分支> <远端分支>
+```
+
 ---
 
 ## 后续计划
@@ -353,22 +388,22 @@ node tools/push-via-api.mjs <本地分支> <远端分支>
 | 计划 7b | api 代码收口（事务 / 分页 / 横切统一 / 访问日志）—— **已完成并验收通过** |
 | 计划 7c | 前端共享包 `@ecom/frontend-shared` + 三端收口 + loading 骨架 —— **已完成并验收通过** |
 | 计划 8a / 8b / 8c | 部署与鉴权 → 资金与并发正确性 → 健壮性与工程债 —— **已完成并验收通过** |
+| 计划 9 | 安全与部署、运维与 CI、资金并发护栏、前端与文档清理 —— **已完成并验收通过** |
 
-### 阶段 7 之后的剩余技术债
+### 阶段 8 之后的剩余技术债
 
 阶段 7 明确**不做**的几件事（设计与验收记录里都写明了，别当成遗漏）：
 
 1. **TLS / secret manager / 结构化日志（pino）/ 慢查询阈值** —— 坚持本机开发形态，
    compose 仅供本机，加固以「不暴露局域网 + 密钥不内联」为度。
-2. **e2e 进 CI** —— 663 条串行要完整迁移 + seed，时长远超单测；CI 只保单测 + 构建。
-3. **三端源码 import 路径大面积替换到共享包** —— 目前保留三端薄壳 re-export
+2. **三端源码 import 路径大面积替换到共享包** —— 目前保留三端薄壳 re-export
    （调用点零改动），将来真要清理再单独做。
-4. **共享包独立发布 / 版本化** —— 阶段 8 已把 `session-sync-component.tsx` 改成
+3. **共享包独立发布 / 版本化** —— 阶段 8 已把 `session-sync-component.tsx` 改成
    工厂注入（不再依赖各端 `@/lib/session-sync` alias），共享包可独立 `tsc` 并进了 CI；
    但**尚未**独立发布或独立版本化，仍按 `file:` 依赖使用。
-5. **守卫的 401/403 不进访问日志** —— Nest 的守卫在拦截器链**之外**执行，
+4. **守卫的 401/403 不进访问日志** —— Nest 的守卫在拦截器链**之外**执行，
    任何全局拦截器都盖不到。
-6. **`Order.itemCount` 是下单时的快照** —— 件数总和；订单项当前无修改路径，
+5. **`Order.itemCount` 是下单时的快照** —— 件数总和；订单项当前无修改路径，
    若将来支持改单需回写。
 
 阶段 6 明确**没做**的四件事（设计与验收记录里都写明了，别当成遗漏）：

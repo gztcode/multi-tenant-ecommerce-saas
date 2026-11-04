@@ -24,7 +24,7 @@ import { ApiError, apiFetch } from '@/lib/api-client';
 export async function PATCH(request: Request) {
   const session = await auth();
 
-  if (!session) {
+  if (!session?.accessToken) {
     return NextResponse.json(
       { message: '未登录或登录已过期' },
       { status: 401 },

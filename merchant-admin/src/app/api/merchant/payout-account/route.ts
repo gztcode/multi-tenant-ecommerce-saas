@@ -22,7 +22,7 @@ const MAX_CHANNEL_LENGTH = 40;
 
 export async function GET() {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     return unauthorizedResponse();
   }
 
@@ -38,7 +38,7 @@ export async function GET() {
 
 export async function PUT(request: Request) {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     return unauthorizedResponse();
   }
 

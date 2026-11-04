@@ -17,6 +17,10 @@ describe('assertSecureConfig', () => {
   const KEYS = [
     'NODE_ENV',
     'JWT_SECRET',
+    'DATABASE_URL',
+    'REDIS_URL',
+    'MINIO_ROOT_PASSWORD',
+    'MINIO_SECRET_KEY',
     'FAKE_PAYMENT_ENABLED',
     'FAKE_PAYOUT_ENABLED',
     'CHANNEL_MODE',
@@ -39,6 +43,11 @@ describe('assertSecureConfig', () => {
     }
     process.env.NODE_ENV = 'production';
     process.env.JWT_SECRET = REAL_SECRET;
+    // 生产基线的合法凭据：每个用例只覆盖自己关心的那一项。
+    process.env.DATABASE_URL =
+      'postgresql://ecommerce:real-db-password@postgres:5432/ecommerce?schema=public';
+    process.env.REDIS_URL = 'redis://:real-redis-password@redis:6379';
+    process.env.MINIO_ROOT_PASSWORD = 'real-minio-password';
   });
 
   afterEach(() => {
@@ -110,5 +119,48 @@ describe('assertSecureConfig', () => {
     process.env.CHANNEL_MODE = 'sandBox';
 
     expect(() => assertSecureConfig()).toThrow(/CHANNEL_MODE.*sandbox/);
+  });
+
+  it('生产环境 + DATABASE_URL 使用默认密码 → 拒绝启动', () => {
+    process.env.DATABASE_URL =
+      'postgresql://ecommerce:ecommerce@postgres:5432/ecommerce?schema=public';
+
+    expect(() => assertSecureConfig()).toThrow(/数据库密码/);
+  });
+
+  it('生产环境 + DATABASE_URL 没有密码 → 拒绝启动', () => {
+    process.env.DATABASE_URL =
+      'postgresql://ecommerce@postgres:5432/ecommerce?schema=public';
+
+    expect(() => assertSecureConfig()).toThrow(/数据库密码/);
+  });
+
+  it('生产环境 + REDIS_URL 没有密码 → 拒绝启动', () => {
+    process.env.REDIS_URL = 'redis://redis:6379';
+
+    expect(() => assertSecureConfig()).toThrow(/Redis/);
+  });
+
+  it('生产环境 + MinIO 使用默认密码 → 拒绝启动', () => {
+    process.env.MINIO_ROOT_PASSWORD = 'ecommerce-minio-secret';
+
+    expect(() => assertSecureConfig()).toThrow(/MinIO/);
+  });
+
+  it('生产环境 + MinIO 密码为空 → 拒绝启动', () => {
+    delete process.env.MINIO_ROOT_PASSWORD;
+    delete process.env.MINIO_SECRET_KEY;
+
+    expect(() => assertSecureConfig()).toThrow(/MinIO/);
+  });
+
+  it('非生产环境使用全部默认凭据 → 放行（本地开发）', () => {
+    process.env.NODE_ENV = 'development';
+    process.env.DATABASE_URL =
+      'postgresql://ecommerce:ecommerce@postgres:5432/ecommerce?schema=public';
+    process.env.REDIS_URL = 'redis://redis:6379';
+    process.env.MINIO_ROOT_PASSWORD = 'ecommerce-minio-secret';
+
+    expect(() => assertSecureConfig()).not.toThrow();
   });
 });

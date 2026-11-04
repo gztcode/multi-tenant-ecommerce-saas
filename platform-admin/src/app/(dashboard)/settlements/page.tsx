@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/table';
 import {
   Card,
+  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
@@ -54,12 +55,12 @@ export default async function SettlementsPage({
 
   if (!periodError) {
     try {
-      // ⚠️ **显式请求 `pageSize=200`**（后端 `pageSize` 的上限就是 200）：
+      // ⚠️ **显式请求 `pageSize=100`**（后端 `pageSize` 的上限就是 100）：
       // 结算单的数量天然比套餐 / 订阅大一到两个数量级（商家数 × 月数），
       // 用后端缺省的 50 条会有一大半看不到，而超管连翻页都无从下手。
       const query = periodParam
-        ? `?period=${encodeURIComponent(periodParam)}&pageSize=200`
-        : '?pageSize=200';
+        ? `?period=${encodeURIComponent(periodParam)}&pageSize=100`
+        : '?pageSize=100';
       list = await apiFetchAuthed<SettlementListResult>(
         `/platform/settlements${query}`,
       );
@@ -114,10 +115,22 @@ export default async function SettlementsPage({
             <CardDescription>
               共 {list.total} 张
               {list.total > items.length ? `（本页显示 ${items.length} 张）` : ''}
-              {/* ⚠️ **明确告诉超管超量时怎么办**：本页一次最多取 200 张
+              {/* ⚠️ **明确告诉超管超量时怎么办**：本页一次最多取 100 张
                   （后端 `pageSize` 上限），超出部分只能靠筛选缩小范围。 */}
-              {list.total > items.length ? '。超过 200 张时请按周期筛选' : ''}
+              {list.total > items.length ? '。超过 100 张时请按周期筛选' : ''}
             </CardDescription>
+            <CardAction>
+              <a
+                href={`/api/billing/settlements/export${
+                  periodParam
+                    ? `?period=${encodeURIComponent(periodParam)}`
+                    : ''
+                }`}
+                className="text-sm underline underline-offset-4 hover:no-underline"
+              >
+                导出 CSV
+              </a>
+            </CardAction>
           </CardHeader>
           <CardContent>
             {items.length === 0 ? (

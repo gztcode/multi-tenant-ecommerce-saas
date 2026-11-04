@@ -22,7 +22,7 @@ export async function PATCH(
   const { id } = await params;
   const session = await auth();
 
-  if (!session) {
+  if (!session?.accessToken) {
     return NextResponse.json(
       { message: '未登录或登录已过期' },
       { status: 401 },

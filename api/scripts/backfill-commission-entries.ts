@@ -26,6 +26,8 @@
  * 用法（在 `api/` 目录下）：
  * ```
  * npm run backfill:ledger
+ * # 已确认过「重复回填也不会重复出款」时，跳过活跃出款单的保护
+ * npm run backfill:ledger -- --force
  * ```
  * ⚠️ `backfill:commissions` 是它的转发别名 —— 运维的老命令名不用改，
  * 但**只有一份脚本**（两份脚本意味着两套逻辑要同步维护，早晚漂）。
@@ -36,6 +38,7 @@ import { resolve } from 'node:path';
 import { NestFactory } from '@nestjs/core';
 
 import { AppModule } from '../src/app.module';
+import { ActivePayoutsError } from '../src/modules/billing/backfill-guard';
 import { CommissionService } from '../src/modules/billing/commission.service';
 import { ReceiptService } from '../src/modules/billing/receipt.service';
 
@@ -55,6 +58,7 @@ function loadEnv(): void {
 
 async function main(): Promise<void> {
   loadEnv();
+  const force = process.argv.includes('--force');
 
   const app = await NestFactory.createApplicationContext(AppModule, {
     // ⚠️ **不启 HTTP 服务**：这个脚本只需要应用上下文（拿 service），
@@ -62,39 +66,60 @@ async function main(): Promise<void> {
     logger: ['error', 'warn', 'log'],
   });
 
+  let exitCode = 0;
+
   try {
     const commission = app.get(CommissionService);
-    const result = await commission.backfill();
-
     const receipt = app.get(ReceiptService);
-    const receiptResult = await receipt.backfill();
 
-    // ⚠️ **把计数打出来**：运维要看到「有多少历史退款被跳过了」
-    // （5b 之前退的款没记时间 → 冲回无法归期）。静默跳过等于账对不上却没人知道。
-    console.log('抽佣流水回填完成：');
-    console.log(`  新建抽佣流水：${result.commissionCreated} 行`);
-    console.log(`  新建冲回流水：${result.reversalCreated} 行`);
-    console.log(`  跳过（抽佣额为 0）：${result.skippedZeroAmount} 单`);
-    console.log(
-      `  跳过（已退款但无退款时间，冲回无法归期）：${result.skippedUndatedRefund} 单`,
-    );
+    try {
+      const result = await commission.backfill({ force });
+      const receiptResult = await receipt.backfill({ force });
 
-    console.log('货款流水回填完成：');
-    console.log(`  新建货款流水：${receiptResult.receiptCreated} 行`);
-    console.log(`  新建货款冲回流水：${receiptResult.reversalCreated} 行`);
-    console.log(`  跳过（货款额为 0）：${receiptResult.skippedZeroAmount} 单`);
-    console.log(
-      `  跳过（已退款但无退款时间，冲回无法归期）：${receiptResult.skippedUndatedRefund} 单`,
-    );
+      // ⚠️ **把计数打出来**：运维要看到「有多少历史退款被跳过了」
+      // （5b 之前退的款没记时间 → 冲回无法归期）。静默跳过等于账对不上却没人知道。
+      console.log('抽佣流水回填完成：');
+      console.log(`  新建抽佣流水：${result.commissionCreated} 行`);
+      console.log(`  新建冲回流水：${result.reversalCreated} 行`);
+      console.log(`  跳过（抽佣额为 0）：${result.skippedZeroAmount} 单`);
+      console.log(
+        `  跳过（已退款但无退款时间，冲回无法归期）：${result.skippedUndatedRefund} 单`,
+      );
+
+      console.log('货款流水回填完成：');
+      console.log(`  新建货款流水：${receiptResult.receiptCreated} 行`);
+      console.log(`  新建货款冲回流水：${receiptResult.reversalCreated} 行`);
+      console.log(
+        `  跳过（货款额为 0）：${receiptResult.skippedZeroAmount} 单`,
+      );
+      console.log(
+        `  跳过（已退款但无退款时间，冲回无法归期）：${receiptResult.skippedUndatedRefund} 单`,
+      );
+    } catch (cause) {
+      if (cause instanceof ActivePayoutsError) {
+        console.error(cause.message);
+        for (const payout of cause.payouts) {
+          console.error(
+            `  - ${payout.payoutNo} tenant=${payout.tenantId} ` +
+              `${payout.periodStart.toISOString().slice(0, 7)} ${payout.kind} ${payout.status}`,
+          );
+        }
+        console.error('确认要跳过着保护时：npm run backfill:ledger -- --force');
+        exitCode = 1;
+      } else {
+        throw cause;
+      }
+    }
   } finally {
     // ⚠️ **必须显式关闭应用**：Nest 的连接池（Prisma、Redis）会吊住进程，
     // 脚本跑完却不退出，CI 与运维都会卡住。
     await app.close();
   }
 
-  // ⚠️ **`process.exit(0)`**：连接池的关闭是异步的，`app.close()` 返回后
-  // 底层 socket 可能还没完全释放。显式退出保证脚本一定结束。
-  process.exit(0);
+  // ⚠️ **显式退出**：连接池的关闭是异步的，`app.close()` 返回后
+  // 底层 socket 可能还没完全释放。显式退出保证脚本一定结束；
+  // 有活跃出款单时退出码非零，CI / 运维能立刻发现。
+  process.exit(exitCode);
 }
 
 void main();

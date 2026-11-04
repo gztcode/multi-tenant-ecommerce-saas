@@ -4,6 +4,10 @@
   "description": "",
   "author": "",
   "private": true,
+  "engines": {
+    "node": ">=22 <27",
+    "npm": ">=11"
+  },
   "license": "UNLICENSED",
   "scripts": {
     "build": "nest build",
@@ -22,12 +26,14 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "prisma db seed",
+    "db:fix-legacy-checksum": "prisma db execute --schema prisma/schema.prisma --file prisma/fix-legacy-migration-checksum.sql",
     "test:cov:e2e": "jest --config ./test/jest-e2e.json --runInBand --coverage --collectCoverageFrom='src/**/*.ts' --collectCoverageFrom='!src/**/*.module.ts' --collectCoverageFrom='!src/main.ts'",
     "db:test:deploy": "node test/deploy-test-db.mjs",
     "backfill:ledger": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/backfill-commission-entries.ts",
     "backfill:commissions": "npm run backfill:ledger",
     "check:ledger": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/check-ledger.ts",
-    "migrate:payout-encryption": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/migrate-payout-encryption.ts"
+    "migrate:payout-encryption": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/migrate-payout-encryption.ts",
+    "payout:retry-pre-payout": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/retry-pre-payout-failures.ts"
   },
   "prisma": {
     "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"
@@ -37,7 +43,6 @@
     "@aws-sdk/s3-request-presigner": "^3.1155.0",
     "@nestjs/bullmq": "^12.0.0",
     "@nestjs/common": "^11.0.1",
-    "@nestjs/config": "^12.0.1",
     "@nestjs/core": "^11.0.1",
     "@nestjs/jwt": "^12.0.3",
     "@nestjs/passport": "^12.0.0",

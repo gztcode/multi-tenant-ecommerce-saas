@@ -24,7 +24,7 @@ export async function POST(
   { params }: { params: Promise<{ number: string }> },
 ) {
   const session = await auth();
-  if (!session) {
+  if (!session?.accessToken) {
     return unauthorizedResponse();
   }
   const { number } = await params;

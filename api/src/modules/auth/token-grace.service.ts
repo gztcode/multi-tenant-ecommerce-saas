@@ -6,6 +6,15 @@ import { QueueService } from '../queue/queue.service';
 /** 清理的间隔（1 小时） */
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 
+/** 过期行保留的天数（审计窗口） */
+const REFRESH_TOKEN_RETENTION_DAYS = 30;
+
+/** 清理结果：抹密文与删行分开计数，日志要能看出各自多少 */
+export interface TokenCleanupResult {
+  cleared: number;
+  deleted: number;
+}
+
 /**
  * 宽限记录的定时清理。
  *
@@ -51,26 +60,38 @@ export class TokenGraceService implements OnModuleInit {
       'token-grace-cleanup',
     );
 
-    const cleared = await this.cleanup();
-    if (cleared > 0) {
-      this.logger.log(`启动时清理了 ${cleared} 条过期的宽限记录`);
+    const result = await this.cleanup();
+    if (result.cleared > 0 || result.deleted > 0) {
+      this.logger.log(
+        `启动时清理了 ${result.cleared} 条宽限密文、${result.deleted} 条过期令牌行`,
+      );
     }
   }
 
   /**
-   * 抹掉所有**已过宽限期**的记录上的密文。
+   * 删除超过保留期的过期行，并抹掉所有**已过宽限期**的记录上的密文。
    *
-   * ⚠️ **只清列不删行**：`refresh_tokens` 的行在 `expiresAt` 过期后依然留着
-   * （既有状况）。删行会让「令牌族」的审计线索断掉。
+   * ⚠️ **30 天内只清列，超过保留期才删行**：`refresh_tokens` 的行在
+   * `expiresAt` 过期后仍保留一段时间作为「令牌族」的审计线索，
+   * 超过保留期后才整行删除。
    *
-   * @returns 抹掉的行数
+   * @returns 抹密文与删行各自的行数
    */
-  async cleanup(): Promise<number> {
+  async cleanup(): Promise<TokenCleanupResult> {
     const now = await this.prisma.databaseNow();
+    const retentionCutoff = new Date(
+      now.getTime() - REFRESH_TOKEN_RETENTION_DAYS * 24 * 60 * 60 * 1000,
+    );
 
     // ⚠️ `RefreshToken` 不在 `TENANT_SCOPED_MODELS` 里，
-    // 所以这个 updateMany 不带 tenantId 条件 —— 它本来就跨租户。
-    const result = await this.prisma.refreshToken.updateMany({
+    // 所以这个 deleteMany 不带 tenantId 条件 —— 它本来就跨租户。
+    // ⚠️ **先删行再抹密文**：过期超过保留期的行整行删除，
+    //    没必要再为它做一次 UPDATE。
+    const deleted = await this.prisma.refreshToken.deleteMany({
+      where: { expiresAt: { lt: retentionCutoff } },
+    });
+
+    const cleared = await this.prisma.refreshToken.updateMany({
       where: {
         graceExpiresAt: { lt: now },
         rotatedToToken: { not: null },
@@ -78,6 +99,6 @@ export class TokenGraceService implements OnModuleInit {
       data: { rotatedToToken: null },
     });
 
-    return result.count;
+    return { cleared: cleared.count, deleted: deleted.count };
   }
 }

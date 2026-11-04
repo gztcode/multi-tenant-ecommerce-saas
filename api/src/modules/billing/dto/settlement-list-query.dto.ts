@@ -3,6 +3,8 @@ import { Type } from 'class-transformer';
 import { IsEnum, IsInt, IsOptional, Matches, Max, Min } from 'class-validator';
 import { SettlementStatus } from '@prisma/client';
 
+import { MAX_PAGE_SIZE } from '../../../common/http/pagination';
+
 /**
  * 结算单列表的查询参数。
  *
@@ -36,11 +38,14 @@ export class SettlementListQueryDto {
   @Min(1)
   page?: number;
 
-  @ApiPropertyOptional({ description: '每页条数', example: 50 })
+  @ApiPropertyOptional({
+    description: '每页条数（上限 100）',
+    example: 100,
+  })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(200)
+  @Max(MAX_PAGE_SIZE)
   pageSize?: number;
 }

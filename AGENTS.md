@@ -35,12 +35,12 @@
 ## 先读什么
 
 - `docs/superpowers/specs/*-design.md` + `docs/superpowers/plans/*.md` 才是真实设计与计划；
-  最近一次已完成的是 **阶段 7「工程化与部署加固」**（2026-11-04，含 7a/7b/7c，
-  验收见 `docs/superpowers/plans/2026-11-03-plan-07a-acceptance.md` /
-  `2026-11-04-plan-07b-acceptance.md` / `2026-11-04-plan-07c-acceptance.md`）。
+  最近一次已完成的是 **阶段 9「历史技术债清理」**（2026-11-04，
+  设计见 `docs/superpowers/specs/2026-11-04-plan-09-tech-debt-cleanup-design.md`，
+  验收见 `docs/superpowers/plans/2026-11-04-plan-09-acceptance.md`）。
   新阶段按「design → plan（勾选式 Task）→ 代码 → acceptance 记录」推进。
 - **每个 plan 开头的 §0「全局约定 / 动手前必须知道」优先于直觉**，里面有失败注入、定向 lint、迁移手写等纪律。
-- `README.md` 已随阶段 7 收尾更新（进度、测试条数、共享包说明、技术债）；但**数字会随提交漂移**，
+- `README.md` 已随阶段 9 收尾更新（进度、测试条数、共享包说明、技术债）；但**数字会随提交漂移**，
   以 `git log`、最新 plan/acceptance、`package.json`、`vitest.config.ts` 为准。
 
 ## 命令
@@ -191,16 +191,16 @@ cd infra && docker compose up -d --build
   一律**手写 `migration.sql`**，用 `npx prisma migrate diff` 核对，再 `npx prisma migrate deploy`。
 - 已落库的迁移**不要改**（checksum 会变）；要补东西就新增迁移文件。`20261022071848_add_sku_stock_version`
   在全新库上整条跳过是**故意的**，不要「修」它。
-- 已应用旧版迁移的库若报 `migration have been modified`，按 `api/prisma/fix-legacy-migration-checksum.sql`
-  的说明处理；**只在真报这个错时执行**。
+- 已应用旧版迁移的库若报 `migration have been modified`，在 `api/` 下执行
+  `npm run db:fix-legacy-checksum`；**只在真报这个错时执行**，执行前先备份。
 - 改完 `schema.prisma` 要 `npx prisma generate`；开发库跑 `npm run prisma:deploy`，种子 `npm run prisma:seed`。
 - 商品搜索依赖 `pg_trgm`；托管数据库（RDS/Cloud SQL）上应用用户通常无权 `CREATE EXTENSION`，部署前让 DBA 先装。
 
 ## lint 与验证纪律
 
-- **不要把 api 的全量 `npm run lint` 当验收闸**：仓库本来就有 8–9 处既有 prettier 报错
-  （`settlement.service.spec.ts`、`payout-worker.spec.ts`、`settlement.e2e-spec.ts` 等）。只对本次改动文件跑
-  `npx eslint <file>`，要求**新增文件零错误、不顺手修无关文件**。
+- **api lint 已归零**（阶段 8c），但全量 lint 仍耗时；日常只对改动文件跑
+  `npx eslint <file>`，要求零错误。CI 的 api job 跑全量 lint 作为门禁。
+- **三个前端 lint 已进 CI**（阶段 9），本地提交前建议跑 `npm run lint`。
 - **失败注入必须独占**：故意改坏源码验证测试时，不要同时跑任何其他测试（会互相污染，产生假回归）。
 - 三个前端没有共享包。同名文件靠「写一份 → `cp` → `diff`」保持一致：`components/ui/button.tsx` 三份逐字节相同，
   `lib/jwt-callback.ts` 在 storefront / merchant-admin 两份逐字节相同。但三份 `lib/api-client.ts` **结构不同，

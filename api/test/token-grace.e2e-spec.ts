@@ -93,10 +93,10 @@ describe('宽限密文的清理 (e2e)', () => {
     const expired = await seedRotatedToken(new Date(Date.now() - 1000));
     const alive = await seedRotatedToken(new Date(Date.now() + 60_000));
 
-    const cleared = await grace.cleanup();
+    const result = await grace.cleanup();
 
     // 至少抹掉了那一行（库里可能还有别的过期行，所以用 >= 而不是 ===）
-    expect(cleared).toBeGreaterThanOrEqual(1);
+    expect(result.cleared).toBeGreaterThanOrEqual(1);
 
     const expiredRow = await prisma.refreshToken.findFirst({
       where: { tokenHash: expired.tokenHash },

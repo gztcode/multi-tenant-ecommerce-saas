@@ -1,7 +1,7 @@
 name: CI
 
-# workflow_dispatch：本机 git 直连不可达、push 走 Git Data API（不产生 push 事件，
-# 自然分支推送触发不了 CI），所以保留手动触发入口，用 API 直接触发。
+# 本机 git 直连不可达时，推送走 Git Data API；该方式现已能触发 push 事件。
+# workflow_dispatch 保留为手动重跑入口。
 on:
   workflow_dispatch:
   push:
@@ -55,6 +55,7 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: api/package-lock.json
+      - run: npm install -g npm@11
       - name: Install pg_trgm (迁移需要，service 容器无 init SQL)
         run: docker exec ${{ job.services.postgres.id }} psql -U ecommerce -d ecommerce -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;'
       - run: npm ci
@@ -71,9 +72,19 @@ jobs:
       - run: npm test
         working-directory: api
 
-  storefront:
+  frontend:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: storefront
+            tenant_subdomain: demo
+          - project: merchant-admin
+            tenant_subdomain: ''
+          - project: platform-admin
+            tenant_subdomain: ''
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -81,74 +92,25 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: |
-            storefront/package-lock.json
+            ${{ matrix.project }}/package-lock.json
             packages/frontend-shared/package-lock.json
+      - run: npm install -g npm@11
       - run: npm ci
         working-directory: packages/frontend-shared
       - run: npm ci
-        working-directory: storefront
+        working-directory: ${{ matrix.project }}
       - run: npx tsc --noEmit
-        working-directory: storefront
+        working-directory: ${{ matrix.project }}
       - run: npm test
-        working-directory: storefront
+        working-directory: ${{ matrix.project }}
+      - run: npm run lint
+        working-directory: ${{ matrix.project }}
       - run: npm run build
-        working-directory: storefront
+        working-directory: ${{ matrix.project }}
         env:
-          NEXT_PUBLIC_TENANT_SUBDOMAIN: demo
+          NEXT_PUBLIC_TENANT_SUBDOMAIN: ${{ matrix.tenant_subdomain }}
           # auth.ts 模块顶层读 AUTH_SECRET，构建期预渲染用到 auth() 的路由会 MissingSecret
-          AUTH_SECRET: ci-only-secret-ci-only-secret-ci-32
-          AUTH_TRUST_HOST: 'true'
-
-  merchant-admin:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            merchant-admin/package-lock.json
-            packages/frontend-shared/package-lock.json
-      - run: npm ci
-        working-directory: packages/frontend-shared
-      - run: npm ci
-        working-directory: merchant-admin
-      - run: npx tsc --noEmit
-        working-directory: merchant-admin
-      - run: npm test
-        working-directory: merchant-admin
-      - run: npm run build
-        working-directory: merchant-admin
-        env:
-          AUTH_SECRET: ci-only-secret-ci-only-secret-ci-32
-          AUTH_TRUST_HOST: 'true'
-
-  platform-admin:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            platform-admin/package-lock.json
-            packages/frontend-shared/package-lock.json
-      - run: npm ci
-        working-directory: packages/frontend-shared
-      - run: npm ci
-        working-directory: platform-admin
-      - run: npx tsc --noEmit
-        working-directory: platform-admin
-      - run: npm test
-        working-directory: platform-admin
-      - run: npm run build
-        working-directory: platform-admin
-        env:
-          AUTH_SECRET: ci-only-secret-ci-only-secret-ci-32
+          AUTH_SECRET: ${{ secrets.CI_AUTH_SECRET || 'ci-auth-secret-with-enough-entropy' }}
           AUTH_TRUST_HOST: 'true'
 
   shared:
@@ -161,7 +123,62 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: packages/frontend-shared/package-lock.json
+      - run: npm install -g npm@11
       - run: npm ci
         working-directory: packages/frontend-shared
       - run: npx tsc --noEmit
         working-directory: packages/frontend-shared
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ecommerce
+          POSTGRES_PASSWORD: ecommerce
+          POSTGRES_DB: ecommerce
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U ecommerce"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 16380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public
+      DATABASE_URL_TEST: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public
+      REDIS_URL: redis://localhost:16380
+      BULLMQ_PREFIX: bull-e2e
+      JWT_SECRET: ci-jwt-secret-with-enough-entropy-0123456789
+      PAYOUT_ACCOUNT_ENCRYPTION_KEY: ci-payout-encryption-key-0123456789
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - run: npm install -g npm@11
+      - run: npm ci
+        working-directory: api
+      - run: npx prisma generate
+        working-directory: api
+      # Prisma 会自动创建 ecommerce_test，再装迁移需要的扩展
+      - run: npx prisma migrate deploy
+        working-directory: api
+      - name: Install pg_trgm (e2e 测试库)
+        run: docker exec ${{ job.services.postgres.id }} psql -U ecommerce -d ecommerce_test -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;'
+      # media 套件依赖 MinIO，CI 不启动 MinIO，只排除这一套
+      - run: npm run test:e2e -- --testPathIgnorePatterns=media.e2e-spec.ts
+        working-directory: api

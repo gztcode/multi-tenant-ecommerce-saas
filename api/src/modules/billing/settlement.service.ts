@@ -12,6 +12,7 @@ import {
   type CommissionEntry,
   type SettlementStatement,
 } from '@prisma/client';
+import type { Prisma } from '@prisma/client';
 
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
@@ -19,7 +20,8 @@ import {
   tenantContext,
 } from '../../common/tenant/tenant-context';
 import { isUniqueViolation } from '../../common/errors/unique-constraint';
-import { clampPagination } from '../../common/http/pagination';
+import { MAX_PAGE_SIZE, clampPagination } from '../../common/http/pagination';
+import { toCsv } from '../../common/http/csv';
 import {
   formatPeriodLabel,
   resolveMonthlyPeriod,
@@ -771,8 +773,10 @@ export class SettlementService {
    */
   private async hasActivePayoutReference(
     statementId: string,
+    client: Prisma.TransactionClient = this
+      .prisma as unknown as Prisma.TransactionClient,
   ): Promise<boolean> {
-    const referenced = await this.prisma.payout.findFirst({
+    const referenced = await client.payout.findFirst({
       where: {
         statementId,
         status: {
@@ -804,59 +808,78 @@ export class SettlementService {
    */
   async unconfirm(statementId: string): Promise<SettlementView> {
     return tenantContext.run(platformScope(), async () => {
-      const statement = await this.prisma.settlementStatement.findFirst({
-        where: { id: statementId },
-      });
-      if (!statement) {
-        throw new NotFoundException('结算单不存在');
-      }
-      if (statement.status !== SettlementStatus.CONFIRMED) {
-        throw new ConflictException(
-          `结算单当前是「${statement.status}」状态，不能取消确认`,
-        );
-      }
+      // ⚠️ **回查与条件更新必须在同一个事务里**：
+      //    原来「读出款单 → 更新状态」分两步，中间新建的出款单看不见。
+      //    事务内回查能把「更新之后、提交之前」的插入纳入同一个快照。
+      //    ⚠️ 仍不能覆盖「回查之后、提交之前」的纳秒级窗口 ——
+      //    `approve` 侧继续回查结算单状态作为第二道防线。
+      const updated = await this.prisma.$transaction(async (tx) => {
+        const statement = await tx.settlementStatement.findFirst({
+          where: { id: statementId },
+        });
+        if (!statement) {
+          throw new NotFoundException('结算单不存在');
+        }
+        if (statement.status !== SettlementStatus.CONFIRMED) {
+          throw new ConflictException(
+            `结算单当前是「${statement.status}」状态，不能取消确认`,
+          );
+        }
 
-      // ⚠️ **已被出款单引用的结算单不能取消确认**（阶段 5h-1，护栏 P6）：
-      //    出款单的佣金金额是**审批那一刻锁定的快照**。
-      //    结算单被取消确认后重算，佣金会变 → 已批的出款单金额失真
-      //    → 平台打出去的钱与账对不上。
-      //
-      //    ⚠️ **判定与 `hasActivePayoutReference` 共用同一份实现** ——
-      //    `detail` 里的 `canRecalculate` 说的是同一件事，
-      //    两处各写一份 → 口径漂了 → 前端说「可以重算」、
-      //    点下去却被 409 拦下。
-      if (await this.hasActivePayoutReference(statementId)) {
-        throw new ConflictException(
-          '该结算单已被出款单引用，不能取消确认。若出款已执行，请走调账流程。',
-        );
-      }
+        // ⚠️ **已被出款单引用的结算单不能取消确认**（阶段 5h-1，护栏 P6）：
+        //    出款单的佣金金额是**审批那一刻锁定的快照**。
+        //    结算单被取消确认后重算，佣金会变 → 已批的出款单金额失真
+        //    → 平台打出去的钱与账对不上。
+        //
+        //    ⚠️ **判定与 `hasActivePayoutReference` 共用同一份实现** ——
+        //    `detail` 里的 `canRecalculate` 说的是同一件事，
+        //    两处各写一份 → 口径漂了 → 前端说「可以重算」、
+        //    点下去却被 409 拦下。
+        if (
+          await this.hasActivePayoutReference(
+            statementId,
+            tx as unknown as Prisma.TransactionClient,
+          )
+        ) {
+          throw new ConflictException(
+            '该结算单已被出款单引用，不能取消确认。若出款已执行，请走调账流程。',
+          );
+        }
 
-      // ⚠️ **必须检查 `affected.count`**（与 `confirm` 对齐）：
-      //    并发两次 `unconfirm` 时，两次都读到 `CONFIRMED`，
-      //    第二次的 `updateMany` 影响 0 行。若不检查就继续往下走，
-      //    它会读到 `DRAFT` 并**返回成功** —— 看起来像「取消确认成功」，
-      //    实际是自己把自己的成功判定抄了一遍。
-      //
-      //    将来有 `PAID` 状态时，同样的写法会让「取消确认一个已出款的单」
-      //    **静默成功** —— 那张单的钱都打给商家了。
-      const affected = await this.prisma.settlementStatement.updateMany({
-        where: { id: statementId, status: SettlementStatus.CONFIRMED },
-        data: { status: SettlementStatus.DRAFT, confirmedAt: null },
+        // ⚠️ **必须检查 `affected.count`**（与 `confirm` 对齐）：
+        //    并发两次 `unconfirm` 时，两次都读到 `CONFIRMED`，
+        //    第二次的 `updateMany` 影响 0 行。若不检查就继续往下走，
+        //    它会读到 `DRAFT` 并**返回成功** —— 看起来像「取消确认成功」，
+        //    实际是自己把自己的成功判定抄了一遍。
+        //
+        //    将来有 `PAID` 状态时，同样的写法会让「取消确认一个已出款的单」
+        //    **静默成功** —— 那张单的钱都打给商家了。
+        const affected = await tx.settlementStatement.updateMany({
+          where: { id: statementId, status: SettlementStatus.CONFIRMED },
+          data: { status: SettlementStatus.DRAFT, confirmedAt: null },
+        });
+
+        if (affected.count === 0) {
+          // ⚠️ **仍要按实际状态报错**：并发下可能已被别人改成 PAID。
+          //    这里在事务内再读一次，抛错会让整个事务回滚。
+          const current = await tx.settlementStatement.findFirst({
+            where: { id: statementId },
+          });
+          throw new ConflictException(
+            `结算单当前是「${current?.status ?? '未知'}」状态，不能取消确认`,
+          );
+        }
+
+        const after = await tx.settlementStatement.findFirst({
+          where: { id: statementId },
+        });
+        if (!after) {
+          throw new NotFoundException('结算单不存在');
+        }
+        return after;
       });
 
-      const after = await this.prisma.settlementStatement.findFirst({
-        where: { id: statementId },
-      });
-      if (!after) {
-        throw new NotFoundException('结算单不存在');
-      }
-      if (affected.count === 0) {
-        // ⚠️ **按实际状态报错**：并发下可能已经被别人改成别的状态了。
-        throw new ConflictException(
-          `结算单当前是「${after.status}」状态，不能取消确认`,
-        );
-      }
-      return this.toView(after);
+      return this.toView(updated);
     });
   }
 
@@ -899,6 +922,51 @@ export class SettlementService {
       //    「每行查一次」就是 200 次额外查询（N+1）。
       return { items: await this.toViews(rows), total };
     });
+  }
+
+  /**
+   * 导出结算单 CSV。
+   *
+   * ⚠️ **仍受 `MAX_PAGE_SIZE` 限制**：不做跨页全量导出，
+   *    超过上限时按周期筛选，与列表页文案口径一致。
+   */
+  async exportCsv(input: { period?: string }): Promise<string> {
+    const { items } = await this.list({
+      period: input.period,
+      page: 1,
+      pageSize: MAX_PAGE_SIZE,
+    });
+
+    const yuan = (cents: number): string => (cents / 100).toFixed(2);
+
+    return toCsv(
+      [
+        '结算单号',
+        '商家',
+        '子域名',
+        '周期',
+        '抽佣毛额',
+        '退款冲回',
+        '净额',
+        '流水笔数',
+        '缺笔数',
+        '状态',
+        '确认时间',
+      ],
+      items.map((item) => [
+        item.statementNo,
+        item.tenantName,
+        item.subdomain,
+        item.periodLabel,
+        yuan(item.grossAmount),
+        yuan(item.reversalAmount),
+        yuan(item.netAmount),
+        item.entryCount,
+        item.missingEntryCount,
+        item.status,
+        item.confirmedAt ?? '',
+      ]),
+    );
   }
 
   /**

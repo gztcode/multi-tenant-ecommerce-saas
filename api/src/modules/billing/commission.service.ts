@@ -8,6 +8,7 @@ import {
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
+import { guardBackfill } from './backfill-guard';
 
 /**
  * 记一笔抽佣或冲回所需要的订单快照。
@@ -297,7 +298,7 @@ export class CommissionService {
    * ⚠️ **没有事务**：中途失败会留下部分已写行。幂等的前提下这可接受 ——
    * 重跑一遍就补齐了（每行都是「先查后插」，不会重复）。
    */
-  async backfill(): Promise<BackfillResult> {
+  async backfill(options: { force?: boolean } = {}): Promise<BackfillResult> {
     const result: BackfillResult = {
       commissionCreated: 0,
       reversalCreated: 0,
@@ -306,6 +307,9 @@ export class CommissionService {
     };
 
     await tenantContext.run(platformScope(), async () => {
+      // ⚠️ **闸必须在订单查询之前**：先挡住「已经出过款的周期」。
+      await guardBackfill(this.prisma, options.force === true);
+
       // ⚠️ **只查 `paidAt` 非空的订单**：没付过钱的订单没有抽佣。
       // Prisma 的 `{ not: null }` 表示「该字段非空」。
       const orders = await this.prisma.order.findMany({

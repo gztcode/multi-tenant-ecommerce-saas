@@ -27,7 +27,7 @@ function composeValue(key: string): string {
   const raw = line[1].trim();
   // 兼容 `${VAR:-默认值}`；占位符替换工具偶尔会把 `:-` 显示成 `:`，
   // 这里一并接受（提取出来的仍必须是真实默认值）。
-  const withDefault = raw.match(/^\$\{[^:}]+:([^}]+)\}$/);
+  const withDefault = raw.match(/^\$\{[^:}]+:-?([^}]+)\}$/);
   if (withDefault) return withDefault[1];
   if (raw.startsWith('${')) {
     throw new Error(`${key} 没有默认值，守卫集合无法覆盖`);
