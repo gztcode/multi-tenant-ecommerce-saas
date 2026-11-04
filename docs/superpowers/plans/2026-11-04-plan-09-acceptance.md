@@ -176,4 +176,16 @@
 
 ## 七、CI
 
-推送后填写运行编号与六个 job 的结论。
+代码提交 `d7b3d70` 的推送运行 [**41827884802**](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/41827884802)
+六个 job 全绿：
+
+| job | 结论 |
+|------|------|
+| `api` | success |
+| `frontend (storefront, demo)` | success |
+| `frontend (merchant-admin)` | success |
+| `frontend (platform-admin)` | success |
+| `shared` | success |
+| `e2e` | success（排除 media 套件；`connection_limit=20`、`PRISMA_TX_TIMEOUT_MS=30000`） |
+
+前两轮 e2e 失败及修法见第四节第 8、9 条。本文档之后的提交只改 markdown。
