@@ -1,0 +1,122 @@
+name: CI
+
+# workflow_dispatch：本机 git 直连不可达、push 走 Git Data API（不产生 push 事件，
+# 自然分支推送触发不了 CI），所以保留手动触发入口，用 API 直接触发。
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ecommerce
+          POSTGRES_PASSWORD: ecommerce
+          POSTGRES_DB: ecommerce
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U ecommerce"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 16380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce?schema=public
+      DATABASE_URL_TEST: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public
+      REDIS_URL: redis://localhost:16380
+      JWT_SECRET: ci-only-jwt-secret-0123456789abcdef
+      PAYOUT_ACCOUNT_ENCRYPTION_KEY: ci-only-payout-encryption-key-0123456789
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - name: Install pg_trgm (迁移需要，service 容器无 init SQL)
+        run: docker exec ${{ job.services.postgres.id }} psql -U ecommerce -d ecommerce -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;'
+      - run: npm ci
+        working-directory: api
+      - run: npx prisma generate
+        working-directory: api
+      - run: npm test
+        working-directory: api
+
+  storefront:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: storefront/package-lock.json
+      - run: npm ci
+        working-directory: storefront
+      - run: npx tsc --noEmit
+        working-directory: storefront
+      - run: npm test
+        working-directory: storefront
+      - run: npm run build
+        working-directory: storefront
+        env:
+          NEXT_PUBLIC_TENANT_SUBDOMAIN: demo
+          # auth.ts 模块顶层读 AUTH_SECRET，构建期预渲染用到 auth() 的路由会 MissingSecret
+          AUTH_SECRET: ci-only-secret-ci-only-secret-ci-32
+          AUTH_TRUST_HOST: 'true'
+
+  merchant-admin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: merchant-admin/package-lock.json
+      - run: npm ci
+        working-directory: merchant-admin
+      - run: npx tsc --noEmit
+        working-directory: merchant-admin
+      - run: npm test
+        working-directory: merchant-admin
+      - run: npm run build
+        working-directory: merchant-admin
+        env:
+          AUTH_SECRET: ci-only-secret-ci-only-secret-ci-32
+          AUTH_TRUST_HOST: 'true'
+
+  platform-admin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: platform-admin/package-lock.json
+      - run: npm ci
+        working-directory: platform-admin
+      - run: npx tsc --noEmit
+        working-directory: platform-admin
+      - run: npm test
+        working-directory: platform-admin
+      - run: npm run build
+        working-directory: platform-admin
+        env:
+          AUTH_SECRET: ci-only-secret-ci-only-secret-ci-32
+          AUTH_TRUST_HOST: 'true'

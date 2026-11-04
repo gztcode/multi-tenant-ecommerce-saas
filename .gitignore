@@ -35,3 +35,6 @@ yarn-error.log*
 
 # 测试覆盖率
 coverage/
+
+infra/backups/
+infra/backup.log
