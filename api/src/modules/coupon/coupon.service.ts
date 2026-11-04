@@ -27,6 +27,7 @@ import {
 } from '../../common/errors/unique-constraint';
 import { clampPagination } from '../../common/http/pagination';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
+import { transactionOptions } from '../../common/db/transaction-options';
 import {
   computeDiscount,
   isWithinWindow,
@@ -369,7 +370,7 @@ export class CouponService {
       try {
         return await this.prisma.$transaction(
           async (tx) => this.claimInTx(tx, tenantId, dto, customerId, quantity),
-          { maxWait: 10_000, timeout: 10_000 },
+          transactionOptions(),
         );
       } catch (error) {
         // ⚠️ P2002 必须在**事务外**处理：唯一约束冲突让事务 aborted，

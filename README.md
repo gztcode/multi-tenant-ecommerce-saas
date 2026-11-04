@@ -234,7 +234,7 @@ PAYOUT_PLATFORM_DEFAULT_CHANNEL=fake-payout
 
 ```bash
 cd api
-npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，947 条 / 57 套件，3 条跳过）
+npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，950 条 / 58 套件，3 条跳过）
 npm run test:e2e      # 端到端（663 条 / 40 个套件，串行）
 npm run test:cov:e2e  # 项目真实覆盖率
 ```

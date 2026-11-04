@@ -7,6 +7,7 @@ import {
 import { InventoryMovement, InventoryMovementType } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
+import { transactionOptions } from '../../common/db/transaction-options';
 import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /**
@@ -98,7 +99,7 @@ export class OrderInventoryService {
   ): Promise<InventoryMovement[]> {
     return this.prisma.$transaction(
       async (tx) => this.reserveInTx(tx, orderId, items),
-      { maxWait: 10_000, timeout: 10_000 },
+      transactionOptions(),
     );
   }
 

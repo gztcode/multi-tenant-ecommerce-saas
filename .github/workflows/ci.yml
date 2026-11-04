@@ -160,6 +160,9 @@ jobs:
       DATABASE_URL_TEST: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public
       REDIS_URL: redis://localhost:16380
       BULLMQ_PREFIX: bull-e2e
+      # CI 的 2 核 runner 上，5 个并发下单会在同一行 SKU 锁上排队，
+      # 10 秒的交互事务预算不够（Prisma P2028）。只在 e2e 放宽，生产不设。
+      PRISMA_TX_TIMEOUT_MS: '30000'
       JWT_SECRET: ci-jwt-secret-with-enough-entropy-0123456789
       PAYOUT_ACCOUNT_ENCRYPTION_KEY: ci-payout-encryption-key-0123456789
     steps:

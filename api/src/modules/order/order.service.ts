@@ -20,6 +20,7 @@ import {
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { clampPagination } from '../../common/http/pagination';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
+import { transactionOptions } from '../../common/db/transaction-options';
 import { PAYMENT_TIMEOUT_QUEUE } from '../../common/queue/queue.constants';
 import { QueueService } from '../queue/queue.service';
 import { CouponService } from '../coupon/coupon.service';
@@ -181,7 +182,7 @@ export class OrderService {
             return created.id;
           },
           // ⚠️ 事务超时设成 10 秒（Prisma 默认只有 5 秒）：行锁等待会占掉这个预算。
-          { maxWait: 10_000, timeout: 10_000 },
+          transactionOptions(),
         );
         break;
       } catch (error) {
@@ -752,7 +753,7 @@ export class OrderService {
   ): Promise<boolean> {
     return this.prisma.$transaction(
       (tx) => this.transitionInTx(tx, orderId, from, to, extra),
-      { maxWait: 10_000, timeout: 10_000 },
+      transactionOptions(),
     );
   }
 
@@ -802,26 +803,23 @@ export class OrderService {
   async cancelOrder(orderNo: string, customerId: string | null): Promise<void> {
     const order = await this.findConsumerOrder(orderNo, customerId);
 
-    await this.prisma.$transaction(
-      async (tx) => {
-        // 条件更新：只有还在 PENDING_PAYMENT 才会成功。
-        // ⚠️ 这一步同时挡住了「已支付的订单被取消」与「两个取消并发时释放两次库存」。
-        const won = await this.transitionInTx(
-          tx,
-          order.id,
-          OrderStatus.PENDING_PAYMENT,
-          OrderStatus.CANCELLED,
-          { cancelledAt: new Date() },
-        );
-        if (!won) {
-          throw new ConflictException('订单当前状态不允许取消');
-        }
+    await this.prisma.$transaction(async (tx) => {
+      // 条件更新：只有还在 PENDING_PAYMENT 才会成功。
+      // ⚠️ 这一步同时挡住了「已支付的订单被取消」与「两个取消并发时释放两次库存」。
+      const won = await this.transitionInTx(
+        tx,
+        order.id,
+        OrderStatus.PENDING_PAYMENT,
+        OrderStatus.CANCELLED,
+        { cancelledAt: new Date() },
+      );
+      if (!won) {
+        throw new ConflictException('订单当前状态不允许取消');
+      }
 
-        // 释放预占：库存还回去 + 记 RELEASE 流水
-        await this.releaseReservationInTx(tx, order.id);
-      },
-      { maxWait: 10_000, timeout: 10_000 },
-    );
+      // 释放预占：库存还回去 + 记 RELEASE 流水
+      await this.releaseReservationInTx(tx, order.id);
+    }, transactionOptions());
   }
 
   /**

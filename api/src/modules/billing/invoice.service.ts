@@ -7,6 +7,7 @@ import {
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
+import { transactionOptions } from '../../common/db/transaction-options';
 
 /**
  * 账单与订阅周期。
@@ -151,7 +152,7 @@ export class InvoiceService {
     // 所以事务客户端上的租户过滤照样生效（见阶段 5a 的 `reserveInTx`）。
     return this.prisma.$transaction(
       async (tx) => this.markInvoicePaidInTx(tx, invoiceId),
-      { maxWait: 10_000, timeout: 10_000 },
+      transactionOptions(),
     );
   }
 

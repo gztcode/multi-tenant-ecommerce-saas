@@ -1,5 +1,6 @@
 import { ConflictException, Injectable } from '@nestjs/common';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
+import { transactionOptions } from '../../common/db/transaction-options';
 import { PaymentProviderRegistry } from './payment-provider.registry';
 
 /**
@@ -131,18 +132,15 @@ export class PaymentMethodService {
    * 反过来（先置新的再清旧的）会把刚设好的那个也清掉。
    */
   async setDefault(tenantId: string, id: string): Promise<void> {
-    await this.prisma.$transaction(
-      async (tx) => {
-        await tx.paymentMethod.updateMany({
-          where: { tenantId },
-          data: { isDefault: false },
-        });
-        await tx.paymentMethod.updateMany({
-          where: { id, tenantId },
-          data: { isDefault: true },
-        });
-      },
-      { maxWait: 10_000, timeout: 10_000 },
-    );
+    await this.prisma.$transaction(async (tx) => {
+      await tx.paymentMethod.updateMany({
+        where: { tenantId },
+        data: { isDefault: false },
+      });
+      await tx.paymentMethod.updateMany({
+        where: { id, tenantId },
+        data: { isDefault: true },
+      });
+    }, transactionOptions());
   }
 }

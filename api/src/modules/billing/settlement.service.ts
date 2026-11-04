@@ -22,6 +22,7 @@ import {
 import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import { MAX_PAGE_SIZE, clampPagination } from '../../common/http/pagination';
 import { toCsv } from '../../common/http/csv';
+import { transactionOptions } from '../../common/db/transaction-options';
 import {
   formatPeriodLabel,
   resolveMonthlyPeriod,
@@ -323,31 +324,28 @@ export class SettlementService {
     for (let attempt = 0; attempt < MAX_NUMBER_ATTEMPTS; attempt++) {
       const statementNo = generateStatementNo(now);
       try {
-        const statement = await this.prisma.$transaction(
-          async (tx) => {
-            const created = await tx.settlementStatement.create({
-              data: {
-                tenantId,
-                statementNo,
-                periodStart: period.from,
-                periodEnd: period.to,
-                grossAmount: amounts.grossAmount,
-                reversalAmount: amounts.reversalAmount,
-                netAmount: amounts.netAmount,
-                entryCount: amounts.entryCount,
-                status: SettlementStatus.DRAFT,
-              },
-            });
-            await tx.settlementStatementEntry.createMany({
-              data: entries.map((entry) => ({
-                statementId: created.id,
-                entryId: entry.id,
-              })),
-            });
-            return created;
-          },
-          { maxWait: 10_000, timeout: 10_000 },
-        );
+        const statement = await this.prisma.$transaction(async (tx) => {
+          const created = await tx.settlementStatement.create({
+            data: {
+              tenantId,
+              statementNo,
+              periodStart: period.from,
+              periodEnd: period.to,
+              grossAmount: amounts.grossAmount,
+              reversalAmount: amounts.reversalAmount,
+              netAmount: amounts.netAmount,
+              entryCount: amounts.entryCount,
+              status: SettlementStatus.DRAFT,
+            },
+          });
+          await tx.settlementStatementEntry.createMany({
+            data: entries.map((entry) => ({
+              statementId: created.id,
+              entryId: entry.id,
+            })),
+          });
+          return created;
+        }, transactionOptions());
         const view = await this.toView(statement);
         return { kind: 'created', view };
       } catch (error) {
@@ -654,40 +652,37 @@ export class SettlementService {
 
       let updated: SettlementStatement;
       try {
-        updated = await this.prisma.$transaction(
-          async (tx) => {
-            await tx.settlementStatementEntry.deleteMany({
-              where: { statementId: statement.id },
-            });
-            await tx.settlementStatementEntry.createMany({
-              data: entries.map((entry) => ({
-                statementId: statement.id,
-                entryId: entry.id,
-              })),
-            });
-            // ⚠️ **条件更新**：where 带 `status` —— 并发重算时只有一个能成功。
-            const affected = await tx.settlementStatement.updateMany({
-              where: { id: statement.id, status: SettlementStatus.DRAFT },
-              data: {
-                grossAmount: amounts.grossAmount,
-                reversalAmount: amounts.reversalAmount,
-                netAmount: amounts.netAmount,
-                entryCount: amounts.entryCount,
-              },
-            });
-            if (affected.count === 0) {
-              throw new ConflictException('结算单状态已变，不能重算');
-            }
-            const rows = await tx.settlementStatement.findFirst({
-              where: { id: statement.id },
-            });
-            if (!rows) {
-              throw new NotFoundException('结算单不存在');
-            }
-            return rows;
-          },
-          { maxWait: 10_000, timeout: 10_000 },
-        );
+        updated = await this.prisma.$transaction(async (tx) => {
+          await tx.settlementStatementEntry.deleteMany({
+            where: { statementId: statement.id },
+          });
+          await tx.settlementStatementEntry.createMany({
+            data: entries.map((entry) => ({
+              statementId: statement.id,
+              entryId: entry.id,
+            })),
+          });
+          // ⚠️ **条件更新**：where 带 `status` —— 并发重算时只有一个能成功。
+          const affected = await tx.settlementStatement.updateMany({
+            where: { id: statement.id, status: SettlementStatus.DRAFT },
+            data: {
+              grossAmount: amounts.grossAmount,
+              reversalAmount: amounts.reversalAmount,
+              netAmount: amounts.netAmount,
+              entryCount: amounts.entryCount,
+            },
+          });
+          if (affected.count === 0) {
+            throw new ConflictException('结算单状态已变，不能重算');
+          }
+          const rows = await tx.settlementStatement.findFirst({
+            where: { id: statement.id },
+          });
+          if (!rows) {
+            throw new NotFoundException('结算单不存在');
+          }
+          return rows;
+        }, transactionOptions());
       } catch (error) {
         // ⚠️ **P2002 逃逸成 500 的兜底**：
         //    上面的 `assertEntriesNotSettledByOthers` 与事务之间存在

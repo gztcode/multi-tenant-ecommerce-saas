@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { OrderStatus } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
+import { transactionOptions } from '../../common/db/transaction-options';
 import { OrderService } from './order.service';
 
 /**
@@ -54,7 +55,7 @@ export class OrderTimeoutService {
     // 事务超时设成 10 秒（Prisma 默认只有 5 秒）：行锁等待会占掉这个预算。
     return this.prisma.$transaction(
       async (tx) => this.releaseExpiredOrderInTx(tx, orderId),
-      { maxWait: 10_000, timeout: 10_000 },
+      transactionOptions(),
     );
   }
 

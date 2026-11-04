@@ -22,6 +22,7 @@ import {
   tenantContext,
 } from '../../common/tenant/tenant-context';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
+import { transactionOptions } from '../../common/db/transaction-options';
 import { QueueService } from '../queue/queue.service';
 import { PAYMENT_WEBHOOK_QUEUE } from '../../common/queue/queue.constants';
 import { OrderService } from '../order/order.service';
@@ -1191,18 +1192,9 @@ export class PaymentService {
     // ⚠️ **退款时间用数据库的时钟**（护栏 M15，与本仓库其它地方一致）：
     // 多副本部署时各机器的时钟有偏差，边界时刻会摇摆。
     const refundedAt = await this.prisma.databaseNow();
-    await this.prisma.$transaction(
-      async (tx) => {
-        await this.applyRefundInTx(
-          tx,
-          paymentId,
-          order,
-          refundedAt,
-          refundTxnId,
-        );
-      },
-      { maxWait: 10_000, timeout: 10_000 },
-    );
+    await this.prisma.$transaction(async (tx) => {
+      await this.applyRefundInTx(tx, paymentId, order, refundedAt, refundTxnId);
+    }, transactionOptions());
     return { status: 'REFUNDED' };
   }
 
@@ -1509,18 +1501,15 @@ export class PaymentService {
     }
 
     // `SUCCESS` → 落 REFUNDED + 冲回（条件更新在事务里幂等）
-    await this.prisma.$transaction(
-      async (tx) => {
-        await this.applyRefundInTx(
-          tx,
-          payment.id,
-          order,
-          await this.prisma.databaseNow(),
-          event.refundTxnId,
-        );
-      },
-      { maxWait: 10_000, timeout: 10_000 },
-    );
+    await this.prisma.$transaction(async (tx) => {
+      await this.applyRefundInTx(
+        tx,
+        payment.id,
+        order,
+        await this.prisma.databaseNow(),
+        event.refundTxnId,
+      );
+    }, transactionOptions());
   }
 
   /**
@@ -1885,12 +1874,9 @@ export class PaymentService {
         return;
       }
 
-      await this.prisma.$transaction(
-        async (tx) => {
-          await this.applyEventInTx(tx, event, order);
-        },
-        { maxWait: 10_000, timeout: 10_000 },
-      );
+      await this.prisma.$transaction(async (tx) => {
+        await this.applyEventInTx(tx, event, order);
+      }, transactionOptions());
     });
     await this.markEventProcessed(event);
   }

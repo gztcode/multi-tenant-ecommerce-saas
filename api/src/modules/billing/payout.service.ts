@@ -20,6 +20,7 @@ import { PAYOUT_VERIFICATION } from '../../common/payment/payout-verification';
 //    下，TS1272 要求装饰器签名里引用的类型必须是 type-only 导入）。
 import type { PayoutVerification } from '../../common/payment/payout-verification';
 import { PAYOUT_QUEUE } from '../../common/queue/queue.constants';
+import { transactionOptions } from '../../common/db/transaction-options';
 // ⚠️ **阶段 6 审查修复：审批时锁定出款渠道** —— 需要注册表与平台设置。
 //    两者都来自 `@Global()` 的模块，**不产生 billing → payment 的模块边**
 //    （与 `PayoutExecutionService` 注入它们的方式完全一致）。
@@ -375,48 +376,45 @@ export class PayoutService {
     const payoutNo = generatePayoutNo(now);
     let created: Payout;
     try {
-      created = await this.prisma.$transaction(
-        async (tx) => {
-          const payout = await tx.payout.create({
-            data: {
-              tenantId,
-              payoutNo,
-              kind,
-              periodStart: period.from,
-              periodEnd: period.to,
-              statementId: amounts.statementId,
-              receiptAmount: amounts.receiptAmount,
-              commissionAmount: amounts.commissionAmount,
-              netAmount: amounts.netAmount,
-              entryCount: amounts.entryCount,
-              status: PayoutStatus.REQUESTED,
-              requestedAmount: amounts.netAmount,
-              requestedBy: userId,
-              // ⚠️ **申请时也抄一份账户**（审批时会覆盖成审批那一刻的值）
-              snapshotAccountName: account.accountName,
-              snapshotBankName: account.bankName,
-              // ⚠️ **复制的是账户行里那份密文本身，不是重新加密**：
-              //    重新加密会得到不同的密文（随机 iv），
-              //    而「快照 = 审批那一刻的那一份」要求复制同一份密文。
-              snapshotAccountNoCipher: account.accountNoCipher,
-              snapshotMaskedAccountNo: account.maskedAccountNo,
-              // ⚠️ **版本号必须跟着密文一起复制** ——
-              //    否则会出现「密文是新的、版本号是 0」的错配。
-              snapshotEncryptionVersion: account.encryptionVersion,
-            },
-          });
-          // ⚠️ **申请时就固定纳入的流水**（设计 D7）：
-          // 审批期间又来一笔流水时，出款范围不悄悄变化。
-          await tx.payoutEntry.createMany({
-            data: amounts.entryIds.map((entryId) => ({
-              payoutId: payout.id,
-              entryId,
-            })),
-          });
-          return payout;
-        },
-        { maxWait: 10_000, timeout: 10_000 },
-      );
+      created = await this.prisma.$transaction(async (tx) => {
+        const payout = await tx.payout.create({
+          data: {
+            tenantId,
+            payoutNo,
+            kind,
+            periodStart: period.from,
+            periodEnd: period.to,
+            statementId: amounts.statementId,
+            receiptAmount: amounts.receiptAmount,
+            commissionAmount: amounts.commissionAmount,
+            netAmount: amounts.netAmount,
+            entryCount: amounts.entryCount,
+            status: PayoutStatus.REQUESTED,
+            requestedAmount: amounts.netAmount,
+            requestedBy: userId,
+            // ⚠️ **申请时也抄一份账户**（审批时会覆盖成审批那一刻的值）
+            snapshotAccountName: account.accountName,
+            snapshotBankName: account.bankName,
+            // ⚠️ **复制的是账户行里那份密文本身，不是重新加密**：
+            //    重新加密会得到不同的密文（随机 iv），
+            //    而「快照 = 审批那一刻的那一份」要求复制同一份密文。
+            snapshotAccountNoCipher: account.accountNoCipher,
+            snapshotMaskedAccountNo: account.maskedAccountNo,
+            // ⚠️ **版本号必须跟着密文一起复制** ——
+            //    否则会出现「密文是新的、版本号是 0」的错配。
+            snapshotEncryptionVersion: account.encryptionVersion,
+          },
+        });
+        // ⚠️ **申请时就固定纳入的流水**（设计 D7）：
+        // 审批期间又来一笔流水时，出款范围不悄悄变化。
+        await tx.payoutEntry.createMany({
+          data: amounts.entryIds.map((entryId) => ({
+            payoutId: payout.id,
+            entryId,
+          })),
+        });
+        return payout;
+      }, transactionOptions());
     } catch (error) {
       // ⚠️ **并发申请会撞唯一索引**：`payouts` 的「同一商家同一周期一张活跃单」
       // 是**部分唯一索引**（`WHERE status NOT IN ('REJECTED','CANCELLED')`）——

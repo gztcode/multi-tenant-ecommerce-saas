@@ -24,7 +24,7 @@ npm run start:dev
 ## 测试
 
 ```bash
-npm test              # 单元测试（947 条 / 57 个套件，3 条跳过）
+npm test              # 单元测试（950 条 / 58 个套件，3 条跳过）
 npm run test:e2e      # 端到端测试（663 条 / 40 个套件，串行）
 npm run test:cov      # 单元测试覆盖率
 npm run test:cov:e2e  # e2e 覆盖率
