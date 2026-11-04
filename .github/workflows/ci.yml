@@ -1,6 +1,9 @@
 name: CI
 
+# workflow_dispatch：本机 git 直连不可达、push 走 Git Data API（不产生 push 事件，
+# 自然分支推送触发不了 CI），所以保留手动触发入口，用 API 直接触发。
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
