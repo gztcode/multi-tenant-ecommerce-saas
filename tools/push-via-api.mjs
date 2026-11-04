@@ -43,12 +43,25 @@ function git(...args) {
 }
 
 function gh(endpoint, payload) {
-  const out = execFileSync(
-    'gh',
-    ['api', '--method', 'POST', `repos/${REPO}/${endpoint}`, '--input', '-'],
-    { input: JSON.stringify(payload), maxBuffer: 64 * 1024 * 1024 },
-  );
-  return JSON.parse(out.toString());
+  const body = JSON.stringify(payload);
+  let lastErr;
+  // api.github.com 偶发返回空响应体（gh 报 `unexpected end of JSON input`），
+  // 属瞬时抖动；单次失败就整体中断会让推送在随机文件上卡住，这里有限重试。
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const out = execFileSync(
+        'gh',
+        ['api', '--method', 'POST', `repos/${REPO}/${endpoint}`, '--input', '-'],
+        { input: body, maxBuffer: 64 * 1024 * 1024 },
+      );
+      return JSON.parse(out.toString());
+    } catch (err) {
+      lastErr = err;
+      console.error(`[retry] ${endpoint} 第 ${attempt} 次失败：${String(err.stderr ?? err.message).trim()}`);
+      execFileSync('sleep', ['1']);
+    }
+  }
+  throw lastErr;
 }
 
 // 1. 列出分支上的全部文件
