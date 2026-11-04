@@ -267,7 +267,7 @@ merchant-admin dev 3016、platform-admin dev 3017（启动前 `rm -rf .next`）�
 「专业版」（`markInvoicePaid` 里 `planId = pendingPlanId`）——
 **商家付 ¥99 用上了 ¥299 的套餐，平台少收了 ¥200**；反向换则是多收。
 
-**根因**：账单覆盖的是**下一个周期**，而下��个周期跑的是**待生效的套餐**。
+**根因**：账单覆盖的是**下一个周期**，而下一个周期跑的是**待生效的套餐**。
 
 **修法**：`renewal.service.ts` 的 `renewOne()` 里取套餐用
 `subscription.pendingPlanId ?? subscription.planId`。

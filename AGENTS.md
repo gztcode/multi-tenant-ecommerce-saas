@@ -1,6 +1,8 @@
 # AGENTS.md
 
-多租户电商 SaaS 单仓：NestJS API + 三个**互不共享代码**的 Next.js 15 应用 + Docker/Nginx。
+多租户电商 SaaS 单仓：NestJS API + 三个 Next.js 15 应用 + Docker/Nginx。
+三个前端从阶段 7c 起共用 `packages/frontend-shared`（`@ecom/frontend-shared`），
+但**不是 npm workspaces**——各端仍各自 `npm install`。
 本文件只记录「看文件名和框架文档看不出来、但一踩就错」的事。
 
 ## 布局与入口
@@ -14,6 +16,11 @@
 | `infra/` | compose 全栈 + Nginx（:80）；网关按 Host 路由并注入 `X-Tenant-Subdomain` | 80 |
 
 - **根目录没有 `package.json`，也没有 workspaces**。依赖必须在各子目录里分别 `npm install`，lockfile 也是各子目录各一份。
+- **`packages/frontend-shared` 是 `file:` 依赖**（三端 package.json 里 `"file:../packages/frontend-shared"`）：
+  它的依赖要**单独 `npm install`**——npm 的 `file:` 链接不会把被链接包自身的依赖装进端的
+  `node_modules`，不装就会在构建/测试时报 `zod` / `react` 解析不到。CI 三个前端 job 都有这一步。
+  三端各有一份薄壳 `src/lib/*.ts` 只做 `export * from '@ecom/frontend-shared/...'`，
+  **逻辑改动写共享包，不要写薄壳**。
 - 本机标准端口被占用，固定使用：PostgreSQL **15432**、Redis **16380**、MinIO **19000**（控制台 19001）。
 - `tools/push-via-api.mjs`：本机 `github.com:443` 常不可达，`git push` 超时时改用
   `GH_TOKEN=$(gh auth token) node tools/push-via-api.mjs <本地分支> <远端分支>`。
@@ -28,10 +35,12 @@
 ## 先读什么
 
 - `docs/superpowers/specs/*-design.md` + `docs/superpowers/plans/*.md` 才是真实设计与计划；
-  最近一次已完成的是 **阶段 6「渠道适配层与沙箱」**（2026-11-03，验收见
-  `docs/superpowers/plans/2026-11-02-plan-06-acceptance.md`）。新阶段按「design → plan（勾选式 Task）→ 代码 → acceptance 记录」推进。
+  最近一次已完成的是 **阶段 7「工程化与部署加固」**（2026-11-04，含 7a/7b/7c，
+  验收见 `docs/superpowers/plans/2026-11-03-plan-07a-acceptance.md` /
+  `2026-11-04-plan-07b-acceptance.md` / `2026-11-04-plan-07c-acceptance.md`）。
+  新阶段按「design → plan（勾选式 Task）→ 代码 → acceptance 记录」推进。
 - **每个 plan 开头的 §0「全局约定 / 动手前必须知道」优先于直觉**，里面有失败注入、定向 lint、迁移手写等纪律。
-- `README.md` 已随阶段 6 收尾更新（进度、测试条数、渠道说明、技术债）；但**数字会随提交漂移**，
+- `README.md` 已随阶段 7 收尾更新（进度、测试条数、共享包说明、技术债）；但**数字会随提交漂移**，
   以 `git log`、最新 plan/acceptance、`package.json`、`vitest.config.ts` 为准。
 
 ## 命令
@@ -49,6 +58,9 @@ docker exec -i ecommerce-postgres psql -U ecommerce -d postgres \
 cd api && npm install && { [ -f .env ] || cp .env.example .env; }
 npm run prisma:deploy && npm run prisma:seed   # 首次
 npm run start:dev
+
+# 共享包（三个前端都依赖它，必须先装它自己的依赖）
+cd packages/frontend-shared && npm install
 
 # 三个前端各开一个终端（同样只在 .env 不存在时复制）
 cd storefront     && npm install && ([ -f .env ] || cp .env.example .env) && npm run dev   # 3001

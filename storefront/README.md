@@ -6,6 +6,9 @@
 ## 本地启动
 
 ```bash
+# 共享包是 file: 依赖，必须先装它自己的依赖（npm 不会替你装）
+(cd ../packages/frontend-shared && npm install)
+
 cp .env.example .env     # 按需改 AUTH_SECRET 与 NEXT_PUBLIC_TENANT_SUBDOMAIN
 npm install
 npm run dev              # http://localhost:3001（固定 3001，3000 留给 api）
@@ -19,9 +22,9 @@ npm run dev              # http://localhost:3001（固定 3001，3000 留给 api
 | 路径 | 说明 |
 | --- | --- |
 | `src/auth.ts` | NextAuth v5 配置。`authorize` 带 `x-tenant-subdomain` 调后端 `/auth/login`，scope 固定为 `CUSTOMER` |
-| `src/lib/jwt-callback.ts` | 令牌刷新的**决策逻辑**（纯模块，可测）。`src/auth.ts` 只负责 NextAuth 配置 |
+| `src/lib/jwt-callback.ts` | 令牌刷新的**决策逻辑**——从 `@ecom/frontend-shared/jwt-callback` 再导出（阶段 7c 收编，三端共用一份） |
 | `src/lib/tenant.ts` | 店铺子域名解析。优先取 `X-Tenant-Subdomain` 头，其次从 host 首段取；裸 IP / IPv6 / localhost 会被识别出来 |
-| `src/lib/api-client.ts` | 后端 API 封装：`apiFetch` / `apiFetchAuthed` / `ApiError` |
+| `src/lib/api-client.ts` | 后端 API 封装（薄壳）：调共享包的 `createApiClient(...)`，按本端策略注入子域名 / cookie 透传 / `auth` |
 | `src/lib/theme.ts` | 主题 token → CSS 变量。`CSS_VARS` / `GROUP_CSS_VARS` 两张映射表**同时是白名单** |
 | `src/lib/server-cart.ts` | 服务端调后端的公共封装（`currentSubdomain` / `forwardableCookie` / `fetchBackend`） |
 | `src/app/(shop)/` | 店铺侧页面：首页、分类、商品详情、搜索、购物车、结算、订单、优惠券、地址簿、账户 |
@@ -40,11 +43,11 @@ npm run dev              # http://localhost:3001（固定 3001，3000 留给 api
   客户端组件用 `signIn` / `signOut`。
 - **令牌存 JWT session。** `accessToken`、`role`、`tenantId` 由 `jwt` 回调写入，
   `session` 回调透出，服务端组件据此调后端。
-- **`jwt` 回调的决策逻辑抽在 `src/lib/jwt-callback.ts`。** `src/auth.ts` 顶层就调
+- **`jwt` 回调的决策逻辑抽在共享包。** `src/auth.ts` 顶层就调
   `NextAuth({...})`，import 它就会初始化整个 next-auth 依赖图 → 测不了。
   抽出来才能对「过期时刷新」「送不回去 cookie 时不刷新」「刷新失败时作废会话」
-  这三条分支做断言。⚠️ **`src/lib/jwt-callback.ts` 与 `merchant-admin` 的那份逐行一致，
-  改一份必须同步另一份。**
+  这三条分支做断言。阶段 7c 起三端共用 `@ecom/frontend-shared/jwt-callback`
+  同一份实现，`src/lib/jwt-callback.ts` 只是再导出——**不要再往这里写逻辑**。
 - **主题变量的映射表要导出给客户端复用。** `CSS_VARS` / `GROUP_CSS_VARS`
   服务端（拼 `<style>`）与客户端（`ThemeWatcher` 的 `setProperty`）各用一份；
   各写一份必然漂移——服务端加了新 token 而客户端没加，那个 token 就永远不生效。

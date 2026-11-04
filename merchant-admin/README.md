@@ -9,6 +9,9 @@
 ## 本地启动
 
 ```bash
+# 共享包是 file: 依赖，必须先装它自己的依赖（npm 不会替你装）
+(cd ../packages/frontend-shared && npm install)
+
 cp .env.example .env     # 按需改 AUTH_SECRET
 npm install
 npm run dev              # http://localhost:3002（固定 3002，3000 留给 api）
@@ -30,9 +33,10 @@ curl -X POST http://localhost:3000/api/v1/auth/register/merchant \
 | 路径 | 说明 |
 | --- | --- |
 | `src/auth.ts` | NextAuth v5 配置。`authorize` 用 `scope: 'MERCHANT'` 调后端 `/auth/login`，**不带** `x-tenant-subdomain` |
-| `src/lib/jwt-callback.ts` | 令牌刷新的**决策逻辑**（纯模块，可测）。`src/auth.ts` 只负责 NextAuth 配置 |
-| `src/lib/api-client.ts` | 后端 API 封装：`apiFetch` / `apiFetchAuthed` / `ApiError` |
-| `src/lib/route-helpers.ts` | 中转路由的公共辅助：`readJson` / `toErrorResponse` / `unauthorizedResponse` |
+| `src/lib/jwt-callback.ts` | 令牌刷新的**决策逻辑**——从 `@ecom/frontend-shared/jwt-callback` 再导出（阶段 7c 收编，三端共用一份） |
+| `src/lib/api-client.ts` | 后端 API 封装（薄壳）：调共享包的 `createApiClient(...)`，按本端策略注入 `auth` |
+| `src/lib/route-helpers.ts` | 中转路由的公共辅助（再导出 `@ecom/frontend-shared/route-helpers`）：`readJson` / `toErrorResponse` / `unauthorizedResponse` |
+| `src/components/product/format.ts` | `formatPrice` 再导出 `@ecom/frontend-shared/money`（阶段 7c 起与 storefront 共用一份实现） |
 | `src/app/(auth)/login/` | 登录页 |
 | `src/app/(dashboard)/` | 概览、品类、商品（含导入）、库存、订单、营销、店铺设置、订阅与账单、结算单与出款、商家对账单、**收款账户（含默认出款渠道）** |
 | `src/app/api/` | 同源中转路由：商品、品类、订单、库存、营销、计费、出款、收款账户、媒体 |
@@ -58,9 +62,10 @@ curl -X POST http://localhost:3000/api/v1/auth/register/merchant \
   客户端组件用 `signIn` / `signOut`。
 - **令牌存 JWT session。** `accessToken`、`role`、`tenantId` 由 `jwt` 回调写入，
   `session` 回调透出，服务端组件据此调后端。
-- **刷新逻辑抽在 `src/lib/jwt-callback.ts`。** `src/auth.ts` 顶层就调 `NextAuth({...})`，
+- **刷新逻辑抽在共享包。** `src/auth.ts` 顶层就调 `NextAuth({...})`，
   import 它就会初始化整个 next-auth 依赖图 → 测不了。
-  ⚠️ **与 `storefront` 的那份逐行一致，改一份必须同步另一份。**
+  阶段 7c 起三端共用 `@ecom/frontend-shared/jwt-callback` 同一份实现，
+  `src/lib/jwt-callback.ts` 只是再导出——**不要再往这里写逻辑**。
 - **`themeTokens` 的结构是 `{ colors: { primary: '#rrggbb' } }`。** 后端只把它当
   不透明的 JSON 存，约定由前端定；storefront 读它渲染主题色时依赖同一结构。
 - **主题表单带预览区。** 改主色 / 字体 / 字阶 / 字重 / 阴影 / 间距时预览区实时联动，
@@ -69,7 +74,7 @@ curl -X POST http://localhost:3000/api/v1/auth/register/merchant \
 ## 单元测试
 
 ```bash
-npm test          # 413 条 / 27 个文件
+npm test          # 417 条 / 27 个文件
 npm run test:watch   # watch 模式
 ```
 

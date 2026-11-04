@@ -2879,7 +2879,7 @@ export interface MyCoupon extends AvailableCoupon {
   quantity: number;
   /** 已用掉的张数 */
   usedQuantity: number;
-  /** 状态：可��� / 已用完 / 已过期 */
+  /** 状态：可用 / 已用完 / 已过期 */
   state: 'AVAILABLE' | 'USED_UP' | 'EXPIRED';
 }
 

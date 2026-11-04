@@ -12,6 +12,8 @@
 
 ```bash
 cd platform-admin
+# 共享包是 file: 依赖，必须先装它自己的依赖（npm 不会替你装）
+(cd ../packages/frontend-shared && npm install)
 npm install
 cp .env.example .env   # 然后把 AUTH_SECRET 换成一串随机字符串
 npm run dev            # http://localhost:3003
@@ -41,8 +43,8 @@ admin@platform.test / Admin12345!
 | 路径 | 说明 |
 |------|------|
 | `src/auth.ts` | NextAuth 配置。`scope` 固定为 `'PLATFORM'`。`jwt` / `session` 回调内联（超管不刷新令牌） |
-| `src/lib/api-client.ts` | `apiFetch` / `apiFetchAuthed` / `ApiError`。**不发** `x-tenant-subdomain` |
-| `src/lib/route-helpers.ts` | 中转路由的公共辅助：`readJson` / `toErrorResponse` / `unauthorizedResponse` |
+| `src/lib/api-client.ts` | 薄壳：调共享包 `createApiClient(...)`。`apiFetch` / `apiFetchAuthed` / `ApiError`，**不发** `x-tenant-subdomain` |
+| `src/lib/route-helpers.ts` | 中转路由的公共辅助（再导出 `@ecom/frontend-shared/route-helpers`）：`readJson` / `toErrorResponse` / `unauthorizedResponse` |
 | `src/lib/tenant.ts` | 商家类型、状态枚举与展示辅助 |
 | `src/lib/reconciliation.ts` | 渠道对账的差异分类与展示口径 |
 | `src/lib/settings.ts` | 平台设置（默认出款渠道）的类型与服务端取数 |
@@ -98,7 +100,7 @@ admin@platform.test / Admin12345!
 ## 单元测试
 
 ```bash
-npm test          # 427 条 / 18 个文件
+npm test          # 429 条 / 18 个文件
 npm run test:watch   # watch 模式
 ```
 

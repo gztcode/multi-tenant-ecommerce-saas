@@ -2,7 +2,21 @@
 
 前后端完全分离的多租户电商底座。一个实例服务多个商家：每个商家有自己的店铺、商品、订单与客户。
 
-**当前进度：阶段 6「渠道适配层与沙箱」已完成并验收通过。**
+**当前进度：阶段 7「工程化与部署加固」已完成并验收通过。**
+
+阶段 7 把「能跑」变成「有回归保护、不对外裸奔、代码不再重复」：
+
+- **7a 工程与部署基建**：GitHub Actions 四 job CI（api 单测 + 三端 tsc/test/build）、
+  Redis `requirepass` 且全部宿主机端口绑回环、compose 日志轮转与内存上限、
+  Nginx 收口（gzip / body 上限 / 安全头 / default server 444）、`infra/backup.sh` 备份。
+- **7b api 代码收口**：购物车合并事务化、`setMedia` 批量化、券与佣金流水分页、
+  对账单 DB 端归期、租户上下文失败统一 403、访问日志收口（不打 body 与原始错误信息）。
+- **7c 前端共享包**：新增 `packages/frontend-shared`（包名 `@ecom/frontend-shared`），
+  把三端逐字节重复的令牌刷新 / 会话同步 / jwt 回调 / error 边界 / `api-client` /
+  `money` / `route-helpers` 收编，三端保留薄壳 re-export（调用点零改动）；
+  三端补 21 个 `loading.tsx` 骨架页。
+
+上一阶段（阶段 6）交付的渠道适配层仍是支付与出款链路的核心：
 阶段 6 修的是**渠道只有一家、契约按同步假设写**的老毛病：以前支付/出款注册表
 硬编码单一渠道，出款「取第一个渠道」，`refund()` 调下去就当成功——接第二家渠道、
 或渠道异步受理（先 `PROCESSING` 后确认）时，本地账会和渠道账对不上。
@@ -16,7 +30,14 @@
 后台 `/settings`）、对账按渠道隔离、CSV 来源的 A 类差异人工闸与**批量确认**
 （勾选 / 全选筛选结果，游标分批）以及**沙箱渠道**（`sandbox`，仅开发环境可见）。
 
-设计文档见
+阶段 7 的设计文档见
+[`docs/superpowers/specs/2026-11-03-plan-07-engineering-hardening-design.md`](docs/superpowers/specs/2026-11-03-plan-07-engineering-hardening-design.md)；
+阶段 7a / 7b / 7c 的验收记录分别见
+[`7a`](docs/superpowers/plans/2026-11-03-plan-07a-acceptance.md) /
+[`7b`](docs/superpowers/plans/2026-11-04-plan-07b-acceptance.md) /
+[`7c`](docs/superpowers/plans/2026-11-04-plan-07c-acceptance.md)。
+
+阶段 6 的设计文档见
 [`docs/superpowers/specs/2026-11-02-plan-06-channel-adapter-sandbox-design.md`](docs/superpowers/specs/2026-11-02-plan-06-channel-adapter-sandbox-design.md)；
 阶段 6 的验收记录见
 [`docs/superpowers/plans/2026-11-02-plan-06-acceptance.md`](docs/superpowers/plans/2026-11-02-plan-06-acceptance.md)；
@@ -48,6 +69,7 @@
 | `merchant-admin/` | 商家后台 | 3002 | Next.js 15 + NextAuth v5 + shadcn/ui |
 | `platform-admin/` | 平台超管后台 | 3003 | Next.js 15 + NextAuth v5 + shadcn/ui |
 | `infra/` | 容器编排与网关路由 | 80 | Docker Compose + Nginx |
+| `packages/frontend-shared/` | 三端共享包（`@ecom/frontend-shared`，`file:` 依赖） | —— | TypeScript + zod |
 
 ---
 
@@ -84,11 +106,19 @@ npm run prisma:deploy     # 应用迁移
 npm run prisma:seed      # 造平台超管 + 示例店铺 + 示例账号（见下）
 npm run start:dev
 
-# 3. 三个前端（各开一个终端）
+# 3. 共享包（三端用 file: 依赖它，必须先装它自己的依赖）
+cd packages/frontend-shared && npm install
+
+# 4. 三个前端（各开一个终端）
 cd storefront     && npm install && cp .env.example .env && npm run dev   # :3001
 cd merchant-admin && npm install && cp .env.example .env && npm run dev   # :3002
 cd platform-admin && npm install && cp .env.example .env && npm run dev   # :3003
 ```
+
+> ⚠️ **共享包是 `file:` 依赖**（`"file:../packages/frontend-shared"`）。npm 的
+> `file:` 链接**不会**把被链接包自身的依赖装进端的 `node_modules`，所以
+> `packages/frontend-shared` 必须先单独 `npm install`，否则三端的构建与测试
+> 会报共享包里的 `zod` / `react` 解析不到。CI 的三个前端 job 都有这一步。
 
 ### 本机端口
 
@@ -160,7 +190,7 @@ PAYOUT_PLATFORM_DEFAULT_CHANNEL=fake-payout
 
 ```bash
 cd api
-npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，886 条 / 47 套件）
+npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，907 条 / 51 套件）
 npm run test:e2e      # 端到端（657 条 / 40 个套件，串行）
 npm run test:cov:e2e  # 项目真实覆盖率
 ```
@@ -175,16 +205,17 @@ npm run test:cov:e2e  # 项目真实覆盖率
 **三个前端都有单元测试**（Vitest）：
 
 ```bash
-cd merchant-admin  && npm test   # 413 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费白名单 + 令牌刷新 + jwt 回调的决策逻辑 + 出款/收款账户组件测试
+cd merchant-admin  && npm test   # 417 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费白名单 + 令牌刷新 + jwt 回调的决策逻辑 + 出款/收款账户组件测试
 cd storefront     && npm test   # 209 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）+ jwt 回调的决策逻辑
-cd platform-admin && npm test   # 427 条：计费与对账中转路由的白名单 + 页面级测试 + 套餐表单 / 平台默认渠道设置的组件测试
+cd platform-admin && npm test   # 429 条：计费与对账中转路由的白名单 + 页面级测试 + 套餐表单 / 平台默认渠道设置的组件测试
 ```
 
 > ✅ **三个前端都有组件测试基建**（`vitest.config.ts` + `test/setup.ts`）：
 > `storefront` 与 `platform-admin` 早就有，`merchant-admin` 在阶段 5d 之后补齐
 > （`test/components/` + `test/app/`，逐文件用 `// @vitest-environment jsdom` 切换）。
-> `jwt` 回调的**决策逻辑**另外抽成纯模块 `src/lib/jwt-callback.ts`（storefront /
-> merchant-admin 两份逐字节相同），在 node 环境下单测。
+> `jwt` 回调的**决策逻辑**另外抽成纯模块，阶段 7c 起收编进
+> `packages/frontend-shared/src/jwt-callback.ts`（三端共用一份，各端
+> `src/lib/jwt-callback.ts` 只是再导出），在 node 环境下单测。
 >
 > ⚠️ `vitest.config.ts` 里两处**不要删**：根级 `esbuild: { jsx: 'automatic' }`，
 > 以及 `'server-only'` 的空模块 alias —— 删了组件测试或 next-auth 的 import 会直接炸。
@@ -253,7 +284,7 @@ cd infra && ./backup.sh    # PostgreSQL 主库全量 + MinIO 数据卷 → infra
 
 - 设计文档：[`docs/superpowers/specs/2026-10-21-multi-tenant-ecommerce-saas-design.md`](docs/superpowers/specs/2026-10-21-multi-tenant-ecommerce-saas-design.md)
 - 实施计划：[`docs/superpowers/plans/`](docs/superpowers/plans/)
-- 验收记录：[`阶段 1`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md) / [`阶段 2a`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md) / [`阶段 2b`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md) / [`阶段 3`](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md) / [`阶段 4`](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md) / [`阶段 5a`](docs/superpowers/plans/2026-10-25-plan-05a-acceptance.md) / [`阶段 5b`](docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md) / [`阶段 5c`](docs/superpowers/plans/2026-10-27-plan-05c-acceptance.md) / [`阶段 5d`](docs/superpowers/plans/2026-10-27-plan-05d-acceptance.md) / [`阶段 5e`](docs/superpowers/plans/2026-10-27-plan-05e-acceptance.md) / [`阶段 5f`](docs/superpowers/plans/2026-10-27-plan-05f-acceptance.md) / [`阶段 5g`](docs/superpowers/plans/2026-10-28-plan-05g-acceptance.md) / [`阶段 5h-1`](docs/superpowers/plans/2026-10-29-plan-05h-payout-ledger-acceptance.md) / [`阶段 5h-2`](docs/superpowers/plans/2026-10-29-plan-05h2-payout-execution-acceptance.md) / [`阶段 5i`](docs/superpowers/plans/2026-10-30-plan-05i-ledger-reconciliation-acceptance.md) / [`阶段 5j`](docs/superpowers/plans/2026-10-30-plan-05j-fund-security-ledger-closure-acceptance.md) / [`阶段 5k`](docs/superpowers/plans/2026-10-30-plan-05k-fund-closure-acceptance.md) / [`阶段 5l`](docs/superpowers/plans/2026-10-30-plan-05l-payout-ops-acceptance.md) / [`阶段 5m`](docs/superpowers/plans/2026-10-31-plan-05m-payout-reconciliation-acceptance.md) / [`阶段 6`](docs/superpowers/plans/2026-11-02-plan-06-acceptance.md)
+- 验收记录：[`阶段 1`](docs/superpowers/plans/2026-10-21-plan-01-acceptance.md) / [`阶段 2a`](docs/superpowers/plans/2026-10-22-plan-02a-acceptance.md) / [`阶段 2b`](docs/superpowers/plans/2026-10-22-plan-02b-acceptance.md) / [`阶段 3`](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md) / [`阶段 4`](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md) / [`阶段 5a`](docs/superpowers/plans/2026-10-25-plan-05a-acceptance.md) / [`阶段 5b`](docs/superpowers/plans/2026-10-25-plan-05b-acceptance.md) / [`阶段 5c`](docs/superpowers/plans/2026-10-27-plan-05c-acceptance.md) / [`阶段 5d`](docs/superpowers/plans/2026-10-27-plan-05d-acceptance.md) / [`阶段 5e`](docs/superpowers/plans/2026-10-27-plan-05e-acceptance.md) / [`阶段 5f`](docs/superpowers/plans/2026-10-27-plan-05f-acceptance.md) / [`阶段 5g`](docs/superpowers/plans/2026-10-28-plan-05g-acceptance.md) / [`阶段 5h-1`](docs/superpowers/plans/2026-10-29-plan-05h-payout-ledger-acceptance.md) / [`阶段 5h-2`](docs/superpowers/plans/2026-10-29-plan-05h2-payout-execution-acceptance.md) / [`阶段 5i`](docs/superpowers/plans/2026-10-30-plan-05i-ledger-reconciliation-acceptance.md) / [`阶段 5j`](docs/superpowers/plans/2026-10-30-plan-05j-fund-security-ledger-closure-acceptance.md) / [`阶段 5k`](docs/superpowers/plans/2026-10-30-plan-05k-fund-closure-acceptance.md) / [`阶段 5l`](docs/superpowers/plans/2026-10-30-plan-05l-payout-ops-acceptance.md) / [`阶段 5m`](docs/superpowers/plans/2026-10-31-plan-05m-payout-reconciliation-acceptance.md) / [`阶段 6`](docs/superpowers/plans/2026-11-02-plan-06-acceptance.md) / [`阶段 7a`](docs/superpowers/plans/2026-11-03-plan-07a-acceptance.md) / [`阶段 7b`](docs/superpowers/plans/2026-11-04-plan-07b-acceptance.md) / [`阶段 7c`](docs/superpowers/plans/2026-11-04-plan-07c-acceptance.md)
 
 ---
 
@@ -266,7 +297,7 @@ git push -u origin <分支名>
 ```
 
 **若 `git push` 超时失败**（某些网络环境下 `github.com:443` 不可达，但 `api.github.com` 可达），
-改用仓库里��� API 推送脚本：
+改用仓库里的 API 推送脚本：
 
 ```bash
 export GH_TOKEN=$(gh auth token)
@@ -297,8 +328,26 @@ node tools/push-via-api.mjs <本地分支> <远端分支>
 | 计划 5l | 出款运维兜底 —— **已完成并验收通过** |
 | 计划 5m | 渠道对账（账单导入、差异分级、解卡重打）—— **已完成并验收通过** |
 | 计划 6 | 渠道适配层与沙箱（注册表、默认渠道、异步出款/退款、CSV 批量确认）—— **已完成并验收通过** |
+| 计划 7a | 工程与部署基建（CI、compose 安全、Nginx、备份）—— **已完成并验收通过** |
+| 计划 7b | api 代码收口（事务 / 分页 / 横切统一 / 访问日志）—— **已完成并验收通过** |
+| 计划 7c | 前端共享包 `@ecom/frontend-shared` + 三端收口 + loading 骨架 —— **已完成并验收通过** |
 
-### 阶段 6 之后的剩余技术债
+### 阶段 7 之后的剩余技术债
+
+阶段 7 明确**不做**的几件事（设计与验收记录里都写明了，别当成遗漏）：
+
+1. **TLS / secret manager / 结构化日志（pino）/ 慢查询阈值** —— 坚持本机开发形态，
+   compose 仅供本机，加固以「不暴露局域网 + 密钥不内联」为度。
+2. **e2e 进 CI** —— 657 条串行要完整迁移 + seed，时长远超单测；CI 只保单测 + 构建。
+3. **三端源码 import 路径大面积替换到共享包** —— 目前保留三端薄壳 re-export
+   （调用点零改动），将来真要清理再单独做。
+4. **共享包独立发布 / 独立 CI** —— `session-sync-component.tsx` 依赖各端
+   `@/lib/session-sync` alias（有意设计：纯逻辑留端内），因此共享包**不可独立安装使用**。
+   要独立发布需先解掉这条回环（props 注入即可）。
+5. **守卫的 401/403 不进访问日志** —— Nest 的守卫在拦截器链**之外**执行，
+   任何全局拦截器都盖不到。
+6. **`Order.itemCount` 是下单时的快照** —— 件数总和；订单项当前无修改路径，
+   若将来支持改单需回写。
 
 阶段 6 明确**没做**的四件事（设计与验收记录里都写明了，别当成遗漏）：
 
@@ -326,7 +375,7 @@ node tools/push-via-api.mjs <本地分支> <远端分支>
 [验收记录 §七](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md)）：
 
 > ⚠️ 下面这份是**阶段 4 验收当时的原始清单**，保留作历史记录。
-> 哪些已完成请看上面「阶段 6 之后的剩余技术债」一节。
+> 哪些已完成请看上面「阶段 7 之后的剩余技术债」一节。
 
 1. **修多标签页的「先后」刷新竞态** —— 优先级最高：本阶段实测发现，**商家只要同时开
    两个后台标签页就会被踢出登录**（旧 refreshToken 被判成「真正的重放」→

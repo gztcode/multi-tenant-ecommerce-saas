@@ -419,7 +419,7 @@ CREATE INDEX "payouts_status_idx" ON "payouts"("status");
 -- ⚠️ **为什么不用全量唯一索引**：全量的会让「被拒绝的出款单」永久占住那个周期，
 -- 商家再也不能申请 → 那笔钱永远拿不到。
 -- ⚠️ **Prisma 的 `@@unique` 表达不了这个语义**（它不认 WHERE 子句），
--- 所以 schema 里**不要**声明它 —— 声明了也不生效，只会让���误以为约束在数据库层。
+-- 所以 schema 里**不要**声明它 —— 声明了也不生效，只会让人误以为约束在数据库层。
 -- 这与 `payments` 表的三个部分唯一索引是同一套做法。
 -- CreateIndex
 CREATE UNIQUE INDEX "payouts_tenantId_active_period_uniq" ON "payouts"("tenantId", "periodStart") WHERE "status" NOT IN ('REJECTED', 'CANCELLED');
@@ -2507,7 +2507,7 @@ import {
  * 商家收款账户的中转。
  *
  * ⚠️ **请求体按白名单重建**：客户端发来的 `tenantId`、`maskedAccountNo`
- * 之类的一律不往��传 —— 账号只认「开户人 / 开户行 / 账号」三个字段。
+ * 之类的一律不往上传 —— 账号只认「开户人 / 开户行 / 账号」三个字段。
  */
 export async function GET() {
   const session = await auth();

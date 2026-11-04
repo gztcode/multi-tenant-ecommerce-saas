@@ -21,7 +21,7 @@ npm run start:dev
 ## 测试
 
 ```bash
-npm test              # 单元测试（886 条 / 47 个套件）
+npm test              # 单元测试（907 条 / 51 个套件）
 npm run test:e2e      # 端到端测试（657 条 / 40 个套件，串行）
 npm run test:cov      # 单元测试覆盖率
 npm run test:cov:e2e  # e2e 覆盖率
@@ -70,7 +70,9 @@ npm run migrate:payout-encryption   # 收款账户明文 → 密文的存量迁�
 
 | 路径 | 说明 |
 | --- | --- |
-| `src/common/tenant/` | 租户隔离的核心：Prisma query extension、租户上下文、三张白名单表 |
+| `src/common/tenant/` | 租户隔离的核心：Prisma query extension、租户上下文、三张白名单表。`require-tenant.ts` 的 `requireTenantId()` 是 service 层「上下文里没有 tenantId → 403 无法确定店铺」的唯一入口（阶段 7b） |
+| `src/common/http/` | 横切 HTTP 关注点：`LoggingInterceptor`（访问日志，不打 body 与原始错误信息；守卫的 401/403 盖不到——守卫在拦截器链之外）、`pagination.ts`（分页参数 clamp） |
+| `src/common/filters/` | 全局异常过滤器 `AllExceptionsFilter`（错误响应脱敏） |
 | `src/common/payment/` | 出款渠道与核实契约的下沉区。**`common/` 下唯一持有 `@Module` 的目录**——因为 `billing` 不能 import `payment`（成环） |
 | `src/common/channel/` | 渠道描述符、配置解析与告警钩子（阶段 6 新增） |
 | `src/common/platform-settings/` | 平台默认出款渠道设置（阶段 6 新增） |

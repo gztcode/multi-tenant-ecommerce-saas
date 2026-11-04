@@ -338,7 +338,7 @@ describe('优惠预览与我的券的每用户状态 (e2e)', () => {
         minAmount: 0,
       });
       const kept = await createCoupon(merchant.token, {
-        name: '还���用的券',
+        name: '还可用的券',
         value: 500,
         minAmount: 0,
       });
