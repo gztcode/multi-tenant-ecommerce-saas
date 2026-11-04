@@ -1,3 +1,4 @@
+import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import {
   BadRequestException,
   Injectable,
@@ -5,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { randomBytes } from 'node:crypto';
 import { Cart, CartItem, ProductStatus, SkuStatus } from '@prisma/client';
+import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { MAX_CART_QUANTITY } from './dto/add-cart-item.dto';
 
@@ -89,7 +91,7 @@ export class CartService {
         },
       });
     } catch (error) {
-      if (!this.isUniqueViolation(error)) {
+      if (!isUniqueViolation(error)) {
         throw error;
       }
       // 并发下另一个请求已经把车建好了 → 复用它
@@ -181,6 +183,12 @@ export class CartService {
       itemsToMerge.map((item) => item.skuId),
     );
 
+    // 先在内存里把合并结果算完（护栏 1/2/3 的判定逻辑保持不变），
+    // 再一次性写入——逐条 create/update 是几十次往返，且三步写入
+    // 不在一个事务里，中途失败会留下「半合并」状态且游客车残留。
+    const creates: { skuId: string; quantity: number }[] = [];
+    const updatesByQuantity = new Map<number, string[]>();
+
     for (const guestItem of itemsToMerge) {
       // 护栏 2：搬进来的每一条都重新校验，不合格的直接丢弃（不报错）
       if (!sellableSkuIds.has(guestItem.skuId)) {
@@ -209,39 +217,55 @@ export class CartService {
 
       if (accountQuantity === undefined) {
         // 只有游客车里有 → 搬过来
-        await this.prisma.cartItem.create({
-          data: {
-            tenantId,
-            cartId: accountCart.id,
-            skuId: guestItem.skuId,
-            quantity: mergedQuantity,
-          },
-        });
+        creates.push({ skuId: guestItem.skuId, quantity: mergedQuantity });
       } else if (mergedQuantity !== accountQuantity) {
         // 两边都有且游客那边更多 → 调成 max
-        await this.prisma.cartItem.updateMany({
-          where: { cartId: accountCart.id, skuId: guestItem.skuId },
-          data: { quantity: mergedQuantity },
-        });
+        const list = updatesByQuantity.get(mergedQuantity) ?? [];
+        list.push(guestItem.skuId);
+        updatesByQuantity.set(mergedQuantity, list);
       }
     }
 
-    // 账号车里**原本就有**、但现在已经不可售的条目，在这次**真的发生了合并**时
-    // 一并清掉——合并的产出是「一个干净的账号购物车」。
-    //
-    // ⚠️ 只在合并发生时做。幂等重试（上面已 return）不动账号车。
-    await this.removeUnsellableItems(accountCart);
+    // 「写合并结果 + 清不可售 + 删游客车」必须原子：分成多个事务的话，
+    // 后面的失败会让账号车停在半合并状态、游客车残留，下次重复合并。
+    await this.prisma.$transaction(async (tx) => {
+      if (creates.length > 0) {
+        await tx.cartItem.createMany({
+          data: creates.map((c) => ({
+            tenantId,
+            cartId: accountCart.id,
+            skuId: c.skuId,
+            quantity: c.quantity,
+          })),
+        });
+      }
+      for (const [quantity, skuIds] of updatesByQuantity) {
+        await tx.cartItem.updateMany({
+          where: { cartId: accountCart.id, skuId: { in: skuIds } },
+          data: { quantity },
+        });
+      }
 
-    // 游客车整体删掉：条目已合并过去，留着会让「游客车还在」与实际状态不符，
-    // 也会让下一次合并重复处理。CartItem 是 cascade 删的。
-    await this.prisma.cart.deleteMany({ where: { id: guestCart.id } });
+      // 账号车里**原本就有**、但现在已经不可售的条目，在这次**真的发生了合并**时
+      // 一并清掉——合并的产出是「一个干净的账号购物车」。
+      //
+      // ⚠️ 只在合并发生时做。幂等重试（上面已 return）不动账号车。
+      await this.removeUnsellableItems(accountCart, tx);
+
+      // 游客车整体删掉：条目已合并过去，留着会让「游客车还在」与实际状态不符，
+      // 也会让下一次合并重复处理。CartItem 是 cascade 删的。
+      await tx.cart.deleteMany({ where: { id: guestCart.id } });
+    });
 
     return accountCart;
   }
 
-  /** 清掉购物车里已经不可售的条目 */
-  private async removeUnsellableItems(cart: Cart): Promise<void> {
-    const items = await this.prisma.cartItem.findMany({
+  /** 清掉购物车里已经不可售的条目（tx 必传：调用方都在事务里） */
+  private async removeUnsellableItems(
+    cart: Cart,
+    tx: PrismaTransaction,
+  ): Promise<void> {
+    const items = await tx.cartItem.findMany({
       where: { cartId: cart.id },
     });
     if (items.length === 0) {
@@ -259,7 +283,7 @@ export class CartService {
     }
 
     // where 里带上 cartId：条目必须属于这个购物车
-    await this.prisma.cartItem.deleteMany({
+    await tx.cartItem.deleteMany({
       where: { id: { in: unsellableItemIds }, cartId: cart.id },
     });
   }
@@ -437,20 +461,5 @@ export class CartService {
       path: '/',
       maxAge: CART_COOKIE_MAX_AGE,
     };
-  }
-
-  /**
-   * 是不是 Prisma 的唯一约束冲突（P2002）。
-   *
-   * 用 `error.code === 'P2002'` 而不是 `instanceof PrismaClientKnownRequestError`：
-   * `@prisma/client` 在 CJS/ESM 混载或多处 require 时会得到不同的模块实例，
-   * instanceof 于是恒为 false（与 common/errors/unique-constraint.ts 同一理由）。
-   */
-  private isUniqueViolation(error: unknown): boolean {
-    return (
-      typeof error === 'object' &&
-      error !== null &&
-      (error as { code?: unknown }).code === 'P2002'
-    );
   }
 }

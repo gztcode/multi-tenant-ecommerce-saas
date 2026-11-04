@@ -5,7 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
-import { getTenantContext } from '../../common/tenant/tenant-context';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 import {
   isChannelEnabled,
   isProduction,
@@ -61,11 +61,7 @@ export class PayoutAccountService {
    * ⚠️ **不要在这里解密兜底** —— 那等于把加密悄悄关掉。
    */
   async get(): Promise<PayoutAccountView | null> {
-    const context = getTenantContext();
-    const tenantId = context.tenantId;
-    if (!tenantId) {
-      throw new NotFoundException('缺少租户上下文');
-    }
+    requireTenantId();
     // ⚠️ **商家侧的查询不手写 tenantId**：`withMergedWhere` 是
     //    `{...base, ...extra}` → 扩展附的那份会**覆盖**调用方手写的同键值，
     //    手写既不生效也不构成漏洞，只是让人误以为「这里自己保证了隔离」。
@@ -97,11 +93,7 @@ export class PayoutAccountService {
     /** 不传 = 不修改；空串 = 清除配置（改用平台默认） */
     preferredChannel?: string;
   }): Promise<PayoutAccountView> {
-    const context = getTenantContext();
-    const tenantId = context.tenantId;
-    if (!tenantId) {
-      throw new NotFoundException('缺少租户上下文');
-    }
+    const tenantId = requireTenantId();
 
     const accountNo = input.accountNo?.trim() ?? '';
 

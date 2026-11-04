@@ -5,10 +5,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { TenantPrismaService } from '../../../common/tenant/tenant-prisma.service';
-import { getTenantContext } from '../../../common/tenant/tenant-context';
 import { ReplaceSpecsDto } from '../dto/replace-specs.dto';
 import { MinPriceService } from '../pricing/min-price.service';
 import { QuotaService } from '../../billing/quota.service';
+import { requireTenantId } from '../../../common/tenant/require-tenant';
 
 /** 最多允许的规格维度数 */
 export const MAX_SPEC_DIMENSIONS = 2;
@@ -39,11 +39,7 @@ export class SpecMatrixService {
   ) {}
 
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new NotFoundException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   /**

@@ -1,15 +1,14 @@
 import {
   ConflictException,
-  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { SubscriptionStatus, type Subscription } from '@prisma/client';
-import { getTenantContext } from '../../common/tenant/tenant-context';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { rethrowIfUniqueViolation } from '../../common/errors/unique-constraint';
 import { PlanService } from './plan.service';
 import { hasService } from './subscription-state';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /**
  * 订阅。
@@ -32,11 +31,7 @@ export class SubscriptionService {
    * 空串查库查不到，会「静默」返回 null，看起来像「没订阅」。
    */
   currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new ForbiddenException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   /** 当前订阅（没有就是 null） */

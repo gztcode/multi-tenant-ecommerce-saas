@@ -448,11 +448,15 @@ const tenantExtension = Prisma.defineExtension({
 // 真正的 client 在 Service 实例化时由 `createExtendedClient()` 重新创建。
 //
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-const _extendedTypeSource = new PrismaClient().$extends(tenantExtension);
+const _extendedTypeSource = new PrismaClient({
+  log: process.env.NODE_ENV === 'test' ? ['error'] : ['warn', 'error'],
+}).$extends(tenantExtension);
 type ExtendedClient = typeof _extendedTypeSource;
 
 const createExtendedClient = (): ExtendedClient =>
-  new PrismaClient().$extends(tenantExtension);
+  new PrismaClient({
+    log: process.env.NODE_ENV === 'test' ? ['error'] : ['warn', 'error'],
+  }).$extends(tenantExtension);
 
 @Injectable()
 export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
@@ -704,6 +708,29 @@ export class TenantPrismaService implements OnModuleInit, OnModuleDestroy {
       SELECT now() as now
     `;
     return rows[0].now;
+  }
+
+  /**
+   * 列出某租户货款流水出现过的月份（`YYYY-MM`，无序）。
+   *
+   * ⚠️ **与 `databaseNow()` 同款的专用 wrapper**：原生 SQL 不经过租户扩展，
+   *    所以 tenantId 由调用方显式作为**绑定参数**传入（无注入风险），
+   *    而不是裸暴露 `$queryRaw` 让调用方随意拼 SQL。
+   *
+   * ⚠️ **DB 端 DISTINCT 归期**（阶段 7b）：对账单列表只需「有哪些期」，
+   *    原来把本租户全部流水拉回内存取月份集合——无界查询；
+   *    现在每月只回一行字符串。
+   *
+   * ⚠️ **`AT TIME ZONE 'UTC'`**：`occurredAt` 是 timestamptz，
+   *    裸 `to_char` 按会话时区取年月，而内存口径
+   *    （`formatPeriodLabel`）用 UTC 年月 → 必须显式转 UTC 才是同一套归期。
+   */
+  async merchantReceiptPeriods(tenantId: string): Promise<string[]> {
+    const rows = await this.client.$queryRaw<Array<{ period: string }>>`
+      SELECT DISTINCT to_char("occurredAt" AT TIME ZONE 'UTC', 'YYYY-MM') AS period
+      FROM "merchant_receipts"
+      WHERE "tenantId" = ${tenantId}`;
+    return rows.map((row) => row.period);
   }
 
   /**

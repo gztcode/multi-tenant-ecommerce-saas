@@ -32,6 +32,7 @@ import {
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 import { QueueService } from '../queue/queue.service';
 import { LedgerService } from './ledger.service';
 import { formatPeriodLabel, resolveMonthlyPeriod } from './settlement';
@@ -247,12 +248,12 @@ export class PayoutService {
    */
   async apply(input: { period: string }): Promise<PayoutView> {
     const period = resolveMonthlyPeriod(input.period);
-    const context = getTenantContext();
-    const tenantId = context.tenantId;
-    const userId = context.userId;
+    // ⚠️ **租户缺失统一 403**（与全仓 service 层一致）；用户上下文缺失仍是 400。
+    const tenantId = requireTenantId();
+    const userId = getTenantContext().userId;
 
-    if (!tenantId || !userId) {
-      throw new BadRequestException('缺少租户或用户上下文');
+    if (!userId) {
+      throw new BadRequestException('缺少用户上下文');
     }
 
     // ⚠️ **幂等分支在最前**（5h-1 的教训）：
@@ -453,11 +454,7 @@ export class PayoutService {
    * 两个更新只有一个能成功，另一个拿到 409。
    */
   async cancel(payoutId: string): Promise<PayoutView> {
-    const context = getTenantContext();
-    const tenantId = context.tenantId;
-    if (!tenantId) {
-      throw new BadRequestException('缺少租户上下文');
-    }
+    requireTenantId();
 
     // ⚠️ **先查后判**：查不到就是不存在或不是本租户的 → 404。
     // ⚠️ **别把「不是我的」说成「不存在」** —— 那是信息泄露（能区分
@@ -1347,11 +1344,7 @@ export class PayoutService {
    *    ⚠️ **口径必须与旧的 `computeAmounts` 逐字一致** —— 两处漂了账就错了。
    */
   async availablePeriods(): Promise<AvailablePeriodView[]> {
-    const context = getTenantContext();
-    const tenantId = context.tenantId;
-    if (!tenantId) {
-      throw new BadRequestException('缺少租户上下文');
-    }
+    const tenantId = requireTenantId();
 
     const now = await this.prisma.databaseNow();
 

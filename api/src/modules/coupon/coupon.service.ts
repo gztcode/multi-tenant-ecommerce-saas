@@ -21,7 +21,11 @@ import {
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
-import { rethrowIfUniqueViolation } from '../../common/errors/unique-constraint';
+import {
+  isUniqueViolation,
+  rethrowIfUniqueViolation,
+} from '../../common/errors/unique-constraint';
+import { clampPagination } from '../../common/http/pagination';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
 import {
   computeDiscount,
@@ -34,6 +38,7 @@ import { CreateCouponDto } from './dto/create-coupon.dto';
 import { UpdateCouponDto } from './dto/update-coupon.dto';
 import { ClaimCouponDto } from './dto/claim-coupon.dto';
 import { FEATURE_MARKETING, QuotaService } from '../billing/quota.service';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /**
  * 领取时撞 `coupon_claims_coupon_customer_uniq` 的重试次数。
@@ -131,11 +136,7 @@ export class CouponService {
    * 的既有写法一致。
    */
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new ForbiddenException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   // ============================================================
@@ -296,14 +297,25 @@ export class CouponService {
     }
   }
 
-  /** 券列表（商家侧） */
-  async listCoupons(): Promise<{ items: Coupon[]; total: number }> {
+  /** 券列表（商家侧，分页） */
+  async listCoupons(
+    params: { page?: number; pageSize?: number } = {},
+  ): Promise<{ items: Coupon[]; total: number }> {
     const tenantId = this.currentTenantId();
-    const items = await this.prisma.coupon.findMany({
-      where: { tenantId },
-      orderBy: { createdAt: 'desc' },
-    });
-    return { items, total: items.length };
+    // ⚠️ 分页参数要夹上下限：pageSize=999999 能把整个租户的券拖出去，
+    // page=0 会算出负的 skip 让 Prisma 报错（500）。
+    const { page, pageSize } = clampPagination(params.page, params.pageSize);
+    const where = { tenantId };
+    const [items, total] = await Promise.all([
+      this.prisma.coupon.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.coupon.count({ where }),
+    ]);
+    return { items, total };
   }
 
   // ============================================================
@@ -362,7 +374,7 @@ export class CouponService {
       } catch (error) {
         // ⚠️ P2002 必须在**事务外**处理：唯一约束冲突让事务 aborted，
         // 在同一个事务里 catch 之后继续查会报 `current transaction is aborted`。
-        if (this.isUniqueViolation(error)) {
+        if (this.isClaimViolation(error)) {
           continue;
         }
         throw error;
@@ -1138,17 +1150,25 @@ export class CouponService {
   }
 
   /**
-   * 是不是 Prisma 的唯一约束冲突（P2002）。
+   * 这次 P2002 是不是「领取记录」冲突（`coupon_claims_coupon_customer_uniq`）。
    *
-   * 用 `error.code === 'P2002'` 而不是 `instanceof PrismaClientKnownRequestError`：
-   * `@prisma/client` 在 CJS/ESM 混载或多处 require 时会得到不同的模块实例，
-   * instanceof 于是恒为 false。
+   * 只有它才该静默重试；别的唯一约束冲突（如券码撞了）是有业务含义的失败，
+   * 吞掉重试会掩盖真实错误。
+   *
+   * ⚠️ Prisma 的 `meta.target` 可能是数组也可能是字符串，逐项判断，
+   * 不做 `String(target)`——那会把未知类型悄悄转成 `"[object Object]"`。
    */
-  private isUniqueViolation(error: unknown): boolean {
-    return (
-      typeof error === 'object' &&
-      error !== null &&
-      (error as { code?: unknown }).code === 'P2002'
-    );
+  private isClaimViolation(error: unknown): boolean {
+    if (!isUniqueViolation(error)) {
+      return false;
+    }
+    const meta = (error as { meta?: { target?: unknown } }).meta;
+    const target = meta?.target;
+    const targetText = Array.isArray(target)
+      ? target.filter((p): p is string => typeof p === 'string').join(',')
+      : typeof target === 'string'
+        ? target
+        : '';
+    return targetText.includes('coupon_claims_coupon_customer_uniq');
   }
 }

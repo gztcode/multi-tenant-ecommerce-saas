@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
+// 走本端 error.tsx / global-error.tsx 薄壳（而非直接指共享包），连薄壳接线一起覆盖
 import ErrorPage from '@/app/error';
 import GlobalError from '@/app/global-error';
 

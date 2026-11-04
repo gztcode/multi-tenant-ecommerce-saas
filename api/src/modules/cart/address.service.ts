@@ -5,9 +5,9 @@ import {
 } from '@nestjs/common';
 import { Address, UserRole } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
-import { getTenantContext } from '../../common/tenant/tenant-context';
 import { CreateAddressDto } from './dto/create-address.dto';
 import { UpdateAddressDto } from './dto/update-address.dto';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 @Injectable()
 export class AddressService {
@@ -15,11 +15,7 @@ export class AddressService {
 
   /** 当前租户 ID */
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new ForbiddenException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   /**

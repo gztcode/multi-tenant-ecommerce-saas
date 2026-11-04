@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { LoggingInterceptor } from './common/http/logging.interceptor';
 import { HealthModule } from './health/health.module';
 import { TenancyModule } from './modules/tenancy/tenancy.module';
 import { AuthModule } from './modules/auth/auth.module';
@@ -43,5 +44,11 @@ import { PlatformSettingsApiModule } from './modules/platform-settings/platform-
     // 平台默认渠道设置接口（阶段 6a Task 4）
     PlatformSettingsApiModule,
   ],
+  // HTTP 访问日志拦截器。
+  //
+  // ⚠️ **必须注册成 provider**，main.ts 才能用 app.get() 拿它——
+  //    未注册的类 app.get() 会抛 UnknownElementException，而单测/e2e
+  //    都不加载 main.ts，这个坑在 CI 里跑不出来（API 会在启动阶段死掉）。
+  providers: [LoggingInterceptor],
 })
 export class AppModule {}

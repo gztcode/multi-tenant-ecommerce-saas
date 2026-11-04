@@ -32,7 +32,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { createSessionSync, type StorageLike } from '@/lib/session-sync';
+import { createSessionSync, type StorageLike } from '@ecom/frontend-shared/session-sync';
 
 /**
  * localStorage 的内存实现。

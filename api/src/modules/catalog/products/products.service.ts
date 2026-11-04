@@ -12,7 +12,6 @@ import {
   Sku,
 } from '@prisma/client';
 import { TenantPrismaService } from '../../../common/tenant/tenant-prisma.service';
-import { getTenantContext } from '../../../common/tenant/tenant-context';
 import { rethrowIfUniqueViolation } from '../../../common/errors/unique-constraint';
 import { MinPriceService } from '../pricing/min-price.service';
 import { QuotaService } from '../../billing/quota.service';
@@ -20,6 +19,7 @@ import { CreateProductDto } from '../dto/create-product.dto';
 import { UpdateProductDto } from '../dto/update-product.dto';
 import { BatchProductsDto } from '../dto/batch-products.dto';
 import { UpdateSkuDto } from '../dto/update-sku.dto';
+import { requireTenantId } from '../../../common/tenant/require-tenant';
 
 /** 管理端列表的每页条数上限 */
 export const MAX_PAGE_SIZE = 100;
@@ -59,11 +59,7 @@ export class ProductsService {
   ) {}
 
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new NotFoundException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   /** 管理端列表：分页 + 关键词 + 品类 + 状态筛选 */
@@ -324,19 +320,23 @@ export class ProductsService {
         where: { productId, mediaId: { notIn: mediaIds } },
       });
 
-      // 补上新引用的（已存在的不动）
-      for (const mediaId of mediaIds) {
-        const existing = await tx.productMedia.findFirst({
-          where: { productId, mediaId },
-        });
-        if (!existing) {
-          await tx.productMedia.create({
-            data: { tenantId, productId, mediaId },
-          });
-        }
+      const existingRows = await tx.productMedia.findMany({
+        where: { productId, mediaId: { in: mediaIds } },
+        select: { mediaId: true },
+      });
+      const existingIds = new Set(existingRows.map((r) => r.mediaId));
+      // DTO 不去重 mediaIds：原实现里重复 id 第二次 findFirst 会命中、跳过 create，
+      // 与去重后只补一条等价；这里显式去重避免 createMany 撞唯一约束。
+      const uniqueMediaIds = [...new Set(mediaIds)];
+      const toCreate = uniqueMediaIds
+        .filter((id) => !existingIds.has(id))
+        .map((mediaId) => ({ tenantId, productId, mediaId }));
+      if (toCreate.length > 0) {
+        await tx.productMedia.createMany({ data: toCreate });
       }
 
-      // 按传入顺序重排 sort
+      // 按传入顺序重排 sort：数组下标各不相同，每条一组（mediaIds 条数
+      // 受 DTO 上限约束），替代逐条 findFirst+create 的旧循环
       for (const [sort, mediaId] of mediaIds.entries()) {
         await tx.productMedia.updateMany({
           where: { productId, mediaId },

@@ -123,7 +123,18 @@ function buildPayload(
   return { body };
 }
 
-export function CouponManager({ initial }: { initial: Coupon[] }) {
+export function CouponManager({
+  initial,
+  page,
+  pageSize,
+  total,
+}: {
+  /** 当前页的券（服务端渲染，翻页走 URL 查询串，与订单列表同款） */
+  initial: Coupon[];
+  page: number;
+  pageSize: number;
+  total: number;
+}) {
   const router = useRouter();
   /** 正在编辑的券；null = 没有编辑表单打开着 */
   const [editing, setEditing] = useState<Coupon | null>(null);
@@ -229,6 +240,11 @@ export function CouponManager({ initial }: { initial: Coupon[] }) {
     } catch (cause) {
       setMessage(cause instanceof Error ? cause.message : '删除失败');
     }
+  }
+
+  /** 翻页：营销页没有别的筛选参数，直接推 page 即可 */
+  function goPage(target: number) {
+    router.push(`/marketing?page=${Math.max(1, target)}`);
   }
 
   function renderForm() {
@@ -354,6 +370,7 @@ export function CouponManager({ initial }: { initial: Coupon[] }) {
 
   return (
     <div className="flex flex-col gap-4">
+      <p className="text-xs text-muted-foreground">共 {total} 张优惠券</p>
       {initial.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           还没有优惠券，先建一张让消费者领。
@@ -422,6 +439,36 @@ export function CouponManager({ initial }: { initial: Coupon[] }) {
           ))}
         </ul>
       )}
+
+      {(() => {
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        if (totalPages <= 1) return null;
+        return (
+          <div className="flex items-center justify-between text-sm">
+            <p className="text-muted-foreground">
+              第 {page} / {totalPages} 页
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                disabled={page <= 1}
+                onClick={() => goPage(page - 1)}
+                className="rounded border px-3 py-1 disabled:opacity-40"
+              >
+                上一页
+              </button>
+              <button
+                type="button"
+                disabled={page >= totalPages}
+                onClick={() => goPage(page + 1)}
+                className="rounded border px-3 py-1 disabled:opacity-40"
+              >
+                下一页
+              </button>
+            </div>
+          </div>
+        );
+      })()}
 
       {creating || editing ? (
         renderForm()

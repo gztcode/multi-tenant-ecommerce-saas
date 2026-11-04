@@ -16,10 +16,10 @@ import {
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import type { Request, Response } from 'express';
 import { OptionalJwtAuthGuard } from '../../common/guards/optional-jwt-auth.guard';
-import { getTenantContext } from '../../common/tenant/tenant-context';
 import { CartService, CART_COOKIE } from './cart.service';
 import { AddCartItemDto } from './dto/add-cart-item.dto';
 import { UpdateCartItemDto } from './dto/update-cart-item.dto';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /**
  * 消费者侧的购物车接口。
@@ -158,11 +158,7 @@ export class CartController {
 
   /** 当前租户（由租户上下文拦截器按 JWT 或子域名解析） */
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new UnauthorizedException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   /** 当前登录消费者 id；游客为 null */

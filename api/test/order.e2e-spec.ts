@@ -927,13 +927,20 @@ describe('订单与状态机 (e2e)', () => {
   it('商家侧：订单列表、详情、发货', async () => {
     const merchant = await createMerchant(app, prisma);
     const skuId = await publishSku(merchant.token, '商家侧的商品', 1000);
+    // ⚠️ **两个 SKU**：itemCount 断言要能挡住「恒返回 1」的错误实现，
+    //    只下 1 条时写死 1 也能通过。
+    const skuId2 = await publishSku(merchant.token, '商家侧的商品二', 1000);
     await stockIn(merchant.token, skuId, 10);
+    await stockIn(merchant.token, skuId2, 10);
     const customer = await registerCustomer(merchant.subdomain);
     const addressId = await createAddress(customer.token);
 
     const placed = await placeOrder(customer.token, {
       addressId,
-      items: [{ skuId, quantity: 1 }],
+      items: [
+        { skuId, quantity: 2 },
+        { skuId: skuId2, quantity: 1 },
+      ],
     }).expect(201);
     const orderNo = orderBody(placed).orderNo;
 
@@ -945,6 +952,10 @@ describe('订单与状态机 (e2e)', () => {
     const items = orderListBody(list).items;
     expect(items).toHaveLength(1);
     expect(items[0].orderNo).toBe(orderNo);
+    // ⚠️ **itemCount 是「件数总和」**（quantity 之和 = 2 + 1 = 3），
+    //    不是订单项**行数**（这里是 2）。这两个口径在多数订单上碰巧相同，
+    //    写死行数或写死件数都能被这条断言挡住。
+    expect(items[0].itemCount).toBe(3);
 
     // 商家详情
     const detail = await http(app)
@@ -952,6 +963,11 @@ describe('订单与状态机 (e2e)', () => {
       .set('authorization', `Bearer ${merchant.token}`)
       .expect(200);
     expect(orderBody(detail).orderNo).toBe(orderNo);
+    // ⚠️ **列表计数必须与详情条目的件数总和一致**——itemCount 的定义就是这个。
+    //    （与上面那条取值相同：同一个数从两个来源算出来，是交叉验证。）
+    expect(items[0].itemCount).toBe(
+      orderBody(detail).items.reduce((sum, i) => sum + i.quantity, 0),
+    );
 
     // ⚠️ Task 5 的支付还没做，先把订单推进到 PAID 才能发货
     await markPaid(merchant.tenantId, orderNo);

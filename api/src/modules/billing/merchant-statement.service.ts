@@ -2,10 +2,10 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { PayoutStatus, SettlementStatus } from '@prisma/client';
 
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
-import { getTenantContext } from '../../common/tenant/tenant-context';
 import { deriveApplicableKind, IN_FLIGHT_PAYOUT_STATUSES } from './ledger';
 import { LedgerService, type PeriodAmounts } from './ledger.service';
 import { formatPeriodLabel, resolveMonthlyPeriod } from './settlement';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /**
  * 商家侧对账单的服务层（阶段 5i）。
@@ -132,9 +132,12 @@ export class MerchantStatementService {
 
     // ⚠️ **先查「有哪些期」** —— 期数是从流水里推出来的，
     //    而不是从结算单推出来的（没结算单的期也要出现在对账单里）。
-    const receipts = (await this.prisma.merchantReceipt.findMany({
-      where: {},
-      select: { occurredAt: true },
+    // ⚠️ 「有哪些期」原来把本租户全部流水拉回内存只为取 `occurredAt` 的月份
+    //    集合——无界查询，改成 DB 端 DISTINCT 归期（`merchantReceiptPeriods`），
+    //    每月只回一行字符串。
+    const periodMonths = await this.prisma.merchantReceiptPeriods(tenantId);
+    const receipts = periodMonths.map((period) => ({
+      occurredAt: new Date(`${period}-01T00:00:00Z`),
     })) as ReceiptPeriodRow[];
 
     const labels = this.collectPeriodLabels(receipts);
@@ -223,11 +226,10 @@ export class MerchantStatementService {
    *    调用（那里扩展不附加过滤），少了它就是跨租户取数。
    */
   private requireTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new NotFoundException('缺少租户上下文');
-    }
-    return context.tenantId;
+    // ⚠️ 方法名与导入的公共函数同名，**但这不是递归**：
+    //    `requireTenantId()`（不带 this）解析到模块作用域的导入，
+    //    `this.requireTenantId()` 才是本方法。名字保留是为了调用点零改动。
+    return requireTenantId();
   }
 
   /**

@@ -1,15 +1,14 @@
 import {
   BadRequestException,
-  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { Promotion, PromotionStatus } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
-import { getTenantContext } from '../../common/tenant/tenant-context';
 import { CreatePromotionDto } from './dto/create-promotion.dto';
 import { UpdatePromotionDto } from './dto/update-promotion.dto';
 import { FEATURE_MARKETING, QuotaService } from '../billing/quota.service';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /**
  * 满减活动服务（阶段 5a Task 3）。
@@ -35,11 +34,7 @@ export class PromotionService {
 
   /** 当前租户 ID（租户从上下文读，不当参数传） */
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new ForbiddenException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   /**

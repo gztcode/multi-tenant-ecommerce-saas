@@ -64,7 +64,11 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: storefront/package-lock.json
+          cache-dependency-path: |
+            storefront/package-lock.json
+            packages/frontend-shared/package-lock.json
+      - run: npm ci
+        working-directory: packages/frontend-shared
       - run: npm ci
         working-directory: storefront
       - run: npx tsc --noEmit
@@ -87,7 +91,11 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: merchant-admin/package-lock.json
+          cache-dependency-path: |
+            merchant-admin/package-lock.json
+            packages/frontend-shared/package-lock.json
+      - run: npm ci
+        working-directory: packages/frontend-shared
       - run: npm ci
         working-directory: merchant-admin
       - run: npx tsc --noEmit
@@ -108,7 +116,11 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: platform-admin/package-lock.json
+          cache-dependency-path: |
+            platform-admin/package-lock.json
+            packages/frontend-shared/package-lock.json
+      - run: npm ci
+        working-directory: packages/frontend-shared
       - run: npm ci
         working-directory: platform-admin
       - run: npx tsc --noEmit

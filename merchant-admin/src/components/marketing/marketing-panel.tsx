@@ -15,9 +15,16 @@ import type { Coupon, Promotion } from '@/lib/marketing';
 export function MarketingPanel({
   coupons,
   promotions,
+  couponPage,
+  couponPageSize,
+  couponTotal,
 }: {
   coupons: Coupon[];
   promotions: Promotion[];
+  /** 券列表的分页状态（服务端渲染，翻页走 URL 查询串） */
+  couponPage: number;
+  couponPageSize: number;
+  couponTotal: number;
 }) {
   const [tab, setTab] = useState<'coupons' | 'promotions'>('coupons');
 
@@ -47,7 +54,12 @@ export function MarketingPanel({
       </div>
 
       {tab === 'coupons' ? (
-        <CouponManager initial={coupons} />
+        <CouponManager
+          initial={coupons}
+          page={couponPage}
+          pageSize={couponPageSize}
+          total={couponTotal}
+        />
       ) : (
         <PromotionManager initial={promotions} />
       )}

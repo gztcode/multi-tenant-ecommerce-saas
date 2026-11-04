@@ -1,4 +1,5 @@
 import { ApiError, apiFetchAuthed } from '@/lib/api-client';
+import { paginatedResponse } from '@ecom/frontend-shared/pagination-schema';
 import { MarketingPanel } from '@/components/marketing/marketing-panel';
 import type { Coupon, Promotion } from '@/lib/marketing';
 
@@ -32,9 +33,28 @@ function errorMessage(cause: unknown, fallback: string): string {
   return fallback;
 }
 
-export default async function MarketingPage() {
+const COUPON_PAGE_SIZE = 20;
+
+export default async function MarketingPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ page?: string }>;
+}) {
+  const { page } = await searchParams;
+  // 分页参数：解析失败落回第 1 页（与订单列表页同款规则）
+  const parsedPage = Number.parseInt(page ?? '1', 10);
+  const currentPage =
+    Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : 1;
+
   const [couponResult, promotionResult] = await Promise.allSettled([
-    apiFetchAuthed<CouponListResponse>('/merchant/coupons'),
+    apiFetchAuthed<CouponListResponse>(
+      `/merchant/coupons?page=${currentPage}&pageSize=${COUPON_PAGE_SIZE}`,
+      // ⚠️ 券列表响应恰好就是 { items, total }，parse 剥字段无损
+      {
+        validate: (data) =>
+          paginatedResponse.parse(data) as CouponListResponse,
+      },
+    ),
     apiFetchAuthed<PromotionListResponse>('/merchant/promotions'),
   ]);
 
@@ -67,7 +87,17 @@ export default async function MarketingPage() {
         （活动先减、券后减）。金额一律以分为单位保存，界面上填「元」。
       </p>
       {error && <p className="text-sm text-destructive">{error}</p>}
-      <MarketingPanel coupons={coupons} promotions={promotions} />
+      <MarketingPanel
+        coupons={coupons}
+        promotions={promotions}
+        couponPage={currentPage}
+        couponPageSize={COUPON_PAGE_SIZE}
+        couponTotal={
+          couponResult.status === 'fulfilled'
+            ? (couponResult.value.total ?? coupons.length)
+            : coupons.length
+        }
+      />
     </div>
   );
 }

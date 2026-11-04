@@ -174,8 +174,11 @@ services:
 
   storefront:
     build:
-      context: ../storefront
-      dockerfile: Dockerfile
+      # ⚠️ **context 是仓库根**：共享包 `packages/frontend-shared` 是 `file:`
+      #    依赖，Dockerfile 要连它一起 COPY —— 单端目录做 context 会装出
+      #    断链软链，构建时共享包的 import 一条都解析不了。
+      context: ..
+      dockerfile: storefront/Dockerfile
       args:
         # NEXT_PUBLIC_* 在构建期被内联进产物，必须通过 build arg 传入。
         NEXT_PUBLIC_TENANT_SUBDOMAIN: ${NEXT_PUBLIC_TENANT_SUBDOMAIN:-demo}
@@ -204,8 +207,9 @@ services:
 
   merchant-admin:
     build:
-      context: ../merchant-admin
-      dockerfile: Dockerfile
+      # context 是仓库根：共享包是 file: 依赖，要连它一起 COPY（见 storefront）。
+      context: ..
+      dockerfile: merchant-admin/Dockerfile
     container_name: ecommerce-merchant-admin
     restart: unless-stopped
     depends_on:
@@ -230,8 +234,9 @@ services:
 
   platform-admin:
     build:
-      context: ../platform-admin
-      dockerfile: Dockerfile
+      # context 是仓库根：共享包是 file: 依赖，要连它一起 COPY（见 storefront）。
+      context: ..
+      dockerfile: platform-admin/Dockerfile
     container_name: ecommerce-platform-admin
     restart: unless-stopped
     depends_on:

@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { centsToYuan, yuanToCents } from '@/lib/money';
+import { centsToYuan, formatPrice, yuanToCents } from '@/lib/money';
 
 describe('yuanToCents：元 → 整数分', () => {
   it('整数元', () => {
@@ -60,5 +60,23 @@ describe('centsToYuan：整数分 → 展示用的元', () => {
   it('null / undefined → —', () => {
     expect(centsToYuan(null)).toBe('—');
     expect(centsToYuan(undefined)).toBe('—');
+  });
+});
+
+describe('formatPrice：分 → ¥xx.xx', () => {
+  it('整数元带两位小数', () => {
+    expect(formatPrice(5900)).toBe('¥59.00');
+  });
+
+  it('null → —（不带 ¥ 前缀）', () => {
+    expect(formatPrice(null)).toBe('—');
+  });
+
+  it('undefined → —（商品卡没有价格时走这条）', () => {
+    expect(formatPrice(undefined)).toBe('—');
+  });
+
+  it('两位小数的分照实展示（口径以 centsToYuan 为准）', () => {
+    expect(formatPrice(5955)).toBe('¥59.55');
   });
 });

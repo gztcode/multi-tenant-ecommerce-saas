@@ -26,6 +26,9 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
       // next-auth 会间接 import 'server-only'，那是个只在 Next 编译期有意义的
       // 标记模块，在 node 环境下直接 import 会抛错。
+      '@ecom/frontend-shared': fileURLToPath(
+        new URL('../packages/frontend-shared/src', import.meta.url),
+      ),
       'server-only': fileURLToPath(
         new URL('./test/stubs/server-only.ts', import.meta.url),
       ),

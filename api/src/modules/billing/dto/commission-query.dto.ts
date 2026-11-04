@@ -1,5 +1,6 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsDateString, IsOptional } from 'class-validator';
+import { Type } from 'class-transformer';
+import { IsDateString, IsInt, IsOptional, Max, Min } from 'class-validator';
 
 /**
  * 平台抽佣明细的查询参数。
@@ -29,4 +30,22 @@ export class CommissionQueryDto {
   @IsOptional()
   @IsDateString()
   to?: string;
+
+  // ⚠️ **`page` / `pageSize` 用 `@Type(() => Number)` 转一下**（与
+  // `PayoutListQueryDto` 同款）：query 参数全是字符串，不转 `@IsInt()` 过不了。
+  // 夹取放 service 层的 `clampPagination`。
+  @ApiPropertyOptional({ description: '页码（从 1 开始）' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number;
+
+  @ApiPropertyOptional({ description: '每页条数（上限 100）' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  pageSize?: number;
 }

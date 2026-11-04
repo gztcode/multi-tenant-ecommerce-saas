@@ -7,14 +7,28 @@
 # ---------- 依赖阶段 ----------
 FROM node:22-alpine AS deps
 WORKDIR /app
-COPY package.json package-lock.json ./
+# ⚠️ **共享包是 `file:` 依赖**（"file:../packages/frontend-shared"）：
+#    它的清单与依赖必须和端一起进镜像，否则 `npm ci` 装出断链软链，
+#    构建时共享包里的 import 一条都解析不了（react / next / zod 都缺）。
+#    build context 是**仓库根**（compose 里 `context: ..`），路径从根算。
+#    ⚠️ **共享包放在 `/packages/frontend-shared`**（不是 /app/packages/…）：
+#    `file:` 的相对路径是相对 **package.json 所在目录**算的，端的
+#    package.json 在 /app → 目标是 /packages/frontend-shared，
+#    而 node_modules/@ecom/frontend-shared 软链正是指向那里。
+#
+#    ⚠️ **要 COPY 整个共享包目录**（含 src/）：只 COPY 清单的话，
+#    镜像里共享包没有源码，构建时 import 一条都解析不了。
+COPY packages/frontend-shared/ /packages/frontend-shared/
+COPY storefront/package.json storefront/package-lock.json ./
+RUN cd /packages/frontend-shared && npm ci
 RUN npm ci
 
 # ---------- 构建阶段 ----------
 FROM node:22-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
-COPY . .
+COPY --from=deps /packages /packages
+COPY storefront/ ./
 
 # NEXT_PUBLIC_* 会在**构建期**被 Next.js 内联进产物，运行期再设环境变量无效。
 # 因此 storefront 的默认子域名必须在这里注入。取值来自宿主机环境变量，

@@ -55,6 +55,7 @@ const LEDGER: CommissionLedger = {
       reversalCount: 1,
     },
   ],
+  total: 2,
   entries: [
     {
       id: 'entry-1',
@@ -82,6 +83,8 @@ const LEDGER: CommissionLedger = {
 async function renderPage(params: {
   from?: string;
   to?: string;
+  page?: string;
+  pageSize?: string;
 } = {}): Promise<string[]> {
   const element = await CommissionsPage({
     searchParams: Promise.resolve(params),
@@ -104,7 +107,8 @@ describe('抽佣明细页：区间来自 URL', () => {
     // （护栏 M15），前端自己算「最近 30 天」用的是浏览器的时钟。
     expect(path).not.toContain('from');
     expect(path).not.toContain('to');
-    expect(path).toBe('/platform/commissions');
+    // ⚠️ **分页参数显式带上**（明细已改为后端分页，缺省 20 与后端一致）
+    expect(path).toBe('/platform/commissions?page=1&pageSize=20');
   });
 
   it('给了两个日期 → 路径里带 from / to', async () => {
@@ -208,5 +212,29 @@ describe('抽佣明细页：空数据', () => {
     const texts = await renderPage();
 
     expect(hasText(texts, '暂无流水。')).toBe(true);
+  });
+});
+
+describe('抽佣明细页：分页', () => {
+  it('⚠️ 总笔数超过一页 → 显示翻页与总笔数；byMerchant 汇总仍全量返回', async () => {
+    apiFetchAuthedMock.mockResolvedValue({ ...LEDGER, total: 45 });
+
+    const texts = await renderPage({ page: '2', pageSize: '20' });
+
+    // ⚠️ **total 是全区间的笔数**，不是当前页的行数
+    expect(hasText(texts, '第 2 / 3 页，共 45 笔')).toBe(true);
+    expect(hasText(texts, '上一页')).toBe(true);
+    expect(hasText(texts, '下一页')).toBe(true);
+    // 请求里要带上翻页参数
+    const [path] = apiFetchAuthedMock.mock.calls[0] as [string];
+    expect(path).toContain('page=2');
+    expect(path).toContain('pageSize=20');
+  });
+
+  it('总笔数没超过一页 → 不显示翻页', async () => {
+    const texts = await renderPage();
+
+    expect(hasText(texts, '上一页')).toBe(false);
+    expect(hasText(texts, '下一页')).toBe(false);
   });
 });

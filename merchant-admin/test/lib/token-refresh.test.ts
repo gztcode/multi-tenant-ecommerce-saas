@@ -8,7 +8,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 
-import { refreshTokens, shouldInvalidateSession } from '@/lib/token-refresh';
+import { refreshTokens, shouldInvalidateSession } from '@ecom/frontend-shared/token-refresh';
 
 /** 造一个成功的刷新响应 */
 function refreshResponse(accessToken: string, refreshToken: string): Response {

@@ -13,8 +13,8 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { makeJwtCallback, makeSessionCallback } from '@/lib/jwt-callback';
-import type { JwtToken } from '@/lib/jwt-callback';
+import { makeJwtCallback, makeSessionCallback } from '@ecom/frontend-shared/jwt-callback';
+import type { JwtToken } from '@ecom/frontend-shared/jwt-callback';
 
 /** 造一个已过期的 accessToken（exp 在 1 小时前） */
 function expiredAccessToken(): string {

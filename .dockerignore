@@ -1,0 +1,27 @@
+# 仓库根的 .dockerignore
+#
+# ⚠️ **只在 build context 是仓库根时生效**（三个前端的 compose 服务
+#    `context: ..`）。端目录各自的 .dockerignore 对它们不再起作用。
+#    api 的 context 仍是 `../api`，用它自己的 .dockerignore。
+#
+# 排除规则与各端 .dockerignore 保持一致，额外用 `**/` 前缀覆盖整棵树
+# （context 变大了，packages/frontend-shared/node_modules 也得排掉）。
+
+**/node_modules
+**/.next
+**/out
+**/dist
+**/build
+**/coverage
+
+**/.env
+**/.env.local
+**/.env.*.local
+
+.git
+*.md
+*.log
+**/Dockerfile
+**/.dockerignore
+**/*.tsbuildinfo
+**/next-env.d.ts

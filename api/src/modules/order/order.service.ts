@@ -1,7 +1,7 @@
+import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import {
   BadRequestException,
   ConflictException,
-  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -18,7 +18,6 @@ import {
   SkuStatus,
 } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
-import { getTenantContext } from '../../common/tenant/tenant-context';
 import { clampPagination } from '../../common/http/pagination';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
 import { PAYMENT_TIMEOUT_QUEUE } from '../../common/queue/queue.constants';
@@ -35,6 +34,7 @@ import {
   MAX_ORDER_QUANTITY,
   PlaceOrderDto,
 } from './dto/place-order.dto';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /**
  * 支付超时窗口：15 分钟（设计 §九）。
@@ -92,11 +92,7 @@ export class OrderService {
    * `AddressService` 的既有写法一致。
    */
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new ForbiddenException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   // ============================================================
@@ -201,7 +197,7 @@ export class OrderService {
         // ⚠️ 必须在事务**外**处理：P2002 让 PostgreSQL 事务进入 aborted 状态，
         // 在同一个事务里 catch 之后继续查会报
         // `current transaction is aborted`。
-        if (dto.idempotencyKey && this.isUniqueViolation(error)) {
+        if (dto.idempotencyKey && isUniqueViolation(error)) {
           const raced = await this.findByIdempotencyKey(
             tenantId,
             dto.idempotencyKey,
@@ -966,7 +962,7 @@ export class OrderService {
         : {}),
     };
 
-    const [items, total] = await Promise.all([
+    const [rows, total] = await Promise.all([
       this.prisma.order.findMany({
         where,
         orderBy: { createdAt: 'desc' },
@@ -975,7 +971,11 @@ export class OrderService {
       }),
       this.prisma.order.count({ where }),
     ]);
-    return { items, total };
+    // ⚠️ **itemCount 直接用 DB 列**（下单时写入的件数总和 = quantity 之和）。
+    //    详情页的「件数」也是这个口径，列表与详情必须一致。
+    //    别用 `_count.items` 补——那是**订单项行数**：1 个 SKU × 数量 2 时
+    //    行数是 1、件数是 2，两者只在多数订单上碰巧相同。
+    return { items: rows, total };
   }
 
   /** 读订单 + 订单项 */
@@ -1078,21 +1078,6 @@ export class OrderService {
   // ============================================================
 
   /**
-   * 是不是 Prisma 的唯一约束冲突（P2002）。
-   *
-   * 用 `error.code === 'P2002'` 而不是 `instanceof PrismaClientKnownRequestError`：
-   * `@prisma/client` 在 CJS/ESM 混载或多处 require 时会得到不同的模块实例，
-   * instanceof 于是恒为 false（与 common/errors/unique-constraint.ts 同一理由）。
-   */
-  private isUniqueViolation(error: unknown): boolean {
-    return (
-      typeof error === 'object' &&
-      error !== null &&
-      (error as { code?: unknown }).code === 'P2002'
-    );
-  }
-
-  /**
    * 这次 P2002 是不是**订单号**冲突。
    *
    * 订单号撞了 → 换一号重试；
@@ -1103,7 +1088,7 @@ export class OrderService {
    * 那会把未知类型悄悄转成 `"[object Object]"`，判断结果不可信。
    */
   private isOrderNoViolation(error: unknown): boolean {
-    if (!this.isUniqueViolation(error)) {
+    if (!isUniqueViolation(error)) {
       return false;
     }
     const meta = (error as { meta?: { target?: unknown } }).meta;
