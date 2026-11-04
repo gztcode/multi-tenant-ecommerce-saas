@@ -91,8 +91,24 @@
 
 ### CI
 
-推送后确认五个 job（api / storefront / merchant-admin / platform-admin / shared）结果：
-**待回填**。
+推送后五个 job 全部通过（run `41807966090`）：
+
+| job | 耗时 | 结果 |
+|---|---|---|
+| api | 3m06s | ✓（含 prisma generate → tsc → lint → test） |
+| storefront | 1m19s | ✓ |
+| merchant-admin | 1m09s | ✓ |
+| platform-admin | 2m32s | ✓ |
+| shared | 13s | ✓ |
+
+⚠️ 第一次 run（`41807168534`）有两个失败，均已定位并修复：
+
+- **api**：`npm ci` 报 `Missing: webpack@5.112.2 from lock file`。
+  本机 npm（Node 26）与 CI 的 npm 10 对删依赖后的 lock 解读不一致；
+  用 `npx npm@10 install --package-lock-only` 重建 lock（+42 行，
+  补回 `@nestjs/cli` 依赖的 webpack 与平台可选包）后通过。
+- **platform-admin**：共享包第二次 `npm ci` 遇到 `ECONNRESET`，属 GitHub
+  Runner 拉包瞬时网络故障；重跑即过。
 
 ---
 
