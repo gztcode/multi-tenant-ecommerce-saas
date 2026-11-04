@@ -2,7 +2,27 @@
 
 前后端完全分离的多租户电商底座。一个实例服务多个商家：每个商家有自己的店铺、商品、订单与客户。
 
-**当前进度：阶段 7「工程化与部署加固」已完成并验收通过。**
+**当前进度：阶段 8「部署韧性、鉴权与资金正确性」已完成并验收通过。**
+
+阶段 8 修的是「部署能跑但会打架、并发下会丢钱」的高危问题：
+
+- **8a 部署与鉴权**：Nginx 只把 `/api/v1/` 代理给 API，店铺子域名的 BFF 路由
+  （`/api/cart`、`/api/auth/session`）归还 storefront；生产密钥守卫改为按
+  「已知占位符集合」判断，compose 内置默认值在生产环境直接拒绝启动；
+  platform-admin 补齐与另两端同构的令牌刷新链路。
+- **8b 资金与并发正确性**：购物车加购改单条原子自增 + P2002 重试（并发不丢增量）；
+  续费按成功支付单幂等结算、单租户异常不中断整批；渠道交易号绑定补 `provider`
+  并检查影响行数，绑不上返回 false。
+- **8c 健壮性与工程债**：券/媒体分页夹取与合并窗口上限 1000；前端搜索/品类/商品页
+  区分 404 与故障、购物车受控输入失败回滚、库存面板切 SKU 丢弃过期响应；
+  共享 `api-client` 无令牌显式 401；CI 补权限/并发/超时与 shared job；
+  备份保留策略、`gunzip -t` 校验、nginx healthcheck 与静态资源 immutable 缓存；
+  api lint 归零并清理未使用依赖。
+
+阶段 8 的设计文档见
+[`docs/superpowers/specs/2026-11-04-plan-08-resilience-auth-funds-design.md`](docs/superpowers/specs/2026-11-04-plan-08-resilience-auth-funds-design.md)；
+验收记录见
+[`docs/superpowers/plans/2026-11-04-plan-08-acceptance.md`](docs/superpowers/plans/2026-11-04-plan-08-acceptance.md)。
 
 阶段 7 把「能跑」变成「有回归保护、不对外裸奔、代码不再重复」：
 
@@ -190,14 +210,14 @@ PAYOUT_PLATFORM_DEFAULT_CHANNEL=fake-payout
 
 ```bash
 cd api
-npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，907 条 / 51 套件）
-npm run test:e2e      # 端到端（657 条 / 40 个套件，串行）
+npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，927 条 / 52 套件，3 条跳过）
+npm run test:e2e      # 端到端（663 条 / 40 个套件，串行）
 npm run test:cov:e2e  # 项目真实覆盖率
 ```
 
 > ✅ **跑 e2e 不需要停 api 容器**（阶段 5c 实测更正）。队列前缀隔离
 > （`BULLMQ_PREFIX=bull-e2e`）与每轮清库早已实现，**容器 api 全程在跑**的情况下
-> 阶段 6 实测 657/657 全绿。若仍遇到**随机的假失败**，再 `docker compose stop api` 排除。
+> 阶段 6 实测 657/657、阶段 8 实测 663/663 全绿。若仍遇到**随机的假失败**，再 `docker compose stop api` 排除。
 > 历史背景见
 > [阶段 3 验收记录 §一](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md)。
 
@@ -205,9 +225,9 @@ npm run test:cov:e2e  # 项目真实覆盖率
 **三个前端都有单元测试**（Vitest）：
 
 ```bash
-cd merchant-admin  && npm test   # 417 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费白名单 + 令牌刷新 + jwt 回调的决策逻辑 + 出款/收款账户组件测试
-cd storefront     && npm test   # 209 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）+ jwt 回调的决策逻辑
-cd platform-admin && npm test   # 429 条：计费与对账中转路由的白名单 + 页面级测试 + 套餐表单 / 平台默认渠道设置的组件测试
+cd merchant-admin  && npm test   # 421 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费白名单 + 令牌刷新 + jwt 回调的决策逻辑 + 出款/收款账户组件测试
+cd storefront     && npm test   # 223 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）+ jwt 回调的决策逻辑
+cd platform-admin && npm test   # 465 条：计费与对账中转路由的白名单 + 页面级测试 + 套餐表单 / 平台默认渠道设置的组件测试
 ```
 
 > ✅ **三个前端都有组件测试基建**（`vitest.config.ts` + `test/setup.ts`）：
@@ -222,7 +242,8 @@ cd platform-admin && npm test   # 429 条：计费与对账中转路由的白名
 
 e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物理隔离。
 
-> CI（`.github/workflows/ci.yml`）只跑单测 + 构建检查；e2e（657 条串行）仍在
+> CI（`.github/workflows/ci.yml`）有 api / storefront / merchant-admin /
+> platform-admin / shared 五个 job（单测 + 构建检查）；e2e（663 条串行）仍在
 > 本地跑（`npm run test:e2e`），首期不进 CI——云端跑一遍要完整迁移 + seed，
 > 时长远超单测，收益不匹配。
 
@@ -331,6 +352,7 @@ node tools/push-via-api.mjs <本地分支> <远端分支>
 | 计划 7a | 工程与部署基建（CI、compose 安全、Nginx、备份）—— **已完成并验收通过** |
 | 计划 7b | api 代码收口（事务 / 分页 / 横切统一 / 访问日志）—— **已完成并验收通过** |
 | 计划 7c | 前端共享包 `@ecom/frontend-shared` + 三端收口 + loading 骨架 —— **已完成并验收通过** |
+| 计划 8a / 8b / 8c | 部署与鉴权 → 资金与并发正确性 → 健壮性与工程债 —— **已完成并验收通过** |
 
 ### 阶段 7 之后的剩余技术债
 
@@ -338,7 +360,7 @@ node tools/push-via-api.mjs <本地分支> <远端分支>
 
 1. **TLS / secret manager / 结构化日志（pino）/ 慢查询阈值** —— 坚持本机开发形态，
    compose 仅供本机，加固以「不暴露局域网 + 密钥不内联」为度。
-2. **e2e 进 CI** —— 657 条串行要完整迁移 + seed，时长远超单测；CI 只保单测 + 构建。
+2. **e2e 进 CI** —— 663 条串行要完整迁移 + seed，时长远超单测；CI 只保单测 + 构建。
 3. **三端源码 import 路径大面积替换到共享包** —— 目前保留三端薄壳 re-export
    （调用点零改动），将来真要清理再单独做。
 4. **共享包独立发布 / 版本化** —— 阶段 8 已把 `session-sync-component.tsx` 改成
