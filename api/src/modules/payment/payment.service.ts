@@ -1,3 +1,4 @@
+import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import {
   BadRequestException,
   ConflictException,
@@ -16,7 +17,6 @@ import {
 } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
-  getTenantContext,
   platformScope,
   runForTenant,
   tenantContext,
@@ -36,6 +36,7 @@ import {
   RefundResult,
 } from './payment-provider.interface';
 import { PaymentProviderRegistry } from './payment-provider.registry';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /** 发起支付的结果 */
 export interface CreatedPayment {
@@ -154,11 +155,7 @@ export class PaymentService {
 
   /** 当前租户 ID */
   currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new NotFoundException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   // ============================================================
@@ -2304,21 +2301,6 @@ export interface ReadableOrder {
   /** 抽佣额快照（整数分） */
   commissionAmount: number;
   items: Array<{ skuId: string; quantity: number; productName: string }>;
-}
-
-/**
- * 是不是 Prisma 的唯一约束冲突（P2002）。
- *
- * 用 `error.code === 'P2002'` 而不是 `instanceof PrismaClientKnownRequestError`：
- * `@prisma/client` 在 CJS/ESM 混载或多处 require 时会得到不同的模块实例，
- * instanceof 于是恒为 false（与 common/errors/unique-constraint.ts 同一理由）。
- */
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { code?: unknown }).code === 'P2002'
-  );
 }
 
 /**

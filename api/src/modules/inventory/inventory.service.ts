@@ -6,19 +6,15 @@ import {
 } from '@nestjs/common';
 import { InventoryMovement, Sku } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
-import { getTenantContext } from '../../common/tenant/tenant-context';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 @Injectable()
 export class InventoryService {
   constructor(private readonly prisma: TenantPrismaService) {}
 
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new NotFoundException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   /**

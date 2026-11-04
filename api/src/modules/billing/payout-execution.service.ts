@@ -1,3 +1,4 @@
+import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import {
   BadRequestException,
   ConflictException,
@@ -807,7 +808,7 @@ export class PayoutExecutionService {
         // ⚠️ **数据库是最后一道兜底** —— 撞部分唯一索引
         //    `payouts_tenantId_period_kind_active_uniq` 说明商家已经重新申请过
         //    同一期 → **必须翻成业务错误**，不能让它冒成 500。
-        if (this.isUniqueViolation(error)) {
+        if (isUniqueViolation(error)) {
           throw new ConflictException(
             '出款单状态已变（商家可能已重新申请同一期），无法标记为已付款',
           );
@@ -836,15 +837,6 @@ export class PayoutExecutionService {
     } catch {
       return [];
     }
-  }
-
-  /** 判断是不是 Prisma 的唯一约束冲突（P2002） */
-  private isUniqueViolation(error: unknown): boolean {
-    return (
-      typeof error === 'object' &&
-      error !== null &&
-      (error as { code?: string }).code === 'P2002'
-    );
   }
 
   /**

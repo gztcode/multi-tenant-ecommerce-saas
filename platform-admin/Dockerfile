@@ -7,14 +7,22 @@
 # ---------- 依赖阶段 ----------
 FROM node:22-alpine AS deps
 WORKDIR /app
-COPY package.json package-lock.json ./
+# ⚠️ **共享包是 `file:` 依赖**（"file:../packages/frontend-shared"）：
+#    它的清单与依赖必须和端一起进镜像，否则 `npm ci` 装出断链软链，
+#    构建时共享包里的 import 一条都解析不了（react / next / zod 都缺）。
+#    build context 是**仓库根**（compose 里 `context: ..`），路径从根算；
+#    共享包放在 /app/packages/frontend-shared，正好对上 `../packages/...`。
+COPY packages/frontend-shared/ /packages/frontend-shared/
+COPY platform-admin/package.json platform-admin/package-lock.json ./
+RUN cd /packages/frontend-shared && npm ci
 RUN npm ci
 
 # ---------- 构建阶段 ----------
 FROM node:22-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
-COPY . .
+COPY --from=deps /packages /packages
+COPY platform-admin/ ./
 
 # platform-admin 没有 NEXT_PUBLIC_* 变量，无需在构建期注入。
 RUN npm run build

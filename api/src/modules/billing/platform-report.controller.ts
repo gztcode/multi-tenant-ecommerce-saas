@@ -67,6 +67,11 @@ export class PlatformReportController {
       from: query.from ? new Date(query.from) : undefined,
       to: query.to ? new Date(query.to) : undefined,
     });
-    return this.commission.ledger({ from, to });
+    return this.commission.ledger({
+      from,
+      to,
+      page: query.page,
+      pageSize: query.pageSize,
+    });
   }
 }

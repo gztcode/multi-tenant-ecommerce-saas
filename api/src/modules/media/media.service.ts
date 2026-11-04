@@ -9,12 +9,12 @@ import { randomBytes } from 'node:crypto';
 import { Media } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
-  getTenantContext,
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
 import { MinioService } from './storage/minio.service';
 import { ALLOWED_MIME_TYPES, UploadUrlDto } from './dto/upload-url.dto';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /** 超过这个时间仍是 PENDING 的记录视为孤儿 */
 export const ORPHAN_AFTER_HOURS = 24;
@@ -57,11 +57,7 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
   }
 
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new NotFoundException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   /** 取文件扩展名：优先用 mime 推断，不信任客户端传的原始文件名 */

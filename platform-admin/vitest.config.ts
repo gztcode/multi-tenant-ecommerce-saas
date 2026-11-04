@@ -34,6 +34,9 @@ export default defineConfig({
       // 被测路由虽然 mock 掉了 '@/auth'（不让真代码被加载），
       // 但只要依赖图里任何一处仍然引用到 server-only，就会炸。
       // 这里把它指向一个空模块兜底。
+      '@ecom/frontend-shared': fileURLToPath(
+        new URL('../packages/frontend-shared/src', import.meta.url),
+      ),
       'server-only': fileURLToPath(
         new URL('./test/stubs/server-only.ts', import.meta.url),
       ),

@@ -8,12 +8,14 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { UserRole } from '@prisma/client';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
+import { toIntOr } from '../../common/http/pagination';
 import { CouponService } from './coupon.service';
 import { PromotionService } from './promotion.service';
 import { CreateCouponDto } from './dto/create-coupon.dto';
@@ -39,9 +41,16 @@ export class MerchantCouponController {
   // ---------- 券 ----------
 
   @Get()
-  @ApiOperation({ summary: '券列表' })
-  list() {
-    return this.couponService.listCoupons();
+  @ApiOperation({ summary: '券列表（分页）' })
+  list(
+    // ⚠️ 没有 DTO 的列表接口拿到的是裸字符串，用 toIntOr 落回默认值
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+  ) {
+    return this.couponService.listCoupons({
+      page: toIntOr(page, undefined),
+      pageSize: toIntOr(pageSize, undefined),
+    });
   }
 
   @Post()

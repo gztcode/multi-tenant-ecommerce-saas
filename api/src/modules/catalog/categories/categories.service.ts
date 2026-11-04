@@ -5,10 +5,10 @@ import {
 } from '@nestjs/common';
 import { Category } from '@prisma/client';
 import { TenantPrismaService } from '../../../common/tenant/tenant-prisma.service';
-import { getTenantContext } from '../../../common/tenant/tenant-context';
 import { rethrowIfUniqueViolation } from '../../../common/errors/unique-constraint';
 import { CreateCategoryDto } from '../dto/create-category.dto';
 import { UpdateCategoryDto } from '../dto/update-category.dto';
+import { requireTenantId } from '../../../common/tenant/require-tenant';
 
 /** 品类树的最大层数。一级品类算第 1 层。 */
 export const MAX_CATEGORY_DEPTH = 3;
@@ -17,13 +17,9 @@ export const MAX_CATEGORY_DEPTH = 3;
 export class CategoriesService {
   constructor(private readonly prisma: TenantPrismaService) {}
 
-  /** 取当前租户 id；没有租户上下文时抛 404（不给调用方泄露「鉴权失败」细节） */
+  /** 取当前租户 id；没有租户上下文时抛 403「无法确定店铺」 */
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new NotFoundException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   /**

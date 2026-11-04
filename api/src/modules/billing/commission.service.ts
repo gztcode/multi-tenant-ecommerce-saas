@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { CommissionEntryType, OrderStatus } from '@prisma/client';
 
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
+import { clampPagination } from '../../common/http/pagination';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   platformScope,
@@ -68,7 +69,9 @@ export interface CommissionLedger {
     /** 其中冲回的笔数 */
     reversalCount: number;
   }>;
-  /** 逐笔流水明细 */
+  /** 区间内的流水总笔数（分页用：全部区间，不受当前页影响） */
+  total: number;
+  /** 逐笔流水明细（一页） */
   entries: Array<{
     id: string;
     tenantId: string;
@@ -404,10 +407,17 @@ export class CommissionService {
    * ⚠️ **净额由后端算**：前端拿到 `netAmount` 直接展示，绝不自己把明细加总一遍
    * —— 两套口径迟早漂移，账对不上。
    *
-   * ⚠️ **当前不分页**：全量返回区间内的明细。订单量增长后响应会无界膨胀
-   * → 将来做结算单时得加分页。
+   * ⚠️ **entries 分页**：明细按 `page`/`pageSize` 返回一页（夹取走
+   * `clampPagination`，与全站列表同一套上限）。`byMerchant` **仍按全区间
+   * 汇总**（来自 `groupBy`，不受当前页影响）——按商家汇总是超管核账的口径，
+   * 只汇当前页的话翻一页数字就变，账就对不上了。
    */
-  async ledger(input: { from: Date; to: Date }): Promise<CommissionLedger> {
+  async ledger(input: {
+    from: Date;
+    to: Date;
+    page?: number;
+    pageSize?: number;
+  }): Promise<CommissionLedger> {
     const { from, to } = input;
 
     // ⚠️ **区间必须非空**：`from >= to` 的区间算不出任何东西，
@@ -418,18 +428,36 @@ export class CommissionService {
       throw new BadRequestException('区间非法：from 必须早于 to');
     }
 
+    const { page, pageSize } = clampPagination(input.page, input.pageSize);
+
     return tenantContext.run(platformScope(), async () => {
-      const entries = await this.prisma.commissionEntry.findMany({
-        // ⚠️ **区间左闭右开 `[from, to)`**：与平台收入报表同一套区间语义，
-        // 相邻两期不重不漏。
-        where: { occurredAt: { gte: from, lt: to } },
-        orderBy: { occurredAt: 'desc' },
-      });
+      // ⚠️ **区间左闭右开 `[from, to)`**：与平台收入报表同一套区间语义，
+      // 相邻两期不重不漏。
+      const where = { occurredAt: { gte: from, lt: to } };
+      const [entries, total, grouped] = await Promise.all([
+        this.prisma.commissionEntry.findMany({
+          where,
+          orderBy: { occurredAt: 'desc' },
+          skip: (page - 1) * pageSize,
+          take: pageSize,
+        }),
+        this.prisma.commissionEntry.count({ where }),
+        // ⚠️ **byMerchant 改 DB 聚合**：按 `tenantId + type` 分组，
+        // `_sum.amount` 就是该商家的净抽佣毛额口径、`_count` 补笔数 ——
+        // 一条 SQL 出全区间汇总，不再把全量明细拖进内存加总
+        // （金额字段实际叫 `amount`，响应字段名仍叫 `netAmount` 不变）。
+        this.prisma.commissionEntry.groupBy({
+          by: ['tenantId', 'type'],
+          where,
+          _sum: { amount: true },
+          _count: { _all: true },
+        }),
+      ]);
 
       // ⚠️ **商家名要单独查**：`CommissionEntry.tenantId` 是纯标量、
       // 没声明 Prisma 关系 → 拿不到商家名。先收集 tenantId 集合再批量查。
       // （`Tenant` **不在** `TENANT_SCOPED_MODELS` 白名单里，任何作用域都能查。）
-      const tenantIds = [...new Set(entries.map((e) => e.tenantId))];
+      const tenantIds = [...new Set(grouped.map((g) => g.tenantId))];
       const tenants =
         tenantIds.length > 0
           ? await this.prisma.tenant.findMany({
@@ -439,23 +467,23 @@ export class CommissionService {
           : [];
       const tenantById = new Map(tenants.map((t) => [t.id, t]));
 
-      // ---- 按商家汇总 ----
+      // ---- 按商家汇总（把按 type 拆开的组并回一行） ----
       const byMerchantMap = new Map<
         string,
         { netAmount: number; entryCount: number; reversalCount: number }
       >();
-      for (const entry of entries) {
-        const agg = byMerchantMap.get(entry.tenantId) ?? {
+      for (const group of grouped) {
+        const agg = byMerchantMap.get(group.tenantId) ?? {
           netAmount: 0,
           entryCount: 0,
           reversalCount: 0,
         };
-        agg.netAmount += entry.amount;
-        agg.entryCount += 1;
-        if (entry.type === CommissionEntryType.REVERSAL) {
-          agg.reversalCount += 1;
+        agg.netAmount += group._sum.amount ?? 0;
+        agg.entryCount += group._count._all;
+        if (group.type === CommissionEntryType.REVERSAL) {
+          agg.reversalCount += group._count._all;
         }
-        byMerchantMap.set(entry.tenantId, agg);
+        byMerchantMap.set(group.tenantId, agg);
       }
 
       const byMerchant = [...byMerchantMap.entries()]
@@ -480,6 +508,7 @@ export class CommissionService {
         from: from.toISOString(),
         to: to.toISOString(),
         byMerchant,
+        total,
         entries: entries.map((entry) => ({
           id: entry.id,
           tenantId: entry.tenantId,

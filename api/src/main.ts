@@ -1,5 +1,5 @@
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
+import { Logger, ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
@@ -7,6 +7,7 @@ import { TenantContextInterceptor } from './modules/tenancy/tenant-context.inter
 import { assertSecureConfig } from './common/config/assert-secure-config';
 import { assertPayoutEncryptionKey } from './common/config/assert-payout-encryption-key';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { LoggingInterceptor } from './common/http/logging.interceptor';
 import { PayoutEncryptionSelfCheck } from './modules/billing/payout-encryption-self-check.service';
 
 async function bootstrap() {
@@ -36,7 +37,16 @@ async function bootstrap() {
       transform: true,
     }),
   );
-  app.useGlobalInterceptors(app.get(TenantContextInterceptor));
+  // ⚠️ **顺序很重要**：全局拦截器里**先注册的在外层**。
+  //    LoggingInterceptor 放**第一位**（最外层）才能记录到租户解析失败
+  //    抛的 404（那是在 TenantContextInterceptor 里抛的）——放里面就看不见。
+  //
+  // ⚠️ **已知缺口**：守卫的 401/403 不落日志——Nest 的守卫在拦截器链
+  //    **之外**执行，任何全局拦截器都盖不到。
+  app.useGlobalInterceptors(
+    app.get(LoggingInterceptor),
+    app.get(TenantContextInterceptor),
+  );
   // 必须在 createDocument 之前注册：过滤器不会改变路由表，但先挂上过滤器
   // 才能保证后面 Swagger UI 自身的请求也走统一错误格式。
   app.useGlobalFilters(new AllExceptionsFilter());
@@ -60,7 +70,7 @@ async function bootstrap() {
   await app.get(PayoutEncryptionSelfCheck).check();
 
   await app.listen(port);
-  console.log(`API 已启动：http://localhost:${port}/api/v1`);
+  new Logger('Bootstrap').log(`API 已启动：http://localhost:${port}/api/v1`);
 }
 
 void bootstrap();

@@ -149,7 +149,9 @@ export interface CommissionLedger {
     entryCount: number;
     reversalCount: number;
   }>;
-  /** 抽佣流水明细 */
+  /** 区间内的流水总笔数（分页用：全部区间，不受当前页影响） */
+  total: number;
+  /** 抽佣流水明细（一页） */
   entries: Array<{
     id: string;
     tenantId: string;

@@ -202,6 +202,8 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
       entryCount: number;
       reversalCount: number;
     }>;
+    /** 区间内的流水总笔数（分页用） */
+    total: number;
     entries: Array<{
       id: string;
       tenantId: string;
@@ -1514,6 +1516,11 @@ describe('平台侧的收入报表与订阅列表 (e2e)', () => {
 
     const sum = body.entries.reduce((acc, e) => acc + e.amount, 0);
     expect(sum).toBe(body.byMerchant[0].netAmount);
+
+    // ⚠️ **分页响应必须带全量计数**（`total` 是区间内全部流水数，
+    //    不是当前页条数）：单页场景两者应相等且 == 造的 1 行。
+    expect(body.total).toBe(1);
+    expect(body.total).toBe(body.entries.length);
   });
 
   it('GET /platform/commissions：商家账号 → 403', async () => {

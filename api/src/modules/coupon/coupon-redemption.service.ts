@@ -1,3 +1,4 @@
+import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import {
   ConflictException,
   Injectable,
@@ -113,7 +114,7 @@ export class CouponRedemptionService {
         },
       });
     } catch (error) {
-      if (this.isUniqueViolation(error)) {
+      if (isUniqueViolation(error)) {
         throw new ConflictException('该券已被使用');
       }
       throw error;
@@ -250,20 +251,5 @@ export class CouponRedemptionService {
       }),
     );
     return rows.length > 0 ? 'PLATFORM' : 'SHOP';
-  }
-
-  /**
-   * 是不是 Prisma 的唯一约束冲突（P2002）。
-   *
-   * 用 `error.code === 'P2002'` 而不是 `instanceof PrismaClientKnownRequestError`：
-   * `@prisma/client` 在 CJS/ESM 混载或多处 require 时会得到不同的模块实例，
-   * instanceof 于是恒为 false（与 common/errors/unique-constraint.ts 同一理由）。
-   */
-  private isUniqueViolation(error: unknown): boolean {
-    return (
-      typeof error === 'object' &&
-      error !== null &&
-      (error as { code?: unknown }).code === 'P2002'
-    );
   }
 }

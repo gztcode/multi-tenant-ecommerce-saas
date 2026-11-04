@@ -94,19 +94,27 @@ function fakePrisma(
 ) {
   const prisma = {
     databaseNow: jest.fn<Promise<Date>, []>(() => Promise.resolve(NOW)),
+    /**
+     * ⚠️ **列表页的「有哪些期」走 DB 端 `DISTINCT to_char(...)`**（阶段 7b，
+     *    封在 `TenantPrismaService.merchantReceiptPeriods` 里），不再是
+     *    `merchantReceipt.findMany` → 这里模拟 DB：从 `periodReceipts`
+     *    推出月份集合（UTC 年月，与 `formatPeriodLabel` 同口径）。
+     */
+    merchantReceiptPeriods: jest.fn<Promise<string[]>, [string]>(() => {
+      const months = new Set(
+        (options.periodReceipts ?? []).map(
+          (r) =>
+            `${r.occurredAt.getUTCFullYear()}-${String(
+              r.occurredAt.getUTCMonth() + 1,
+            ).padStart(2, '0')}`,
+        ),
+      );
+      return Promise.resolve([...months]);
+    }),
     merchantReceipt: {
-      /**
-       * ⚠️ **一次 mock 服务两个查询**（列表页的「有哪些期」与详情页的明细）：
-       *    靠 `where.occurredAt` 区分 —— 列表页不按时间过滤（只 select
-       *    `occurredAt`），详情页按区间过滤。
-       */
-      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(
-        (args?: QueryArgs) =>
-          Promise.resolve(
-            args?.where?.occurredAt === undefined
-              ? (options.periodReceipts ?? [])
-              : (options.receipts ?? []),
-          ),
+      /** 详情页的货款明细（列表页不再走这里） */
+      findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
+        Promise.resolve(options.receipts ?? []),
       ),
     },
     settlementStatement: {
@@ -642,7 +650,7 @@ describe('商家对账单：明细', () => {
 });
 
 describe('商家对账单：租户隔离', () => {
-  it('⚠️ 商家侧的查询不手写 tenantId（靠租户作用域扩展自动附加）', async () => {
+  it('⚠️ 列表归期查询显式传当前租户的 tenantId（原生 SQL 无租户扩展兜底）', async () => {
     const prisma = fakePrisma({
       periodReceipts: [{ occurredAt: new Date('2026-08-10T00:00:00.000Z') }],
     });
@@ -653,8 +661,7 @@ describe('商家对账单：租户隔离', () => {
 
     await asTenant(() => service.list());
 
-    const call = argsOf(prisma.merchantReceipt.findMany);
-    expect(call.where?.tenantId).toBeUndefined();
+    expect(prisma.merchantReceiptPeriods).toHaveBeenCalledWith('tenant-a');
   });
 
   it('⚠️ 查关联表时先查该租户的结算单 / 出款单（归属凭证）', async () => {

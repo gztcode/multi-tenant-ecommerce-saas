@@ -6,8 +6,8 @@ import {
 } from '@nestjs/common';
 import { InventoryMovement, InventoryMovementType } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
-import { getTenantContext } from '../../common/tenant/tenant-context';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
+import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /**
  * 交易链路的库存服务（阶段 3 Task 3）。
@@ -76,11 +76,7 @@ export class OrderInventoryService {
    * `AsyncLocalStorage` 沿 Promise 链传播，事务回调仍在同一条链上。
    */
   private currentTenantId(): string {
-    const context = getTenantContext();
-    if (!context.tenantId) {
-      throw new NotFoundException('无法确定店铺');
-    }
-    return context.tenantId;
+    return requireTenantId();
   }
 
   /**

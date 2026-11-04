@@ -9,7 +9,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { isTokenExpired, readJwtExpiry } from '@/lib/token-expiry';
+import { isTokenExpired, readJwtExpiry } from '@ecom/frontend-shared/token-expiry';
 
 /**
  * 造一枚 JWT。

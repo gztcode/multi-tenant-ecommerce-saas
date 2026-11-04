@@ -1,4 +1,6 @@
+import Link from 'next/link';
 import { ApiError, apiFetchAuthed } from '@/lib/api-client';
+import { paginatedEntriesResponse } from '@ecom/frontend-shared/pagination-schema';
 import {
   COMMISSION_ENTRY_TYPE_LABEL,
   formatCommissionRate,
@@ -27,6 +29,11 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 
 /**
+ * 每页条数的可选档位（与出款单列表页同款）。
+ */
+const PAGE_SIZE_OPTIONS = [20, 50, 100] as const;
+
+/**
  * 平台抽佣明细页（Server Component）。
  *
  * ⚠️ **净抽佣一律用后端返回的 `netAmount`，前端不自己加总**：
@@ -40,25 +47,38 @@ export default async function CommissionsPage({
   searchParams,
 }: {
   // Next.js 15 起 searchParams 是 Promise，必须 await。
-  searchParams: Promise<{ from?: string; to?: string }>;
+  searchParams: Promise<{
+    from?: string;
+    to?: string;
+    page?: string;
+    pageSize?: string;
+  }>;
 }) {
-  const { from: fromDay, to: toDay } = await searchParams;
+  const { from: fromDay, to: toDay, page: pageParam, pageSize: pageSizeParam } =
+    await searchParams;
+
+  // ⚠️ **页码与每页条数从 URL 读** —— 纯服务端翻页，不需要客户端组件
+  // （与出款单列表页同款做法；缺省 20 与后端 `DEFAULT_PAGE_SIZE` 一致）。
+  const parsedPage = Number.parseInt(pageParam ?? '1', 10);
+  const page = Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : 1;
+  const parsedPageSize = Number.parseInt(pageSizeParam ?? '20', 10);
+  // ⚠️ **夹到 1..100**（上限与后端 `clampPagination` 的 `MAX_PAGE_SIZE` 一致）。
+  const pageSize = Math.min(
+    100,
+    Math.max(1, Number.isFinite(parsedPageSize) ? parsedPageSize : 20),
+  );
 
   // ---- 定出要发给后端的区间 ----
   let query = '';
   let intervalError: string | null = null;
+  // ⚠️ **两个都给了才转区间**：只给一个时报错，不调后端——
+  // 区间不完整的明细比没有明细更糟。
+  const range =
+    fromDay && toDay ? toIsoRange(fromDay, toDay) : { error: 'INCOMPLETE' };
 
   if (fromDay && toDay) {
-    // ⚠️ **两个都给了才转区间**：只给一个时报错，不调后端——
-    // 区间不完整的明细比没有明细更糟。
-    const range = toIsoRange(fromDay, toDay);
     if ('error' in range) {
       intervalError = range.error;
-    } else {
-      const params = new URLSearchParams();
-      params.set('from', range.from);
-      params.set('to', range.to);
-      query = `?${params.toString()}`;
     }
   } else if (fromDay || toDay) {
     intervalError = '请同时选择开始与结束日期';
@@ -68,6 +88,19 @@ export default async function CommissionsPage({
   // 的时钟有偏差），前端自己算「最近 30 天」用的是浏览器的时钟，
   // 两者对不上时界面显示的区间与后端统计的就不是同一个区间。
 
+  // ⚠️ **分页参数无论有没有区间都要带上**（明细已改为后端分页）：
+  // 漏掉的话不带区间的请求会永远只拿第一页。
+  if (!intervalError) {
+    const params = new URLSearchParams();
+    if (fromDay && toDay && !('error' in range)) {
+      params.set('from', range.from);
+      params.set('to', range.to);
+    }
+    params.set('page', String(page));
+    params.set('pageSize', String(pageSize));
+    query = `?${params.toString()}`;
+  }
+
   let ledger: CommissionLedger | null = null;
   let error: string | null = null;
 
@@ -76,6 +109,12 @@ export default async function CommissionsPage({
       // ⚠️ **path 里带 query 串是可以的**（apiFetch 直接把 path 拼到 base url 后面）。
       ledger = await apiFetchAuthed<CommissionLedger>(
         `/platform/commissions${query}`,
+        // ⚠️ 报表响应带自有字段（from/to/byMerchant），用 looseObject
+        //    只校验 entries + total，其余字段原样保留
+        {
+          validate: (data) =>
+            paginatedEntriesResponse.parse(data) as unknown as CommissionLedger,
+        },
       );
     } catch (cause) {
       if (cause instanceof ApiError) {
@@ -88,6 +127,27 @@ export default async function CommissionsPage({
 
   const merchants = ledger?.byMerchant ?? [];
   const entries = ledger?.entries ?? [];
+  const total = ledger?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  /**
+   * 拼一个带全部当前条件的 query（翻页 / 换每页条数用）。
+   *
+   * ⚠️ **翻页必须把区间一起带上** —— 漏掉的话翻一页区间就被重置成
+   * 「最近 30 天」，看到的就不是同一份明细了。
+   * ⚠️ **换每页条数时页码重置为 1** —— 新条数下原页码可能已越界。
+   * ⚠️ **区间原样回传 URL 里的日期**（后端还会回显它实际统计的区间）。
+   */
+  const buildQuery = (nextPage: number, nextPageSize: number): string => {
+    const params = new URLSearchParams();
+    if (fromDay && toDay) {
+      params.set('from', fromDay);
+      params.set('to', toDay);
+    }
+    params.set('page', String(nextPage));
+    params.set('pageSize', String(nextPageSize));
+    return `?${params.toString()}`;
+  };
 
   return (
     <div className="flex flex-col gap-6">
@@ -229,6 +289,51 @@ export default async function CommissionsPage({
                     ))}
                   </TableBody>
                 </Table>
+              )}
+              {/* ⚠️ **每页条数三档** —— 默认 20（与后端缺省一致） */}
+              <div className="mt-4 flex gap-2 text-sm">
+                {PAGE_SIZE_OPTIONS.map((size) => (
+                  <Link
+                    key={size}
+                    href={buildQuery(1, size)}
+                    className={
+                      size === pageSize
+                        ? 'underline font-medium'
+                        : 'underline-offset-4 hover:underline'
+                    }
+                  >
+                    {size}
+                  </Link>
+                ))}
+                <span className="text-muted-foreground">条 / 页</span>
+              </div>
+              {/* ⚠️ **翻页** —— 纯服务端：`<Link>` 改 URL，Server Component 重渲染。 */}
+              {totalPages > 1 && (
+                <div className="mt-2 flex items-center gap-4 text-sm">
+                  <Link
+                    href={buildQuery(Math.max(1, page - 1), pageSize)}
+                    className={
+                      page <= 1
+                        ? 'pointer-events-none opacity-40'
+                        : 'underline-offset-4 hover:underline'
+                    }
+                  >
+                    上一页
+                  </Link>
+                  <span>
+                    第 {page} / {totalPages} 页，共 {total} 笔
+                  </span>
+                  <Link
+                    href={buildQuery(Math.min(totalPages, page + 1), pageSize)}
+                    className={
+                      page >= totalPages
+                        ? 'pointer-events-none opacity-40'
+                        : 'underline-offset-4 hover:underline'
+                    }
+                  >
+                    下一页
+                  </Link>
+                </div>
               )}
             </CardContent>
           </Card>
