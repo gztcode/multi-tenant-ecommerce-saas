@@ -310,7 +310,7 @@ export class OrderService {
     // ⚠️ **「从未订阅」不拦**：商家还没选套餐，不是不允许卖货 ——
     // 拦的是「到期后」。判定同时看状态与时间，不依赖
     // 「有没有人来把过期的改成 EXPIRED」。
-    if (!(await this.billing.canAcceptOrders(tenantId))) {
+    if (!(await this.billing.canAcceptOrders(tenantId, tx))) {
       throw new ServiceUnavailableException('该店铺暂未开通服务');
     }
 
@@ -355,13 +355,16 @@ export class OrderService {
       originalAmount += detail.price * item.quantity;
     }
 
-    const discount = await this.coupon.computeForOrder({
-      tenantId,
-      customerId: owner,
-      originalAmount,
-      items: pricedItems,
-      requestedCouponId: dto.couponId,
-    });
+    const discount = await this.coupon.computeForOrder(
+      {
+        tenantId,
+        customerId: owner,
+        originalAmount,
+        items: pricedItems,
+        requestedCouponId: dto.couponId,
+      },
+      tx,
+    );
 
     // ⚠️ **下单前再校验一次实付不为负**（M6）：
     // 引擎保证了它，但这里是最后一道闸——负金额订单会破坏账目。
@@ -376,7 +379,7 @@ export class OrderService {
     //
     // ⚠️ **快照在订单上**：改套餐的费率**不影响已成交的订单** ——
     // 与阶段 5a 的券减免额同款做法（订单存的是下单那一刻算出来的值）。
-    const plan = await this.quota.currentPlan(tenantId);
+    const plan = await this.quota.currentPlan(tenantId, tx);
     const rateBps = plan?.commissionBps ?? 0;
     const commission = computeCommission({
       payableAmount: discount.payableAmount,

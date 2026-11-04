@@ -2,9 +2,30 @@
 
 前后端完全分离的多租户电商底座。一个实例服务多个商家：每个商家有自己的店铺、商品、订单与客户。
 
-**当前进度：阶段 9「历史技术债清理」已完成并验收通过。**
+**当前进度：阶段 10「事务边界与连接池收口」已完成并验收通过。**
 
-阶段 9 按四批清历史遗留：
+阶段 10 修的是并发写路径的**根因**：
+
+- **事务回调内不再借第二条连接**：Prisma 的交互事务（`$transaction(async (tx) => ...)`）
+  会独占一条连接，回调内再用非事务客户端（`this.prisma`）就要再借一条 ——
+  连接池小时（GitHub 2 核 runner 上默认池只有 5 条），并发下单互相等死，
+  先报 `P2024`（拿不到连接），外层事务随后超时报 `P2028`。
+  涉及 coupon / subscription / quota / cart / invoice / payment /
+  platform-setting 七个模块，**9 个根因、15 处借用点**全部改为走事务客户端。
+- **静态检测器 + 回归护栏**：用 TypeScript 类型信息构建全局调用图，
+  追踪「事务回调 → 方法转调 → `this.prisma`」的完整链路；
+  护栏单测扫全仓，新增违规即 CI 红。豁免必须写明理由，
+  锚点用「文件 + 方法名 + 表达式」而非会漂移的行号。
+- **CI 撤掉规避配置**：e2e job 不再放大连接池（`connection_limit=20`）、
+  也不再放宽事务超时（`PRISMA_TX_TIMEOUT_MS=30000`）——
+  用默认池跑正是为了持续验证「根因已修」。
+
+设计文档见
+[`docs/superpowers/specs/2026-11-04-plan-10-tx-boundary-design.md`](docs/superpowers/specs/2026-11-04-plan-10-tx-boundary-design.md)；
+实施计划见
+[`docs/superpowers/plans/2026-11-04-plan-10-tx-boundary.md`](docs/superpowers/plans/2026-11-04-plan-10-tx-boundary.md)。
+
+阶段 9「历史技术债清理」已完成并验收通过。阶段 9 按四批清历史遗留：
 
 - **A 安全与部署**：生产环境拒绝默认/空的 PostgreSQL、Redis、MinIO 凭据；
   三端 `AUTH_SECRET` 启动守卫（含 compose 默认值与 `.env.example` 占位值，
@@ -234,14 +255,16 @@ PAYOUT_PLATFORM_DEFAULT_CHANNEL=fake-payout
 
 ```bash
 cd api
-npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，950 条 / 58 套件，3 条跳过）
+npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，959 条 / 59 套件，3 条跳过）
 npm run test:e2e      # 端到端（663 条 / 40 个套件，串行）
 npm run test:cov:e2e  # 项目真实覆盖率
 ```
 
 > ✅ **跑 e2e 不需要停 api 容器**（阶段 5c 实测更正）。队列前缀隔离
 > （`BULLMQ_PREFIX=bull-e2e`）与每轮清库早已实现，**容器 api 全程在跑**的情况下
-> 阶段 6 实测 657/657、阶段 8 实测 663/663、阶段 9 实测 663/663 全绿。
+> 阶段 6 实测 657/657、阶段 8 实测 663/663、阶段 9 实测 663/663、
+> 阶段 10 实测 663/663 全绿（阶段 10 还在**连接池压到 5 条**的严苛条件下
+> 连跑两次全绿 —— 即 GitHub 2 核 runner 的默认池大小）。
 > 若仍遇到**随机的假失败**，再 `docker compose stop api` 排除。
 > 历史背景见
 > [阶段 3 验收记录 §一](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md)。
@@ -389,6 +412,7 @@ node tools/push-via-api-curl.mjs <本地分支> <远端分支>
 | 计划 7c | 前端共享包 `@ecom/frontend-shared` + 三端收口 + loading 骨架 —— **已完成并验收通过** |
 | 计划 8a / 8b / 8c | 部署与鉴权 → 资金与并发正确性 → 健壮性与工程债 —— **已完成并验收通过** |
 | 计划 9 | 安全与部署、运维与 CI、资金并发护栏、前端与文档清理 —— **已完成并验收通过** |
+| 计划 10 | 事务边界与连接池收口（并发写路径的根因修复 + 静态护栏） —— **已完成并验收通过** |
 
 ### 阶段 8 之后的剩余技术债
 

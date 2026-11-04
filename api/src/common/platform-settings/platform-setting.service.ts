@@ -4,6 +4,7 @@ import {
   Injectable,
 } from '@nestjs/common';
 import { TenantPrismaService } from '../tenant/tenant-prisma.service';
+import type { PrismaTransaction } from '../prisma/prisma-transaction';
 import { platformScope, tenantContext } from '../tenant/tenant-context';
 import {
   isChannelEnabled,
@@ -92,10 +93,17 @@ export class PlatformSettingService {
    * 顺序：DB 行 → 环境变量兜底 → 都没有则返回 `channel: null`（不算错误）。
    * ⚠️ DB 行的渠道若已停用 / 生产环境是 devOnly → **仍然抛错**：
    *    那是「配置被改坏了」，必须让运营看到并重新设置，不能展示成一个能用的值。
+   *
+   * @param client 读用的客户端。
+   * ⚠️ **事务内必须传 `tx`**：交互事务会独占一条连接，
+   *    回调内再用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
+   *    阶段 10 修的就是这个。
    */
-  async readPayoutDefaultChannel(): Promise<PayoutDefaultChannelDisplay> {
+  async readPayoutDefaultChannel(
+    client: PrismaTransaction | TenantPrismaService = this.prisma,
+  ): Promise<PayoutDefaultChannelDisplay> {
     const row = await tenantContext.run(platformScope(), async () =>
-      this.prisma.platformSetting.findUnique({
+      client.platformSetting.findUnique({
         where: { key: PAYOUT_DEFAULT_CHANNEL_KEY },
       }),
     );
@@ -130,9 +138,16 @@ export class PlatformSettingService {
    * 顺序：DB 行 → 环境变量兜底 → 抛中文 409。
    * ⚠️ DB 行的渠道若已停用 / 生产环境是 devOnly → 抛错，**不回落到环境变量**
    *    —— 配置被改坏了就响亮失败，绝不悄悄换一个收款路径。
+   *
+   * @param client 读用的客户端。
+   * ⚠️ **事务内必须传 `tx`**：交互事务会独占一条连接，
+   *    回调内再用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
+   *    阶段 10 修的就是这个。
    */
-  async getPayoutDefaultChannel(): Promise<PayoutDefaultChannelResult> {
-    const current = await this.readPayoutDefaultChannel();
+  async getPayoutDefaultChannel(
+    client: PrismaTransaction | TenantPrismaService = this.prisma,
+  ): Promise<PayoutDefaultChannelResult> {
+    const current = await this.readPayoutDefaultChannel(client);
     if (!current.channel) {
       throw new ConflictException(
         '平台未配置默认出款渠道：请在超管后台设置，或配置环境变量 PAYOUT_PLATFORM_DEFAULT_CHANNEL。',

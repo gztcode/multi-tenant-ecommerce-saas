@@ -860,7 +860,16 @@ export class PaymentService {
     // 报表把 `Order.paidAt` 与 `Order.refundedAt` 聚到了一起，
     // 两个时间字段的时钟口径必须一致 —— 一个用应用时钟、一个用数据库时钟，
     // 多副本部署时各机器时钟有偏差，边界时刻会漏计或错计。
-    const paidAt = await this.prisma.databaseNow();
+    //
+    // ⚠️ **时钟走 tx**：交互事务会独占一条连接，
+    //    用 `this.prisma.databaseNow()` 会再借一条 → 小连接池上死等（P2024）。
+    //
+    // ⚠️ **tx 上的 `now()` 是「事务开始时刻」**，与事务外取有 ≤30s 偏差。
+    //    `paidAt` 是财务口径字段，这个偏差在容差内，但**必须在此写明**。
+    const nowRows = await tx.$queryRaw<Array<{ now: Date }>>`
+      SELECT now() as now
+    `;
+    const paidAt = nowRows[0].now;
     const won = await this.orderService.transitionInTx(
       tx,
       order.id,
@@ -1501,14 +1510,12 @@ export class PaymentService {
     }
 
     // `SUCCESS` → 落 REFUNDED + 冲回（条件更新在事务里幂等）
+    //
+    // ⚠️ **时钟在事务外取**：它表达的是「事件发生时刻」的语义，
+    //    放在事务内会多借一条连接（小连接池上死等，P2024）。
+    const now = await this.prisma.databaseNow();
     await this.prisma.$transaction(async (tx) => {
-      await this.applyRefundInTx(
-        tx,
-        payment.id,
-        order,
-        await this.prisma.databaseNow(),
-        event.refundTxnId,
-      );
+      await this.applyRefundInTx(tx, payment.id, order, now, event.refundTxnId);
     }, transactionOptions());
   }
 

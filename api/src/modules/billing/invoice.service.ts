@@ -165,7 +165,15 @@ export class InvoiceService {
     tx: PrismaTransaction,
     invoiceId: string,
   ): Promise<boolean> {
-    const now = await this.prisma.databaseNow();
+    // ⚠️ **时钟走 tx**：交互事务会独占一条连接，
+    //    用 `this.prisma.databaseNow()` 会再借一条 → 小连接池上死等（P2024）。
+    //
+    // ⚠️ **tx 上的 `now()` 是「事务开始时刻」**，与事务外取有 ≤30s 偏差。
+    //    `paidAt` 是财务口径字段，这个偏差在容差内，但**必须在此写明**。
+    const rows = await tx.$queryRaw<Array<{ now: Date }>>`
+      SELECT now() as now
+    `;
+    const now = rows[0].now;
     // ⚠️ **`status` 条件是第二层防御，当前实现下测不到** ——
     // 订阅期延长写的是**绝对值**（`currentPeriodStart: invoice.periodStart`、
     // `currentPeriodEnd: invoice.periodEnd`），所以**同一个账单被重复处理也只会延长一次**。

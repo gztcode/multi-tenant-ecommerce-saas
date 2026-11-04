@@ -7,8 +7,9 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { PayoutStatus, Prisma, SettlementStatus } from '@prisma/client';
+import { PayoutStatus, SettlementStatus } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
+import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
 import {
   platformScope,
   tenantContext,
@@ -215,13 +216,7 @@ export class PayoutExecutionService {
         let channel: string | null = null;
         let channelError: string | null = null;
         try {
-          channel = await this.resolvePayoutChannel(
-            // `$transaction` 传入的 tx 是「租户扩展版」客户端，其类型与
-            // `Prisma.TransactionClient` 不兼容（扩展式的查找参数），
-            // 这里按结构收窄 —— 本方法只用到只读 delegate。
-            tx as unknown as Prisma.TransactionClient,
-            payout,
-          );
+          channel = await this.resolvePayoutChannel(tx, payout);
         } catch (error) {
           channelError = error instanceof Error ? error.message : String(error);
         }
@@ -306,7 +301,7 @@ export class PayoutExecutionService {
    *    否则就是跨租户读（同 `confirmPaidAfterReconciliation` 的那类坑）。
    */
   private async resolvePayoutChannel(
-    tx: Prisma.TransactionClient,
+    tx: PrismaTransaction,
     payout: { tenantId: string; payoutChannel: string | null },
   ): Promise<string> {
     if (normalizeChannel(payout.payoutChannel ?? '').length > 0) {
@@ -339,7 +334,10 @@ export class PayoutExecutionService {
 
     // ⚠️ **平台默认渠道（DB → env）** —— 商家没配时才读。
     //    平台设置坏了就响亮失败（channelError），不静默换一个收款路径。
-    const platformChannel = (await this.settings.getPayoutDefaultChannel())
+    //
+    // ⚠️ **必须传 `tx`**：交互事务会独占一条连接，
+    //    这里再用 `this.prisma` 读平台设置会再借一条 → 小连接池上死等（P2024）。
+    const platformChannel = (await this.settings.getPayoutDefaultChannel(tx))
       .channel;
 
     return this.registry.resolveForPayout({

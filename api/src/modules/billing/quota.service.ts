@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import type { Plan } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
+import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
 
 /** 功能开关的键（**用常量，不写字面量**） */
 export const FEATURE_MARKETING = 'marketing';
@@ -35,15 +36,24 @@ const QUOTA_LABEL: Record<QuotaKind, string> = {
 export class QuotaService {
   constructor(private readonly prisma: TenantPrismaService) {}
 
-  /** 当前租户的套餐（没有订阅就没有套餐） */
-  async currentPlan(tenantId: string): Promise<Plan | null> {
-    const subscription = await this.prisma.subscription.findFirst({
+  /**
+   * 当前租户的套餐（没有订阅就没有套餐）。
+   *
+   * ⚠️ **事务内必须传 `tx`**：交互事务会独占一条连接，
+   *    回调内再用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
+   *    阶段 10 修的就是这个。
+   */
+  async currentPlan(
+    tenantId: string,
+    client: PrismaTransaction | TenantPrismaService = this.prisma,
+  ): Promise<Plan | null> {
+    const subscription = await client.subscription.findFirst({
       where: { tenantId },
     });
     if (!subscription) {
       return null;
     }
-    return this.prisma.plan.findFirst({ where: { id: subscription.planId } });
+    return client.plan.findFirst({ where: { id: subscription.planId } });
   }
 
   /**

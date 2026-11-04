@@ -6,6 +6,7 @@ import {
 import { SubscriptionStatus, type Subscription } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { rethrowIfUniqueViolation } from '../../common/errors/unique-constraint';
+import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
 import { PlanService } from './plan.service';
 import { hasService } from './subscription-state';
 import { requireTenantId } from '../../common/tenant/require-tenant';
@@ -34,9 +35,18 @@ export class SubscriptionService {
     return requireTenantId();
   }
 
-  /** 当前订阅（没有就是 null） */
-  async current(tenantId: string): Promise<Subscription | null> {
-    return this.prisma.subscription.findFirst({ where: { tenantId } });
+  /**
+   * 当前订阅（没有就是 null）。
+   *
+   * ⚠️ **事务内必须传 `tx`**：交互事务会独占一条连接，
+   *    回调内再用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
+   *    阶段 10 修的就是这个。
+   */
+  async current(
+    tenantId: string,
+    client: PrismaTransaction | TenantPrismaService = this.prisma,
+  ): Promise<Subscription | null> {
+    return client.subscription.findFirst({ where: { tenantId } });
   }
 
   /**
@@ -53,13 +63,20 @@ export class SubscriptionService {
    * 判定也是对的（同时看状态**与时间**）。
    * ⚠️ **时间用数据库的时钟**（护栏 M15）—— 多副本部署时各机器的时钟
    * 有偏差，边界时刻会摇摆。
+   *
+   * ⚠️ **事务内必须传 `tx`**：交互事务会独占一条连接，
+   *    回调内再用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
+   *    阶段 10 修的就是这个。
    */
-  async canAcceptOrders(tenantId: string): Promise<boolean> {
-    const subscription = await this.current(tenantId);
+  async canAcceptOrders(
+    tenantId: string,
+    client: PrismaTransaction | TenantPrismaService = this.prisma,
+  ): Promise<boolean> {
+    const subscription = await this.current(tenantId, client);
     if (!subscription) {
       return true;
     }
-    const now = await this.prisma.databaseNow();
+    const now = await this.databaseNow(client);
     return hasService(subscription, now);
   }
 
@@ -157,5 +174,23 @@ export class SubscriptionService {
       where: { tenantId },
       data: { cancelAtPeriodEnd: true },
     });
+  }
+
+  /**
+   * 数据库时钟（双形态）。
+   *
+   * ⚠️ **事务内必须传 `tx`**：`this.prisma.databaseNow()` 会借普通连接，
+   *    事务已经占住一条，再借一条会在小连接池上死等（P2024）。
+   */
+  private async databaseNow(
+    client: PrismaTransaction | TenantPrismaService,
+  ): Promise<Date> {
+    if (client instanceof TenantPrismaService) {
+      return client.databaseNow();
+    }
+    const rows = await client.$queryRaw<Array<{ now: Date }>>`
+      SELECT now() as now
+    `;
+    return rows[0].now;
   }
 }

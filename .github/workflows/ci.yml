@@ -156,17 +156,17 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      # ⚠️ **必须显式放大连接池**：GitHub 2 核 runner 的 Prisma 默认池只有 5
-      #    （CPU×2+1）。5 个并发下单各占一条事务连接，事务内的
-      #    `this.prisma.databaseNow()` 又要再借一条 → 池被打满互相等 → P2024。
-      #    本地核多（池 ~21）所以复现不出来。
-      DATABASE_URL: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public&connection_limit=20&pool_timeout=20
-      DATABASE_URL_TEST: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public&connection_limit=20&pool_timeout=20
+      # ⚠️ **连接池不再显式放大**：阶段 10 修了根因 ——
+      #    交互事务独占一条连接，回调内再用非事务客户端会再借一条，
+      #    2 核 runner 上默认池只有 5 条，5 个并发下单就把池打满互相等死
+      #    （P2024，随后外层事务超时报 P2028）。
+      #    现在事务内的查询全部走事务客户端，一个事务只占一条连接，
+      #    不再依赖池的大小 —— 所以这里用**默认池**跑，
+      #    正是为了持续验证「根因已修」。
+      DATABASE_URL: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public
+      DATABASE_URL_TEST: postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_test?schema=public
       REDIS_URL: redis://localhost:16380
       BULLMQ_PREFIX: bull-e2e
-      # CI 的 2 核 runner 上，5 个并发下单会在同一行 SKU 锁上排队，
-      # 10 秒的交互事务预算不够（Prisma P2028）。只在 e2e 放宽，生产不设。
-      PRISMA_TX_TIMEOUT_MS: '30000'
       JWT_SECRET: ci-jwt-secret-with-enough-entropy-0123456789
       PAYOUT_ACCOUNT_ENCRYPTION_KEY: ci-payout-encryption-key-0123456789
     steps:

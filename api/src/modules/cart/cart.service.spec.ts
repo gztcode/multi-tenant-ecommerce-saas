@@ -72,6 +72,22 @@ function fakePrisma(options: FakeOptions = {}) {
   const guestItems = options.guestItems ?? [];
   const sellable = new Set(options.sellableSkuIds ?? []);
 
+  /**
+   * 可售判定的假实现：返回「请求的 id ∩ 配置的可售集合」。
+   *
+   * ⚠️ 每次调用返回一个**独立的** jest.fn —— 事务客户端（tx）与非事务客户端
+   *    （this.prisma）必须能分开断言「这一步查库走的是哪一个」。
+   */
+  const fakeSkuFindMany = () =>
+    jest.fn<Promise<Array<{ id: string }>>, [args?: QueryArgs]>(
+      (args?: QueryArgs) => {
+        const ids = (args?.where?.id as { in?: string[] })?.in ?? [];
+        return Promise.resolve(
+          ids.filter((id) => sellable.has(id)).map((id) => ({ id })),
+        );
+      },
+    );
+
   /** 事务内的假 Prisma 片段（写入断言都落在它身上） */
   const tx = {
     cartItem: {
@@ -92,6 +108,10 @@ function fakePrisma(options: FakeOptions = {}) {
       deleteMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
         Promise.resolve({ count: 1 }),
       ),
+    },
+    // ⚠️ 可售判定在事务内也发生过一次（清陈旧条目）——那次必须走 tx
+    sku: {
+      findMany: fakeSkuFindMany(),
     },
   };
 
@@ -136,14 +156,7 @@ function fakePrisma(options: FakeOptions = {}) {
     },
     sku: {
       // 可售判定：返回「请求的 id ∩ 配置的可售集合」
-      findMany: jest.fn<Promise<Array<{ id: string }>>, [args?: QueryArgs]>(
-        (args?: QueryArgs) => {
-          const ids = (args?.where?.id as { in?: string[] })?.in ?? [];
-          return Promise.resolve(
-            ids.filter((id) => sellable.has(id)).map((id) => ({ id })),
-          );
-        },
-      ),
+      findMany: fakeSkuFindMany(),
     },
     $transaction: jest.fn<
       Promise<unknown>,
@@ -260,6 +273,23 @@ describe('CartService.merge', () => {
         id: { in: ['ai-old'] },
         cartId: ACCOUNT_CART_ID,
       });
+    });
+
+    it('事务内的可售判定走事务客户端（不借第二条连接）', async () => {
+      const { prisma, tx } = fakePrisma({
+        accountItems: [{ id: 'ai-1', skuId: 'sku-A', quantity: 2 }],
+        guestItems: [{ id: 'gi-1', skuId: 'sku-A', quantity: 5 }],
+        sellableSkuIds: ['sku-A'],
+      });
+      const service = makeService(prisma);
+
+      await service.merge(TENANT, CUSTOMER, 'guest-token');
+
+      // ⚠️ 清理陈旧条目时的可售判定发生在**事务回调内**，
+      //    必须走 tx；走 this.prisma 会再借一条连接 → 小连接池上死等（P2024）。
+      expect(tx.sku.findMany).toHaveBeenCalledTimes(1);
+      // 事务外那次（校验游客条目）仍走 this.prisma —— 那里本来就不在事务里
+      expect(prisma.sku.findMany).toHaveBeenCalledTimes(1);
     });
 
     it('数量超上限的游客条目直接丢弃（不报错）', async () => {

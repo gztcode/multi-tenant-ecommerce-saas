@@ -135,6 +135,18 @@ cd infra && docker compose up -d --build
 - **落库时刻用 `prisma.databaseNow()`，不要用 `new Date()`**；唯一例外是假网关进程内的 `executedAt`。
 - 订单状态流转必须用**条件更新**（把 `from` 状态放进 `updateMany.where`，按受影响行数判定赢家）；
   改状态与动库存必须**同一个事务**。库存流水三种：`RESERVE` / `RELEASE` / `DEDUCT`（支付成功不动库存）。
+- **事务回调内不许借第二条连接**（阶段 10）：`$transaction(async (tx) => ...)` 会**独占一条连接**
+  直到回调返回，回调内（含**经方法转调**）再用 `this.prisma` 就得**再借一条** → 连接池小时
+  （GitHub 2 核 runner 上 Prisma 默认池 = CPU×2+1 = 5）并发写路径互相等死，
+  先报 `P2024`，外层事务随后超时报 `P2028`。
+  改法：方法接受**可选客户端参数**（`client: PrismaTransaction | TenantPrismaService = this.prisma`），
+  事务内显式传 `tx`；事务外的既有调用点不用改。
+  ⚠️ **Prisma 6 的租户扩展会应用到事务客户端** —— `tx` 上照样按上下文解析作用域，
+  平台作用域（`tenantContext.run(platformScope(), ...)`）在 tx 上同样生效，
+  所以「平台券查询必须留在事务外」是**错的**（`coupon.service.ts` 的 `findClaimableCoupon` 早就在用 tx 查平台券）。
+  护栏：`api/src/common/db/tx-boundary-scanner.spec.ts` 扫全仓，新增违规即 CI 红；
+  `cd api && npm run scan:tx-boundary` 看当前清单。豁免必须写明理由（`tx-boundary-exemptions.ts`），
+  锚点用「文件 + 方法名 + 表达式」，**不用行号**（会漂移）。
 - 文案、注释、测试名、commit message 一律**简体中文**；commit 用中文 conventional commits
   （`feat(api): ...` / `fix(front): ...`）。计划约定在当前分支 `gzt/电商项目` 直接提交，docs 改动单独 commit。
 

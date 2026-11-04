@@ -33,7 +33,8 @@
     "backfill:commissions": "npm run backfill:ledger",
     "check:ledger": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/check-ledger.ts",
     "migrate:payout-encryption": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/migrate-payout-encryption.ts",
-    "payout:retry-pre-payout": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/retry-pre-payout-failures.ts"
+    "payout:retry-pre-payout": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/retry-pre-payout-failures.ts",
+    "scan:tx-boundary": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/scan-tx-boundary.ts"
   },
   "prisma": {
     "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"

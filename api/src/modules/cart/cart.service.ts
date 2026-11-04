@@ -274,6 +274,7 @@ export class CartService {
 
     const sellableSkuIds = await this.findSellableSkuIds(
       items.map((item) => item.skuId),
+      tx,
     );
     const unsellableItemIds = items
       .filter((item) => !sellableSkuIds.has(item.skuId))
@@ -300,14 +301,21 @@ export class CartService {
    *
    * 一次查完返回 id 集合，调用方在内存里判断——
    * 逐条查是 N+1，条目一多就是几百次往返。
+   *
+   * ⚠️ **事务内必须传 `tx`**：交互事务会独占一条连接，
+   *    回调内再用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
+   *    阶段 10 修的就是这个。
    */
-  private async findSellableSkuIds(skuIds: string[]): Promise<Set<string>> {
+  private async findSellableSkuIds(
+    skuIds: string[],
+    client: PrismaTransaction | TenantPrismaService = this.prisma,
+  ): Promise<Set<string>> {
     const unique = [...new Set(skuIds)];
     if (unique.length === 0) {
       return new Set();
     }
 
-    const skus = await this.prisma.sku.findMany({
+    const skus = await client.sku.findMany({
       where: {
         id: { in: unique },
         status: SkuStatus.ACTIVE,

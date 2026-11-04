@@ -782,22 +782,32 @@ export class CouponService {
    * 用户在结算页手动选了哪张，就该用哪张。否则用户选了 30 元券、
    * 系统偷偷用了 50 元券，界面上显示的和实际扣的不一样。
    * 「自动取最优」只在用户**没选**时兜底。
+   *
+   * ⚠️ **事务内必须传 `tx`**：交互事务会独占一条连接，
+   *    回调内再用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
+   *    阶段 10 修的就是这个。
    */
-  async computeForOrder(input: {
-    tenantId: string;
-    customerId: string;
-    /** 商品原价小计（整数分），已锁定 SKU 的实时价算出来的 */
-    originalAmount: number;
-    items: Array<{ skuId: string; quantity: number; price: number }>;
-    /** 客户端指定的券（只传 id，面额与门槛一律从库里读） */
-    requestedCouponId?: string;
-  }): Promise<OrderDiscount> {
-    const { context, found, promotion } = await this.buildDiscountContext({
-      tenantId: input.tenantId,
-      customerId: input.customerId,
-      originalAmount: input.originalAmount,
-      items: input.items,
-    });
+  async computeForOrder(
+    input: {
+      tenantId: string;
+      customerId: string;
+      /** 商品原价小计（整数分），已锁定 SKU 的实时价算出来的 */
+      originalAmount: number;
+      items: Array<{ skuId: string; quantity: number; price: number }>;
+      /** 客户端指定的券（只传 id，面额与门槛一律从库里读） */
+      requestedCouponId?: string;
+    },
+    client: PrismaTransaction | TenantPrismaService = this.prisma,
+  ): Promise<OrderDiscount> {
+    const { context, found, promotion } = await this.buildDiscountContext(
+      {
+        tenantId: input.tenantId,
+        customerId: input.customerId,
+        originalAmount: input.originalAmount,
+        items: input.items,
+      },
+      client,
+    );
 
     // ---- 3. 手动指定了券 → 收窄成那一张 ----
     //
@@ -871,23 +881,34 @@ export class CouponService {
    * 就会出现「预览显示减 20，下单只减 0」。
    *
    * ⚠️ **有效期判定用数据库的 `now()`**（M15），不用应用进程的时钟。
+   *
+   * ⚠️ **事务内必须传 `tx`**：交互事务会独占一条连接，
+   *    回调内再用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
+   *    阶段 10 修的就是这个。
    */
-  private async buildDiscountContext(input: {
-    tenantId: string;
-    customerId: string;
-    originalAmount: number;
-    items: Array<{ skuId: string; quantity: number; price: number }>;
-  }): Promise<{
+  private async buildDiscountContext(
+    input: {
+      tenantId: string;
+      customerId: string;
+      originalAmount: number;
+      items: Array<{ skuId: string; quantity: number; price: number }>;
+    },
+    client: PrismaTransaction | TenantPrismaService = this.prisma,
+  ): Promise<{
     context: DiscountContext;
     found: { candidates: CouponCandidate[]; alreadyUsedIds: Set<string> };
     promotion: Promotion | null;
   }> {
     // ---- 1. 候选券 ----
-    const dbNow = await this.databaseNow(this.prisma);
-    const found = await this.findCandidateCoupons(input.customerId, dbNow);
+    const dbNow = await this.databaseNow(client);
+    const found = await this.findCandidateCoupons(
+      input.customerId,
+      dbNow,
+      client,
+    );
 
     // ---- 2. 当前生效的满减活动（租户作用域内）----
-    const promotion = await this.prisma.promotion.findFirst({
+    const promotion = await client.promotion.findFirst({
       where: {
         status: PromotionStatus.ACTIVE,
         startsAt: { lte: dbNow },
@@ -1032,16 +1053,21 @@ export class CouponService {
    * ⚠️ **「已被占住/已用掉」单独返回**：它不在候选里（不能用），
    * 但要**单独告诉调用方**——客户端指定这张券时该回 409「该券已被使用」，
    * 而不是笼统的 400「优惠券不可用」。
+   *
+   * ⚠️ **事务内必须传 `tx`**：交互事务会独占一条连接，
+   *    回调内再用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
+   *    阶段 10 修的就是这个。
    */
   private async findCandidateCoupons(
     customerId: string,
     dbNow: Date,
+    client: PrismaTransaction | TenantPrismaService = this.prisma,
   ): Promise<{
     candidates: CouponCandidate[];
     alreadyUsedIds: Set<string>;
   }> {
     // 1. 领取记录（租户作用域内 —— 扩展自动附加 tenantId 条件）
-    const claims = await this.prisma.couponClaim.findMany({
+    const claims = await client.couponClaim.findMany({
       where: { customerId },
       orderBy: { createdAt: 'asc' },
       select: { couponId: true },
@@ -1055,7 +1081,7 @@ export class CouponService {
     //    CouponClaim 上没有 coupon 关系，include 编译不过）。
     //
     //    店铺券：租户作用域内查，扩展自动过滤掉别家店的券（M3）。
-    const shopCoupons = await this.prisma.coupon.findMany({
+    const shopCoupons = await client.coupon.findMany({
       where: {
         id: { in: claimedIds },
         status: CouponStatus.ACTIVE,
@@ -1069,7 +1095,7 @@ export class CouponService {
     // ⚠️ 平台作用域下扩展**不附加** tenantId 条件，
     // 所以不加 `scope: PLATFORM` 就会把别家店的券一起捞出来（M3）。
     const platformCoupons = await tenantContext.run(platformScope(), async () =>
-      this.prisma.coupon.findMany({
+      client.coupon.findMany({
         where: {
           id: { in: claimedIds },
           scope: CouponScope.PLATFORM,
@@ -1089,7 +1115,7 @@ export class CouponService {
     //
     // ⚠️ **「没被用掉」的判定与部分唯一索引是同一件事的两个面**：
     // 索引保证「不可能同时有两条」，这里的查询保证「只把没被占的拿出来当候选」。
-    const used = await this.prisma.couponRedemption.findMany({
+    const used = await client.couponRedemption.findMany({
       where: {
         couponId: { in: coupons.map((coupon) => coupon.id) },
         status: {
