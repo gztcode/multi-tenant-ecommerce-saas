@@ -9,6 +9,7 @@ import { ReplaceSpecsDto } from '../dto/replace-specs.dto';
 import { MinPriceService } from '../pricing/min-price.service';
 import { QuotaService } from '../../billing/quota.service';
 import { requireTenantId } from '../../../common/tenant/require-tenant';
+import { transactionOptions } from '../../../common/db/transaction-options';
 
 /** 最多允许的规格维度数 */
 export const MAX_SPEC_DIMENSIONS = 2;
@@ -71,15 +72,6 @@ export class SpecMatrixService {
 
   async replace(productId: string, dto: ReplaceSpecsDto) {
     const tenantId = this.currentTenantId();
-
-    // ⚠️ **额度检查在 service 层**（护栏 M13 / M16）：
-    // 只在 controller 层拦的话，绕过 controller 直接调 service 就拦不住。
-    //
-    // ⚠️ **按「当前 SKU 数」保守判断**：替换规格矩阵会把这个商品的 SKU
-    // 全删重建，替换后的总数可能不变（也可能是新的组合数）。
-    // 这里不去预测替换后的数量（那要先把笛卡尔积算出来），
-    // 而是「已达上限就不许再动规格」——保守但绝不会让商家超限。
-    await this.quota.assertWithinQuota(tenantId, 'SKU');
 
     const product = await this.prisma.product.findFirst({
       where: { id: productId },
@@ -309,6 +301,23 @@ export class SpecMatrixService {
         });
       }
 
+      // ---- 7. 额度：按「替换后的实际活跃 SKU 数」判 ----
+      //
+      // ⚠️ **必须放在写完之后、事务之内**（审计 P2-9 / P2-10）：
+      // 替换规格矩阵到底剩下多少个活跃 SKU，走完第 5、6 步才知道 ——
+      // 匹配到的保留、缺失的新建、多余的置 INACTIVE。按「替换前的当前 SKU 数」
+      // 预先判断有两个后果：
+      //   ① 一次提交 2 维度 × 20 值 = 400 个组合，检查只看旧数量 → 上限被击穿；
+      //   ② 击穿之后所有替换请求一律被拒，**连缩小矩阵也拒** →
+      //      商家只能求平台抬高额度才能恢复，规格编辑被永久锁死。
+      // 写后校验两个问题都没有：超限就抛错、整个事务回滚，什么都没落下；
+      // 缩小矩阵时数出来的是个小数量，自然放行。
+      // 超限时白写一遍再回滚的代价有界 —— 写入量由 DTO 的 2 × 20 上限兜住。
+      //
+      // ⚠️ **delta 传 0**：此刻库里已经是替换后的状态，直接按实际数量判；
+      // 默认值 1 是给「写入之前判断」的调用方（建商品）用的。
+      await this.quota.assertWithinQuota(tenantId, 'SKU', tx, 0);
+
       // 商品版本递增
       await tx.product.updateMany({
         where: { id: productId },
@@ -355,6 +364,6 @@ export class SpecMatrixService {
         },
       });
       return result;
-    });
+    }, transactionOptions());
   }
 }

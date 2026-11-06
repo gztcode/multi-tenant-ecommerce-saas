@@ -1,6 +1,6 @@
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { ValidationPipe } from '@nestjs/common';
+import { ConflictException, ValidationPipe } from '@nestjs/common';
 import cookieParser from 'cookie-parser';
 import { AppModule } from '../src/app.module';
 import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.interceptor';
@@ -518,6 +518,289 @@ describe('下单接入抽佣、到期拦截与额度权限 (e2e)', () => {
           endsAt: new Date(Date.now() + 86_400_000).toISOString(),
         })
         .expect(201);
+    });
+  });
+
+  // ============================================================
+  // 套餐额度的并发放大与计数口径（审计 P2-9 / P2-9b / P2-10）
+  // ============================================================
+
+  describe('套餐额度：并发放大与计数口径', () => {
+    /** 建一个还没有规格矩阵的商品（此时 0 个 SKU） */
+    async function createBlankProduct(
+      token: string,
+      name: string,
+    ): Promise<{ id: string; version: number }> {
+      const created = await http(app)
+        .post('/api/v1/catalog/products')
+        .set('authorization', `Bearer ${token}`)
+        .send({ name, slug: `p-${unique()}` })
+        .expect(201);
+      return created.body as { id: string; version: number };
+    }
+
+    /** 整体替换规格矩阵 */
+    function replaceSpecs(
+      token: string,
+      productId: string,
+      version: number,
+      dims: Array<{ name: string; values: string[] }>,
+    ) {
+      return http(app)
+        .put(`/api/v1/catalog/products/${productId}/specs`)
+        .set('authorization', `Bearer ${token}`)
+        .send({
+          version,
+          specs: dims.map((dim) => ({
+            name: dim.name,
+            values: dim.values.map((value) => ({ value })),
+          })),
+        });
+    }
+
+    /** 一维、指定取值个数的规格 */
+    function oneDim(
+      count: number,
+      prefix = 'v',
+    ): Array<{ name: string; values: string[] }> {
+      return [
+        {
+          name: '规格',
+          values: Array.from({ length: count }, (_, i) => `${prefix}${i}`),
+        },
+      ];
+    }
+
+    /** 本租户的活跃 SKU 数（额度的计数口径） */
+    function activeSkuCount(tenantId: string): Promise<number> {
+      return asTenant(tenantId, () =>
+        prisma.sku.count({ where: { tenantId, status: 'ACTIVE' } }),
+      );
+    }
+
+    /** 本租户的 SKU 总行数（含 INACTIVE，用来看「有没有白占额度」） */
+    function totalSkuCount(tenantId: string): Promise<number> {
+      return asTenant(tenantId, () =>
+        prisma.sku.count({ where: { tenantId } }),
+      );
+    }
+
+    it('P2-9：一次提交 400 个组合也击不穿 maxSkus，且整笔回滚', async () => {
+      const plan = await createPlan({ maxSkus: 5 });
+      const merchant = await createMerchant(app, prisma);
+      await subscribe(merchant.token, merchant.tenantId, plan.id);
+
+      const product = await createBlankProduct(merchant.token, '大矩阵商品');
+
+      // 2 维度 × 20 值 = 400 个组合，远超上限 5
+      const response = await replaceSpecs(
+        merchant.token,
+        product.id,
+        product.version,
+        [
+          {
+            name: '颜色',
+            values: Array.from({ length: 20 }, (_, i) => `c${i}`),
+          },
+          {
+            name: '尺码',
+            values: Array.from({ length: 20 }, (_, i) => `s${i}`),
+          },
+        ],
+      ).expect(409);
+
+      expect(errorText(response)).toContain('最多 5 个SKU');
+      // 超限时整笔回滚：一个 SKU 都不该留下
+      expect(await totalSkuCount(merchant.tenantId)).toBe(0);
+      // 商品版本也没被推高（回滚），后续请求用原版本仍能过乐观锁
+      const after = await asTenant(merchant.tenantId, () =>
+        prisma.product.findFirst({ where: { id: product.id } }),
+      );
+      expect(after?.version).toBe(product.version);
+    });
+
+    it('P2-9：超限被拒之后，缩小矩阵仍然可以保存（不会永久锁死）', async () => {
+      const plan = await createPlan({ maxSkus: 3 });
+      const merchant = await createMerchant(app, prisma);
+      await subscribe(merchant.token, merchant.tenantId, plan.id);
+
+      const product = await createBlankProduct(merchant.token, '可恢复的商品');
+
+      const first = await replaceSpecs(
+        merchant.token,
+        product.id,
+        product.version,
+        oneDim(3),
+      ).expect(200);
+      const version = (first.body as { version: number }).version;
+
+      // 4 个组合 > 上限 3 → 拒绝
+      await replaceSpecs(
+        merchant.token,
+        product.id,
+        version,
+        oneDim(4, 'w'),
+      ).expect(409);
+
+      // 关键：超限之后**缩小**矩阵必须能存下去
+      const shrunk = await replaceSpecs(
+        merchant.token,
+        product.id,
+        version,
+        oneDim(2, 'x'),
+      ).expect(200);
+      const skus = (shrunk.body as { skus: Array<{ status: string }> }).skus;
+      // ⚠️ 响应里的 skus 含 INACTIVE 的历史行，只能数 ACTIVE 的
+      expect(skus.filter((sku) => sku.status === 'ACTIVE')).toHaveLength(2);
+      expect(await activeSkuCount(merchant.tenantId)).toBe(2);
+    });
+
+    it('P2-9b：置 INACTIVE 的旧 SKU 不再占额度', async () => {
+      const plan = await createPlan({ maxSkus: 2 });
+      const merchant = await createMerchant(app, prisma);
+      await subscribe(merchant.token, merchant.tenantId, plan.id);
+
+      const product = await createBlankProduct(merchant.token, '换规格的商品');
+
+      const first = await replaceSpecs(
+        merchant.token,
+        product.id,
+        product.version,
+        [{ name: '颜色', values: ['红', '蓝'] }],
+      ).expect(200);
+
+      // 换成另一组取值：旧的两个 SKU 被置 INACTIVE（不是软删）
+      await replaceSpecs(
+        merchant.token,
+        product.id,
+        (first.body as { version: number }).version,
+        [{ name: '颜色', values: ['绿', '黄'] }],
+      ).expect(200);
+
+      // 库里 4 行、活跃的只有 2 个 —— 若 INACTIVE 也计数，这一步会是 409
+      expect(await totalSkuCount(merchant.tenantId)).toBe(4);
+      expect(await activeSkuCount(merchant.tenantId)).toBe(2);
+    });
+
+    it('P2-9b：软删商品会释放它的 SKU 额度', async () => {
+      const plan = await createPlan({ maxSkus: 2 });
+      const merchant = await createMerchant(app, prisma);
+      await subscribe(merchant.token, merchant.tenantId, plan.id);
+
+      const first = await createBlankProduct(merchant.token, '要被删掉的商品');
+      await replaceSpecs(
+        merchant.token,
+        first.id,
+        first.version,
+        oneDim(2),
+      ).expect(200);
+      expect(await activeSkuCount(merchant.tenantId)).toBe(2);
+
+      await http(app)
+        .delete(`/api/v1/catalog/products/${first.id}`)
+        .set('authorization', `Bearer ${merchant.token}`)
+        .expect(204);
+
+      // 额度刚好满了：若软删商品没有级联到 SKU，这一步会 409
+      const second = await createBlankProduct(merchant.token, '删完之后再建的');
+      await replaceSpecs(
+        merchant.token,
+        second.id,
+        second.version,
+        oneDim(2, 'n'),
+      ).expect(200);
+      expect(await activeSkuCount(merchant.tenantId)).toBe(2);
+    });
+
+    it('P2-10：并发建商品不会击穿 maxProducts', async () => {
+      const plan = await createPlan({ maxProducts: 1 });
+      const merchant = await createMerchant(app, prisma);
+      await subscribe(merchant.token, merchant.tenantId, plan.id);
+
+      // ⚠️ **直接并发调 service，不走 HTTP**：实测 4 个并发 HTTP 请求
+      //    在这套 supertest 上会被串行处理（去掉行锁也照样只有 1 个成功），
+      //    测不到并发放大。直接并发调 service 才能让事务真正重叠。
+      //
+      // ⚠️ **并发数要小于连接池**：CI 是 2 核 runner，Prisma 默认池 = 5，
+      // 并发事务超过池大小会先报 P2024，那就测不到额度这件事了。
+      const products = app.get(ProductsService);
+      const results = await Promise.allSettled(
+        Array.from({ length: 4 }, (_, i) =>
+          asTenant(merchant.tenantId, () =>
+            products.create({
+              name: `并发商品 ${i}`,
+              slug: `p-${unique()}`,
+            }),
+          ),
+        ),
+      );
+
+      const created = results.filter((r) => r.status === 'fulfilled');
+      expect(created).toHaveLength(1);
+      for (const rejected of results.filter((r) => r.status === 'rejected')) {
+        expect(rejected.reason).toBeInstanceOf(ConflictException);
+      }
+
+      const count = await asTenant(merchant.tenantId, () =>
+        prisma.product.count({ where: { tenantId: merchant.tenantId } }),
+      );
+      expect(count).toBe(1);
+    });
+
+    it('P2-10：额度检查会等同一租户的锁（这才是并发不分家的原因）', async () => {
+      const plan = await createPlan({ maxProducts: 1 });
+      const merchant = await createMerchant(app, prisma);
+      await subscribe(merchant.token, merchant.tenantId, plan.id);
+
+      const products = app.get(ProductsService);
+
+      // ⚠️ **这条用例是确定性的**（上一条并发用例只是概率性的：实测无锁时
+      // 4 个并发请求有时也会"恰好"只成功 1 个）。做法是手动占住那把锁：
+      // 用与 `QuotaService.lockQuota` 相同的语句锁住本租户的订阅行，
+      // 事务不结束锁就一直握着。
+      let signalLocked!: () => void;
+      const locked = new Promise<void>((resolve) => {
+        signalLocked = resolve;
+      });
+      let releaseHold!: () => void;
+      const hold = new Promise<void>((resolve) => {
+        releaseHold = resolve;
+      });
+
+      const holder = asTenant(merchant.tenantId, () =>
+        prisma.$transaction(
+          async (tx) => {
+            await tx.$queryRaw`SELECT id FROM subscriptions WHERE "tenantId" = ${merchant.tenantId} FOR UPDATE`;
+            signalLocked();
+            await hold;
+          },
+          { maxWait: 15_000, timeout: 15_000 },
+        ),
+      );
+
+      let pending: Promise<unknown> | undefined;
+      let outcome: 'settled' | 'waiting' = 'settled';
+      try {
+        await locked;
+
+        // 锁被别人握着时，建商品的额度检查必须**卡住**。
+        // 没有行锁的话它会在几十毫秒内就建完 —— 那就是并发放大的入口。
+        pending = asTenant(merchant.tenantId, () =>
+          products.create({ name: '被锁挡住的商品', slug: `p-${unique()}` }),
+        );
+        outcome = await Promise.race([
+          pending.then(() => 'settled' as const),
+          new Promise<'waiting'>((resolve) =>
+            setTimeout(() => resolve('waiting'), 200),
+          ),
+        ]);
+      } finally {
+        releaseHold();
+        await holder;
+        await pending?.catch(() => undefined);
+      }
+
+      expect(outcome).toBe('waiting');
     });
   });
 

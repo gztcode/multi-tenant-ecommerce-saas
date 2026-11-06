@@ -12,6 +12,8 @@ import {
   Sku,
 } from '@prisma/client';
 import { TenantPrismaService } from '../../../common/tenant/tenant-prisma.service';
+import type { PrismaTransaction } from '../../../common/prisma/prisma-transaction';
+import { transactionOptions } from '../../../common/db/transaction-options';
 import { rethrowIfUniqueViolation } from '../../../common/errors/unique-constraint';
 import { MinPriceService } from '../pricing/min-price.service';
 import { QuotaService } from '../../billing/quota.service';
@@ -143,9 +145,14 @@ export class ProductsService {
    * 数据库层面挡不住跨租户挂载，而扩展只往 data 注入 tenantId、不校验被引用对象的归属。
    * 必须在这里显式查一次归属——用 findFirst（findUnique 会被扩展拒绝），
    * 扩展自动合并的 where.tenantId 就是那道闸门，别的租户的 id 查不到。
+   *
+   * ⚠️ **事务内必须传 `tx`**（阶段 10）：回调内再用 `this.prisma` 会再借一条连接。
    */
-  private async assertCategoryUsable(categoryId: string): Promise<void> {
-    const category = await this.prisma.category.findFirst({
+  private async assertCategoryUsable(
+    categoryId: string,
+    client: PrismaTransaction | TenantPrismaService = this.prisma,
+  ): Promise<void> {
+    const category = await client.category.findFirst({
       where: { id: categoryId },
     });
     if (!category) {
@@ -156,34 +163,39 @@ export class ProductsService {
   async create(dto: CreateProductDto): Promise<Product> {
     const tenantId = this.currentTenantId();
 
-    // ⚠️ **额度检查在 service 层**（护栏 M13 / M16）：
-    // 只在 controller 层拦的话，绕过 controller 直接调 service 就拦不住。
-    await this.quota.assertWithinQuota(tenantId, 'PRODUCT');
-
-    // null 表示「不分类」，不需要校验归属；非 null 才要查
-    if (dto.categoryId) {
-      await this.assertCategoryUsable(dto.categoryId);
-    }
-
     try {
-      return await this.prisma.product.create({
-        // as never 的理由同 CategoriesService.create：展开后 TS 推断出的是含
-        // undefined 的可选属性，与 ProductCreateInput 对不齐；tenantId 由扩展注入。
-        data: {
-          name: dto.name,
-          slug: dto.slug,
-          ...(dto.subtitle !== undefined ? { subtitle: dto.subtitle } : {}),
-          ...(dto.description !== undefined
-            ? { description: dto.description }
-            : {}),
-          ...(dto.categoryId !== undefined
-            ? { categoryId: dto.categoryId }
-            : {}),
-          ...(dto.attributes !== undefined
-            ? { attributes: dto.attributes }
-            : {}),
-        } as never,
-      });
+      // ⚠️ **额度检查与创建必须在同一个事务里**（审计 P2-10）：
+      // 分开放的话，检查与写入之间能被别的请求插进来，上限被并发击穿
+      // （实测上限 1 的套餐并发建出 6 个商品）。
+      return await this.prisma.$transaction(async (tx) => {
+        // ⚠️ **额度检查在 service 层**（护栏 M13 / M16）：
+        // 只在 controller 层拦的话，绕过 controller 直接调 service 就拦不住。
+        await this.quota.assertWithinQuota(tenantId, 'PRODUCT', tx);
+
+        // null 表示「不分类」，不需要校验归属；非 null 才要查
+        if (dto.categoryId) {
+          await this.assertCategoryUsable(dto.categoryId, tx);
+        }
+
+        return await tx.product.create({
+          // as never 的理由同 CategoriesService.create：展开后 TS 推断出的是含
+          // undefined 的可选属性，与 ProductCreateInput 对不齐；tenantId 由扩展注入。
+          data: {
+            name: dto.name,
+            slug: dto.slug,
+            ...(dto.subtitle !== undefined ? { subtitle: dto.subtitle } : {}),
+            ...(dto.description !== undefined
+              ? { description: dto.description }
+              : {}),
+            ...(dto.categoryId !== undefined
+              ? { categoryId: dto.categoryId }
+              : {}),
+            ...(dto.attributes !== undefined
+              ? { attributes: dto.attributes }
+              : {}),
+          } as never,
+        });
+      }, transactionOptions());
     } catch (error) {
       // 同租户内 slug 重复 → 409，而不是让 P2002 一路冒成 500。
       // 这个函数签名是 never，所以 catch 之后必然抛出，TS 也能据此
@@ -260,16 +272,26 @@ export class ProductsService {
     return updated;
   }
 
-  /** 软删除商品 */
+  /** 软删除商品（连同它的 SKU） */
   async remove(id: string): Promise<void> {
     this.currentTenantId();
     const product = await this.prisma.product.findFirst({ where: { id } });
     if (!product) {
       throw new NotFoundException('商品不存在');
     }
-    await this.prisma.product.updateMany({
-      where: { id },
-      data: { deletedAt: new Date() },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.product.updateMany({
+        where: { id },
+        data: { deletedAt: new Date() },
+      });
+      // ⚠️ **级联软删 SKU**（审计 P2-9b）：SKU 额度是按「活跃 SKU 数」算的，
+      // 商品软删后它的 SKU 若还活着，就一直占着额度 —— 商品删了额度还在，
+      // 商家再想建商品或改规格会被**自己已经删掉的商品**挡住。
+      // 历史订单不受影响：`OrderItem` 只存 `skuId` 标量，没有指向 SKU 的关系。
+      await tx.sku.updateMany({
+        where: { productId: id },
+        data: { deletedAt: new Date() },
+      });
     });
   }
 
@@ -397,6 +419,11 @@ export class ProductsService {
         case 'DELETE': {
           await tx.product.updateMany({
             where: { id: { in: productIds } },
+            data: { deletedAt: new Date() },
+          });
+          // 级联软删 SKU，理由同 remove()（审计 P2-9b）
+          await tx.sku.updateMany({
+            where: { productId: { in: productIds } },
             data: { deletedAt: new Date() },
           });
           break;

@@ -22,8 +22,21 @@
  *    版本号是写在数据里的事实，不依赖密钥。
  *
  * ⚠️ **首次迁移时密钥配错仍无解** —— 库里没有可参照的密文。
- *    所以脚本做三件事降低后果：① 自动建备份表 ② 打印密钥指纹供人工核对
- *    ③ 要求显式 `--force` 才写库。
+ *    所以脚本做四件事降低后果：① 打印密钥指纹供人工核对 ② 要求显式 `--force` 才写库
+ *    ③ 自动建备份表 ④ **迁移前、迁移后各跑一次解密自检**（审计 P2-A3）。
+ *
+ * ⚠️ **两次自检各自能抓什么、抓不到什么**（别高估）：
+ *    · 迁移**前**：库里已有 `encryptionVersion = 1` 的行时，用当前密钥试解一行 ——
+ *      解不开说明这把密钥不是系统正在用的那把，**直接中止、一行都不写**。
+ *      挡住的是「已有密文用密钥 A、这次又拿密钥 B 加密一批」的混合密钥事故
+ *      （5j 的失败注入 F11 实测过这种数据）。
+ *    · 迁移**后**：再试解一次，确认刚写进库的密文用当前密钥解得开 ——
+ *      「写坏了」当场暴露，不用等到下次重启的启动自检。
+ *    · **全新库 + 首次迁移 + 密钥配错** 两次都拦不住：自己加密、自己解密永远自洽。
+ *      这一档只能靠人工核对上面打印的密钥指纹，是 5j 设计里就承认的残余风险。
+ *
+ * ⚠️ **自检直接复用启动自检 `PayoutEncryptionSelfCheck`**，不另写一套判定 ——
+ *    两套口径迟早会分叉，脚本说「通过」而容器起不来是最坏的结果。
  */
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -36,7 +49,10 @@ import {
   decryptField,
   encryptField,
 } from '../src/common/crypto/field-cipher';
+import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
 import { maskAccountNo } from '../src/modules/billing/payout-account.service';
+import { PayoutCipherService } from '../src/modules/billing/payout-cipher.service';
+import { PayoutEncryptionSelfCheck } from '../src/modules/billing/payout-encryption-self-check.service';
 
 /**
  * 加载 `.env`。
@@ -55,6 +71,50 @@ function loadEnv(): void {
 
 const prisma = new PrismaClient();
 const force = process.argv.includes('--force');
+
+/**
+ * 自检用的客户端。
+ *
+ * ⚠️ **单独建一个租户扩展过的客户端，不复用上面的裸 `prisma`** ——
+ *    这样自检走的是**与容器启动自检完全相同的代码路径**（平台作用域 + 租户扩展）。
+ *    走裸客户端也能查到行，但那就不是「同一套口径」了。
+ *
+ * ⚠️ **惰性创建**：只有真正跑进 `main()` 才建，且必须在 `loadEnv()` 之后
+ *    （`PayoutCipherService` 在构造时就要读密钥）。
+ */
+let selfCheckClient: TenantPrismaService | null = null;
+let selfCheckService: PayoutEncryptionSelfCheck | null = null;
+
+function selfCheck(): PayoutEncryptionSelfCheck {
+  if (!selfCheckService) {
+    selfCheckClient = new TenantPrismaService();
+    selfCheckService = new PayoutEncryptionSelfCheck(
+      selfCheckClient,
+      new PayoutCipherService(),
+    );
+  }
+  return selfCheckService;
+}
+
+/**
+ * 跑一次启动自检那套解密校验，失败就换成「这个脚本该说的话」再抛。
+ *
+ * ⚠️ **只换文案，不换判定** —— 判定仍然完全由 `PayoutEncryptionSelfCheck` 决定，
+ *    这样脚本与容器的结论永远一致。
+ */
+async function assertSelfCheckPasses(
+  whatFailed: string,
+  advice: string,
+): Promise<void> {
+  try {
+    await selfCheck().check();
+  } catch (error) {
+    throw new Error(
+      `${whatFailed}：${error instanceof Error ? error.message : String(error)} ` +
+        advice,
+    );
+  }
+}
 
 async function main(): Promise<void> {
   loadEnv();
@@ -85,6 +145,17 @@ async function main(): Promise<void> {
   console.log(
     `待迁移：账户 ${accounts.length} 行，出款单快照 ${payouts.length} 行`,
   );
+
+  // ⚠️ **迁移前核对密钥**（审计 P2-A3）：库里已有密文时，用当前密钥试解一行。
+  //    解不开说明这把密钥不是系统正在用的那把 —— 直接中止，**一行都不写**。
+  //    干跑也跑这一步：密钥配错时干跑就该报出来，而不是等加了 --force 才发现。
+  await assertSelfCheckPasses(
+    '迁移前密钥核对失败：库里已有的密文用当前密钥解不开',
+    '未写任何数据。请把 PAYOUT_ACCOUNT_ENCRYPTION_KEY 换成与 api 进程一致的那把' +
+      '（本地 .env 与 infra/docker-compose.yml 必须逐字相同），' +
+      '再核对其指纹是否与上面打印的一致。',
+  );
+
   if (accounts.length === 0 && payouts.length === 0) {
     console.log('无需迁移。');
     return;
@@ -148,9 +219,20 @@ async function main(): Promise<void> {
     }
   });
 
+  // ⚠️ **迁移后立刻自检**（审计 P2-A3）——
+  //    不要把「这批密文到底解不解得开」留给下次重启的启动自检：
+  //    那时容器会直接起不来，而运维已经不知道该回滚什么了。
+  //    这里失败会以非 0 退出码结束，并把备份表名写进错误文案。
+  await assertSelfCheckPasses(
+    '迁移后自检失败：库里的密文用当前密钥解不开',
+    `请立即从备份表 *_backup_${stamp} 恢复，` +
+      '并核对 PAYOUT_ACCOUNT_ENCRYPTION_KEY 是否与 api 进程使用的一致。',
+  );
+
   console.log(
     `迁移完成：账户 ${accounts.length} 行，出款单快照 ${payouts.length} 行`,
   );
+  console.log('迁移后自检通过：库中已有的密文可以用当前密钥解开。');
 }
 
 main()
@@ -158,4 +240,8 @@ main()
     console.error('迁移失败：', error instanceof Error ? error.message : error);
     process.exitCode = 1;
   })
-  .finally(() => prisma.$disconnect());
+  .finally(async () => {
+    // 自检客户端是惰性创建的：没跑到那一步就是 null
+    await selfCheckClient?.onModuleDestroy();
+    await prisma.$disconnect();
+  });
