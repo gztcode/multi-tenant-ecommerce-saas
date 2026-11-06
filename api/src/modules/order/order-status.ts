@@ -46,6 +46,31 @@ export function isTerminal(status: OrderStatus): boolean {
 }
 
 /**
+ * 「钱已经结算进订单」的订单状态。
+ *
+ * ⚠️ **只有这三个算接住了**（`PAID` / `SHIPPED` / `COMPLETED`）。
+ * 剩下的都意味着**这笔钱没有落进订单**：
+ * `PENDING_PAYMENT`（还在待支付）、`CANCELLED`（已被取消）、
+ * `CLOSED`（已超时关闭）、`REFUNDED`（已退款，钱已经退走了）。
+ *
+ * ⚠️ **单点定义**（2026-11-05 审计 P0-3）：账目自检
+ *    （`modules/billing/ledger-check.ts`）与商家侧「待退款」统计
+ *    （`modules/order/order.service.ts`）问的是同一个问题——
+ *    「这笔钱结算进订单了吗」——两处口径必须一致，
+ *    否则自检查出来的缺口与商家看到的待退款会对不上。
+ */
+export const SETTLED_ORDER_STATUSES: readonly OrderStatus[] = [
+  OrderStatus.PAID,
+  OrderStatus.SHIPPED,
+  OrderStatus.COMPLETED,
+];
+
+/** 这个订单状态是不是「钱已经结算进订单」 */
+export function isSettled(status: OrderStatus): boolean {
+  return SETTLED_ORDER_STATUSES.includes(status);
+}
+
+/**
  * 这个流转是否被状态机允许。
  *
  * ⚠️ **光问「允不允许」不够**——并发场景下两个请求都可能拿到 `true`

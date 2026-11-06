@@ -14,11 +14,22 @@ import { Roles } from '../src/common/decorators/roles.decorator';
 import { http } from './helpers';
 
 /**
- * 只在测试里存在的探针控制器，用来验证角色守卫真的生效。
+ * 只在测试里存在的探针控制器，用来验证角色守卫的**机制**真的生效。
  *
- * 探针挂在独立模块里而非 AppModule：它必须和真实业务代码走完全相同的
- * 全局守卫链路（RolesGuard 由 AppModule 的 APP_GUARD 提供），
- * 才能证明全局注册确实覆盖到了所有路由。
+ * ⚠️ **RolesGuard 不是全局守卫**（这条注释以前写反了，审计 P2-14）：
+ *    `app.module.ts` 里刻意**不注册** APP_GUARD —— NestJS 的守卫顺序是
+ *    [...全局, ...类级, ...方法级]，全局守卫先于路由级 `@UseGuards` 执行，
+ *    那时 request.user 还没填，鉴权会失效。
+ *    真正的挂载点是 `@Roles()` 装饰器：它在**一次** `UseGuards` 里显式排
+ *    [认证, 鉴权]，顺序即执行顺序（见 `common/decorators/roles.decorator.ts`）。
+ *    → **每条要限角色的路由都必须显式写 `@Roles`，漏写就是静默敞开** ——
+ *      审计 P1-1 正是在这里漏挂过 5 个控制器。
+ *
+ * ⚠️ **本文件只验机制，不验业务路由**：探针控制器是假的。
+ *    真实业务控制器的防线由 `test/merchant-roles.e2e-spec.ts` 钉住
+ *    （消费者令牌打商家管理端全部 403）；
+ *    「全仓控制器路由有没有漏挂 `@Roles`」由
+ *    `src/common/guards/controller-roles-scanner.spec.ts` 扫全仓守住。
  */
 @Controller('probe')
 class RoleProbeController {
@@ -174,6 +185,14 @@ describe('RBAC (e2e)', () => {
 
   it('未登录访问带角色限制的端点返回 401', async () => {
     await http(app).get('/api/v1/probe/platform-only').expect(401);
+  });
+
+  it('未登录访问真实业务控制器的 @Roles 路由返回 401', async () => {
+    // ⚠️ **探针控制器证明不了这一点**：它只验「挂了 @Roles 的路由会鉴权」。
+    //    真实业务控制器上还多一层语义 —— `@Roles()` 在**同一次** UseGuards 里
+    //    排了 [认证, 鉴权]，所以未登录时先被认证挡住 → **401 而不是 403**。
+    //    两种失败语义不混淆，正是它把认证与鉴权绑在一次调用里的理由。
+    await http(app).get('/api/v1/catalog/products').expect(401);
   });
 
   it('登出需要 access token，且登出后刷新令牌失效', async () => {

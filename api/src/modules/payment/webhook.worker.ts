@@ -5,10 +5,16 @@ import { PaymentKind } from '@prisma/client';
 import { PAYMENT_WEBHOOK_QUEUE } from '../../common/queue/queue.constants';
 import { runForTenant } from '../../common/tenant/tenant-context';
 import { PaymentService } from './payment.service';
-import { NormalizedWebhookEvent } from './payment-provider.interface';
 import { REFUND_SCAN_JOB } from './refund-scan.scheduler';
 
-/** webhook 队列任务的数据 */
+/**
+ * webhook 队列任务的数据。
+ *
+ * ⚠️ **消费端只信 `provider` / `eventId` / `tenantId`**（审计 P0-6 ③）：
+ *    其余字段（金额、业务单号、成功与否、退款状态）**只是投递时的快照**，
+ *    消费端一律以**事件行**为准 —— 队列内容是可以被拿到 Redis 写权限的人
+ *    改写的，事件行才是验签端点落下的原文。
+ */
 export interface PaymentWebhookJob {
   /** 订单所属租户 id（**从订单反查**，不是客户端提交的） */
   tenantId: string;
@@ -21,6 +27,9 @@ export interface PaymentWebhookJob {
    *
    * ⚠️ 由 **webhook 端点**写入（端点自己知道是哪个端点），
    * 不是渠道适配器猜的。
+   *
+   * ⚠️ 消费端**以事件行上的 `kind` 为准**（事件行也是端点写的），
+   *    这一栏留着是为了排查时能看出任务是谁投的。
    */
   kind: PaymentKind;
   eventId: string;
@@ -48,9 +57,9 @@ export interface PaymentWebhookJob {
  * 异步调用链内，队列消费者是跨进程边界的——不显式重建的话，
  * 查租户作用域模型（Order / Payment）会抛 `TenantScopeError`。
  *
- * ⚠️ 任务里的 `tenantId` **必须来自可信源**——它由 webhook 端点从**订单反查**
+ * ⚠️ 任务里的 `tenantId` **只能当作用域提示**——它由 webhook 端点从**订单反查**
  * 得到并签发，绝不能取自客户端提交的内容。否则「重建上下文」本身
- * 就成了越权通道。
+ * 就成了越权通道。事件内容则一律来自**事件行**（审计 P0-6 ③）。
  *
  * ⚠️ **事件行已经由 webhook 端点落库了**（验签之后才插的，R1）。
  * 消费端不再插一次——插了必然撞唯一索引。这里做的是业务流转：
@@ -81,29 +90,38 @@ export class WebhookWorker extends WorkerHost {
     }
     const data = job.data;
 
+    // ⚠️ **消费端复核事件行**（审计 P0-6 ③）：
+    //    队列里的任务可以被拿到 Redis 写权限的人随意改写
+    //    （金额、业务单号、租户都能改）。
+    //    事件行是**验签端点**落库的 —— 行存在 = 这笔事件确实过了验签入口，
+    //    行里的字段是当时的原文。**所以这里用行里的内容重建事件，
+    //    不采信任务里的金额 / 业务单号。**
+    //
+    //    没有这张行 = 这个任务没经过验签端点 → **一律不生效**。
+    const registered = await this.paymentService.loadRegisteredEvent(
+      data.provider,
+      data.eventId,
+    );
+    if (!registered) {
+      this.logger.warn(
+        `支付回调任务找不到对应的事件行（provider=${data.provider} ` +
+          `eventId=${data.eventId}），不入账 —— 没经过验签端点登记的任务一律不生效。`,
+      );
+      return;
+    }
+    const { event, kind } = registered;
+
     // ⚠️ **必须重建租户上下文**：队列消费是跨进程边界的，
     // AsyncLocalStorage 的上下文不跟着走。不重建的话查 Order/Payment
     // 会抛 TenantScopeError。
+    //
+    // ⚠️ 任务里的 `tenantId` 只是**作用域提示**：事件内容来自事件行，
+    //    订单的查询又在这个作用域内做 —— 租户不对就查不到订单，
+    //    什么都不会发生（R14）。
     await runForTenant(data.tenantId, async () => {
-      const event: NormalizedWebhookEvent = {
-        provider: data.provider,
-        channel: data.channel,
-        eventId: data.eventId,
-        providerTxnId: data.providerTxnId,
-        referenceNo: data.referenceNo,
-        amount: data.amount,
-        success: data.success,
-        // ⚠️ **退款事件必须把类型与状态带进状态机**：少了它们
-        //    消费端会把它当成支付事件去反查订单，静默丢掉这笔退款。
-        eventType: data.eventType,
-        refundTxnId: data.refundTxnId,
-        refundStatus: data.refundStatus,
-        definitive: data.definitive,
-      };
-
-      if ((data.eventType ?? 'PAYMENT') === 'REFUND') {
-        // ⚠️ **退款事件走退款状态机**：`PROCESSING` 不改状态，
-        //    `SUCCESS` 才落 `REFUNDED`。
+      // ⚠️ **退款事件走退款状态机**：`PROCESSING` 不改状态，
+      //    `SUCCESS` 才落 `REFUNDED`。
+      if ((event.eventType ?? 'PAYMENT') === 'REFUND') {
         await this.paymentService.applyRefundEvent(event, data.tenantId);
         return;
       }
@@ -111,13 +129,10 @@ export class WebhookWorker extends WorkerHost {
       // ⚠️ **第 2~5 步在同一个事务里**：订单转 PAID 与记 DEDUCT 流水分属
       // 两个事务的话，会出现「订单已支付但流水没记」的账目缺口。
       //
-      // ⚠️ 任务里的 `tenantId` 是**可信源**——它由 webhook 端点从订单反查后
-      // 签发。订单的查询在这个租户的作用域内做，租户不对就查不到订单，
-      // 什么都不会发生（R14）。
-      //
-      // ⚠️ **`kind` 一路带下来**：它决定 `applyEvent` 反查订单还是反查账单。
-      // 少了它，订阅回调会被当成订单回调而查不到订单——**静默丢掉**。
-      await this.paymentService.applyEvent(event, data.tenantId, data.kind);
+      // ⚠️ **`kind` 一路带下来**（取自事件行）：它决定 `applyEvent` 反查订单
+      // 还是反查账单。少了它，订阅回调会被当成订单回调而查不到订单——
+      // **静默丢掉**。
+      await this.paymentService.applyEvent(event, data.tenantId, kind);
     });
   }
 }

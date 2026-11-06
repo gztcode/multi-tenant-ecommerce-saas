@@ -74,8 +74,12 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-ecommerce}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ecommerce-minio-secret}
       # 浏览器直传要跨域。镜像里没有 mc 可以改服务端配置，只能走环境变量。
-      # 多个来源用英文逗号分隔；实测该变量对预检请求生效。
-      MINIO_CORS_ALLOW_ORIGIN: ${MINIO_CORS_ALLOW_ORIGIN:-http://localhost:3001,http://localhost:3002,http://localhost:3003,http://localhost}
+      # 多个来源用英文逗号分隔。
+      # ⚠️ **变量名必须是 MINIO_API_CORS_ALLOW_ORIGIN**（审计 P1-4）：
+      #    写成 MINIO_CORS_ALLOW_ORIGIN 会被 MinIO **静默忽略** →
+      #    回落到「反射任意 Origin + Allow-Credentials: true」→ 白名单形同虚设。
+      #    （当年那句「实测该变量对预检请求生效」正是变量名写错时的假象。）
+      MINIO_API_CORS_ALLOW_ORIGIN: ${MINIO_API_CORS_ALLOW_ORIGIN:-http://localhost:3001,http://localhost:3002,http://localhost:3003,http://localhost}
     ports:
       # 默认只绑本机回环；局域网访问显式设置 BIND_HOST=0.0.0.0
       - '${BIND_HOST:-127.0.0.1}:${MINIO_PORT:-19000}:9000'

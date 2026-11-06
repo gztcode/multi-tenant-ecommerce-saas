@@ -1,3 +1,4 @@
+import { UserRole } from '@prisma/client';
 import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
 import {
@@ -5,12 +6,17 @@ import {
   type CurrentUserPayload,
 } from '../../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { Roles } from '../../common/decorators/roles.decorator';
 import { InventoryService } from './inventory.service';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
+import { InventoryMovementsQueryDto } from './dto/inventory-movements-query.dto';
 
 @ApiTags('inventory')
 @Controller('inventory')
 @UseGuards(JwtAuthGuard)
+// ⚠️ 商家管理端必须挂角色（审计 P1-1）：库存流水还含店主账号标识，
+// 消费者令牌曾经能直接读（对抗验证实测）。
+@Roles(UserRole.MERCHANT_OWNER, UserRole.MERCHANT_STAFF)
 export class InventoryController {
   constructor(private readonly inventoryService: InventoryService) {}
 
@@ -22,18 +28,13 @@ export class InventoryController {
 
   @Get('movements')
   @ApiOperation({ summary: '库存流水列表' })
-  @ApiQuery({ name: 'skuId', required: false, type: String })
-  @ApiQuery({ name: 'page', required: false, type: Number })
-  @ApiQuery({ name: 'pageSize', required: false, type: Number })
-  movements(
-    @Query('skuId') skuId?: string,
-    @Query('page') page?: string,
-    @Query('pageSize') pageSize?: string,
-  ) {
+  // ⚠️ 查询参数走 DTO（而不是裸 `@Query`）：裸参数拿不到校验，
+  // `page=abc` 会变成 NaN 传给 Prisma，直接 500（审计 P2-5）。
+  movements(@Query() query: InventoryMovementsQueryDto) {
     return this.inventoryService.movements({
-      skuId,
-      page: page ? Number(page) : undefined,
-      pageSize: pageSize ? Number(pageSize) : undefined,
+      skuId: query.skuId,
+      page: query.page,
+      pageSize: query.pageSize,
     });
   }
 

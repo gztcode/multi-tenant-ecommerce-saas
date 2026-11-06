@@ -1,3 +1,4 @@
+import { UserRole } from '@prisma/client';
 import {
   Body,
   Controller,
@@ -17,12 +18,15 @@ import {
 } from '../../common/decorators/current-user.decorator';
 import { clampPagination, toIntOr } from '../../common/http/pagination';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { Roles } from '../../common/decorators/roles.decorator';
 import { MediaService } from './media.service';
 import { UploadUrlDto } from './dto/upload-url.dto';
 
 @ApiTags('media')
 @Controller('media')
 @UseGuards(JwtAuthGuard)
+// ⚠️ 商家管理端必须挂角色（审计 P1-1），理由同 products.controller。
+@Roles(UserRole.MERCHANT_OWNER, UserRole.MERCHANT_STAFF)
 export class MediaController {
   constructor(private readonly mediaService: MediaService) {}
 

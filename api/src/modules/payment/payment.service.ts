@@ -37,6 +37,7 @@ import {
   RefundResult,
 } from './payment-provider.interface';
 import { PaymentProviderRegistry } from './payment-provider.registry';
+import { eventFromRow } from './webhook-event-row';
 import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /** 发起支付的结果 */
@@ -432,7 +433,6 @@ export class PaymentService {
       data: {
         status: PaymentStatus.PENDING,
         amount,
-        updatedAt: new Date(),
       },
     });
     return {
@@ -773,6 +773,47 @@ export class PaymentService {
   }
 
   /**
+   * 消费端复核事件行（审计 P0-6 ③）。
+   *
+   * ⚠️ **为什么消费端要再查一次事件行**：队列里的任务可以被拿到 Redis 写权限的
+   *    人随意改写（金额、业务单号、租户都能改）。事件行是**验签端点**落库的 ——
+   *    行存在 = 这笔事件确实过了验签入口；行里的字段是当时的原文。
+   *    所以这里**用行里的内容重建事件**，不采信任务里的金额 / 业务单号。
+   *
+   * ⚠️ **只认「还没处理完」的行**（`processedAt` 为 null）：
+   *    已经处理过的事件重复投递不再生效（幂等本来靠状态流转的条件更新，
+   *    这里提前挡住是更省的一道）。
+   *
+   * ⚠️ 事件表**不在租户作用域白名单里** —— 查它不需要租户上下文，
+   *    也不需要 `platformScope()`。
+   *
+   * @returns null = 没有这张事件行（或行里的 payload 结构不对）→ 这个任务不生效
+   */
+  async loadRegisteredEvent(
+    provider: string,
+    eventId: string,
+  ): Promise<{ event: NormalizedWebhookEvent; kind: PaymentKind } | null> {
+    const row = await this.prisma.paymentWebhookEvent.findFirst({
+      where: { provider, eventId, processedAt: null },
+      select: {
+        provider: true,
+        eventId: true,
+        providerTxnId: true,
+        kind: true,
+        payload: true,
+      },
+    });
+    if (!row) {
+      return null;
+    }
+    const event = eventFromRow(row);
+    if (!event) {
+      return null;
+    }
+    return { event, kind: row.kind };
+  }
+
+  /**
    * 在**调用方的事务内**应用一个已落库的支付事件。
    *
    * ⚠️ 「订单转 PAID」与「记 DEDUCT 流水」必须同生共死——
@@ -878,11 +919,25 @@ export class PaymentService {
       { paidAt },
     );
     if (!won) {
-      // 订单已经不是 PENDING_PAYMENT（已支付 / 已超时关闭 / 已取消）。
-      // 事件仍然记下了（幂等表已插入），但订单不再流转。
-      this.logger.warn(
-        `订单 ${order.orderNo} 当前不是 PENDING_PAYMENT，不流转（事件 ${event.eventId}）`,
-      );
+      // ⚠️ **按「这笔钱是不是刚收的」分流**（2026-11-05 审计 P0-3 / P1-3）：
+      //
+      // - `paid.count === 1` → **本次新确认了一笔收款**（钱确实收了），
+      //   但订单接不住（已超时关闭 / 已被消费者取消 / 已被另一渠道先付掉）。
+      //   → 这笔钱**没有结算进订单**，必须退回去，
+      //     否则平台账上凭空多一笔收不掉的钱。
+      // - `paid.count === 0` → **重复投递**（同一笔支付的同一个事件又来了一次），
+      //   钱早就收过了，这里什么都不用做。
+      //
+      // ⚠️ **不能抛异常回滚**：抛了整笔事务回滚 → 支付单退回 PENDING →
+      //    「钱已经收了」这个事实被抹掉，而事件又会被标记成已处理，
+      //    补偿扫描再也救不回来（审计 P0-3 的第 3 条对抗验证）。
+      if (paid.count === 1) {
+        await this.markUnsettledInTx(tx, order, event);
+      } else {
+        this.logger.warn(
+          `订单 ${order.orderNo} 当前不是 PENDING_PAYMENT，不流转（事件 ${event.eventId}）`,
+        );
+      }
       return;
     }
 
@@ -930,6 +985,80 @@ export class PaymentService {
     //
     // ⚠️ **`occurredAt` 用 `paidAt`** —— 与抽佣流水、与平台收入报表的归期口径逐字一致。
     await this.receipt.recordReceiptInTx(tx, order, paidAt);
+  }
+
+  /**
+   * 钱收了但订单没接住：把支付单落成「已收款待退款」并告警。
+   *
+   * ⚠️ **为什么要有这个状态**（2026-11-05 审计 P0-3 / P1-3）：
+   *    渠道回调确认收款时，订单可能已经不是 `PENDING_PAYMENT`
+   *    （超时关闭 / 消费者取消 / 已被另一渠道先付掉）。
+   *    这时钱**确实收了**，但它**没有结算进订单**——
+   *    订单从没记过抽佣 / 货款流水，也永远等不到「整单退款」把它带走。
+   *    → 落成 `NEEDS_REFUND`（已收款待退款），让商家在系统内能把它退掉。
+   *
+   * ⚠️ **绝不抛异常**：抛了会回滚整笔事务，把「钱已经收了」这个事实抹掉。
+   *
+   * ⚠️ **不写订单的流水**：这单从没结算过，没有可冲回的东西。
+   *
+   * ⚠️ **两次查询都走 `tx`**：交互事务独占一条连接，
+   *    用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
+   */
+  private async markUnsettledInTx(
+    tx: PrismaTransaction,
+    order: { id: string; orderNo: string },
+    event: NormalizedWebhookEvent,
+  ): Promise<void> {
+    // 同一订单同一渠道只有一笔支付单（`payments_order_channel_uniq` 唯一索引），
+    // 所以这一条就是刚被置成 SUCCESS 的那笔。
+    const unsettled = await tx.payment.findFirst({
+      where: {
+        orderId: order.id,
+        channel: event.channel,
+        status: PaymentStatus.SUCCESS,
+      },
+      select: { id: true },
+    });
+    if (!unsettled) {
+      this.logger.error(
+        `支付回调找不到已收款的支付单：订单 ${order.orderNo}` +
+          `（渠道 ${event.channel}，事件 ${event.eventId}）`,
+      );
+      return;
+    }
+
+    const current = await tx.order.findFirst({
+      where: { id: order.id },
+      select: { status: true },
+    });
+    const orderStatus = current?.status;
+
+    const marked = await tx.payment.updateMany({
+      where: { id: unsettled.id, status: PaymentStatus.SUCCESS },
+      data: { status: PaymentStatus.NEEDS_REFUND },
+    });
+    if (marked.count === 0) {
+      this.logger.warn(
+        `支付单 ${unsettled.id} 没能落成「已收款待退款」（状态已被改动），请人工核查：` +
+          `订单 ${order.orderNo}（事件 ${event.eventId}）`,
+      );
+      return;
+    }
+
+    // ⚠️ **告警要能区分两种成因** —— 处置动作不同：
+    //    - 订单已关闭 / 已取消 → **迟到扣款**：货不会发，钱必须退
+    //    - 订单已被别的渠道付掉 → **重复收款**：货会发，多收的那笔必须退
+    const cause =
+      orderStatus === OrderStatus.CLOSED ||
+      orderStatus === OrderStatus.CANCELLED
+        ? '订单已关闭或已取消后才到账（迟到扣款）'
+        : '订单已被其它渠道付过款（重复收款）';
+    this.logger.error(
+      `支付回调已收款但订单无法流转：订单 ${order.orderNo}` +
+        `（当前状态 ${orderStatus ?? '未知'}），${cause}；` +
+        `支付单 ${unsettled.id} 已标记为「已收款待退款」，` +
+        `请走退款通道把这笔钱退回给用户（事件 ${event.eventId}）`,
+    );
   }
 
   /** 标记事件已处理 */
@@ -1030,22 +1159,32 @@ export class PaymentService {
    * ⚠️ **退款不回补库存**——货已经发出去了，退的是钱不是库存。
    * 「退货入库」是另一套流程（要有退货单、质检），不在本阶段。
    * 这个取舍要在商家后台的文案里说明。
+   *
+   * ⚠️ **退的是该订单「所有可退的支付单」**（2026-11-05 审计 P1-3）：
+   *    同一个订单可能被两个渠道各收了一笔——`createPayment` 只要求订单还在
+   *    `PENDING_PAYMENT`，两个渠道的支付单都能建出来，谁先回调谁结算。
+   *    只退其中一笔的话，另一笔会永远卡住（订单已是终态，谁也动不了它）。
+   *
+   * ⚠️ **订单状态决定「能不能退钱」**（2026-11-05 审计 P0-3）：
+   *    - `PAID` / `SHIPPED` → 整单退款（钱退回去，订单也退掉）
+   *    - `CLOSED` / `CANCELLED` → **迟到扣款**：钱收了但货不会发，
+   *      订单本身是终态、退款也不改它 → **只把钱退回去**。
+   *      审计 P0-3 明确要求覆盖 `CANCELLED`（不只是 15 分钟超时），
+   *      而且商家原来对这类单**没有任何系统内手段**——这一支就是那个出口。
    */
   async refund(orderNo: string, reason: string): Promise<RefundOutcome> {
     const order = await this.readOrderByNo(orderNo);
-    if (
-      order.status !== OrderStatus.PAID &&
-      order.status !== OrderStatus.SHIPPED
-    ) {
-      throw new ConflictException('订单当前状态不允许退款');
-    }
 
-    // 支付单：该订单的**已成功**的那笔
+    // ⚠️ **候选是该订单所有「可退」的支付单**，不是 `payments[0]`：
+    //    `payments[0]` 没有 `orderBy`，取到哪一笔完全不可预测，
+    //    另一笔就永远退不掉（审计 P1-3）。
     const payments = await this.prisma.payment.findMany({
-      where: { orderId: order.id, status: PaymentStatus.SUCCESS },
+      where: {
+        orderId: order.id,
+        status: { in: [PaymentStatus.SUCCESS, PaymentStatus.NEEDS_REFUND] },
+      },
     });
-    const payment = payments[0];
-    if (!payment) {
+    if (payments.length === 0) {
       // ⚠️ **已经处于 `REFUNDING` 时不要说「没有可退款的支付单」** ——
       //    那是一句会让人以为「可以从别处退」的误导话术。
       const refunding = await this.prisma.payment.findMany({
@@ -1057,12 +1196,92 @@ export class PaymentService {
       throw new ConflictException('订单没有可退款的支付单');
     }
 
+    if (!this.orderAllowsRefund(order.status)) {
+      throw new ConflictException('订单当前状态不允许退款');
+    }
+
+    // ---- 逐笔退 ----
+    //
+    // ⚠️ **一笔失败不打断其余的**：多笔时第一笔退成功、第二笔被渠道拒付，
+    //    这时若立刻抛错，商家会以为「什么都没退」——
+    //    而钱其实已经退了一部分（订单可能已经转成 `REFUNDED`）。
+    const failures: Array<{ channel: string; error: unknown }> = [];
+    let refundedCount = 0;
+    let pendingCount = 0;
+    for (const payment of payments) {
+      try {
+        const outcome = await this.refundOnePayment(payment, order, reason);
+        if (outcome.status === 'REFUNDED') {
+          refundedCount += 1;
+        } else {
+          pendingCount += 1;
+        }
+      } catch (error) {
+        failures.push({ channel: payment.channel, error });
+      }
+    }
+
+    if (failures.length > 0) {
+      this.logger.error(
+        `订单 ${order.orderNo} 有 ${failures.length} 笔退款失败：${failures
+          .map((item) => `${item.channel}：${readableError(item.error)}`)
+          .join('；')}`,
+      );
+      // ⚠️ **全部失败时抛第一个原始异常**：异常类型与文案都不变
+      //    （单笔场景的老行为不能变）。
+      if (failures.length === payments.length) {
+        throw failures[0].error;
+      }
+      throw new BadRequestException(
+        `部分退款失败（已退 ${refundedCount} 笔）：` +
+          failures
+            .map((item) => `${item.channel}：${readableError(item.error)}`)
+            .join('；'),
+      );
+    }
+
+    return { status: pendingCount > 0 ? 'REFUNDING' : 'REFUNDED' };
+  }
+
+  /**
+   * 这个订单状态能不能退款。
+   *
+   * ⚠️ **`PAID` / `SHIPPED` 是整单退款**（钱退回去，订单也退掉）。
+   * ⚠️ **`CLOSED` / `CANCELLED` / `REFUNDED` / `PENDING_PAYMENT` 只退钱**：
+   *    这些订单要么从没结算过（钱收了但货不会发 → 迟到扣款），
+   *    要么已经被退过（还残留一笔要退掉），
+   *    要么钱收了但订单还卡在待支付 —— 一律**不改订单状态、不记冲回**。
+   *    审计 P0-3 要求覆盖 `CANCELLED`（不只是 15 分钟超时），
+   *    而且商家原来对这类单**没有任何系统内手段**——这一支就是那个出口。
+   * ⚠️ **`COMPLETED` 不放行**：已完成的订单要退是「退货退款」，
+   *    那是带质检与退货单的另一套流程，不在本阶段。
+   */
+  private orderAllowsRefund(status: OrderStatus): boolean {
+    return (
+      status === OrderStatus.PAID ||
+      status === OrderStatus.SHIPPED ||
+      status === OrderStatus.CLOSED ||
+      status === OrderStatus.CANCELLED ||
+      status === OrderStatus.REFUNDED ||
+      status === OrderStatus.PENDING_PAYMENT
+    );
+  }
+
+  /**
+   * 退**一笔**支付单（抢闸门 → 调渠道 → 落账）。
+   *
+   * ⚠️ **能力门控必须在调用渠道之前**（阶段 6a）：不支持在线退款的渠道
+   * 调下去要么静默失败、要么被渠道当成「退款成功」回一个空结果——
+   * 那时本地已经改了状态，外部却一分没退。宁可显式 409。
+   * 放在抢闸门之前，连本地状态都不碰。
+   */
+  private async refundOnePayment(
+    payment: { id: string; channel: string; amount: number },
+    order: ReadableOrder,
+    reason: string,
+  ): Promise<RefundOutcome> {
     const provider = this.providerOf(payment.channel);
 
-    // ⚠️ **能力门控必须在调用渠道之前**（阶段 6a）：不支持在线退款的渠道
-    // 调下去要么静默失败、要么被渠道当成「退款成功」回一个空结果——
-    // 那时本地已经改了状态，外部却一分没退。宁可显式 409。
-    // 放在抢闸门之前，连本地状态都不碰。
     if (!provider.capabilities.refund) {
       throw new ConflictException(
         `当前渠道 ${provider.channel} 不支持在线退款`,
@@ -1082,11 +1301,14 @@ export class PaymentService {
     //    但不能无限重试——超过预算的单留在 `REFUNDING`（或原状态），
     //    只在扫描里告警，交人工处理。放在条件更新里而不是先读后判，
     //    是为了让预算判定与抢闸门一样是原子的。
+    //
+    // ⚠️ **`NEEDS_REFUND` 也要能抢闸门**：那是「钱收了但订单没接住」的
+    //    支付单（审计 P0-3），它正是商家要退的那一笔。
     const refundRequestedAt = await this.prisma.databaseNow();
     const claimed = await this.prisma.payment.updateMany({
       where: {
         id: payment.id,
-        status: PaymentStatus.SUCCESS,
+        status: { in: [PaymentStatus.SUCCESS, PaymentStatus.NEEDS_REFUND] },
         refundAttemptCount: { lt: REFUND_ATTEMPT_LIMIT },
       },
       data: {
@@ -1117,7 +1339,7 @@ export class PaymentService {
       result = await provider.refund(payment.id, payment.amount, reason);
     } catch (error) {
       // ⚠️ **抛异常 = 结果未知**（网络超时 / 网关错误），不是「渠道拒付」。
-      //    这时**不能回退 SUCCESS**——渠道可能已经受理了，回退后商家再退一次
+      //    这时**不能回退闸门**——渠道可能已经受理了，回退后商家再退一次
       //    就是重复退款。保持 REFUNDING，写可读原因，交给扫描 / 回调核实。
       const readable = readableError(error);
       await this.markRefundPending(payment.id, readable);
@@ -1141,7 +1363,7 @@ export class PaymentService {
     // ---- FAILED ----
     const failureReason = result.failureReason ?? '渠道拒绝了本次退款';
     if (result.definitive) {
-      // ⚠️ **渠道明确说没退出去** → 回退 SUCCESS，允许商家重试。
+      // ⚠️ **渠道明确说没退出去** → 放回闸门，允许商家重试。
       //    重试预算由上面条件更新里的 `refundAttemptCount` 兜底。
       await this.releaseRefundClaim(payment.id, failureReason);
       throw new BadRequestException('渠道拒绝了本次退款');
@@ -1173,7 +1395,8 @@ export class PaymentService {
       return new ConflictException('该订单已在退款中');
     }
     if (
-      current.status === PaymentStatus.SUCCESS &&
+      (current.status === PaymentStatus.SUCCESS ||
+        current.status === PaymentStatus.NEEDS_REFUND) &&
       current.refundAttemptCount >= REFUND_ATTEMPT_LIMIT
     ) {
       // ⚠️ **超预算不加告警去重列**（本阶段约定）：只记日志，扫描每轮最多一次。
@@ -1250,6 +1473,35 @@ export class PaymentService {
       return false;
     }
 
+    // ⚠️ **订单级动作按「订单当前状态」决定**（2026-11-05 审计 P0-3 / P1-3）：
+    //
+    // - `PAID` / `SHIPPED` → 这单结算过订单 → 订单转 `REFUNDED` + 记冲回流水
+    // - `CLOSED` / `CANCELLED` → **这单从没结算过**（钱收了但订单已关闭 / 已取消）
+    //   → **只退钱**：不改订单状态、不记冲回
+    //   （那单从没记过抽佣 / 货款流水，没有可冲回的东西；
+    //     而 `CLOSED` / `CANCELLED` 是终态，订单转移表也不允许转）
+    // - `REFUNDED` → 已经被退过（多渠道的第二笔就是这样）→ 跳过，不重复冲回
+    //
+    // ⚠️ **这里读的是事务内的当前状态，不是退款发起时的快照** ——
+    //    多笔退款时第一笔已经把订单转成 `REFUNDED`，第二笔必须看到它，
+    //    否则第二笔会重复记一遍冲回流水（或者直接卡死）。
+    const current = await tx.order.findFirst({
+      where: { id: order.id },
+      select: { status: true },
+    });
+    const orderStatus = current?.status;
+    if (
+      orderStatus !== OrderStatus.PAID &&
+      orderStatus !== OrderStatus.SHIPPED
+    ) {
+      this.logger.warn(
+        `支付单 ${paymentId} 退款落账，但订单 ${order.orderNo} 当前状态是 ` +
+          `${orderStatus ?? '未知'}：不改订单状态、不记冲回` +
+          `（该订单没有可冲回的流水）`,
+      );
+      return true;
+    }
+
     // 订单转 REFUNDED（条件更新，走 order 模块的转移表校验）
     //
     // ⚠️ **顺手记下退款时间**（阶段 5b Task 1 加的 `Order.refundedAt`）：
@@ -1259,12 +1511,21 @@ export class PaymentService {
     const won = await this.orderService.transitionInTx(
       tx,
       order.id,
-      order.status,
+      orderStatus,
       OrderStatus.REFUNDED,
       { refundedAt },
     );
     if (!won) {
-      throw new ConflictException('订单当前状态不允许退款');
+      // ⚠️ **不能抛异常**：抛了整笔事务回滚 → 支付单退回 `REFUNDING` →
+      //    这笔退款**永远卡死**（审计 P1-3：多渠道的第二笔就是这样卡住的）。
+      //    条件更新抢不到 = 订单已经不是那个状态了 = 另一笔退款已经退过这单
+      //    → 跳过订单级动作（不重复记冲回）；
+      //    但**支付单已经是 `REFUNDED`**——渠道确认过钱确实退了，
+      //    这个事实不能被抹掉（抹掉会让商家再点一次退款 → 重复退款）。
+      this.logger.warn(
+        `订单 ${order.orderNo} 状态已被改动，跳过订单级冲回：支付单 ${paymentId}`,
+      );
+      return true;
     }
 
     // ---- 记一笔冲回流水（阶段 5e）----
@@ -1864,6 +2125,21 @@ export class PaymentService {
         return;
       }
 
+      // ⚠️ **金额必须与订单一致**（审计 P0-6 ②）：
+      //    消费端**不信事件里的金额** —— 队列里的任务可以被拿到 Redis 写权限的
+      //    人改写，金额就是最值钱的那一栏。这里从订单反查应付金额，
+      //    `order.totalAmount` 已经在手里，**零额外查询**。
+      //
+      //    ⚠️ 这一层是**兜底**：验签端点（`checkWebhookEvent`）已经核过一次，
+      //    但端点与消费端之间隔着一个可写的队列，消费端必须自己再核一遍。
+      if (event.amount !== order.totalAmount) {
+        this.logger.error(
+          `支付回调金额不符，拒绝流转：订单 ${order.orderNo} ` +
+            `应付 ${order.totalAmount}，实付 ${event.amount}（事件 ${event.eventId}）`,
+        );
+        return;
+      }
+
       // ⚠️ **先把渠道交易号写进支付单，且在业务事务之外**。
       //
       // `(provider, providerTxnId)` 唯一索引是幂等的第二道防线
@@ -2298,9 +2574,19 @@ export class PaymentService {
     return this.registry.get(channel);
   }
 
-  /** 全部已注册的渠道（含未启用，排查用） */
-  listChannels(): string[] {
-    return this.registry.registeredChannels();
+  /**
+   * **已启用**的支付渠道名（消费端用它挑默认渠道）。
+   *
+   * ⚠️ **只给「已启用」的**（审计 P2-A1）：原来这里给的是**全部已注册**的渠道
+   *    （含未启用），生产环境一个渠道都没配时，调用方拿到的第一个渠道
+   *    照样会被注册表以「未启用」拒掉 —— 用户看到的是「支付渠道 fake 未启用」，
+   *    而不是「没有可用的支付渠道」，排障方向被带偏。
+   *
+   * ⚠️ 非生产环境**包含 devOnly 渠道**（`fake` 等）—— 注册表在非生产时放行它们；
+   *    生产环境则自动排除（注册表那里同理）。
+   */
+  listEnabledChannels(): string[] {
+    return this.registry.list({ includeDevOnly: true }).map((d) => d.channel);
   }
 }
 

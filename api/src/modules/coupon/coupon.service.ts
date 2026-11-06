@@ -336,7 +336,7 @@ export class CouponService {
    *
    * 正确做法（与阶段 3 的状态流转同款）：
    * ```
-   * updateMany({ where: { id, claimedCount: { lt: totalLimit } },
+   * updateMany({ where: { id, claimedCount: { lte: totalLimit - quantity } },
    *              data: { claimedCount: { increment: quantity } } })
    * ```
    * 受影响行数为 0 就是「额度已满」→ 409。
@@ -419,10 +419,14 @@ export class CouponService {
 
     // 3. **条件更新**扣总量（M4）
     //
-    // ⚠️ `claimedCount: { lt: totalLimit }` 这个 where 条件只在
+    // ⚠️ `claimedCount: { lte: totalLimit - quantity }` 这个 where 条件只在
     // totalLimit 非空时才有意义 —— totalLimit 为 null（不限量）时，
-    // where 条件要省略（`{ lt: null }` 在 Prisma 里恒为 false，
+    // where 条件要省略（`{ lte: null }` 在 Prisma 里恒为 false，
     // 会把不限量的券也拦住）。
+    //
+    // ⚠️ **减掉本次领取量**：条件比的是「加上本次之后」的总量，
+    // 只判「当前值 < 总量」会漏掉最后几份额度（限 3 张时一次领 2 张，
+    // 剩 1 份额度却还能再领 2 张 → 超发）。
     //
     // ⚠️ **平台券的计数在「平台租户」的那一行上**：
     // 租户作用域的 `updateMany` 改不到它（受影响行数会是 0），
@@ -559,7 +563,13 @@ export class CouponService {
   ): Promise<{ count: number }> {
     const where = {
       id: couponId,
-      ...(totalLimit !== null ? { claimedCount: { lt: totalLimit } } : {}),
+      // ⚠️ 条件是「加上本次领取量之后不超过总量」，不是「当前值小于总量」：
+      // `{ lt: totalLimit }` 只保证还有 1 份额度，于是「限 3 张的券一次领 2 张」
+      // 会把 claimedCount 写成 2（应该是 1），第二次再领 2 张就把总量冲破。
+      // 正确写法与「每用户限领」同款：`claimedCount <= totalLimit - 本次领取量`。
+      ...(totalLimit !== null
+        ? { claimedCount: { lte: totalLimit - quantity } }
+        : {}),
     };
 
     if (isPlatform) {
@@ -816,10 +826,13 @@ export class CouponService {
     if (input.requestedCouponId) {
       const requestedId = input.requestedCouponId;
 
-      // ⚠️ **已被占住/已用掉的券 → 409**（M5）：
-      // 这与「券根本不能用」是**两回事**——前者是「你来晚了，这张券刚被别人用掉」，
+      // ⚠️ **这个用户已被占住/已用掉的券 → 409**（M5）：
+      // 这与「券根本不能用」是**两回事**——前者是「你来晚了，这张券刚被你用掉」，
       // 后者是「这张券不适用于这笔订单」。文案必须分开：
       // 用户看到「该券已被使用」知道该换一张，看到「优惠券不可用」知道该去掉它。
+      //
+      // ⚠️ **判据按用户维度**（审计 P0-7）：别人用过这张券**不影响**你用它
+      // ——「一份券给一个用户用一次」，各人各份。
       if (found.alreadyUsedIds.has(requestedId)) {
         throw new ConflictException('该券已被使用');
       }
@@ -1044,7 +1057,7 @@ export class CouponService {
    * - 用户持有（`coupon_claims` 里有它的领取记录）
    * - 券本身 `status = ACTIVE`
    * - 券在有效期内（`startsAt <= dbNow < endsAt`）
-   * - 券没被用过（没有 `status IN (RESERVED, USED)` 的核销记录）
+   * - **这个用户**没被用过（没有他本人的 `status IN (RESERVED, USED)` 的核销记录）
    * - 适用范围匹配（平台券全店可用，店铺券限本店）
    *
    * ⚠️ **返回顺序按领取时间升序**：引擎在「折后总价并列」时取先到的那张，
@@ -1053,6 +1066,9 @@ export class CouponService {
    * ⚠️ **「已被占住/已用掉」单独返回**：它不在候选里（不能用），
    * 但要**单独告诉调用方**——客户端指定这张券时该回 409「该券已被使用」，
    * 而不是笼统的 400「优惠券不可用」。
+   *
+   * ⚠️ **判据是「这个用户用过没有」，不是「有人用过没有」**（审计 P0-7）：
+   * 「一份券给一个用户用一次」，各人各份 —— 别人用过不影响你。
    *
    * ⚠️ **事务内必须传 `tx`**：交互事务会独占一条连接，
    *    回调内再用 `this.prisma` 会再借一条 → 小连接池上死等（P2024）。
@@ -1111,12 +1127,20 @@ export class CouponService {
       return { candidates: [], alreadyUsedIds: new Set() };
     }
 
-    // 4. 已被占住/已用掉的券要排除。
+    // 4. **这个用户**已被占住/已用掉的券要排除。
+    //
+    // ⚠️ **必须带 `customerId` 过滤**（审计 P0-7）：
+    // 「没被用掉」问的是「**我**用过没有」，不是「有人用过没有」。
+    // 少了这个过滤 → 任意一个消费者下单占用后，
+    // 全店所有其他消费者手里的同一张券同时失效
+    // （明明各自都领了，结算页却看不到、显式指定则 409）。
     //
     // ⚠️ **「没被用掉」的判定与部分唯一索引是同一件事的两个面**：
-    // 索引保证「不可能同时有两条」，这里的查询保证「只把没被占的拿出来当候选」。
+    // 索引保证「同一个用户对同一张券不可能同时有两条」，
+    // 这里的查询保证「只把这个用户没被占的拿出来当候选」。
     const used = await client.couponRedemption.findMany({
       where: {
+        customerId,
         couponId: { in: coupons.map((coupon) => coupon.id) },
         status: {
           in: [CouponRedemptionStatus.RESERVED, CouponRedemptionStatus.USED],

@@ -4,7 +4,11 @@
 //    避免整条 import 图被 ESM 解析卡住。
 jest.mock('@nestjs/jwt', () => ({ JwtService: class JwtService {} }));
 
+import { HttpException, HttpStatus } from '@nestjs/common';
+import * as argon2 from 'argon2';
 import { AuthService } from './auth.service';
+import { LoginThrottleService } from './login-throttle.service';
+import { LoginScope } from './dto/login.dto';
 
 const DB_NOW = new Date('2026-11-04T00:00:00.000Z');
 
@@ -16,13 +20,18 @@ function makeService(stored: Record<string, unknown>, dbNow: Date) {
       updateMany: jest.fn(),
       create: jest.fn(),
     },
+    user: { findMany: jest.fn().mockResolvedValue([]) },
     $transaction: jest.fn(),
   };
   const jwt = { signAsync: jest.fn().mockResolvedValue('access-token') };
 
   return {
     prisma,
-    service: new AuthService(prisma as never, jwt as never),
+    service: new AuthService(
+      prisma as never,
+      jwt as never,
+      new LoginThrottleService(),
+    ),
   };
 }
 
@@ -58,5 +67,75 @@ describe('AuthService.refresh：时钟跟随数据库', () => {
     );
 
     jest.useRealTimers();
+  });
+});
+
+/**
+ * 登录失败限流（审计 P2-3）。
+ *
+ * ⚠️ **账号不存在也要计数**：撞库主要就是在试大量**没注册过**的邮箱。
+ */
+describe('AuthService.login：失败限流（审计 P2-3）', () => {
+  const WRONG = {
+    email: 'a@example.com',
+    password: 'wrong-password',
+    scope: LoginScope.CUSTOMER,
+  };
+
+  it('连续失败 5 次 → 第 6 次被 429 拦住', async () => {
+    const { service } = makeService({}, DB_NOW);
+
+    for (let i = 0; i < 5; i += 1) {
+      await expect(service.login(WRONG, null)).rejects.toThrow(
+        '邮箱或密码不正确',
+      );
+    }
+
+    await expect(service.login(WRONG, null)).rejects.toThrow(HttpException);
+    await expect(service.login(WRONG, null)).rejects.toThrow(
+      /登录失败次数过多/,
+    );
+    // 必须是 429（而不是别的错误码），否则前端会按「密码错误」提示误导用户
+    await expect(service.login(WRONG, null)).rejects.toMatchObject({
+      status: HttpStatus.TOO_MANY_REQUESTS,
+    });
+  });
+
+  it('登录成功 → 计数清零（改对密码就不该继续被限）', async () => {
+    const hash = await argon2.hash('right-password');
+    const { service, prisma } = makeService({}, DB_NOW);
+    prisma.user.findMany.mockResolvedValue([
+      {
+        id: 'u1',
+        email: 'a@example.com',
+        passwordHash: hash,
+        role: 'MERCHANT_OWNER',
+        tenantId: 'tenant-a',
+        displayName: 'A',
+      },
+    ]);
+
+    for (let i = 0; i < 4; i += 1) {
+      await expect(service.login(WRONG, null)).rejects.toThrow(
+        '邮箱或密码不正确',
+      );
+    }
+    await expect(
+      service.login({ ...WRONG, password: 'right-password' }, null),
+    ).resolves.toBeDefined();
+
+    // 计数已清零 → 再错 5 次才轮到 429
+    for (let i = 0; i < 4; i += 1) {
+      await expect(service.login(WRONG, null)).rejects.toThrow(
+        '邮箱或密码不正确',
+      );
+    }
+    await expect(service.login(WRONG, null)).rejects.toThrow(
+      '邮箱或密码不正确',
+    );
+    await expect(service.login(WRONG, null)).rejects.toThrow(HttpException);
+    await expect(service.login(WRONG, null)).rejects.toThrow(
+      /登录失败次数过多/,
+    );
   });
 });

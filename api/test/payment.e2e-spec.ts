@@ -7,6 +7,7 @@ import { AppModule } from '../src/app.module';
 import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.interceptor';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
 import { PaymentService } from '../src/modules/payment/payment.service';
+import { PaymentProviderRegistry } from '../src/modules/payment/payment-provider.registry';
 import { tenantContext } from '../src/common/tenant/tenant-context';
 import { assertSecureConfig } from '../src/common/config/assert-secure-config';
 import { PAYMENT_WEBHOOK_QUEUE } from '../src/common/queue/queue.constants';
@@ -1675,5 +1676,133 @@ describe('支付与 webhook (e2e)', () => {
     expect(events).toHaveLength(1);
     // ⚠️ **kind 由端点写入**（端点自己知道是哪个端点）→ 订阅回调就是 SUBSCRIPTION
     expect(events[0].kind).toBe('SUBSCRIPTION');
+  });
+
+  // ============================================================
+  // 审计 P0-3：钱收了但订单没接住（迟到扣款）
+  // ============================================================
+
+  it('⚠️ 订单已取消后渠道才回调 → 支付单落「已收款待退款」，商家能在系统内把它退掉', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const skuId = await publishSku(merchant.token, '迟到扣款的商品', 1000);
+    await stockIn(merchant.token, skuId, 10);
+    const customer = await registerCustomer(merchant.subdomain);
+    const addressId = await createAddress(customer.token);
+
+    // 下单 + 发起支付（支付单还是 PENDING）
+    const { order, payment } = await placeAndPay(
+      merchant.token,
+      customer.token,
+      addressId,
+      skuId,
+    );
+
+    // 消费者取消订单 → 订单进终态 CANCELLED
+    await http(app)
+      .post(`/api/v1/orders/${order.orderNo}/cancel`)
+      .set('authorization', `Bearer ${customer.token}`)
+      .expect(200);
+
+    // 渠道这时才回调「支付成功」——钱确实收了，但订单已经取消了
+    await postFakeWebhook({
+      eventId: `evt-${unique()}`,
+      providerTxnId: payment.paymentId,
+      orderNo: order.orderNo,
+      amount: order.totalAmount,
+      success: true,
+    }).expect(200);
+
+    // ⚠️ 消费端是异步的：等支付单落成「已收款待退款」
+    const marked = await waitFor(async () => {
+      const rows = await readPayments(merchant.tenantId, order.id);
+      return rows[0]?.status === 'NEEDS_REFUND';
+    });
+    expect(marked).toBe(true);
+
+    // 订单没有被流转（还是 CANCELLED）
+    const afterCallback = await readOrder(merchant.tenantId, order.orderNo);
+    expect(afterCallback.status).toBe('CANCELLED');
+
+    // ⚠️ **补救出口**：商家在系统内能把这笔钱退掉
+    //    （审计 P0-3：这类单原来商家只能线下退款或改库）
+    const refunded = await http(app)
+      .post(`/api/v1/merchant/orders/${order.orderNo}/refund`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ reason: '订单已取消，迟到的扣款退回' })
+      .expect(201);
+    expect(refunded.body).toEqual({ refunded: true, status: 'REFUNDED' });
+
+    const afterRefund = await readPayments(merchant.tenantId, order.id);
+    expect(afterRefund[0].status).toBe('REFUNDED');
+
+    // ⚠️ **订单是终态，退款不改它**（那单从没结算过，没有可冲回的流水）
+    const finalOrder = await readOrder(merchant.tenantId, order.orderNo);
+    expect(finalOrder.status).toBe('CANCELLED');
+  });
+
+  it('⚠️ 退款被渠道明确拒付 → 支付单退回「已收款」→ 商家仍能看到待退款（提示不能消失）', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const skuId = await publishSku(merchant.token, '拒付后仍可见的商品', 1000);
+    await stockIn(merchant.token, skuId, 10);
+    const customer = await registerCustomer(merchant.subdomain);
+    const addressId = await createAddress(customer.token);
+
+    const { order, payment } = await placeAndPay(
+      merchant.token,
+      customer.token,
+      addressId,
+      skuId,
+    );
+
+    // 消费者取消订单 → 订单进终态 CANCELLED
+    await http(app)
+      .post(`/api/v1/orders/${order.orderNo}/cancel`)
+      .set('authorization', `Bearer ${customer.token}`)
+      .expect(200);
+
+    // 渠道这时才回调「支付成功」→ 钱收了但订单接不住
+    await postFakeWebhook({
+      eventId: `evt-${unique()}`,
+      providerTxnId: payment.paymentId,
+      orderNo: order.orderNo,
+      amount: order.totalAmount,
+      success: true,
+    }).expect(200);
+
+    const marked = await waitFor(async () => {
+      const rows = await readPayments(merchant.tenantId, order.id);
+      return rows[0]?.status === 'NEEDS_REFUND';
+    });
+    expect(marked).toBe(true);
+
+    // ⚠️ **让渠道明确拒付这次退款**：闸门放回「已收款」让商家能重试
+    const registry = app.get(PaymentProviderRegistry);
+    (
+      registry.get('fake') as unknown as {
+        armRefundScenario: (scenario: string) => void;
+      }
+    ).armRefundScenario('reject');
+
+    const rejected = await http(app)
+      .post(`/api/v1/merchant/orders/${order.orderNo}/refund`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ reason: '迟到的扣款要退回去' });
+    expect(rejected.status).toBe(400);
+
+    // ⚠️ **闸门放开了**：支付单回到「已收款」（不再是「已收款待退款」）
+    const afterReject = await readPayments(merchant.tenantId, order.id);
+    expect(afterReject[0].status).toBe('SUCCESS');
+
+    // ⚠️ **但钱依然没收进订单**（订单还是 CANCELLED）→
+    //    商家后台必须照样看得见这笔钱，否则 P0-3 补的出口自己关上了
+    const detail = await http(app)
+      .get(`/api/v1/merchant/orders/${order.orderNo}`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(200);
+    expect(detail.body).toMatchObject({
+      status: 'CANCELLED',
+      pendingRefundCount: 1,
+      pendingRefundAmount: order.totalAmount,
+    });
   });
 });

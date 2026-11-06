@@ -1045,16 +1045,20 @@ describe('订单与状态机 (e2e)', () => {
 
     // ⚠️ **pageSize 有上限**：否则 pageSize=999999 一次就把整个租户的
     // 订单拖出去——那是实打实的数据泄露。
+    // 查询参数改走 DTO 校验之后（审计 P2-5），超上限直接 400，
+    // 不再是「静默夹到 100」。
     const huge = await http(app)
       .get('/api/v1/merchant/orders')
       .query({ pageSize: 999999 })
       .set('authorization', `Bearer ${merchant.token}`)
-      .expect(200);
-    expect(orderListBody(huge).items.length).toBeLessThanOrEqual(100);
+      .expect(400);
+    // 一个订单都拖不出去：响应里根本没有列表字段
+    expect(huge.body).not.toHaveProperty('items');
 
     // ⚠️ **畸形参数不能变成 500**：page=0 会算出负的 skip 让 Prisma 报错，
     // page=abc 会让 Number() 得到 NaN。畸形入参变 500 是最容易被拿来
-    // 刷错误日志、触发告警的形态。
+    // 刷错误日志、触发告警的形态——所以现在要求 400（而不是过去的 200
+    // + 静默落回默认值）。
     const malformed: Array<Record<string, string | number>> = [
       { page: 0 },
       { page: -5 },
@@ -1068,7 +1072,7 @@ describe('订单与状态机 (e2e)', () => {
         .get('/api/v1/merchant/orders')
         .query(query)
         .set('authorization', `Bearer ${merchant.token}`);
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(400);
     }
 
     // 正常分页仍然工作

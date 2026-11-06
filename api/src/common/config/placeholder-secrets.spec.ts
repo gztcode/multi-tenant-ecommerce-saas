@@ -18,6 +18,11 @@ import { assertPayoutEncryptionKey } from './assert-payout-encryption-key';
  */
 const COMPOSE_PATH = join(__dirname, '../../../../infra/docker-compose.yml');
 const ENV_EXAMPLE_PATH = join(__dirname, '../../../.env.example');
+/** compose 用的那份 env 模板（CORS 变量给 MinIO 容器用） */
+const INFRA_ENV_EXAMPLE_PATH = join(
+  __dirname,
+  '../../../../infra/.env.example',
+);
 
 function composeValue(key: string): string {
   const content = readFileSync(COMPOSE_PATH, 'utf8');
@@ -136,5 +141,38 @@ describe('已知占位符密钥集合', () => {
         expect(() => assertPayoutEncryptionKey()).not.toThrow();
       },
     );
+  });
+});
+
+/**
+ * compose 的 MinIO CORS 变量名（审计 P1-4）。
+ *
+ * ⚠️ **变量名写错 = 白名单完全失效**：MinIO 的真实变量名是
+ *    `MINIO_API_CORS_ALLOW_ORIGIN`；写成 `MINIO_CORS_ALLOW_ORIGIN`
+ *    会被**静默忽略** → 回落到「反射任意 Origin + `Allow-Credentials: true`」
+ *    → 任意站点都能带着用户 cookie 读预签名对象。
+ *
+ * ⚠️ 当年那句「实测该变量对预检请求生效」正是变量名写错时的假象
+ *    （写错时**任何** Origin 都"生效"），所以它反而掩盖了这个 bug。
+ *
+ * ⚠️ **compose 与 .env.example 要一起改**：只改 compose 的话，
+ *    照着 .env.example 配环境的人还是会踩同一个坑。
+ */
+describe('compose 的 MinIO CORS 变量名', () => {
+  it('compose 用的是 MINIO_API_CORS_ALLOW_ORIGIN（不是写错的那个）', () => {
+    const content = readFileSync(COMPOSE_PATH, 'utf8');
+
+    expect(content).toContain('MINIO_API_CORS_ALLOW_ORIGIN');
+    // 错名一旦回来，这里立刻红
+    expect(content).not.toMatch(/^\s*MINIO_CORS_ALLOW_ORIGIN\s*:/m);
+  });
+
+  it('.env.example 用的也是 MINIO_API_CORS_ALLOW_ORIGIN', () => {
+    // ⚠️ **是 infra 那份**：CORS 变量给 **MinIO 容器**用，
+    //    compose 从同目录的 `.env` 读它（api 自己那份不配 CORS）。
+    const content = readFileSync(INFRA_ENV_EXAMPLE_PATH, 'utf8');
+
+    expect(content).toMatch(/^MINIO_API_CORS_ALLOW_ORIGIN=/m);
+    expect(content).not.toMatch(/^MINIO_CORS_ALLOW_ORIGIN=/m);
   });
 });

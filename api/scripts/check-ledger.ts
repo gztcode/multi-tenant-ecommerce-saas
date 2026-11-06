@@ -19,6 +19,12 @@
  * 共同定义了「哪些订单**应该有**流水行」。判定规则与它们对不上，
  * 脚本就会把**本来就不该有流水行**的订单报成缺口 → 防线变成噪音（永远 exit 1）。
  *
+ * ⚠️ **除了订单与流水表，还要查 `payments` 表**（2026-11-05 审计 P0-3 / P1-3）：
+ * 「渠道回调到达时订单已超时关闭 / 已被取消 / 已被另一渠道先付掉」→
+ * 钱收了但订单没结算；「同一订单两个渠道各收一笔」→ 重复收款。
+ * 这两种资损在订单与流水表里**一个都看不出来**，只查那三张表会报
+ * 「✅ 流水完整」然后 exit 0 → 防线形同虚设。
+ *
  * 用法（在 `api/` 目录下）：
  * ```
  * npm run check:ledger
@@ -29,7 +35,11 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { NestFactory } from '@nestjs/core';
-import { CommissionEntryType, ReceiptType } from '@prisma/client';
+import {
+  CommissionEntryType,
+  PaymentStatus,
+  ReceiptType,
+} from '@prisma/client';
 
 import { AppModule } from '../src/app.module';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
@@ -40,6 +50,7 @@ import {
 import {
   checkLedger,
   type LedgerCheckResult,
+  type LedgerPaymentIssue,
 } from '../src/modules/billing/ledger-check';
 
 /**
@@ -71,6 +82,44 @@ function printMissing(label: string, orderNos: string[]): void {
   }
   if (orderNos.length > 20) {
     console.log(`    …… 另有 ${orderNos.length - 20} 条未列出`);
+  }
+}
+
+/**
+ * 金额换算成元（保留两位小数）。
+ *
+ * ⚠️ **库里一律存整数分**，换算只发生在展示层。
+ */
+function yuan(cents: number): string {
+  return (cents / 100).toFixed(2);
+}
+
+/**
+ * 打印支付单维度的差异明细（最多 20 条）。
+ *
+ * ⚠️ **必须把明细打出来**（订单号 / 支付单 id / 渠道 / 金额 / 状态）：
+ * 只给一个计数，运维看到「差异 N 条」也不知道是哪几单、收了多少钱、
+ * 走的是哪个渠道 → 这个自检就等于没做。
+ */
+function printPaymentIssues(label: string, issues: LedgerPaymentIssue[]): void {
+  if (issues.length === 0) {
+    return;
+  }
+  console.log(`  ${label}（前 ${Math.min(20, issues.length)} 条）：`);
+  for (const issue of issues.slice(0, 20)) {
+    // ⚠️ **订阅支付单没有订单号**（它的钱不进订单流水）→ 订单那栏要写清楚，
+    // 不能打一个空的订单号让人以为查漏了。
+    const orderPart =
+      issue.orderNo === null
+        ? '订阅支付单（无订单）'
+        : `订单 ${issue.orderNo}（订单状态 ${issue.orderStatus}）`;
+    console.log(
+      `    - ${orderPart}｜支付单 ${issue.paymentId}｜渠道 ${issue.channel}` +
+        `｜金额 ${yuan(issue.amount)} 元｜支付单状态 ${issue.paymentStatus}`,
+    );
+  }
+  if (issues.length > 20) {
+    console.log(`    …… 另有 ${issues.length - 20} 条未列出`);
   }
 }
 
@@ -122,6 +171,35 @@ async function main(): Promise<void> {
         select: { orderId: true, type: true },
       });
 
+      // ⚠️ **必须读 `payments` 表**（审计 P0-3 / P1-3）：
+      // 「钱收了但订单没接住」与「同一订单重复收款」这两种资损，
+      // **在 `orders` / 流水表里一个都看不出来** —— 前者订单压根没有流水行，
+      // 后者两笔支付单都是 `SUCCESS`、看起来一切正常。
+      //
+      // ⚠️ **只取 `SUCCESS` 与 `NEEDS_REFUND` 两种状态**：判定只用这两种
+      // （`PENDING` / `FAILED` / `CLOSED` / `REFUNDED` / `REFUNDING` 都不参与）。
+      //
+      // ⚠️ **带上订单号与订单状态**：判定「订单有没有接住这笔钱」要订单状态，
+      // 而上面的 `orders` 只查了 `paidAt` 非空的订单 —— 超时关闭 / 已取消的订单
+      // `paidAt` 是空的，压根不在那个结果里 → 必须在这里关联出来。
+      const payments = await prisma.payment.findMany({
+        where: {
+          status: {
+            in: [PaymentStatus.SUCCESS, PaymentStatus.NEEDS_REFUND],
+          },
+        },
+        select: {
+          id: true,
+          orderId: true,
+          channel: true,
+          amount: true,
+          status: true,
+          // ⚠️ **订阅支付单的 `orderId` 为 null** → 这里关联出来就是 null，
+          // 判定时按「不参与订单维度的判定」处理。
+          order: { select: { orderNo: true, status: true } },
+        },
+      });
+
       return checkLedger({
         orders,
         commissionEntryOrderIds: commissionEntries
@@ -136,6 +214,15 @@ async function main(): Promise<void> {
         reversalReceiptOrderIds: receiptEntries
           .filter((e) => e.type === ReceiptType.SALE_REVERSAL)
           .map((e) => e.orderId),
+        payments: payments.map((p) => ({
+          id: p.id,
+          orderId: p.orderId,
+          orderNo: p.order?.orderNo ?? null,
+          orderStatus: p.order?.status ?? null,
+          channel: p.channel,
+          amount: p.amount,
+          status: p.status,
+        })),
       });
     });
   } finally {
@@ -146,19 +233,40 @@ async function main(): Promise<void> {
   console.log('账目流水自检');
   console.log('──────────────────────────────');
   console.log(`缺抽佣流水：${result.commissionMissing.length} 单`);
-  console.log(`缺冲回流水：${result.reversalMissing.length} 单`);
+  console.log(`缺抽佣冲回流水：${result.reversalMissing.length} 单`);
   console.log(`缺货款流水：${result.receiptMissing.length} 单`);
+  console.log(`缺货款冲回流水：${result.receiptReversalMissing.length} 单`);
   console.log(
-    `已退款但无退款时间（冲回永远无法归期）：${result.undatedRefundCount} 单`,
+    `已退款但无退款时间（抽佣侧冲回永远无法归期）：${result.undatedRefundCount} 单`,
   );
+  console.log(
+    `已退款但无退款时间（货款侧冲回永远无法归期）：` +
+      `${result.undatedReceiptReversalCount} 单`,
+  );
+  console.log(`钱收了但订单没接住：${result.orphanSuccessPayments.length} 笔`);
+  console.log(
+    `重复收款（同一订单多笔成功支付）：${result.duplicateSuccessPayments.length} 笔`,
+  );
+  console.log(`已收款待退款：${result.needsRefundPayments.length} 笔`);
   console.log('──────────────────────────────');
 
   if (result.hasGap) {
     printMissing('缺抽佣流水', result.commissionMissing);
-    printMissing('缺冲回流水', result.reversalMissing);
+    printMissing('缺抽佣冲回流水', result.reversalMissing);
     printMissing('缺货款流水', result.receiptMissing);
+    printMissing('缺货款冲回流水', result.receiptReversalMissing);
+    printPaymentIssues(
+      '钱收了但订单没接住（渠道已确认收款，订单没结算这笔钱）',
+      result.orphanSuccessPayments,
+    );
+    printPaymentIssues(
+      '重复收款（同一订单被收了多笔）',
+      result.duplicateSuccessPayments,
+    );
+    printPaymentIssues('已收款待退款', result.needsRefundPayments);
     console.log(
-      '结论：❌ 流水不完整 —— 先跑 `npm run backfill:ledger`，不要切报表口径',
+      '结论：❌ 账目不完整 —— 流水缺口先跑 `npm run backfill:ledger`；' +
+        '支付单缺口见上方明细，需人工处理（退钱 / 核销）',
     );
     // ⚠️ **有缺口 → 退出码 1**：这道防线要能被 CI / 部署前置检查接住。
     process.exitCode = 1;

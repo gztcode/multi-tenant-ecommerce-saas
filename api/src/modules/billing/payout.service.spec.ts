@@ -265,6 +265,14 @@ function fakePrisma(options: {
   receipts?: ReturnType<typeof receipt>[];
   /** 结算单 */
   statement?: ReturnType<typeof statement> | null;
+  /**
+   * 该期 `commission_entries` 的条数（审计 P0-4）。
+   *
+   * ⚠️ **「无结算单但有抽佣流水」= 超管漏跑结算单 → fail-closed**；
+   * **「无结算单也无流水」= 真零佣金商家（免费套餐不记抽佣流水）→ 放行**。
+   * 假 Prisma 不按 where 过滤，条数由这里配置（默认 0）。
+   */
+  commissionEntryCount?: number;
   /** 已有的出款单（幂等检查） */
   payout?: ReturnType<typeof payout> | null;
   /**
@@ -442,6 +450,10 @@ function fakePrisma(options: {
     commissionEntry: {
       findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
         Promise.resolve([]),
+      ),
+      // ⚠️ 审计 P0-4：`assertStatementConfirmed` 用 count 判断「该期该不该有佣金」
+      count: jest.fn<Promise<number>, [args?: QueryArgs]>(() =>
+        Promise.resolve(options.commissionEntryCount ?? 0),
       ),
     },
     payout: {
@@ -1251,6 +1263,73 @@ describe('审批：必须重算金额（护栏 P5）', () => {
       asPlatform(() => service.approve('payout-a')),
     ).rejects.toBeInstanceOf(ConflictException);
     expect(prisma.payout.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 无结算单的出款口径（审计 P0-4）。
+ *
+ * 「无结算单」有两个截然不同的含义，写路径必须区分：
+ * ① 该期**本该有**佣金（有抽佣流水）但超管漏跑了结算单 → **fail-closed**，
+ *    不能把佣金兜成 0（否则商家按货款全额出款，平台白送佣金）；
+ * ② 该期**真的**零佣金（免费套餐费率 0 不记抽佣流水，结算单生成覆盖不到）→
+ *    **必须放行**，否则零佣金商家永远出不了款。
+ * ⚠️ `CommissionEntry` 只用来判断「该不该有佣金」，佣金数值仍以结算单为准
+ * （结算单是已冻结的凭证，重新聚合会对不上）。
+ */
+describe('无结算单的出款口径（审计 P0-4）', () => {
+  it('apply：该期没有结算单但有抽佣流水 → 409（不能把佣金兜成 0）', async () => {
+    const prisma = fakePrisma({
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+      statement: null,
+      commissionEntryCount: 1,
+    });
+    const service = makeService(prisma);
+
+    await expect(
+      asTenant(async () => service.apply({ period: '2025-07' })),
+    ).rejects.toThrow(
+      new ConflictException('该期（2025-07）的结算单尚未生成，不能申请出款'),
+    );
+  });
+
+  it('apply：没有结算单也没有抽佣流水（真零佣金商家）→ 放行，佣金 0', async () => {
+    const prisma = fakePrisma({
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+      statement: null,
+      commissionEntryCount: 0,
+    });
+    const service = makeService(prisma);
+
+    const view = await asTenant(async () =>
+      service.apply({ period: '2025-07' }),
+    );
+
+    expect(view.commissionAmount).toBe(0);
+    expect(view.netAmount).toBe(view.receiptAmount);
+  });
+
+  it('approve：该期没有结算单但有抽佣流水 → 409（审批同样不能兜 0）', async () => {
+    const prisma = fakePrisma({
+      payout: payout({ kind: PayoutKind.NORMAL }),
+      statement: null,
+      commissionEntryCount: 1,
+      receipts: [receipt({ id: 'r-1', amount: 10000 })],
+    });
+    const service = makeService(
+      prisma,
+      fakeQueues(),
+      fakeVerification(),
+      fakeRegistry({ enabled: ['channel-a'] }),
+      fakePlatformSettings('channel-a'),
+    );
+
+    await expect(
+      asPlatform(async () => service.approve('payout-a')),
+    ).rejects.toThrow(
+      // ⚠️ 文案沿用既有口径（「尚未确认」分支对 approve 也写「申请出款」）
+      new ConflictException('该期（2025-07）的结算单尚未生成，不能申请出款'),
+    );
   });
 });
 

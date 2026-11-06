@@ -415,8 +415,14 @@ export class ProductsService {
             where: { productId: { in: productIds }, status: 'ACTIVE' },
           });
           for (const sku of skus) {
+            // ⚠️ SET 与 PERCENT 一样要夹 0（审计 P1-2）：DTO 的 value 下限是
+            // @Min(-100)，直接落库会写出负价（Sku.price 无 check 约束），
+            // minPrice 变负后公开列表的价格筛选与排序全乱。
+            // 夹到 0 而不是抛错：与 applyPercent 的「降价 150% → 0 元」语义一致。
             const nextPrice =
-              mode === 'SET' ? value : applyPercent(sku.price, value);
+              mode === 'SET'
+                ? Math.max(0, value)
+                : applyPercent(sku.price, value);
             await tx.sku.updateMany({
               where: { id: sku.id },
               data: { price: nextPrice },

@@ -10,12 +10,12 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { OrderStatus, UserRole } from '@prisma/client';
+import { UserRole } from '@prisma/client';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
-import { toIntOr } from '../../common/http/pagination';
 import { OrderService } from './order.service';
 import { ShipOrderDto } from './dto/ship-order.dto';
+import { MerchantOrderListQueryDto } from './dto/merchant-order-list-query.dto';
 
 /**
  * 商家侧的订单接口。
@@ -49,19 +49,15 @@ export class MerchantOrderController {
 
   @Get()
   @ApiOperation({ summary: '订单列表（按状态 / 时间筛选）' })
-  async list(
-    @Query('status') status?: OrderStatus,
-    @Query('from') from?: string,
-    @Query('to') to?: string,
-    @Query('page') page?: string,
-    @Query('pageSize') pageSize?: string,
-  ) {
+  // ⚠️ 查询参数走 DTO（而不是裸 `@Query`）：裸参数拿不到校验，
+  // `from=乱码` 会变成 Invalid Date、`status=FOO` 会被 Prisma 拒成 500（审计 P2-5）。
+  async list(@Query() query: MerchantOrderListQueryDto) {
     return this.orderService.listMerchantOrders({
-      status,
-      from: from ? new Date(from) : undefined,
-      to: to ? new Date(to) : undefined,
-      page: toIntOr(page, undefined),
-      pageSize: toIntOr(pageSize, undefined),
+      status: query.status,
+      from: query.from,
+      to: query.to,
+      page: query.page,
+      pageSize: query.pageSize,
     });
   }
 

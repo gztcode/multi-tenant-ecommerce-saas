@@ -1,5 +1,11 @@
 import { OrderStatus } from '@prisma/client';
-import { ORDER_TRANSITIONS, canTransition, isTerminal } from './order-status';
+import {
+  ORDER_TRANSITIONS,
+  SETTLED_ORDER_STATUSES,
+  canTransition,
+  isSettled,
+  isTerminal,
+} from './order-status';
 
 /**
  * 订单状态机的**转移表**本身要有独立覆盖（阶段 3 验收 G5）。
@@ -176,5 +182,34 @@ describe('订单状态机转移表', () => {
     expect(canTransition(OrderStatus.COMPLETED, OrderStatus.COMPLETED)).toBe(
       false,
     );
+  });
+});
+
+/**
+ * 「钱有没有结算进订单」（2026-11-05 审计 P0-3）。
+ *
+ * ⚠️ **这个口径被两处共用**：账目自检（`billing/ledger-check.ts`）与
+ *    商家侧「待退款」统计（`order.service.ts`）问的是同一个问题——
+ *    「这笔钱结算进订单了吗」。两处口径必须一致，
+ *    否则自检查出来的缺口与商家看到的待退款会对不上。
+ */
+describe('isSettled：钱有没有结算进订单', () => {
+  it('已支付 / 已发货 / 已完成 = 结算了', () => {
+    expect(isSettled(OrderStatus.PAID)).toBe(true);
+    expect(isSettled(OrderStatus.SHIPPED)).toBe(true);
+    expect(isSettled(OrderStatus.COMPLETED)).toBe(true);
+  });
+
+  it('待支付 / 已取消 / 已关闭 / 已退款 = 没结算', () => {
+    expect(isSettled(OrderStatus.PENDING_PAYMENT)).toBe(false);
+    expect(isSettled(OrderStatus.CANCELLED)).toBe(false);
+    expect(isSettled(OrderStatus.CLOSED)).toBe(false);
+    expect(isSettled(OrderStatus.REFUNDED)).toBe(false);
+  });
+
+  it('⚠️ 判定范围与 `SETTLED_ORDER_STATUSES` 逐字一致', () => {
+    for (const status of ALL_STATUSES) {
+      expect(isSettled(status)).toBe(SETTLED_ORDER_STATUSES.includes(status));
+    }
   });
 });

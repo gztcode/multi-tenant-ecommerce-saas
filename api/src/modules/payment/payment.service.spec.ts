@@ -1,5 +1,5 @@
 import { BadRequestException, ConflictException } from '@nestjs/common';
-import { OrderStatus, PaymentStatus } from '@prisma/client';
+import { OrderStatus, PaymentKind, PaymentStatus } from '@prisma/client';
 import type { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import type { QueueService } from '../queue/queue.service';
 import type { OrderService } from '../order/order.service';
@@ -94,13 +94,17 @@ function prismaMock() {
       updateMany: jest.fn(),
     },
     invoice: { findFirst: jest.fn() },
-    order: { findMany: jest.fn() },
+    // ⚠️ `findFirst` 是退款落账时读「订单当前状态」用的
+    //    （事务内判断该不该做订单级动作，审计 P0-3 / P1-3）
+    order: { findMany: jest.fn(), findFirst: jest.fn() },
     paymentWebhookEvent: {
       create: jest.fn(),
       updateMany: jest.fn(),
       findFirst: jest.fn(),
     },
     $transaction: jest.fn(),
+    // ⚠️ 事务里的 `now()` 走 tx 的原生 SQL（不走租户扩展）
+    $queryRaw: jest.fn(),
     databaseNow: jest.fn(),
   };
 }
@@ -135,7 +139,7 @@ function buildService(
     new PaymentProviderRegistry([providerInstance]),
   );
 
-  return { service, orderService, commission, receipt };
+  return { service, orderService, inventory, commission, receipt };
 }
 
 /** 捕获被抛出的异常（单次调用，不断言两次） */
@@ -213,6 +217,8 @@ describe('PaymentService 能力门控（阶段 6a）', () => {
       const prisma = prismaMock();
       const { service, orderService } = buildService(fake, prisma);
       prisma.order.findMany.mockResolvedValue([paidOrder()]);
+      // 退款落账时会在事务内读一次订单的当前状态（判该不该做订单级动作）
+      prisma.order.findFirst.mockResolvedValue({ status: OrderStatus.PAID });
       prisma.payment.findMany.mockResolvedValue([successPayment()]);
       // 抢闸门的条件更新命中
       prisma.payment.updateMany.mockResolvedValue({ count: 1 });
@@ -305,6 +311,9 @@ describe('PaymentService 退款状态机（阶段 6c）', () => {
     const prisma = prismaMock();
     const built = buildService(fake, prisma);
     prisma.order.findMany.mockResolvedValue([paidOrder()]);
+    // ⚠️ 退款落账时会在事务内读一次订单的**当前状态**
+    //    （判「该不该做订单级动作」）。默认是一张已付款的订单。
+    prisma.order.findFirst.mockResolvedValue({ status: OrderStatus.PAID });
     prisma.payment.findMany.mockResolvedValue([successPayment()]);
     prisma.payment.updateMany.mockResolvedValue({ count: 1 });
     prisma.databaseNow.mockResolvedValue(new Date('2026-11-02T00:00:00Z'));
@@ -322,8 +331,10 @@ describe('PaymentService 退款状态机（阶段 6c）', () => {
     await service.refund('SO-1', '测试退款');
 
     const claim = updateCalls(prisma)[0];
+    // ⚠️ **闸门要能抢 `SUCCESS` 与 `NEEDS_REFUND` 两种**：
+    //    后者是「钱收了但订单没接住」的支付单（审计 P0-3），正是商家要退的那笔。
     expect(claim.where).toMatchObject({
-      status: PaymentStatus.SUCCESS,
+      status: { in: [PaymentStatus.SUCCESS, PaymentStatus.NEEDS_REFUND] },
       refundAttemptCount: { lt: 3 },
     });
     expect(claim.data?.status).toBe(PaymentStatus.REFUNDING);
@@ -432,10 +443,26 @@ describe('PaymentService 退款状态机（阶段 6c）', () => {
       .mockResolvedValueOnce({ count: 1 })
       .mockResolvedValue({ count: 0 });
     prisma.payment.findMany.mockImplementation(
-      (arg: { where?: { status?: unknown } }) =>
-        arg?.where?.status === PaymentStatus.SUCCESS
-          ? [successPayment()]
-          : [{ status: PaymentStatus.REFUNDING, refundAttemptCount: 1 }],
+      (arg: { where?: { id?: unknown; status?: unknown } }) => {
+        const where = arg?.where ?? {};
+        // 抢闸门冲突时要按 id 回读那一笔的状态
+        if (where.id !== undefined) {
+          return [
+            {
+              id: 'payment-1',
+              status: PaymentStatus.SUCCESS,
+              refundAttemptCount: 1,
+            },
+          ];
+        }
+        // ⚠️ 候选查询用 `status: { in: [...] }`，
+        //    「是否已在退款中」用 `status: REFUNDING`
+        const status = where.status as { in?: unknown[] } | undefined;
+        if (status && Array.isArray(status.in)) {
+          return [successPayment()];
+        }
+        return [{ status: PaymentStatus.REFUNDING, refundAttemptCount: 1 }];
+      },
     );
 
     const [first, second] = await Promise.allSettled([
@@ -454,10 +481,24 @@ describe('PaymentService 退款状态机（阶段 6c）', () => {
     const { fake, prisma, service } = setup();
     prisma.payment.updateMany.mockResolvedValue({ count: 0 });
     prisma.payment.findMany.mockImplementation(
-      (arg: { where?: { status?: unknown } }) =>
-        arg?.where?.status === PaymentStatus.SUCCESS
-          ? [successPayment()]
-          : [{ status: PaymentStatus.SUCCESS, refundAttemptCount: 3 }],
+      (arg: { where?: { id?: unknown; status?: unknown } }) => {
+        const where = arg?.where ?? {};
+        // 抢闸门冲突时要按 id 回读那一笔的状态
+        if (where.id !== undefined) {
+          return [
+            {
+              id: 'payment-1',
+              status: PaymentStatus.SUCCESS,
+              refundAttemptCount: 3,
+            },
+          ];
+        }
+        const status = where.status as { in?: unknown[] } | undefined;
+        if (status && Array.isArray(status.in)) {
+          return [successPayment()];
+        }
+        return [];
+      },
     );
 
     const error = await catchError(() => service.refund('SO-1', '测试退款'));
@@ -836,5 +877,554 @@ describe('渠道交易号绑定（阶段 8b）', () => {
       attach({ id: 'order-1', orderNo: 'SO-1' }, event()),
     ).resolves.toBe(false);
     expect(prisma.payment.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 支付事件应用（消费端复核，审计 P0-6）。
+ *
+ * ⚠️ **这里模拟的是「能写 Redis 的人」**：他可以改写队列任务里的金额。
+ *    消费端必须**从订单反查应付金额**（②），并且**只认事件行**（③）。
+ */
+describe('支付事件应用（消费端复核，审计 P0-6）', () => {
+  function paymentEvent(
+    over: Partial<NormalizedWebhookEvent> = {},
+  ): NormalizedWebhookEvent {
+    return {
+      provider: 'fake',
+      channel: 'fake',
+      eventId: 'evt-1',
+      providerTxnId: 'txn-1',
+      referenceNo: 'SO-1',
+      amount: 1000,
+      success: true,
+      eventType: 'PAYMENT',
+      ...over,
+    };
+  }
+
+  function setupApply() {
+    const prisma = prismaMock();
+    const built = buildService(provider('fake', FAKE_CAPABILITIES), prisma);
+    prisma.order.findMany.mockResolvedValue([paidOrder()]);
+    prisma.payment.findFirst.mockResolvedValue(null);
+    prisma.payment.updateMany.mockResolvedValue({ count: 1 });
+    prisma.$transaction.mockImplementation(
+      (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
+    );
+    prisma.$queryRaw.mockResolvedValue([
+      { now: new Date('2026-11-02T00:00:00Z') },
+    ]);
+    built.orderService.transitionInTx.mockResolvedValue(true);
+    return { prisma, ...built };
+  }
+
+  it('金额与订单应付额不符 → 不流转（不进事务、不动支付单）', async () => {
+    const { prisma, service, orderService } = setupApply();
+
+    await service.applyEvent(paymentEvent({ amount: 1 }), TENANT_ID);
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.payment.updateMany).not.toHaveBeenCalled();
+    expect(orderService.transitionInTx).not.toHaveBeenCalled();
+  });
+
+  it('金额与订单应付额一致 → 正常流转（对照组）', async () => {
+    const { prisma, service, orderService } = setupApply();
+
+    await service.applyEvent(paymentEvent(), TENANT_ID);
+
+    expect(prisma.$transaction).toHaveBeenCalled();
+    expect(orderService.transitionInTx).toHaveBeenCalled();
+  });
+
+  describe('loadRegisteredEvent（复核事件行）', () => {
+    it('没有这张事件行 → null（这个任务不生效）', async () => {
+      const { prisma, service } = setupApply();
+      prisma.paymentWebhookEvent.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.loadRegisteredEvent('fake', 'evt-1'),
+      ).resolves.toBeNull();
+    });
+
+    it('有事件行 → 用**行里的内容**还原事件（金额取自行，不取任务）', async () => {
+      const { prisma, service } = setupApply();
+      prisma.paymentWebhookEvent.findFirst.mockResolvedValue({
+        provider: 'fake',
+        eventId: 'evt-1',
+        providerTxnId: 'txn-1',
+        kind: PaymentKind.ORDER,
+        payload: {
+          channel: 'fake',
+          referenceNo: 'SO-1',
+          amount: 1000,
+          success: true,
+        },
+      });
+
+      const loaded = await service.loadRegisteredEvent('fake', 'evt-1');
+
+      expect(loaded?.event.amount).toBe(1000);
+      expect(loaded?.event.referenceNo).toBe('SO-1');
+      expect(loaded?.kind).toBe(PaymentKind.ORDER);
+      // ⚠️ 只认「还没处理完」的行
+      expect(prisma.paymentWebhookEvent.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            provider: 'fake',
+            eventId: 'evt-1',
+            processedAt: null,
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('行里的 payload 结构不对 → null', async () => {
+      const { prisma, service } = setupApply();
+      prisma.paymentWebhookEvent.findFirst.mockResolvedValue({
+        provider: 'fake',
+        eventId: 'evt-1',
+        providerTxnId: null,
+        kind: PaymentKind.ORDER,
+        payload: { channel: 'fake' },
+      });
+
+      await expect(
+        service.loadRegisteredEvent('fake', 'evt-1'),
+      ).resolves.toBeNull();
+    });
+  });
+});
+
+/**
+ * 支付回调的状态机分流（2026-11-05 审计 P0-3 / P1-3）。
+ *
+ * ⚠️ **这里守的是「钱收了但订单没接住」**：
+ *    渠道回调确认收款时，订单可能已经不是「待支付」
+ *    （超时关闭 / 消费者取消 / 已被另一渠道先付掉）。
+ *    这时钱**确实收了**，但它**没有结算进订单**——
+ *    落成 `NEEDS_REFUND`（已收款待退款），让商家在系统内能把它退掉。
+ *
+ * ⚠️ **绝不回滚**：回滚会把「钱已经收了」这个事实抹掉，
+ *    而事件又会被标记成已处理 → 补偿扫描再也救不回来。
+ */
+describe('支付回调分流：钱收了但订单没接住（审计 P0-3 / P1-3）', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalEnabled = process.env.PAYMENT_ENABLED_CHANNELS;
+
+  beforeAll(() => {
+    process.env.NODE_ENV = 'development';
+    process.env.PAYMENT_ENABLED_CHANNELS = 'fake';
+  });
+
+  afterAll(() => {
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+    if (originalEnabled === undefined) {
+      delete process.env.PAYMENT_ENABLED_CHANNELS;
+    } else {
+      process.env.PAYMENT_ENABLED_CHANNELS = originalEnabled;
+    }
+  });
+
+  /** 一笔已收款的支付单（钱确实收了） */
+  function successPaymentRow() {
+    return {
+      id: 'payment-1',
+      orderId: 'order-1',
+      channel: 'fake',
+      amount: 1000,
+      status: PaymentStatus.SUCCESS,
+    };
+  }
+
+  /**
+   * 装好一个「订单接不住钱」的场景。
+   *
+   * @param orderStatus 订单当前的状态（回调到达时的真实状态）
+   * @param paidCount   置 SUCCESS 那次条件更新命中了几行（1 = 新收款，0 = 重复投递）
+   */
+  function setupUnsettled(orderStatus: OrderStatus, paidCount: number) {
+    const prisma = prismaMock();
+    const built = buildService(provider('fake', FAKE_CAPABILITIES), prisma);
+    prisma.order.findMany.mockResolvedValue([
+      { ...paidOrder(), status: orderStatus },
+    ]);
+    // 事务内读订单的当前状态（判分流文案 + 「这单结没结算过」）
+    prisma.order.findFirst.mockResolvedValue({ status: orderStatus });
+    // ⚠️ 「找已收款的支付单」那次查询要命中；「渠道交易号是否冲突」那次要落空
+    prisma.payment.findFirst.mockImplementation(
+      (arg: { where?: { status?: unknown } }) =>
+        arg?.where?.status === PaymentStatus.SUCCESS
+          ? successPaymentRow()
+          : null,
+    );
+    // 重复投递时那次「查已有支付单」要查到那笔 SUCCESS 的
+    prisma.payment.findMany.mockResolvedValue([successPaymentRow()]);
+    prisma.payment.updateMany.mockImplementation(
+      (arg: { where?: { provider?: unknown; status?: unknown } }) => {
+        // 绑定渠道交易号那次（事务外，带 provider）
+        if (arg?.where?.provider !== undefined) {
+          return { count: 1 };
+        }
+        // ⚠️ 置 SUCCESS 那次（事务内，只按 PENDING 过滤）
+        if (arg?.where?.status === PaymentStatus.PENDING) {
+          return { count: paidCount };
+        }
+        return { count: 1 };
+      },
+    );
+    prisma.$transaction.mockImplementation(
+      (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
+    );
+    prisma.$queryRaw.mockResolvedValue([
+      { now: new Date('2026-11-02T00:00:00Z') },
+    ]);
+    // 订单接不住：条件更新抢不到
+    built.orderService.transitionInTx.mockResolvedValue(false);
+    return { prisma, ...built };
+  }
+
+  function event() {
+    return {
+      provider: 'fake',
+      channel: 'fake',
+      eventId: 'evt-1',
+      providerTxnId: 'txn-1',
+      referenceNo: 'SO-1',
+      amount: 1000,
+      success: true,
+      eventType: 'PAYMENT',
+    } satisfies NormalizedWebhookEvent;
+  }
+
+  /** 全部 `payment.updateMany` 调用的参数 */
+  function updateCalls(prisma: ReturnType<typeof prismaMock>): Array<{
+    where?: Record<string, unknown>;
+    data?: Record<string, unknown>;
+  }> {
+    return (
+      prisma.payment.updateMany.mock.calls as unknown as Array<
+        [{ where?: Record<string, unknown>; data?: Record<string, unknown> }]
+      >
+    ).map(([arg]) => arg);
+  }
+
+  it('订单已超时关闭 + 本次新收款 → 支付单落「已收款待退款」', async () => {
+    const { prisma, service } = setupUnsettled(OrderStatus.CLOSED, 1);
+
+    await service.applyEvent(event(), TENANT_ID);
+
+    expect(
+      updateCalls(prisma).some(
+        (call) =>
+          call.data?.status === PaymentStatus.NEEDS_REFUND &&
+          call.where?.status === PaymentStatus.SUCCESS,
+      ),
+    ).toBe(true);
+  });
+
+  it('⚠️ 订单已被消费者取消 + 本次新收款 → 同样落「已收款待退款」（审计要求覆盖 CANCELLED）', async () => {
+    const { prisma, service } = setupUnsettled(OrderStatus.CANCELLED, 1);
+
+    await service.applyEvent(event(), TENANT_ID);
+
+    expect(
+      updateCalls(prisma).some(
+        (call) =>
+          call.data?.status === PaymentStatus.NEEDS_REFUND &&
+          call.where?.status === PaymentStatus.SUCCESS,
+      ),
+    ).toBe(true);
+  });
+
+  it('⚠️ 订单已被另一渠道付过 + 本次新收款 → 落「已收款待退款」（重复收款）', async () => {
+    const { prisma, service } = setupUnsettled(OrderStatus.PAID, 1);
+
+    await service.applyEvent(event(), TENANT_ID);
+
+    expect(
+      updateCalls(prisma).some(
+        (call) =>
+          call.data?.status === PaymentStatus.NEEDS_REFUND &&
+          call.where?.status === PaymentStatus.SUCCESS,
+      ),
+    ).toBe(true);
+  });
+
+  it('⚠️ 订单没接住 → 一条流水都不能记（没结算过就没有可记的）', async () => {
+    const { service, commission, receipt, inventory } = setupUnsettled(
+      OrderStatus.CLOSED,
+      1,
+    );
+
+    await service.applyEvent(event(), TENANT_ID);
+
+    expect(commission.recordCommissionInTx).toHaveBeenCalledTimes(0);
+    expect(receipt.recordReceiptInTx).toHaveBeenCalledTimes(0);
+    expect(inventory.deductInTx).toHaveBeenCalledTimes(0);
+  });
+
+  it('⚠️ 重复投递（支付单已经是 SUCCESS）→ 不落「已收款待退款」（防误标）', async () => {
+    const { prisma, service } = setupUnsettled(OrderStatus.PAID, 0);
+
+    await service.applyEvent(event(), TENANT_ID);
+
+    expect(
+      updateCalls(prisma).some(
+        (call) => call.data?.status === PaymentStatus.NEEDS_REFUND,
+      ),
+    ).toBe(false);
+  });
+});
+
+/**
+ * 退款路径（2026-11-05 审计 P0-3 补救出口 / P1-3 双渠道）。
+ *
+ * ⚠️ **这里守三件事**：
+ * 1. **P0-3 的补救出口**：订单已关闭 / 已取消，但有一笔「已收款待退款」的钱
+ *    → 商家在系统内能把它退掉（原来只能线下退款或改库）。
+ * 2. **P1-3 的第二笔**：同一个订单被两个渠道各收了一笔
+ *    → 整单退款要**两笔都退**，不能只退 `payments[0]`（那笔随机挑的）。
+ * 3. **第二笔不再卡死**：订单已经是 `REFUNDED` 时退第二笔
+ *    → 只落支付单 `REFUNDED`，**不抛异常**（抛了整笔回滚 → 这笔永远卡在 `REFUNDING`）。
+ */
+describe('退款路径：补救出口与双渠道（审计 P0-3 / P1-3）', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalEnabled = process.env.PAYMENT_ENABLED_CHANNELS;
+
+  beforeAll(() => {
+    process.env.NODE_ENV = 'development';
+    process.env.PAYMENT_ENABLED_CHANNELS = 'fake';
+  });
+
+  afterAll(() => {
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+    if (originalEnabled === undefined) {
+      delete process.env.PAYMENT_ENABLED_CHANNELS;
+    } else {
+      process.env.PAYMENT_ENABLED_CHANNELS = originalEnabled;
+    }
+  });
+
+  function updateCalls(prisma: ReturnType<typeof prismaMock>): Array<{
+    where?: Record<string, unknown>;
+    data?: Record<string, unknown>;
+  }> {
+    return (
+      prisma.payment.updateMany.mock.calls as unknown as Array<
+        [{ where?: Record<string, unknown>; data?: Record<string, unknown> }]
+      >
+    ).map(([arg]) => arg);
+  }
+
+  function setupRefund(orderStatus: OrderStatus) {
+    const fake = provider('fake', FAKE_CAPABILITIES);
+    fake.refund.mockResolvedValue({ status: 'SUCCESS', refundTxnId: 'rt-1' });
+    const prisma = prismaMock();
+    const built = buildService(fake, prisma);
+    prisma.order.findMany.mockResolvedValue([
+      { ...paidOrder(), status: orderStatus },
+    ]);
+    prisma.order.findFirst.mockResolvedValue({ status: orderStatus });
+    prisma.payment.updateMany.mockResolvedValue({ count: 1 });
+    prisma.databaseNow.mockResolvedValue(new Date('2026-11-02T00:00:00Z'));
+    prisma.$transaction.mockImplementation(
+      (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
+    );
+    built.orderService.transitionInTx.mockResolvedValue(true);
+    return { fake, prisma, ...built };
+  }
+
+  it('⚠️ 订单已关闭 + 一笔「已收款待退款」→ 钱退得回去，订单不动、也不记冲回', async () => {
+    const { fake, prisma, service, orderService, commission, receipt } =
+      setupRefund(OrderStatus.CLOSED);
+    prisma.payment.findMany.mockResolvedValue([
+      {
+        id: 'payment-1',
+        orderId: 'order-1',
+        channel: 'fake',
+        amount: 1000,
+        status: PaymentStatus.NEEDS_REFUND,
+      },
+    ]);
+
+    await expect(service.refund('SO-1', '迟到扣款退回')).resolves.toEqual({
+      status: 'REFUNDED',
+    });
+
+    expect(fake.refund).toHaveBeenCalledTimes(1);
+    // ⚠️ **订单是终态，改不了、也不该改**（那单从没结算过，没有可冲回的流水）
+    expect(orderService.transitionInTx).toHaveBeenCalledTimes(0);
+    expect(commission.recordReversalInTx).toHaveBeenCalledTimes(0);
+    expect(receipt.recordReceiptReversalInTx).toHaveBeenCalledTimes(0);
+    expect(
+      updateCalls(prisma).some(
+        (call) => call.data?.status === PaymentStatus.REFUNDED,
+      ),
+    ).toBe(true);
+  });
+
+  it('⚠️ 订单已被消费者取消 → 同样退得回去（审计要求覆盖 CANCELLED 路径）', async () => {
+    const { fake, prisma, service, orderService } = setupRefund(
+      OrderStatus.CANCELLED,
+    );
+    prisma.payment.findMany.mockResolvedValue([
+      {
+        id: 'payment-1',
+        orderId: 'order-1',
+        channel: 'fake',
+        amount: 1000,
+        status: PaymentStatus.NEEDS_REFUND,
+      },
+    ]);
+
+    await expect(service.refund('SO-1', '取消后到账退回')).resolves.toEqual({
+      status: 'REFUNDED',
+    });
+
+    expect(fake.refund).toHaveBeenCalledTimes(1);
+    expect(orderService.transitionInTx).toHaveBeenCalledTimes(0);
+  });
+
+  it('⚠️ 订单已付 + 两笔（结算款 + 另一渠道多收的那笔）→ 两笔都退，冲回只记一次', async () => {
+    const { fake, prisma, service, orderService, commission, receipt } =
+      setupRefund(OrderStatus.PAID);
+    prisma.payment.findMany.mockResolvedValue([
+      {
+        id: 'payment-1',
+        orderId: 'order-1',
+        channel: 'fake',
+        amount: 1000,
+        status: PaymentStatus.SUCCESS,
+      },
+      {
+        id: 'payment-2',
+        orderId: 'order-1',
+        channel: 'fake',
+        amount: 1000,
+        status: PaymentStatus.NEEDS_REFUND,
+      },
+    ]);
+    // ⚠️ 事务内读订单当前状态：第一笔看到的是 PAID（还没退），
+    //    第二笔看到的是 REFUNDED（第一笔已经提交）
+    let reads = 0;
+    prisma.order.findFirst.mockImplementation(() => {
+      reads += 1;
+      return Promise.resolve({
+        status: reads === 1 ? OrderStatus.PAID : OrderStatus.REFUNDED,
+      });
+    });
+
+    await expect(service.refund('SO-1', '整单退款')).resolves.toEqual({
+      status: 'REFUNDED',
+    });
+
+    // ⚠️ **两笔都退**（只退 `payments[0]` 的话另一笔永远退不掉）
+    expect(fake.refund).toHaveBeenCalledTimes(2);
+    // ⚠️ **订单级动作只做一次**（第二笔看到订单已退款 → 跳过，不重复记冲回）
+    expect(orderService.transitionInTx).toHaveBeenCalledTimes(1);
+    expect(commission.recordReversalInTx).toHaveBeenCalledTimes(1);
+    expect(receipt.recordReceiptReversalInTx).toHaveBeenCalledTimes(1);
+  });
+
+  it('⚠️ 订单已经被退过 → 第二笔只落 REFUNDED，不抛异常（不再卡死在 REFUNDING）', async () => {
+    const { fake, prisma, service, orderService, commission } = setupRefund(
+      OrderStatus.REFUNDED,
+    );
+    prisma.payment.findMany.mockResolvedValue([
+      {
+        id: 'payment-2',
+        orderId: 'order-1',
+        channel: 'fake',
+        amount: 1000,
+        status: PaymentStatus.SUCCESS,
+      },
+    ]);
+
+    await expect(service.refund('SO-1', '退残留的一笔')).resolves.toEqual({
+      status: 'REFUNDED',
+    });
+
+    expect(fake.refund).toHaveBeenCalledTimes(1);
+    expect(orderService.transitionInTx).toHaveBeenCalledTimes(0);
+    expect(commission.recordReversalInTx).toHaveBeenCalledTimes(0);
+    expect(
+      updateCalls(prisma).some(
+        (call) => call.data?.status === PaymentStatus.REFUNDED,
+      ),
+    ).toBe(true);
+  });
+
+  it('⚠️ 订单还是已付状态但条件更新抢不到（并发）→ 不抛异常，只落 REFUNDED', async () => {
+    // ⚠️ **这条分支正是 P1-3「第二笔永远卡在 REFUNDING」的根因**：
+    //    老实现在这里抛 ConflictException → 整笔事务回滚 →
+    //    支付单退回 REFUNDING → 这笔钱再也退不掉。
+    const { fake, prisma, service, orderService, commission, receipt } =
+      setupRefund(OrderStatus.PAID);
+    prisma.payment.findMany.mockResolvedValue([
+      {
+        id: 'payment-2',
+        orderId: 'order-1',
+        channel: 'fake',
+        amount: 1000,
+        status: PaymentStatus.SUCCESS,
+      },
+    ]);
+    // 另一笔并发退款已经把这单退掉了 → 条件更新抢不到
+    orderService.transitionInTx.mockResolvedValue(false);
+
+    await expect(service.refund('SO-1', '整单退款')).resolves.toEqual({
+      status: 'REFUNDED',
+    });
+
+    expect(fake.refund).toHaveBeenCalledTimes(1);
+    // ⚠️ **不能抛**：抛了这笔就卡死在 REFUNDING
+    expect(orderService.transitionInTx).toHaveBeenCalledTimes(1);
+    // 订单级动作抢不到 → 不重复记冲回
+    expect(commission.recordReversalInTx).toHaveBeenCalledTimes(0);
+    expect(receipt.recordReceiptReversalInTx).toHaveBeenCalledTimes(0);
+    // 但支付单确实退了
+    expect(
+      updateCalls(prisma).some(
+        (call) => call.data?.status === PaymentStatus.REFUNDED,
+      ),
+    ).toBe(true);
+  });
+
+  it('⚠️ 没有可退款的支付单 → 409，且不调渠道', async () => {
+    const { fake, prisma, service } = setupRefund(OrderStatus.PAID);
+    prisma.payment.findMany.mockResolvedValue([]);
+
+    const error = await catchError(() => service.refund('SO-1', '测试退款'));
+
+    expect(error).toBeInstanceOf(ConflictException);
+    expect(fake.refund).toHaveBeenCalledTimes(0);
+  });
+
+  it('⚠️ 已完成的订单 → 409（退货退款不在本阶段）', async () => {
+    const { fake, prisma, service } = setupRefund(OrderStatus.COMPLETED);
+    prisma.payment.findMany.mockResolvedValue([
+      {
+        id: 'payment-1',
+        orderId: 'order-1',
+        channel: 'fake',
+        amount: 1000,
+        status: PaymentStatus.SUCCESS,
+      },
+    ]);
+
+    const error = await catchError(() => service.refund('SO-1', '测试退款'));
+
+    expect(error).toBeInstanceOf(ConflictException);
+    expect(fake.refund).toHaveBeenCalledTimes(0);
   });
 });

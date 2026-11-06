@@ -23,6 +23,7 @@ import {
 import { RegisterMerchantDto } from './dto/register-merchant.dto';
 import { RegisterCustomerDto } from './dto/register-customer.dto';
 import { LoginDto, LoginScope } from './dto/login.dto';
+import { LoginThrottleService } from './login-throttle.service';
 
 /**
  * 用于在「用户不存在」时也执行一次 argon2 校验，消除登录接口的时序侧信道。
@@ -58,6 +59,7 @@ export class AuthService {
   constructor(
     private readonly prisma: TenantPrismaService,
     private readonly jwt: JwtService,
+    private readonly loginThrottle: LoginThrottleService,
   ) {
     this.graceKey = deriveGraceKey(
       process.env.JWT_SECRET ??
@@ -199,6 +201,12 @@ export class AuthService {
   async login(dto: LoginDto, tenantId?: string | null): Promise<AuthResult> {
     const email = dto.email.toLowerCase();
 
+    // ⚠️ **失败限流按账号**（审计 P2-3）：key 里带 `scope` ——
+    //    同一个邮箱在「商家后台」与「店铺前台」是两个账号，不能互相锁。
+    //    不带租户：换店铺重试也该被算到同一个账号头上。
+    const throttleKey = `${dto.scope}:${email}`;
+    this.loginThrottle.assertNotLocked(throttleKey);
+
     const roleFilter = this.roleFilterFor(dto.scope);
 
     const where: Prisma.UserWhereInput = {
@@ -228,6 +236,10 @@ export class AuthService {
       // 即使用户不存在也走一次 argon2 校验，让「用户不存在」与「密码错误」
       // 的响应时间接近，避免通过时间差枚举已注册邮箱。
       await argon2.verify(DUMMY_PASSWORD_HASH, dto.password);
+      // ⚠️ **账号不存在也要计数**（审计 P2-3）：撞库主要就是在试
+      //    大量**没注册过**的邮箱 —— 那条路径没有行可以落库，
+      //    只能靠这里的失败计数兜住。
+      this.loginThrottle.recordFailure(throttleKey);
       throw new UnauthorizedException('邮箱或密码不正确');
     }
 
@@ -240,12 +252,15 @@ export class AuthService {
         if (candidate.role !== UserRole.PLATFORM_ADMIN && !candidate.tenantId) {
           continue;
         }
+        // 登录成功 → 清掉失败计数（用户改对了密码就不该继续被限）
+        this.loginThrottle.reset(throttleKey);
         return this.issueTokens(candidate);
       }
     }
 
     // 邮箱存在与不存在、以及密码错误，都返回同一句提示，
     // 避免攻击者据此枚举出已注册的邮箱。
+    this.loginThrottle.recordFailure(throttleKey);
     throw new UnauthorizedException('邮箱或密码不正确');
   }
 

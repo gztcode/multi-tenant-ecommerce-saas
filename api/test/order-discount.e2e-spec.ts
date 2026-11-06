@@ -860,6 +860,104 @@ describe('下单优惠与券的预占核销 (e2e)', () => {
   });
 
   // ============================================================
+  // P0-7：一张券被一个用户核销后，其他用户仍能用它
+  // ============================================================
+
+  /**
+   * 审计 P0-7：券的「一券一实例」原本是**按券全局**的 ——
+   * `coupon_redemptions_coupon_active_uniq` 是 `ON ("couponId")`，
+   * `findCandidateCoupons` 排除「已被占住/已用掉」时也没带 `customerId`。
+   *
+   * → 任意一个消费者下单占用后，**全店所有其他消费者**手里的同一张券同时失效：
+   * 明明各自领了（`coupon_claims` 里各有一行），结算页却看不到、显式指定则 409。
+   * 「限 50 张」的券实际只能用 1 张。
+   *
+   * ⚠️ **「一券一实例」不是产品要求，是索引选错了粒度**：
+   * `totalLimit`（总发放份数）、`perUserLimit`（每用户份数）、
+   * `coupon_claims.quantity`（这个用户领了几份）、
+   * 前端「已领 N 张 / 剩余 N 张」——全是**份数**语义。
+   * 正确模型是「一份券给一个用户用一次」，所以唯一索引必须是 `(couponId, customerId)`。
+   */
+  describe('P0-7：券的核销不跨用户波及', () => {
+    it('A 下单占用券后，B 仍能在结算页看到并使用它', async () => {
+      const merchant = await createMerchant(app, prisma);
+      const skuId = await publishSku(merchant.token, '两人各用一张券', 1000);
+      await stockIn(merchant.token, skuId, 20);
+      const a = await registerCustomer(merchant.subdomain);
+      const b = await registerCustomer(merchant.subdomain);
+      const coupon = await createCoupon(merchant.token, {
+        value: 1000,
+        minAmount: 0,
+        totalLimit: 50,
+      });
+      await claimCoupon(a.token, coupon.id);
+      await claimCoupon(b.token, coupon.id);
+
+      // A 先下单占用这张券
+      await placeOrder(a.token, {
+        addressId: await createAddress(a.token),
+        items: [{ skuId, quantity: 1 }],
+        couponId: coupon.id,
+      }).expect(201);
+
+      // ⚠️ **B 的结算页预览里必须还有这张券**
+      // （改之前这里是空的：候选查询没带 customerId，A 一占用就全店失效）
+      const preview = await http(app)
+        .get('/api/v1/coupons/preview?originalAmount=1000')
+        .set('authorization', `Bearer ${b.token}`)
+        .expect(200);
+      const previewCouponIds = (
+        preview.body as { coupons: Array<{ id: string }> }
+      ).coupons.map((c) => c.id);
+      expect(previewCouponIds).toContain(coupon.id);
+
+      // ⚠️ **B 显式指定这张券下单必须成功**（改之前是 409「该券已被使用」）
+      const orderB = await placeOrder(b.token, {
+        addressId: await createAddress(b.token),
+        items: [{ skuId, quantity: 1 }],
+        couponId: coupon.id,
+      }).expect(201);
+      expect(orderBody(orderB).couponId).toBe(coupon.id);
+      expect(orderBody(orderB).totalAmount).toBe(0);
+
+      // ⚠️ 查库：两条核销记录，各属一人
+      const redemptions = await readRedemptions(merchant.tenantId, coupon.id);
+      expect(redemptions).toHaveLength(2);
+      expect(redemptions.every((r) => r.status === 'RESERVED')).toBe(true);
+    });
+
+    it('A 下单占用券后，B 的「我的券」里它仍然可用', async () => {
+      // ⚠️ 前后端口径必须一致：「我的券」说能用，结算页也要能用
+      const merchant = await createMerchant(app, prisma);
+      const skuId = await publishSku(merchant.token, '口径一致的商品', 1000);
+      await stockIn(merchant.token, skuId, 20);
+      const a = await registerCustomer(merchant.subdomain);
+      const b = await registerCustomer(merchant.subdomain);
+      const coupon = await createCoupon(merchant.token, {
+        value: 1000,
+        minAmount: 0,
+      });
+      await claimCoupon(a.token, coupon.id);
+      await claimCoupon(b.token, coupon.id);
+
+      await placeOrder(a.token, {
+        addressId: await createAddress(a.token),
+        items: [{ skuId, quantity: 1 }],
+        couponId: coupon.id,
+      }).expect(201);
+
+      const mineB = await http(app)
+        .get('/api/v1/coupons/mine')
+        .set('authorization', `Bearer ${b.token}`)
+        .expect(200);
+      const itemB = (
+        mineB.body as { items: Array<{ id: string; used: boolean }> }
+      ).items.find((item) => item.id === coupon.id);
+      expect(itemB?.used).toBe(false);
+    });
+  });
+
+  // ============================================================
   // M6：优惠不绕过金额校验
   // ============================================================
 

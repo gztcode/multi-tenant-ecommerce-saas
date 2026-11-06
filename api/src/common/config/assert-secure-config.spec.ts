@@ -1,4 +1,59 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { assertSecureConfig } from './assert-secure-config';
+import { isDevOnlyChannel } from '../channel/channel-config';
+
+/**
+ * ⚠️ **生产基线需要一条「生产可用」的渠道，但今天还没有**：
+ *    `fake` / `sandbox` / `fake-payout` **全部**在 `DEV_ONLY_CHANNELS` 里
+ *    （单一事实来源：`common/channel/channel-config.ts`），
+ *    也就是**现在还没有任何渠道能在生产启用**。
+ *
+ *    所以这里把 `isDevOnlyChannel` 打成桩：默认「谁都不算 devOnly」，
+ *    相当于「接入真实渠道之后的形态」；要验 devOnly 守卫的用例再显式点名。
+ *    不打这个桩的话，「生产环境配了合法渠道 → 启动通过」这条根本没法测：
+ *    每条生产用例都会先撞上 devOnly 那条断言。
+ */
+jest.mock('../channel/channel-config', () => ({
+  __esModule: true,
+  ...jest.requireActual<typeof import('../channel/channel-config')>(
+    '../channel/channel-config',
+  ),
+  isDevOnlyChannel: jest.fn(() => false),
+}));
+
+/** 把点名的那些渠道桩成「仅限非生产环境使用」；其余渠道在生产可用 */
+function stubDevOnlyChannels(...channels: string[]): void {
+  jest
+    .mocked(isDevOnlyChannel)
+    .mockImplementation((_kind, channel) => channels.includes(channel));
+}
+
+/** compose 文件路径（与 `placeholder-secrets.spec.ts` 同一份） */
+const COMPOSE_PATH = join(__dirname, '../../../../infra/docker-compose.yml');
+
+/**
+ * 从 compose 里取某个变量的默认值。
+ *
+ * ⚠️ **这里不写死 compose 的默认 Redis 密码**：写死的话，
+ *    将来谁改了 compose 默认值而守卫没跟上，这个用例还会继续绿
+ *    （测的还是旧值）—— 现取才能在漂移时立刻红。
+ */
+function composeDefault(key: string): string {
+  const content = readFileSync(COMPOSE_PATH, 'utf8');
+  const line = content.match(new RegExp(`^\\s*${key}:\\s*(.+)$`, 'm'));
+  if (!line) throw new Error(`compose 里找不到 ${key}`);
+
+  const raw = line[1].trim();
+  // 兼容 `${VAR:-默认值}`；占位符替换工具偶尔会把 `:-` 显示成 `:`，
+  // 这里一并接受（提取出来的仍必须是真实默认值）。
+  const withDefault = raw.match(/^\$\{[^:}]+:-?([^}]+)\}$/);
+  if (withDefault) return withDefault[1];
+  if (raw.startsWith('${')) {
+    throw new Error(`${key} 没有默认值，守卫覆盖不到`);
+  }
+  return raw;
+}
 
 /**
  * 启动时的配置安全断言（护栏 X11 + 阶段 6a 渠道配置校验）。
@@ -48,6 +103,14 @@ describe('assertSecureConfig', () => {
       'postgresql://ecommerce:real-db-password@postgres:5432/ecommerce?schema=public';
     process.env.REDIS_URL = 'redis://:real-redis-password@redis:6379';
     process.env.MINIO_ROOT_PASSWORD = 'real-minio-password';
+    // ⚠️ **生产基线必须配渠道**（审计 P2-A1）：一个渠道都不配时启动校验放行，
+    //    故障会被推迟到第一笔交易才暴露。基线里配一个**已部署实现**的渠道，
+    //    「不配渠道」由下面的专用用例单独验。
+    //    （`sandbox` 是真实渠道实现；它当前仅限非生产 —— 由上面的桩放开。）
+    process.env.PAYMENT_ENABLED_CHANNELS = 'sandbox';
+    process.env.PAYOUT_ENABLED_CHANNELS = 'sandbox';
+    // 默认「没有渠道是 devOnly」= 假设真实渠道已接入（见文件头说明）。
+    stubDevOnlyChannels();
   });
 
   afterEach(() => {
@@ -86,7 +149,7 @@ describe('assertSecureConfig', () => {
 
   it('生产环境 + PAYMENT_ENABLED_CHANNELS=fake → 抛错并点名变量与渠道', () => {
     process.env.PAYMENT_ENABLED_CHANNELS = 'fake';
-    process.env.PAYOUT_ENABLED_CHANNELS = 'fake-payout';
+    stubDevOnlyChannels('fake');
 
     expect(() => assertSecureConfig()).toThrow(
       /PAYMENT_ENABLED_CHANNELS.*fake/,
@@ -94,7 +157,10 @@ describe('assertSecureConfig', () => {
   });
 
   it('生产环境 + PAYOUT_ENABLED_CHANNELS=sandbox → 抛错并点名变量与渠道', () => {
+    // ⚠️ 支付渠道要留在「生产可用」的那一边，否则会先撞上支付那条断言。
+    process.env.PAYMENT_ENABLED_CHANNELS = 'fake';
     process.env.PAYOUT_ENABLED_CHANNELS = 'sandbox';
+    stubDevOnlyChannels('sandbox');
 
     expect(() => assertSecureConfig()).toThrow(
       /PAYOUT_ENABLED_CHANNELS.*sandbox/,
@@ -107,6 +173,27 @@ describe('assertSecureConfig', () => {
     expect(() => assertSecureConfig()).toThrow(
       /PAYOUT_PLATFORM_DEFAULT_CHANNEL.*not-registered/,
     );
+  });
+
+  it('生产环境一个渠道都不配 → 拒绝启动（审计 P2-A1）', () => {
+    delete process.env.PAYMENT_ENABLED_CHANNELS;
+    delete process.env.PAYOUT_ENABLED_CHANNELS;
+
+    expect(() => assertSecureConfig()).toThrow(/PAYMENT_ENABLED_CHANNELS/);
+  });
+
+  it('生产环境只配支付渠道、没配出款渠道 → 拒绝启动（审计 P2-A1）', () => {
+    delete process.env.PAYOUT_ENABLED_CHANNELS;
+
+    expect(() => assertSecureConfig()).toThrow(/PAYOUT_ENABLED_CHANNELS/);
+  });
+
+  it('生产环境 + REDIS_URL 用 compose 默认密码 → 拒绝启动（审计 P0-5）', () => {
+    process.env.REDIS_URL = `redis://:${composeDefault(
+      'REDIS_PASSWORD',
+    )}@redis:6379`;
+
+    expect(() => assertSecureConfig()).toThrow(/Redis/);
   });
 
   it('非生产环境不设任何渠道变量 → 默认 fake / fake-payout，正常返回', () => {

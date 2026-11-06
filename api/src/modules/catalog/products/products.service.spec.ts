@@ -109,3 +109,82 @@ describe('ProductsService.setMedia（批量化）', () => {
     expect(updateMany).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * 批量改价（P1-2）：SET 模式必须把负值夹到 0。
+ *
+ * DTO 注释写「SET 模式非负由 service 层夹」——但实现曾直接用 `value`，
+ * 负价会写进库（Sku.price 无 check 约束），minPrice 变负后公开列表的
+ * 价格筛选与排序全乱。PERCENT 侧由 applyPercent 内部夹 0，这里补 SET 侧。
+ */
+describe('ProductsService.batch · ADJUST_PRICE', () => {
+  function fakeBatchPrisma(skus: Array<{ id: string; price: number }>) {
+    const skuUpdateMany = jest.fn().mockResolvedValue({ count: skus.length });
+    const tx = {
+      product: { findMany: jest.fn().mockResolvedValue([{ id: 'p1' }]) },
+      productUpdateMany: jest.fn(),
+      sku: {
+        findMany: jest.fn().mockResolvedValue(skus),
+        updateMany: skuUpdateMany,
+      },
+    };
+    const prisma = {
+      $transaction: jest.fn(async (cb: (t: unknown) => Promise<unknown>) =>
+        cb(tx),
+      ),
+    };
+    const minPrice = { recalculate: jest.fn().mockResolvedValue(undefined) };
+    return { prisma, tx, skuUpdateMany, minPrice };
+  }
+
+  function makeBatchService(
+    prisma: unknown,
+    minPrice: { recalculate: jest.Mock },
+  ): ProductsService {
+    return new ProductsService(prisma as never, minPrice, {} as QuotaService);
+  }
+
+  it('SET 模式传负值时夹到 0 落库，而不是写进负价', async () => {
+    const { prisma, skuUpdateMany, minPrice } = fakeBatchPrisma([
+      { id: 's1', price: 100 },
+    ]);
+    const service = makeBatchService(prisma, minPrice);
+
+    await runForTenant(() =>
+      service.batch({
+        ids: ['p1'],
+        action: 'ADJUST_PRICE',
+        mode: 'SET',
+        value: -5,
+      }),
+    );
+
+    expect(skuUpdateMany).toHaveBeenCalledWith({
+      where: { id: 's1' },
+      data: { price: 0 },
+    });
+    expect(minPrice.recalculate).toHaveBeenCalled();
+  });
+
+  it('SET 模式合法正值原样落库（夹零不影响正常路径）', async () => {
+    const { prisma, skuUpdateMany, minPrice } = fakeBatchPrisma([
+      { id: 's1', price: 100 },
+    ]);
+    const service = makeBatchService(prisma, minPrice);
+
+    await runForTenant(() =>
+      service.batch({
+        ids: ['p1'],
+        action: 'ADJUST_PRICE',
+        mode: 'SET',
+        value: 2500,
+      }),
+    );
+
+    expect(skuUpdateMany).toHaveBeenCalledWith({
+      where: { id: 's1' },
+      data: { price: 2500 },
+    });
+    expect(minPrice.recalculate).toHaveBeenCalled();
+  });
+});

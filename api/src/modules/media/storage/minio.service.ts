@@ -1,17 +1,39 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import {
+  CreateBucketCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadBucketCommand,
   HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { withTimeout } from '../../../common/util/with-timeout';
 
 /** 读 URL 的有效期：1 小时 */
 const READ_URL_TTL_SECONDS = 60 * 60;
 
 const MAX_PRESIGN_TTL_SECONDS = 15 * 60;
+
+/** 启动时确认 bucket 存在的超时（毫秒）。超时只告警，不挡启动。 */
+const BUCKET_CHECK_TIMEOUT_MS = 5_000;
+
+/** 判断是不是「bucket 不存在」（MinIO 返回 404 / NotFound / NoSuchBucket） */
+function isBucketNotFound(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+  const err = error as {
+    name?: string;
+    $metadata?: { httpStatusCode?: number };
+  };
+  return (
+    err.name === 'NotFound' ||
+    err.name === 'NoSuchBucket' ||
+    err.$metadata?.httpStatusCode === 404
+  );
+}
 
 /**
  * MinIO 封装。
@@ -23,6 +45,7 @@ const MAX_PRESIGN_TTL_SECONDS = 15 * 60;
  */
 @Injectable()
 export class MinioService implements OnModuleInit {
+  private readonly logger = new Logger(MinioService.name);
   private publicClient!: S3Client;
   private internalClient!: S3Client;
   private bucket!: string;
@@ -31,7 +54,7 @@ export class MinioService implements OnModuleInit {
     this.bucket = process.env.MINIO_BUCKET ?? 'ecommerce-media';
   }
 
-  onModuleInit(): void {
+  async onModuleInit(): Promise<void> {
     const region = process.env.MINIO_REGION ?? 'us-east-1';
     const credentials = {
       accessKeyId: process.env.MINIO_ACCESS_KEY ?? 'ecommerce',
@@ -51,6 +74,58 @@ export class MinioService implements OnModuleInit {
       credentials,
       forcePathStyle: true,
     });
+
+    await this.ensureBucket();
+  }
+
+  /**
+   * 确认 bucket 存在，不存在就建一个（审计 P2-7）。
+   *
+   * ⚠️ **全新部署必须能自动建**：MinIO 镜像里没有 `mc`（注释明写），
+   *    compose 也不会建 bucket → 全新卷上「presigned 签发成功、
+   *    但 PUT 返回 404 NoSuchBucket」，媒体表还会留下一堆 PENDING 垃圾行
+   *    （`cleanupOrphans` 只标 ORPHANED，**从不硬删**）。
+   *
+   * ⚠️ **失败不挡启动**：MinIO 暂时不可达时只告警 —— 容器该起来还是要起来
+   *    （健康检查会报 MinIO 不可用），让整个 api 因为对象存储没连上就起不来，
+   *    弊大于利。
+   */
+  async ensureBucket(): Promise<void> {
+    try {
+      await withTimeout(
+        this.internalClient.send(
+          new HeadBucketCommand({ Bucket: this.bucket }),
+        ),
+        BUCKET_CHECK_TIMEOUT_MS,
+        `确认 MinIO bucket ${this.bucket}`,
+      );
+      return;
+    } catch (error) {
+      if (!isBucketNotFound(error)) {
+        // 连不上 / 鉴权失败 / 超时 —— 都不是「bucket 不存在」，不建。
+        this.logger.warn(
+          `确认 MinIO bucket ${this.bucket} 失败（不自动创建）：` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
+    }
+
+    try {
+      await withTimeout(
+        this.internalClient.send(
+          new CreateBucketCommand({ Bucket: this.bucket }),
+        ),
+        BUCKET_CHECK_TIMEOUT_MS,
+        `创建 MinIO bucket ${this.bucket}`,
+      );
+      this.logger.log(`已创建 MinIO bucket：${this.bucket}`);
+    } catch (error) {
+      this.logger.warn(
+        `创建 MinIO bucket ${this.bucket} 失败：` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /** 签发上传用的 presigned PUT URL */

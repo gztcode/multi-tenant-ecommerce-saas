@@ -12,11 +12,13 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
-import { ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
-import { ProductStatus } from '@prisma/client';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { UserRole } from '@prisma/client';
 import { JwtAuthGuard } from '../../auth/jwt-auth.guard';
+import { Roles } from '../../../common/decorators/roles.decorator';
 import { ProductsService } from './products.service';
 import { CreateProductDto } from '../dto/create-product.dto';
+import { ProductListQueryDto } from '../dto/product-list-query.dto';
 import { UpdateProductDto } from '../dto/update-product.dto';
 import { BatchProductsDto } from '../dto/batch-products.dto';
 import { SetProductMediaDto } from '../dto/set-product-media.dto';
@@ -35,6 +37,9 @@ import { SpecMatrixService } from '../specs/spec-matrix.service';
 @ApiTags('products')
 @Controller('catalog/products')
 @UseGuards(JwtAuthGuard)
+// ⚠️ 商家管理端必须挂角色（审计 P1-1）：@Roles 是挂 RolesGuard 的唯一入口，
+// 漏挂 = 消费者令牌可改价/改库存/下架商品。店员 STAFF 是合法商家角色。
+@Roles(UserRole.MERCHANT_OWNER, UserRole.MERCHANT_STAFF)
 export class ProductsController {
   constructor(
     private readonly productsService: ProductsService,
@@ -43,28 +48,15 @@ export class ProductsController {
 
   @Get()
   @ApiOperation({ summary: '商品列表（管理端）' })
-  @ApiQuery({ name: 'page', required: false, type: Number })
-  @ApiQuery({ name: 'pageSize', required: false, type: Number })
-  @ApiQuery({ name: 'keyword', required: false, type: String })
-  @ApiQuery({ name: 'categoryId', required: false, type: String })
-  @ApiQuery({
-    name: 'status',
-    required: false,
-    enum: ['DRAFT', 'PUBLISHED', 'UNPUBLISHED'],
-  })
-  list(
-    @Query('page') page?: string,
-    @Query('pageSize') pageSize?: string,
-    @Query('keyword') keyword?: string,
-    @Query('categoryId') categoryId?: string,
-    @Query('status') status?: ProductStatus,
-  ) {
+  // ⚠️ 查询参数走 DTO（而不是裸 `@Query`）：裸参数拿不到校验，
+  // `page=abc` 会变成 NaN、`status=FOO` 会被 Prisma 拒成 500（审计 P2-5）。
+  list(@Query() query: ProductListQueryDto) {
     return this.productsService.list({
-      page: page ? Number(page) : undefined,
-      pageSize: pageSize ? Number(pageSize) : undefined,
-      keyword,
-      categoryId,
-      status,
+      page: query.page,
+      pageSize: query.pageSize,
+      keyword: query.keyword,
+      categoryId: query.categoryId,
+      status: query.status,
     });
   }
 

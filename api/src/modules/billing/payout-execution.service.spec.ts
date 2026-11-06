@@ -1781,5 +1781,148 @@ describe('PayoutExecutionService', () => {
 
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
+
+    // ---- 闸 ③：明细未被他人占用 ----
+
+    it('⚠️ 闸 ③：明细已被同期的另一个出款单占用 → 拒绝，不动钱', async () => {
+      // ⚠️ **闸 ③ 之前一直零覆盖** —— 这句「疑似重复付款，需人工退款处理」
+      //    只在源码里出现过，从没被断言过。
+      const prisma = fakePrisma(
+        bClassOptions({
+          occupiedEntries: [
+            {
+              entryId: 'entry-1',
+              // ⚠️ **别的出款单** —— 闸 ③ 查的就是「被本单之外的单子占用」的明细
+              payoutId: 'payout-b',
+              payout: {
+                // ⚠️ **同租户 + 同期** —— 闸 ③ 的判定条件（缺一不可）
+                tenantId: 'tenant-a',
+                periodStart: new Date('2025-08-01T00:00:00.000Z'),
+              },
+            },
+          ],
+        }),
+      );
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      const call = service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      await expect(call).rejects.toBeInstanceOf(ConflictException);
+      // ⚠️ **文案必须带「疑似重复付款」的指向** —— 操作员据此判断要人工退款
+      await expect(call).rejects.toThrow(/疑似重复付款，需人工退款处理/);
+
+      // ⚠️ **闸没过就不许动钱** —— 事务压根没开
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      // ⚠️ **`tx` 都没建出来** → `tx.payout.updateMany` / `tx.payoutOperation.create`
+      //    一次都不可能发生 → 钱的状态没被改
+      expect(prisma.tx()).toBeNull();
+    });
+
+    it('⚠️ 闸 ③：只查本单释放出来的明细，且排除本单自己', async () => {
+      const prisma = fakePrisma(bClassOptions());
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      const where = argsOf(prisma.payoutEntry.findMany).where as {
+        entryId: { in: string[] };
+        NOT: { payoutId: string };
+      };
+      expect(where.entryId.in).toEqual(['entry-1', 'entry-2']);
+      // ⚠️ **排除本单自己** —— 否则本单已释放的明细会把自己判成冲突
+      expect(where.NOT.payoutId).toBe('payout-a');
+    });
+
+    it('⚠️ 闸 ③：占用明细属于别的租户 → 不拦，继续往下走', async () => {
+      // ⚠️ **判定条件是「同租户 + 同期」** —— 只满足其一就不算冲突
+      const prisma = fakePrisma(
+        bClassOptions({
+          occupiedEntries: [
+            {
+              entryId: 'entry-1',
+              payoutId: 'payout-b',
+              payout: {
+                // ⚠️ **别的租户** —— 同同期，但不同租户
+                tenantId: 'tenant-b',
+                periodStart: new Date('2025-08-01T00:00:00.000Z'),
+              },
+            },
+          ],
+        }),
+      );
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      const ok = await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      expect(ok).toBe(true);
+      // ⚠️ **闸 ③ 没拦** → 走到后面的闸并完成处置
+      expect(prisma.tx()!.payoutOperation.create).toHaveBeenCalled();
+    });
+
+    it('⚠️ 闸 ③：占用明细属于同期之外 → 不拦，继续往下走', async () => {
+      const prisma = fakePrisma(
+        bClassOptions({
+          occupiedEntries: [
+            {
+              entryId: 'entry-1',
+              payoutId: 'payout-b',
+              payout: {
+                // ⚠️ **同期之外** —— 同租户，但不是一个结算期
+                tenantId: 'tenant-a',
+                periodStart: new Date('2025-09-01T00:00:00.000Z'),
+              },
+            },
+          ],
+        }),
+      );
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      const ok = await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      expect(ok).toBe(true);
+      expect(prisma.tx()!.payoutOperation.create).toHaveBeenCalled();
+    });
+
+    it('⚠️ 撞唯一索引（P2002）→ 翻成 409，文案同时覆盖两个来源', async () => {
+      // ⚠️ **P2002 有两个来源** ——
+      //    ① `payouts_tenantId_period_kind_active_uniq`（商家重新申请了同一期）；
+      //    ② `payout_entries_entryId_key`（明细已被别的出款单占用 = 疑似重复付款）。
+      //    只说 ① 会把 ② 的信号一起掩盖掉。
+      const prisma = fakePrisma(bClassOptions());
+      prisma.$transaction.mockImplementation(() =>
+        Promise.reject(
+          Object.assign(new Error('Unique constraint failed'), {
+            code: 'P2002',
+          }),
+        ),
+      );
+      const service = makeService(prisma, fakeVerification('PAID'));
+
+      const call = service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      await expect(call).rejects.toBeInstanceOf(ConflictException);
+      const err = await call.then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
+      // ⚠️ **两个来源都要在文案里** —— 少了任一条操作员就会误判
+      expect(err?.message).toContain('商家可能已重新申请同一期');
+      expect(err?.message).toContain('疑似重复付款，需人工退款处理');
+    });
   });
 });

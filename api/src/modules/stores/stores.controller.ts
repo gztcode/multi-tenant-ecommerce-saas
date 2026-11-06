@@ -1,8 +1,10 @@
 import { Body, Controller, Get, Param, Patch, UseGuards } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { UserRole } from '@prisma/client';
 import { StoresService } from './stores.service';
 import { UpdateStoreDto } from './dto/update-store.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { Roles } from '../../common/decorators/roles.decorator';
 import { Skip } from '../../common/decorators/skip.decorator';
 
 /**
@@ -27,6 +29,9 @@ export class StoresController {
 
   @Patch('me')
   @UseGuards(JwtAuthGuard)
+  // ⚠️ 商家管理端写操作必须挂角色（审计 P1-1）。GET me 刻意不挂：
+  // 它返回的内容（店名/主题 token）消费者本就能从公开接口看到。
+  @Roles(UserRole.MERCHANT_OWNER, UserRole.MERCHANT_STAFF)
   @ApiOperation({ summary: '更新当前租户的店铺设置' })
   updateMine(@Body() dto: UpdateStoreDto) {
     return this.storesService.updateMine(dto);

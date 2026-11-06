@@ -803,12 +803,20 @@ export class PayoutExecutionService {
           });
         });
       } catch (error) {
-        // ⚠️ **数据库是最后一道兜底** —— 撞部分唯一索引
-        //    `payouts_tenantId_period_kind_active_uniq` 说明商家已经重新申请过
-        //    同一期 → **必须翻成业务错误**，不能让它冒成 500。
+        // ⚠️ **数据库是最后一道兜底** —— P2002 有**两个来源**，都要翻成
+        //    业务错误，不能让它冒成 500：
+        //    ① `payouts_tenantId_period_kind_active_uniq` —— 商家已经重新申请过
+        //       同一期（转 `PAID` 时撞上「同期同类型已有活跃单」）；
+        //    ② `payout_entries_entryId_key` —— **明细已被别的出款单占用**，
+        //       是闸 ③ 的数据库兜底（闸 ③ 放行后，`tx.payoutEntry.createMany`
+        //       复原明细时撞上它）。
+        // ⚠️ **不能只说 ①** —— 把 ② 说成普通的状态冲突，会把「疑似重复付款」
+        //    这个信号一起掩盖掉 → 操作员会误判成一次普通冲突，
+        //    而设计里那句「需人工退款处理」的明确指向就拿不到了。
         if (isUniqueViolation(error)) {
           throw new ConflictException(
-            '出款单状态已变（商家可能已重新申请同一期），无法标记为已付款',
+            '无法标记为已付款：出款单状态已变（商家可能已重新申请同一期），' +
+              '或明细已被别的出款单占用（疑似重复付款，需人工退款处理）',
           );
         }
         throw error;

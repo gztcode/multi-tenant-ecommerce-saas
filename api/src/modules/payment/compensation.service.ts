@@ -10,7 +10,7 @@ import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { OrderTimeoutService } from '../order/order-timeout.service';
 import { QueueService } from '../queue/queue.service';
 import { PaymentService } from './payment.service';
-import { NormalizedWebhookEvent } from './payment-provider.interface';
+import { eventFromRow } from './webhook-event-row';
 
 /** 补偿扫描的周期（毫秒）。默认 10 分钟 */
 const COMPENSATION_INTERVAL_MS = 10 * 60 * 1000;
@@ -128,7 +128,7 @@ export class CompensationService implements OnModuleInit {
     for (const row of rows) {
       // ⚠️ **一条失败不能带倒整轮扫描**
       try {
-        const event = this.eventFromRow(row);
+        const event = eventFromRow(row);
         if (!event) {
           rejected++;
           continue;
@@ -219,69 +219,5 @@ export class CompensationService implements OnModuleInit {
     }
 
     return { scanned: orders.length, released, failed };
-  }
-
-  /**
-   * 从事件行还原出归一化事件。
-   *
-   * ⚠️ **payload 的形状由 `insertEvent` 决定**（`channel` / `referenceNo` /
-   * `amount` / `success`）。字段缺失或类型不对时返回 null ——
-   * 宁可少投一条，也不能把一个**结构不对**的事件投进队列
-   * （消费端会拿到 `amount: undefined`，金额核对必然不过，
-   * 白白在队列里滚一圈）。
-   */
-  private eventFromRow(row: {
-    provider: string;
-    eventId: string;
-    providerTxnId: string | null;
-    payload: unknown;
-  }): NormalizedWebhookEvent | null {
-    if (
-      typeof row.payload !== 'object' ||
-      row.payload === null ||
-      Array.isArray(row.payload)
-    ) {
-      return null;
-    }
-    const payload = row.payload as Record<string, unknown>;
-    const referenceNo = payload.referenceNo;
-    const amount = payload.amount;
-    const success = payload.success;
-    const channel = payload.channel;
-    if (
-      typeof referenceNo !== 'string' ||
-      typeof amount !== 'number' ||
-      typeof success !== 'boolean' ||
-      typeof channel !== 'string'
-    ) {
-      return null;
-    }
-    return {
-      provider: row.provider,
-      channel,
-      eventId: row.eventId,
-      // ⚠️ 事件行的 `providerTxnId` 可空，而归一化事件要求字符串
-      providerTxnId: row.providerTxnId ?? '',
-      referenceNo,
-      amount,
-      success,
-      // ⚠️ **退款事件重放必须带上类型与状态**（阶段 6c）：
-      //    少了它们，退款事件会被当成支付事件重投 —— 查不到订单，
-      //    这笔退款就永远停在 `REFUNDING`。
-      ...(payload.eventType === 'REFUND'
-        ? { eventType: 'REFUND' as const }
-        : {}),
-      ...(typeof payload.refundTxnId === 'string'
-        ? { refundTxnId: payload.refundTxnId }
-        : {}),
-      ...(payload.refundStatus === 'SUCCESS' ||
-      payload.refundStatus === 'FAILED' ||
-      payload.refundStatus === 'PROCESSING'
-        ? { refundStatus: payload.refundStatus }
-        : {}),
-      ...(typeof payload.definitive === 'boolean'
-        ? { definitive: payload.definitive }
-        : {}),
-    };
   }
 }

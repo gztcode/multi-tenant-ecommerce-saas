@@ -51,6 +51,14 @@ export interface MerchantOrder {
   createdAt: string;
   updatedAt: string;
   items?: OrderItem[];
+  /**
+   * 「已收款待退款」的金额合计（整数分）。
+   *
+   * ⚠️ 可选：旧数据与其它端可能没有这个字段，缺省按 0 处理。
+   */
+  pendingRefundAmount?: number;
+  /** 「已收款待退款」的笔数（可选，同上） */
+  pendingRefundCount?: number;
 }
 
 /** 订单状态的中文文案 */
@@ -87,15 +95,25 @@ export const ORDER_STATUS_OPTIONS: Array<{
  * - `SHIPPED` → 可退款（货已发出，仍可退）
  * - `PENDING_PAYMENT` → 都不行（还没收到钱）
  *
+ * ⚠️ **`pendingRefundCount > 0` 时一律可退款**（2026-11-05 审计 P0-3）：
+ *    订单已超时关闭 / 已被消费者取消 / 已被另一渠道先付掉时，
+ *    渠道却确认收到了钱 —— 这笔钱标成了「已收款待退款」，
+ *    订单本身是终态、按状态机退不了，但**商家必须有办法把它退掉**。
+ *    后端 `PaymentService.orderAllowsRefund` 也放行这些状态，两边口径一致。
+ *
  * ⚠️ 这里只是**界面上**的判断，后端还会再判一次。
  * 宁可保守：少显示一个按钮是体验问题，多显示一个按钮是「点了必然报错」。
  */
-export function merchantActions(status: OrderStatus): {
+export function merchantActions(
+  status: OrderStatus,
+  pendingRefundCount = 0,
+): {
   canShip: boolean;
   canRefund: boolean;
 } {
   return {
     canShip: status === 'PAID',
-    canRefund: status === 'PAID' || status === 'SHIPPED',
+    canRefund:
+      status === 'PAID' || status === 'SHIPPED' || pendingRefundCount > 0,
   };
 }

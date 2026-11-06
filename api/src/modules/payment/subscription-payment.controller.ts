@@ -105,9 +105,9 @@ export class SubscriptionPaymentController {
     return { updated: true };
   }
 
-  /** 默认渠道 */
+  /** 默认渠道（只从**已启用**的渠道里挑，审计 P2-A1） */
   private defaultChannel(): string {
-    const channels = this.paymentService.listChannels();
+    const channels = this.paymentService.listEnabledChannels();
     const first = channels[0];
     if (!first) {
       throw new ServiceUnavailableException('没有可用的支付渠道');

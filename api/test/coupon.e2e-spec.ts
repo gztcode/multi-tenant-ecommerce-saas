@@ -843,6 +843,66 @@ describe('优惠券与满减活动 (e2e)', () => {
       expect(sum).toBeLessThanOrEqual(5);
     });
 
+    it('总量闸：一次领的量超过剩余额度 → 409，且计数不变', async () => {
+      const merchant = await createMerchant(app, prisma);
+      const customer = await registerCustomer(merchant.subdomain);
+      const created = await http(app)
+        .post('/api/v1/merchant/coupons')
+        .set('authorization', `Bearer ${merchant.token}`)
+        .send(couponPayload({ totalLimit: 3 }))
+        .expect(201);
+      const couponId = couponBody(created).id;
+
+      // 先领 2 张（还剩 1 份额度）
+      await http(app)
+        .post('/api/v1/coupons/claim')
+        .set('authorization', `Bearer ${customer.token}`)
+        .send({ couponId, quantity: 2 })
+        .expect(200);
+
+      // ⚠️ **剩余 1 份额度，却要领 2 张** → 必须被拒。
+      // 条件写的是「加上本次领取量之后不超过总量」
+      // （`claimedCount <= totalLimit - 本次领取量`），
+      // 只比「当前值 < 总量」的话这次会通过 → claimedCount 变成 4 → 超发。
+      await http(app)
+        .post('/api/v1/coupons/claim')
+        .set('authorization', `Bearer ${customer.token}`)
+        .send({ couponId, quantity: 2 })
+        .expect(409);
+
+      // ⚠️ **被拒的那次不能留下痕迹**：计数停在 2
+      const coupon = await asTenant(merchant.tenantId, () =>
+        prisma.coupon.findFirst({ where: { id: couponId } }),
+      );
+      expect(coupon?.claimedCount).toBe(2);
+    });
+
+    it('总量闸：一次领的量超过总量本身 → 409（限 1 张的券不能一次领 10 张）', async () => {
+      const merchant = await createMerchant(app, prisma);
+      const customer = await registerCustomer(merchant.subdomain);
+      const created = await http(app)
+        .post('/api/v1/merchant/coupons')
+        .set('authorization', `Bearer ${merchant.token}`)
+        .send(couponPayload({ totalLimit: 1 }))
+        .expect(201);
+      const couponId = couponBody(created).id;
+
+      await http(app)
+        .post('/api/v1/coupons/claim')
+        .set('authorization', `Bearer ${customer.token}`)
+        .send({ couponId, quantity: 10 })
+        .expect(409);
+
+      const coupon = await asTenant(merchant.tenantId, () =>
+        prisma.coupon.findFirst({ where: { id: couponId } }),
+      );
+      expect(coupon?.claimedCount).toBe(0);
+      const claims = await asTenant(merchant.tenantId, () =>
+        prisma.couponClaim.findMany({ where: { couponId } }),
+      );
+      expect(claims).toHaveLength(0);
+    });
+
     it('每用户限领：超出 perUserLimit 被拒', async () => {
       const merchant = await createMerchant(app, prisma);
       const customer = await registerCustomer(merchant.subdomain);

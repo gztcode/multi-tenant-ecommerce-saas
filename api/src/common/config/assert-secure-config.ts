@@ -75,6 +75,17 @@ const COMPOSE_DEFAULT_DB_PASSWORD = 'ecommerce';
 const COMPOSE_DEFAULT_MINIO_PASSWORD = 'ecommerce-minio-secret';
 
 /**
+ * docker-compose 内置的默认 Redis 密码。
+ *
+ * ⚠️ **它已经在 git 里**（提交 e6305c2），而远端仓库是 PUBLIC ——
+ *    这个值**零秘密**。生产环境用了它 = 任何能连到 Redis 的人都能读写
+ *    全部队列（`bull:payout` / `bull:billing` / `bull:payment-webhook`）。
+ * ⚠️ 与数据库密码、MinIO 密码同一套判定口径 —— 守卫之间必须一致，
+ *    否则运维会误以为「Redis 也被覆盖了」（此前它只判空）。
+ */
+const COMPOSE_DEFAULT_REDIS_PASSWORD = 'ecommerceRedis163';
+
+/**
  * 生产环境的凭据守卫（阶段 9）。
  *
  * ⚠️ 只检查**本进程能看到的环境变量**：
@@ -98,6 +109,11 @@ function assertProductionCredentials(): void {
   if (!redisPassword) {
     throw new Error(
       '生产环境禁止使用无密码的 Redis：请在 REDIS_URL 中写入密码（redis://:密码@主机:端口）。',
+    );
+  }
+  if (redisPassword === COMPOSE_DEFAULT_REDIS_PASSWORD) {
+    throw new Error(
+      '生产环境禁止使用 docker-compose 内置的默认 Redis 密码：请设置 REDIS_PASSWORD，并同步更新 REDIS_URL。',
     );
   }
 
@@ -228,6 +244,18 @@ function assertChannelConfig(): void {
   if (production) {
     for (const kind of KNOWN_KINDS) {
       const envKey = ENABLED_ENV_KEY[kind];
+      // ⚠️ **一个渠道都不配也要拒绝启动**（审计 P2-A1）：下面那个 devOnly
+      //    检查遍历的是「启用列表」——列表为空时循环一次都不执行 →
+      //    **没有任何断言触发**，生产环境零渠道照样启动。
+      //    运行时是 fail-closed（支付/出款都 409，钱不会出去），
+      //    所以危害不是资损，而是「部署期配置错误被推迟到第一笔交易才暴露」：
+      //    容器起来是健康的、健康检查绿、队列正常消费，看着一切正常。
+      //    → 这里把故障提前到启动期。
+      if (enabledByKind[kind].length === 0) {
+        throw new Error(
+          `生产环境必须配置至少一个 ${kind} 渠道：请设置 ${envKey}。`,
+        );
+      }
       for (const channel of enabledByKind[kind]) {
         // ⚠️ devOnly 名单的**单一事实来源**在 `common/channel/channel-config.ts`
         //    （平台设置服务读的是同一份）—— 这里不要再复制一份。

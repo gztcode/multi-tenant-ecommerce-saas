@@ -24,7 +24,9 @@ export function OrderDetail({ initial }: { initial: MerchantOrder }) {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
-  const actions = merchantActions(initial.status);
+  const actions = merchantActions(initial.status, initial.pendingRefundCount ?? 0);
+  const pendingRefundCount = initial.pendingRefundCount ?? 0;
+  const pendingRefundAmount = initial.pendingRefundAmount ?? 0;
 
   async function ship(event: React.FormEvent) {
     event.preventDefault();
@@ -55,7 +57,11 @@ export function OrderDetail({ initial }: { initial: MerchantOrder }) {
   async function refund() {
     if (
       !confirm(
-        '确定整单退款？\n\n退款只退钱，库存不会自动加回——退货入库是另一套流程。',
+        pendingRefundCount > 0
+          ? `确定退款？\n\n本次会一并退回该订单的待退款 ${formatPrice(
+              pendingRefundAmount,
+            )}。\n\n退款只退钱，库存不会自动加回——退货入库是另一套流程。`
+          : '确定整单退款？\n\n退款只退钱，库存不会自动加回——退货入库是另一套流程。',
       )
     ) {
       return;
@@ -126,13 +132,32 @@ export function OrderDetail({ initial }: { initial: MerchantOrder }) {
       {actions.canRefund && (
         <section className="flex flex-col gap-2 rounded-md border p-4">
           <h3 className="font-semibold">退款</h3>
+          {/* ⚠️ 这条提示不能省（2026-11-05 审计 P0-3）：
+              渠道确认收款时订单已经不是「待支付」（已超时关闭 / 已被消费者取消 /
+              已被另一支付渠道先付掉），钱收了但没结算进订单。
+              商家看不到这条就会以为这单压根没收过钱，
+              而钱明明在平台账上等着退。 */}
+          {pendingRefundCount > 0 && (
+            <p
+              data-testid="pending-refund-notice"
+              className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-sm text-destructive"
+            >
+              {`⚠️ 本单有 ${pendingRefundCount} 笔款项已收款但未结算进本单（订单已关闭 / 已取消 / 已被另一支付渠道先付掉），合计 ${formatPrice(
+                pendingRefundAmount,
+              )}。点下面的退款按钮会把这笔待退款退回给买家。`}
+            </p>
+          )}
           <button
             type="button"
             disabled={busy}
             onClick={refund}
             className="self-start rounded-md border border-destructive px-3 py-1.5 text-sm text-destructive disabled:opacity-40"
           >
-            整单退款
+            {/* ⚠️ 有待退款时不能叫「整单退款」：这一下会退两笔
+                （已结算的那笔 + 待退款的那笔），叫法要说清楚。 */}
+            {pendingRefundCount > 0
+              ? `退款（含待退款 ${formatPrice(pendingRefundAmount)}）`
+              : '整单退款'}
           </button>
           {/* 这行说明不能省：商家看到「退款后库存没变」会以为系统坏了。
               退款只退钱，库存的回补是「退货入库」那套流程的事（设计 §7.1）。 */}

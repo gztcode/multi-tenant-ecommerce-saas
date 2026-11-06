@@ -354,7 +354,13 @@ export class PayoutService {
         );
       }
       // ⚠️ **补差单允许结算单是 `PAID`**（它不算佣金，结算单只作追溯凭证）
-      this.assertStatementConfirmed(amounts, period.label, { allowPaid: true });
+      await this.assertStatementConfirmed(
+        tenantId,
+        amounts,
+        period,
+        period.label,
+        { allowPaid: true },
+      );
     } else {
       kind = PayoutKind.NORMAL;
       amounts = await this.computeAmounts(tenantId, period);
@@ -370,7 +376,12 @@ export class PayoutService {
         );
       }
       // ⚠️ **正常单的 P3 不放宽** —— 佣金要拿结算单的 `netAmount`
-      this.assertStatementConfirmed(amounts, period.label);
+      await this.assertStatementConfirmed(
+        tenantId,
+        amounts,
+        period,
+        period.label,
+      );
     }
 
     const payoutNo = generatePayoutNo(now);
@@ -571,9 +582,15 @@ export class PayoutService {
 
       // ⚠️ **P3 校验**：补差单允许结算单是 `PAID`（它不算佣金，
       //    结算单只作追溯凭证）；正常单**不放宽**（护栏 P5 / P6 不能失效）。
-      this.assertStatementConfirmed(amounts, periodLabel, {
-        allowPaid: isSupplement,
-      });
+      await this.assertStatementConfirmed(
+        payout.tenantId,
+        amounts,
+        period,
+        periodLabel,
+        {
+          allowPaid: isSupplement,
+        },
+      );
 
       // ⚠️ **重算后必须仍是正的应结金额**（与 `apply` 同款的两道闸）：
       //    申请与审批之间流水可能变了（订单退款冲回、回填补进一笔）。
@@ -1444,6 +1461,20 @@ export class PayoutService {
    * 「可申请周期」列表要照常显示未确认的周期（带 `statementStatus`），
    * 在那里抛异常会把整个列表打成 409。
    *
+   * ⚠️ **「无结算单」≠「佣金 0」**（审计 P0-4，fail-closed）：
+   * 「没有结算单」有两种截然不同的含义，必须用「该期有没有抽佣流水」区分——
+   * - **有流水没结算单** → 超管漏跑了结算单（结算单只能超管手动生成，无定时任务）
+   *   → **409 拒绝**。若把佣金兜成 0，商家会按货款全额出款，平台白送佣金
+   *   （损失 = 佣金率，审批重算还会把这个错值锁进 `APPROVED`，执行层的三道闸
+   *   全是内部自洽校验、拦不住）。
+   * - **没流水** → 真零佣金（免费套餐费率 0 时 `shouldBackfillCommission` 不记流水，
+   *   结算单生成对空流水返回 `empty` → 零佣金商家天然没有结算单）
+   *   → **放行**，佣金就是 0。一律 fail-closed 会误伤零佣金商家。
+   * ⚠️ **`CommissionEntry` 只用来判断「该不该有佣金」，不用来算佣金数值** ——
+   *    数值仍以结算单为准（结算单是已冻结的凭证，重新聚合会对不上，
+   *    与 `computeAmounts` 的既有注释同一口径）。
+   * ⚠️ **必须显式带 `tenantId`**：`approve` 跑在平台作用域下，扩展不附加租户条件。
+   *
    * ⚠️ **`allowPaid` 只给补差路径开**（阶段 5h-2）：
    * 补差单不算佣金（佣金在结算单里一次性扣完），结算单只作追溯凭证 →
    * 允许它对着已 `PAID` 的结算单。
@@ -1452,13 +1483,26 @@ export class PayoutService {
    * 结算单重新算佣金，5h-1 的 P5（审批重算）与 P6（`PAID` 不可取消确认）
    * 会一起失效。`DRAFT` 状态**任何路径都要 409**。
    */
-  private assertStatementConfirmed(
+  private async assertStatementConfirmed(
+    tenantId: string,
     amounts: { statementStatus: SettlementStatus | null },
+    period: { from: Date; to: Date },
     periodLabel: string,
     options: { allowPaid?: boolean } = {},
-  ): void {
+  ): Promise<void> {
     const status = amounts.statementStatus;
-    if (status === null || status === SettlementStatus.CONFIRMED) {
+    if (status === null) {
+      const entries = await this.prisma.commissionEntry.count({
+        where: { tenantId, occurredAt: { gte: period.from, lt: period.to } },
+      });
+      if (entries > 0) {
+        throw new ConflictException(
+          `该期（${periodLabel}）的结算单尚未生成，不能申请出款`,
+        );
+      }
+      return;
+    }
+    if (status === SettlementStatus.CONFIRMED) {
       return;
     }
     if (options.allowPaid && status === SettlementStatus.PAID) {

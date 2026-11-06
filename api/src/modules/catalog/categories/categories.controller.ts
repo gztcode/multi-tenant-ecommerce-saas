@@ -11,7 +11,9 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { UserRole } from '@prisma/client';
 import { JwtAuthGuard } from '../../auth/jwt-auth.guard';
+import { Roles } from '../../../common/decorators/roles.decorator';
 import { CategoriesService } from './categories.service';
 import { CreateCategoryDto } from '../dto/create-category.dto';
 import { UpdateCategoryDto } from '../dto/update-category.dto';
@@ -26,6 +28,8 @@ import { UpdateCategoryDto } from '../dto/update-category.dto';
 @ApiTags('categories')
 @Controller('catalog/categories')
 @UseGuards(JwtAuthGuard)
+// ⚠️ 商家管理端必须挂角色（审计 P1-1），理由同 products.controller。
+@Roles(UserRole.MERCHANT_OWNER, UserRole.MERCHANT_STAFF)
 export class CategoriesController {
   constructor(private readonly categoriesService: CategoriesService) {}
 

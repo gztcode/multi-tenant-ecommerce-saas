@@ -13,6 +13,7 @@ import {
   Order,
   OrderItem,
   OrderStatus,
+  PaymentStatus,
   Prisma,
   ProductStatus,
   SkuStatus,
@@ -29,7 +30,7 @@ import { SubscriptionService } from '../billing/subscription.service';
 import { QuotaService } from '../billing/quota.service';
 import { computeCommission } from '../billing/commission';
 import { OrderInventoryService } from './inventory.service';
-import { canTransition } from './order-status';
+import { canTransition, isSettled } from './order-status';
 import {
   MAX_ORDER_LINES,
   MAX_ORDER_QUANTITY,
@@ -105,8 +106,13 @@ export class OrderService {
    *
    * ## 幂等键的三段式处理（计划 §4.4b 第 1 条）
    *
-   * 两个并发请求带**同一个** `idempotencyKey`：都会查到「不存在」，
-   * 然后都去插入 → 一个撞 `orders_tenant_idempotency_uniq` 的 P2002。
+   * 同一个消费者的两个并发请求带**同一个** `idempotencyKey`：
+   * 都会查到「不存在」，然后都去插入 → 一个撞
+   * `orders_tenant_idempotency_uniq`（`(tenantId, customerId, idempotencyKey)`）
+   * 的 P2002。
+   *
+   * ⚠️ 幂等键按消费者隔离（审计 P0-2）：不同消费者用同一个键各下各的单，
+   * B 不能命中 A 的订单——索引与下面两处查询都带 `customerId`。
    *
    * 正确做法：
    * 1. **事务外**先查一次（快路径，命中直接返回已有订单，不重新扣库存）
@@ -141,6 +147,7 @@ export class OrderService {
     if (dto.idempotencyKey) {
       const existing = await this.findByIdempotencyKey(
         tenantId,
+        owner,
         dto.idempotencyKey,
       );
       if (existing) {
@@ -201,6 +208,7 @@ export class OrderService {
         if (dto.idempotencyKey && isUniqueViolation(error)) {
           const raced = await this.findByIdempotencyKey(
             tenantId,
+            owner,
             dto.idempotencyKey,
           );
           if (raced) {
@@ -678,10 +686,15 @@ export class OrderService {
   /** 按幂等键找订单（租户内） */
   private async findByIdempotencyKey(
     tenantId: string,
+    customerId: string,
     idempotencyKey: string,
   ): Promise<Order | null> {
+    // ⚠️ 幂等键按「租户 + 消费者 + 键」查（审计 P0-2）：幂等键是每个消费者
+    // 各自的，B 用 A 的键不能命中 A 的订单。唯一索引
+    // `orders_tenant_idempotency_uniq` 与这里的 where 保持同一口径——
+    // 只改 where 不改索引，并发时 B 的插入仍撞旧索引 → 重查查不到 → 500。
     return this.prisma.order.findFirst({
-      where: { tenantId, idempotencyKey },
+      where: { tenantId, customerId, idempotencyKey },
     });
   }
 
@@ -991,10 +1004,33 @@ export class OrderService {
     return order;
   }
 
-  /** 按订单号读订单 + 订单项 */
-  async readOrderByNo(
-    orderNo: string,
-  ): Promise<Order & { items: OrderItem[] }> {
+  /**
+   * 按订单号读订单 + 订单项 + 待退款统计。
+   *
+   * ⚠️ `pendingRefundAmount` / `pendingRefundCount` 说的是**「钱已收但订单没接住」**
+   *    的支付单（2026-11-05 审计 P0-3）：订单已超时关闭 / 已被消费者取消 /
+   *    已被另一渠道先付掉，渠道却确认收到了钱。
+   *    这笔钱没结算进订单，商家后台要靠这两个字段**看见它、也能把它退掉**。
+   *
+   * ⚠️ **口径是「钱收了但订单没接住」，不是「支付单的状态是 NEEDS_REFUND」**：
+   *    退款被渠道**明确拒付**时，支付单会被退回 `SUCCESS`
+   *    （`releaseRefundClaim`，闸门放开让商家重试）——
+   *    那时钱依然没收进订单，只看状态的话商家后台的提示会消失，
+   *    P0-3 补的出口自己关上。所以口径按「订单结算了没有」来定：
+   *    - 订单**没**结算（待支付 / 已取消 / 已关闭 / 已退款）
+   *      → 这单上的**任何**已收款支付单都是待退款的钱；
+   *    - 订单**已**结算（已支付 / 已发货 / 已完成）
+   *      → 只有标着「已收款待退款」的才是（另一个渠道也收了钱 = 重复收款）。
+   *
+   * ⚠️ 金额单位是**整数分**（与全仓口径一致），只在展示层换算。
+   */
+  async readOrderByNo(orderNo: string): Promise<
+    Order & {
+      items: OrderItem[];
+      pendingRefundAmount: number;
+      pendingRefundCount: number;
+    }
+  > {
     const order = await this.prisma.order.findFirst({
       where: { orderNo },
       include: { items: true },
@@ -1002,7 +1038,23 @@ export class OrderService {
     if (!order) {
       throw new NotFoundException('订单不存在');
     }
-    return order;
+    // ⚠️ 用 `aggregate` 而不是 `findMany`：只要合计与笔数，别把支付单整行拉出来。
+    //    `aggregate` 已被租户扩展拦截，会自动补上 tenantId 过滤。
+    const pendingRefund = await this.prisma.payment.aggregate({
+      where: {
+        orderId: order.id,
+        status: isSettled(order.status)
+          ? PaymentStatus.NEEDS_REFUND
+          : { in: [PaymentStatus.SUCCESS, PaymentStatus.NEEDS_REFUND] },
+      },
+      _sum: { amount: true },
+      _count: true,
+    });
+    return {
+      ...order,
+      pendingRefundAmount: pendingRefund._sum.amount ?? 0,
+      pendingRefundCount: pendingRefund._count,
+    };
   }
 
   /**
