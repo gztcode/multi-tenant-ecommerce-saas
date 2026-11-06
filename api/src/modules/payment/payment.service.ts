@@ -1063,9 +1063,11 @@ export class PaymentService {
 
   /** 标记事件已处理 */
   async markEventProcessed(event: NormalizedWebhookEvent): Promise<void> {
+    // ⚠️ **落库时刻用数据库时钟**：该字段没有 `@updatedAt` 兜底，
+    // 多副本部署时各机器时钟有偏差，用应用进程时钟会写出不可比的时刻。
     await this.prisma.paymentWebhookEvent.updateMany({
       where: { provider: event.provider, eventId: event.eventId },
-      data: { processedAt: new Date() },
+      data: { processedAt: await this.prisma.databaseNow() },
     });
   }
 

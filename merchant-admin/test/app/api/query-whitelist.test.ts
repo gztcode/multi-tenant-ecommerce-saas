@@ -2,11 +2,12 @@
  * 护栏 6：中转路由的**查询参数**白名单——未知 query 参数不得透传给后端。
  *
  * 与护栏 2（请求体白名单）同族，但走的是另一条路：query 串不是 JSON，
- * 是手写重建的。后端的 DTO 校验只管 body，`@Query` 参数没有
- * `forbidNonWhitelisted`，所以透传未知 query 不会被拒——必须靠这一层拦。
+ * 是手写重建的。已改用查询 DTO 的后端接口开了 `forbidNonWhitelisted`，
+ * 透传未知 query 会被判 400，而那种 400 在界面上只会显示一句没头没尾的
+ * 校验失败；没走 DTO 的接口则会把未知参数静默忽略。两种都得靠这一层挡。
  *
  * 为什么值得测：页面上拼错了筛选参数（比如手滑写成 `catagoryId`），
- * 透传的话后端会静默忽略它，页面看起来「筛选没生效」却查不出原因。
+ * 透传的话要么 400 要么「筛选没生效」却查不出原因。
  * 白名单重建让「这个页面支持哪些筛选」只有一处定义。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -28,6 +29,7 @@ vi.mock('@/lib/api-client', async () => {
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 
+import { GET as inventoryMovementsGet } from '@/app/api/inventory/movements/route';
 import { GET as productsGet } from '@/app/api/products/route';
 
 const mockedAuth = vi.mocked(auth);
@@ -99,5 +101,16 @@ describe('中转路由的查询参数白名单', () => {
     await productsGet(request);
 
     expect(calledPath()).toBe('/catalog/products');
+  });
+
+  it('库存流水只透传 skuId / page / pageSize，未知参数与空值一律丢弃', async () => {
+    const request = new Request(
+      'http://localhost/api/inventory/movements?skuId=sku-1&page=2&pageSize=20&evil=1&keyword=',
+    );
+
+    const response = await inventoryMovementsGet(request);
+
+    expect(response.status).toBe(200);
+    expect(calledPath()).toBe('/inventory/movements?skuId=sku-1&page=2&pageSize=20');
   });
 });

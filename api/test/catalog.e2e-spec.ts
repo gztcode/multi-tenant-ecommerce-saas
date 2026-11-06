@@ -113,6 +113,36 @@ function specMatrixBody(response: { body: unknown }): SpecMatrixResponseBody {
   return response.body as SpecMatrixResponseBody;
 }
 
+/**
+ * 把规格矩阵响应展开成「规格值文本组合 → SKU」的映射。
+ *
+ * ⚠️ **不要按 `skus` 数组的位置取 SKU**：同一事务里创建的多条 SKU
+ * `createdAt` 完全相同，服务端按 `createdAt` 排序返回，顺序并不固定
+ * （全量跑时偶现「红色拿到了蓝色那条的价格」）。SKU 上只挂着 valueId，
+ * 必须借同一个响应里的 `specs` 把 valueId 翻回文本，才能稳定定位。
+ *
+ * ⚠️ 组合键**先排序再拼接**：多维度矩阵里 `specValues` 的顺序不保证与维度一致。
+ */
+function skusByCombo(
+  body: SpecMatrixResponseBody,
+): Map<string, SpecMatrixResponseBody['skus'][number]> {
+  const valueText = new Map<string, string>();
+  for (const spec of body.specs) {
+    for (const value of spec.values) {
+      valueText.set(value.id, value.value);
+    }
+  }
+  return new Map(
+    body.skus.map((sku) => [
+      sku.specValues
+        .map((sv) => valueText.get(sv.valueId))
+        .sort()
+        .join('/'),
+      sku,
+    ]),
+  );
+}
+
 /** 单个 SKU 更新接口的响应体 */
 interface SkuResponseBody {
   id: string;
@@ -1469,13 +1499,24 @@ describe('规格矩阵 (e2e)', () => {
         .expect(200),
     );
 
-    for (const [i, sku] of first.skus.entries()) {
-      await http(app)
-        .patch(`/api/v1/catalog/products/${created.id}/skus/${sku.id}`)
-        .set('authorization', `Bearer ${merchant.token}`)
-        .send({ price: i === 0 ? 8000 : 20000 })
-        .expect(200);
+    // ⚠️ 不能按数组下标定价（见 skusByCombo 的注释）：两条 SKU 在同一事务里创建，
+    // createdAt 相同 → 返回顺序不固定，下标定价会把「红色」定成 20000。
+    const byCombo = skusByCombo(first);
+    const redSku = byCombo.get('红色');
+    const blueSku = byCombo.get('蓝色');
+    if (!redSku || !blueSku) {
+      throw new Error('规格矩阵响应里找不到「红色」或「蓝色」对应的 SKU');
     }
+    await http(app)
+      .patch(`/api/v1/catalog/products/${created.id}/skus/${redSku.id}`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ price: 8000 })
+      .expect(200);
+    await http(app)
+      .patch(`/api/v1/catalog/products/${created.id}/skus/${blueSku.id}`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ price: 20000 })
+      .expect(200);
 
     const priced = productBody(
       await http(app)
@@ -1663,34 +1704,8 @@ describe('规格矩阵 (e2e)', () => {
     const firstBody = specMatrixBody(first);
     expect(firstBody.skus).toHaveLength(2);
 
-    /**
-     * 把 replace 的响应体展开成「组合文本 → SKU」的映射。
-     *
-     * SKU 上只挂着 valueId，要读出「红色/M」这样的可读组合，
-     * 就得用同一个响应里的 specs 去把 valueId 翻回文本——
-     * 否则断言只能对着 uuid 写，一改顺序就失效，也看不出匹配对不对。
-     */
-    const byCombo = (
-      body: SpecMatrixResponseBody,
-    ): Map<string, SpecMatrixResponseBody['skus'][number]> => {
-      const valueText = new Map<string, string>();
-      for (const spec of body.specs) {
-        for (const value of spec.values) {
-          valueText.set(value.id, value.value);
-        }
-      }
-      return new Map(
-        body.skus.map((sku) => [
-          sku.specValues
-            .map((sv) => valueText.get(sv.valueId))
-            .sort()
-            .join('/'),
-          sku,
-        ]),
-      );
-    };
-
-    const before = byCombo(firstBody);
+    // 展开成「组合文本 → SKU」（实现在文件顶部，别再在这里写一份）
+    const before = skusByCombo(firstBody);
     expect([...before.keys()].sort()).toEqual(['M/红色', 'M/蓝色']);
 
     await http(app)
@@ -1723,7 +1738,7 @@ describe('规格矩阵 (e2e)', () => {
 
     const secondBody = specMatrixBody(second);
     expect(secondBody.skus).toHaveLength(4);
-    const after = byCombo(secondBody);
+    const after = skusByCombo(secondBody);
     expect([...after.keys()].sort()).toEqual([
       'L/红色',
       'L/蓝色',
@@ -1765,7 +1780,17 @@ describe('规格矩阵 (e2e)', () => {
 
     const firstBody = specMatrixBody(first);
     expect(firstBody.skus).toHaveLength(2);
-    const [redId, blueId] = firstBody.skus.map((s) => s.id) as [string, string];
+    // ⚠️ 不能按数组位置取 id：这两条 SKU 在同一个事务里创建，createdAt 完全相同，
+    // 服务端按 createdAt 排序返回，顺序并不固定。改为按规格值文本反查 id，
+    // 查不到就让断言明确失败，避免把价格改到错误的那条 SKU 上。
+    const byCombo = skusByCombo(firstBody);
+    const redSku = byCombo.get('红色');
+    const blueSku = byCombo.get('蓝色');
+    if (!redSku || !blueSku) {
+      throw new Error('规格矩阵响应里找不到「红色」或「蓝色」对应的 SKU');
+    }
+    const redId = redSku.id;
+    const blueId = blueSku.id;
 
     // 「红色/M」保留价格，「蓝色/M」置 INACTIVE —— 顺带验证 INACTIVE 不计入 minPrice
     await http(app)

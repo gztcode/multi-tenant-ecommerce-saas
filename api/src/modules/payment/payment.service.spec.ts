@@ -37,6 +37,15 @@ const FAKE_CAPABILITIES: ChannelCapabilities = {
 
 const TENANT_ID = 'tenant-a';
 
+/**
+ * 假 Prisma 的 `databaseNow()` 返回值（与下面几处 `mockResolvedValue` 用的是同一个固定时刻）。
+ *
+ * ⚠️ **必须是固定值，不能写成 `new Date()`**：`markEventProcessed` 若把落库时刻
+ * 改回应用进程时钟，断言 `processedAt` 等于这个固定值就会变红；
+ * 期望值也取 `new Date()` 的话两条路都能过，等于没测。
+ */
+const DATABASE_NOW = new Date('2026-11-02T00:00:00Z');
+
 /** 一条已支付订单（`readOrderByNo` 从 `prisma.order.findMany` 里映射出来） */
 function paidOrder() {
   return {
@@ -105,7 +114,8 @@ function prismaMock() {
     $transaction: jest.fn(),
     // ⚠️ 事务里的 `now()` 走 tx 的原生 SQL（不走租户扩展）
     $queryRaw: jest.fn(),
-    databaseNow: jest.fn(),
+    // 落库时刻一律取库时钟；返回值固定，供断言分辨「用的是库时钟还是 new Date()」
+    databaseNow: jest.fn(() => Promise.resolve(DATABASE_NOW)),
   };
 }
 
@@ -554,7 +564,15 @@ describe('PaymentService 退款状态机（阶段 6c）', () => {
       expect(orderService.transitionInTx).toHaveBeenCalledTimes(1);
       expect(commission.recordReversalInTx).toHaveBeenCalledTimes(1);
       expect(receipt.recordReceiptReversalInTx).toHaveBeenCalledTimes(1);
-      expect(prisma.paymentWebhookEvent.updateMany).toHaveBeenCalled();
+      // ⚠️ **必须断言 data 里的时刻**，只断言「调用过」抓不住 P2-15 那类回退：
+      //    `processedAt: new Date()` 同样会调用到这里，但它写的是应用进程时钟。
+      expect(prisma.paymentWebhookEvent.updateMany).toHaveBeenCalledWith({
+        where: {
+          provider: refundEvent().provider,
+          eventId: refundEvent().eventId,
+        },
+        data: { processedAt: DATABASE_NOW },
+      });
     });
 
     it('REFUNDING + 回调 FAILED + definitive=true → 回退 SUCCESS', async () => {

@@ -20,9 +20,10 @@ const LIST_QUERY_KEYS = ['page', 'pageSize', 'keyword', 'categoryId', 'status'] 
 /**
  * 查询串按白名单重建，而不是原样透传。
  *
- * 后端的 DTO 校验只管 body，@Query 参数没有 forbidNonWhitelisted，
- * 透传未知 query 不会被拒；但透传进来的东西一律丢掉可以让「这个页面到底支持
- * 哪些筛选」只有这一处定义，页面上拼错了也不会悄悄生效。
+ * 已改用查询 DTO 的后端接口（如商品列表、库存流水）开了 `forbidNonWhitelisted`，
+ * 透传未知 query 会被直接判 400，界面上只显示一句没头没尾的校验失败。
+ * 这里按白名单重建，既挡掉这类 400，也让「这个页面到底支持哪些筛选」
+ * 只有这一处定义，页面上拼错了不会悄悄生效。
  */
 export async function GET(request: Request) {
   const session = await auth();
