@@ -2,7 +2,7 @@
 
 > 生成时间：2026-11-05（当日收尾更新）
 > 依据：主控独立核查 + 4 视角 RBAC 复核 + 7 维审计 workflow + 32 条对抗验证
-> 状态：**已按 §六 顺序修完批次 1-10**，进度见 §〇。每条都标注了验证方式与修法方向。
+> 状态：**已按 §六 顺序修完批次 1-11（全部批次）**，进度见 §〇。每条都标注了验证方式与修法方向。
 >
 > **统计**：P0 **6** 条 / P1 **5** 条 / P2 **29** 条（其中 4 条已被对抗验证**推翻或升级**，
 > 实际待修 P2 为 **25** 条）。
@@ -33,7 +33,89 @@
 | 8 | P2-B2 闸 ③ 用例、控制器角色限定静态扫描器、RBAC 注释纠错、对账写路由接线护栏 | `b371bae`、`13bca4f`、`e31e8ae`、`14778d9` | ✅ |
 | 9 | **P0-3 支付回调状态机 + P1-3 双渠道退款** | `80dcc3c`、`474345c` | ✅ |
 | 10 | P2-A4 账目自检补货款冲回检查 | `6f02d30` | ✅ |
-| 11 | P2 各项（P2-9/9b/10 套餐额度、P2-5 三处 500、P2-15 时间戳纪律、P2-A3、P2-1/P2-1b/P2-2 依赖漏洞） | —— | ⬜ 待做 |
+| 11 | P2 各项（P2-9/9b/10 套餐额度、P2-5 三处 500、P2-15 时间戳纪律、P2-A3、P2-1/P2-1b/P2-2 依赖漏洞） | `40e3c54`、`b264ac5`、`ce98ae4`、`1c5d94c`、`3fb8550` | ✅ |
+
+### 批次 11 的实施记录（P2 各项）
+
+**① P2-9 / P2-9b / P2-10 套餐额度（同一条链，5 个文件）**
+
+三处改动必须一起做，少任何一处都不成立：
+
+| 改动 | 文件 | 解决什么 |
+|---|---|---|
+| 额度检查进事务 + **先锁订阅行、再计数** | `api/src/modules/billing/quota.service.ts` | 并发击穿（P2-10） |
+| SKU 计数排除 `INACTIVE` | 同上 | 改规格白吃额度（P2-9b） |
+| 规格矩阵改**写后校验**（`delta = 0`） | `api/src/modules/catalog/specs/spec-matrix.service.ts` | 400 组合击穿 + 击穿后永久锁死（P2-9） |
+| 软删商品时级联软删 SKU | `api/src/modules/catalog/products/products.service.ts` | 软删商品不释放 SKU 额度（P2-9b） |
+
+三个设计取舍（都写进了代码注释，改动前先读）：
+
+1. **光把检查搬进事务不够**。PostgreSQL 默认 READ COMMITTED，两个并发事务各自
+   `count` 拿到同一个旧快照 → 双双放行。必须在计数**之前** `SELECT … FOR UPDATE`。
+   顺序反了等于没锁（单测用 `calls` 数组钉住顺序）。
+2. **锁的是 `subscriptions` 行，不是 `tenants` 的租户行**。租户行会被「插入任何带
+   `tenantId` 的表」时的外键校验隐式加上 `FOR KEY SHARE`，它与 `FOR UPDATE` 冲突：
+   规格替换是「先持租户行锁、再写 SKU」，下单是「先锁 SKU、再插订单（要租户行
+   `KEY SHARE`）」—— 方向相反，正好凑成死锁环。订阅行没有外键引用它。
+3. **规格矩阵用写后校验而不是预测增量**。「替换后到底剩多少个活跃 SKU」走完
+   保留 / 新建 / 置 INACTIVE 才知道，预测增量算不准；写后校验口径唯一，
+   且自动修好「击穿后连缩小矩阵都被拒」的永久锁死。代价是超限时白写一遍再回滚，
+   写入量由 DTO 的 2 × 20 上限兜住。
+
+**② P2-5 三处分页 / 时间参数**（`b264ac5`，8 个文件）
+
+在 **api 侧**加 DTO 校验（不是改前端中转）：`products.controller.ts`、
+`inventory.controller.ts`、`merchant-order.controller.ts` + 三个新 DTO + 新 e2e
+`api/test/query-validation.e2e-spec.ts`。分页用 `@Type(() => Number) + @IsInt + @Min`；
+时间用 `@Type(() => Date) + @IsDate`——**不用 `@IsDateString()`**，它会放过 `20260101`
+这类「看着像日期其实不是」的输入。既有契约 `order.e2e-spec.ts` 相应由 200 改 400。
+
+**③ P2-15 时间戳纪律**（`40e3c54`）：`payment.service.ts` 里建支付单时多余的
+`updatedAt: new Date()` 删掉（`@updatedAt` 由 Prisma 管）。
+
+**④ P2-1 / P2-1b / P2-2 依赖漏洞**（`ce98ae4`，8 个文件）：四个 `package.json` 加
+`overrides`（三端 `@vitest/mocker` / `tinypool` / `postcss` / `body-parser`，
+api `multer` / `body-parser`），四份 lock 重新 install 同步。
+⚠️ **api 的 lock 原来记 `body-parser` 2.3.0、实际装 2.4.0** —— CI 的 `npm ci` 跑的是
+有洞的那版，这就是 P2-2 的实体。结果：三端 high/critical 归零；
+api 剩 3 条 high 全来自 `deepmerge-ts`（经 `@prisma/config`，只影响 prisma CLI），
+**有意不修**（只能升 Prisma 7）。
+⚠️ 本机 `npm audit` 对腾讯镜像报 404，需加 `--registry=https://registry.npmjs.org`。
+
+**⑤ P2-A3 迁移后立即自检**（`3fb8550`）：`scripts/migrate-payout-encryption.ts`
+直接复用启动自检 `PayoutEncryptionSelfCheck`（同一套判定，不另写一份），跑两次：
+写库**前**用当前密钥试解库中已有的密文（解不开 = 密钥不对，中止且一行不写），
+写库**后**再自检一次（失败即非 0 退出码，文案带备份表名与恢复指引）。
+⚠️ **能抓什么要写清**：它挡住「已有密文用密钥 A、这次又拿密钥 B 加密一批」的混合密钥
+事故；**全新库 + 首次迁移 + 密钥配错**两次都拦不住（自己加密自己解密永远自洽），
+仍需人工核对脚本打印的密钥指纹 —— 这是 5j 设计里就承认的残余风险。
+
+**验证**：api e2e 全量 **45 suites / 715 passed**（连跑两次）；新增
+`quota.service.spec.ts` 8 条单测、`billing-quota.e2e-spec.ts` 6 条 e2e；
+改动文件 `npx eslint` 与 `npx tsc --noEmit` 零问题。
+**失败注入四处全部命中**（每次独占执行）：去掉行锁、SKU 计数不排除 INACTIVE、
+去掉规格矩阵额度检查、不级联软删 SKU —— 对应用例分别变红，改回即绿；
+另对迁移脚本注入「自检必失败」，确认退出码为 1 且文案正确。
+
+**踩到的坑（后续改这块的人必看）**：
+
+- **并发 e2e 是概率性的**，不能当唯一证据。第一版用 `Promise.all` 打 4 个 HTTP POST，
+  去掉行锁后仍全绿：HTTP 请求在测试进程里被串行化了。改成直接并发调 service 仍不稳定
+  （临时探针打出 `-t "P2-10"` 单跑是 `0,0,0,0`、全量跑是 `0,1,1,1`）。最终补了一条
+  **确定性命中**用例：手动占住订阅行 → 断言 `products.create` 在 200ms 内不返回。
+  去掉行锁后这条稳定报 `Expected: "waiting" / Received: "settled"`。
+- 并发用例的并发数要**小于连接池**（CI 2 核 → Prisma 默认池 = 5）。
+- **P2-B2 已在批次 8 完成**（闸 ③ 的 4 条用例 + P2002 双来源文案），本批未重复做。
+
+**已报告但本批未动（不在条目范围内，需另行决定）**：
+
+- `merchant-admin/src/app/api/inventory/movements/route.ts` 仍原样透传整个 query string，
+  在 P2-5 的 `forbidNonWhitelisted` 下可能被 api 判 400；
+- `payment.service.ts` 的 `markEventProcessed` 里 `processedAt: new Date()` 是 P2-15 的
+  同类违反点（该字段没有 `@updatedAt` 兜底）；
+- `test/catalog.e2e-spec.ts`「规格减少时多余的 SKU 置为 INACTIVE」用 `skus` 顺序解构 id，
+  同一事务里创建的两个 SKU `createdAt` 相同、排序不确定 → 既有 flake（未修）；
+- `Plan.maxStores` 全仓没有执行点（没有创建店铺的接口），按外科手术式改动未扩范围。
 
 ### 批次 10 的实施记录（P2-A4）
 
@@ -827,10 +909,14 @@
 10. **P2-A4 账目自检补货款冲回检查** —— ✅ 已完成（提交 `6f02d30`，实施记录见 §〇）
    （⚠️ 谓词用 `totalAmount` 不是 `commissionAmount`，否则零佣金订单被误报）
 11. **P2 各项**（含 P2-B2 闸 ③ 用例、P2-15 时间戳纪律、P2-A3 迁移后立即自检）
-    —— 其中 **P2-9 + P2-9b + P2-10 是同一条链**（套餐额度），
+    —— ✅ 全部完成（提交 `40e3c54`、`b264ac5`、`ce98ae4`、`1c5d94c`、`3fb8550`，
+    实施记录见 §〇「批次 11 的实施记录」）。
+    其中 **P2-9 + P2-9b + P2-10 是同一条链**（套餐额度），
     修法：额度检查进事务 + `countUsage` 加可选 `client` 参数 + 排除 INACTIVE + 软删商品级联软删 SKU。
-    **P2-5** 三处 500 修在 **api 侧**（不是前端中转），可直接用仓库现成的 `toIntOr` 与
-    `@IsDateString()` DTO 范式。
+    ⚠️ 落地时补充了两条原条目没写到的：**必须先锁 `subscriptions` 行**（只搬进事务挡不住并发放大），
+    且**不能锁 `tenants` 行**（外键的 `FOR KEY SHARE` 与 `FOR UPDATE` 冲突 → 与下单路径成死锁环）。
+    **P2-5** 三处 500 修在 **api 侧**（不是前端中转）。⚠️ 时间参数用
+    `@Type(() => Date) + @IsDate`，**不是 `@IsDateString()`** —— 后者会放过 `20260101`。
 
 ---
 
