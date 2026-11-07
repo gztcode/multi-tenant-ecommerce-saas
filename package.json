@@ -1,0 +1,22 @@
+{
+  "name": "multi-tenant-ecommerce-saas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "多租户电商 SaaS 平台（monorepo 根，npm workspaces）",
+  "engines": {
+    "node": ">=22 <27",
+    "npm": ">=11"
+  },
+  "workspaces": [
+    "api",
+    "storefront",
+    "merchant-admin",
+    "platform-admin",
+    "packages/frontend-shared"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test:api": "npm test --workspace api",
+    "dev:install": "npm install"
+  }
+}

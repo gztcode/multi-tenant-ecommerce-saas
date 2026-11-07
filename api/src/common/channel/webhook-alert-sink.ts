@@ -1,6 +1,7 @@
 import { Logger } from '@nestjs/common';
 
 import { ChannelAlert, ChannelAlertSink } from './channel-alert';
+import type { ChannelOperation } from './channel-alert';
 
 /** 告警 payload 格式。`generic` 是裸 JSON，`feishu` / `dingtalk` 是各自机器人的文本消息格式 */
 export type WebhookAlertFormat = 'generic' | 'feishu' | 'dingtalk';
@@ -32,21 +33,63 @@ export function renderAlertText(event: ChannelAlert): string {
   return parts.join('\n');
 }
 
-/** 按 `ALERT_WEBHOOK_FORMAT` 渲染请求体 */
+/** 飞书自定义机器人的文本消息（https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot） */
+export interface FeishuAlertPayload {
+  msg_type: 'text';
+  content: { text: string };
+}
+
+/** 钉钉自定义机器人的文本消息（https://open.dingtalk.com/document/robots/custom-robot-access） */
+export interface DingtalkAlertPayload {
+  msgtype: 'text';
+  text: { content: string };
+}
+
+/** 通用接收端：结构化字段 + 文本，各字段语义见 channel-alert.ts */
+export interface GenericAlertPayload {
+  severity: 'critical' | 'warning';
+  channel: string;
+  provider: string;
+  operation: ChannelOperation;
+  referenceNo?: string;
+  attempt?: number;
+  definitive?: boolean;
+  elapsedMs?: number;
+  message: string;
+  text: string;
+}
+
+export type AlertPayload =
+  FeishuAlertPayload | DingtalkAlertPayload | GenericAlertPayload;
+
+/** 按 `ALERT_WEBHOOK_FORMAT` 渲染请求体（重载：调用方传字面量时返回精确形状） */
+export function renderAlertPayload(
+  format: 'feishu',
+  event: ChannelAlert,
+): FeishuAlertPayload;
+export function renderAlertPayload(
+  format: 'dingtalk',
+  event: ChannelAlert,
+): DingtalkAlertPayload;
+export function renderAlertPayload(
+  format: 'generic',
+  event: ChannelAlert,
+): GenericAlertPayload;
 export function renderAlertPayload(
   format: WebhookAlertFormat,
   event: ChannelAlert,
-): Record<string, unknown> {
+): AlertPayload;
+export function renderAlertPayload(
+  format: WebhookAlertFormat,
+  event: ChannelAlert,
+): AlertPayload {
   const text = renderAlertText(event);
   switch (format) {
     case 'feishu':
-      // 飞书自定义机器人：https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot
       return { msg_type: 'text', content: { text } };
     case 'dingtalk':
-      // 钉钉自定义机器人：https://open.dingtalk.com/document/robots/custom-robot-access
       return { msgtype: 'text', text: { content: text } };
     default:
-      // 通用接收端：结构化字段 + 文本，各字段语义见 channel-alert.ts
       return {
         severity: event.definitive === false ? 'critical' : 'warning',
         channel: event.channel,
@@ -144,7 +187,8 @@ export class WebhookAlertSink implements ChannelAlertSink {
       return;
     }
 
-    const payload = renderAlertPayload(this.format, event);
+    // ⚠️ 运行时按变量调用 → 走宽签名（字面量重载只服务测试/静态调用点）
+    const payload: AlertPayload = renderAlertPayload(this.format, event);
     // fire-and-forget：告警失败不影响业务路径
     void this.deliver(key, payload);
   }
@@ -180,10 +224,7 @@ export class WebhookAlertSink implements ChannelAlertSink {
     return true;
   }
 
-  private async deliver(
-    key: string,
-    payload: Record<string, unknown>,
-  ): Promise<void> {
+  private async deliver(key: string, payload: AlertPayload): Promise<void> {
     try {
       const response = await fetch(this.url as string, {
         method: 'POST',

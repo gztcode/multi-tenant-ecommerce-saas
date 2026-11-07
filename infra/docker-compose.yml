@@ -106,8 +106,9 @@ services:
 
   api:
     build:
-      context: ../api
-      dockerfile: Dockerfile
+      # ⚠️ workspaces 之后 context 是仓库根（根 lockfile + api 清单都要进镜像）
+      context: ..
+      dockerfile: api/Dockerfile
     container_name: ecommerce-api
     restart: unless-stopped
     depends_on:
@@ -327,6 +328,7 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-ecommerce}:${POSTGRES_PASSWORD:-ecommerce}@postgres:5432/${POSTGRES_DB:-ecommerce}?schema=public
+    working_dir: /app/api
     command: ['npx', 'prisma', 'migrate', 'deploy']
 
 volumes:

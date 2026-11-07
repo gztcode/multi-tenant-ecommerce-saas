@@ -162,7 +162,7 @@
 | `merchant-admin/` | 商家后台 | 3002 | Next.js 15 + NextAuth v5 + shadcn/ui |
 | `platform-admin/` | 平台超管后台 | 3003 | Next.js 15 + NextAuth v5 + shadcn/ui |
 | `infra/` | 容器编排与网关路由 | 80 | Docker Compose + Nginx |
-| `packages/frontend-shared/` | 三端共享包（`@ecom/frontend-shared`，`file:` 依赖） | —— | TypeScript + zod |
+| `packages/frontend-shared/` | 三端共享包（`@ecom/frontend-shared`，npm workspace） | —— | TypeScript + zod |
 
 ---
 
@@ -200,27 +200,27 @@ cd infra && docker compose up -d
 # 1. 数据库
 cd infra && docker compose up -d postgres redis
 
-# 2. 后端
-cd api
+# 2. 依赖（npm workspaces：仓库根一次装完，含共享包）
 npm install
+
+# 3. 后端
+cd api
 cp .env.example .env
 npm run prisma:deploy     # 应用迁移
 npm run prisma:seed      # 造平台超管 + 示例店铺 + 示例账号（见下）
 npm run start:dev
 
-# 3. 共享包（三端用 file: 依赖它，必须先装它自己的依赖）
-cd packages/frontend-shared && npm install
-
 # 4. 三个前端（各开一个终端）
-cd storefront     && npm install && cp .env.example .env && npm run dev   # :3001
-cd merchant-admin && npm install && cp .env.example .env && npm run dev   # :3002
-cd platform-admin && npm install && cp .env.example .env && npm run dev   # :3003
+cd storefront     && cp .env.example .env && npm run dev   # :3001
+cd merchant-admin && cp .env.example .env && npm run dev   # :3002
+cd platform-admin && cp .env.example .env && npm run dev   # :3003
 ```
 
-> ⚠️ **共享包是 `file:` 依赖**（`"file:../packages/frontend-shared"`）。npm 的
-> `file:` 链接**不会**把被链接包自身的依赖装进端的 `node_modules`，所以
-> `packages/frontend-shared` 必须先单独 `npm install`，否则三端的构建与测试
-> 会报共享包里的 `zod` / `react` 解析不到。CI 的三个前端 job 都有这一步。
+> ⚠️ **npm workspaces**（阶段 11b）：仓库根是一份 lockfile + 一个
+> node_modules（依赖提升），`@ecom/frontend-shared` 以 workspace 符号链接
+> 被三端引用。跑测试/构建用 `npm test --workspace api`、
+> `npm run build --workspace storefront`，或直接进各目录执行原脚本
+> （二进制会沿目录树向上解析到根 node_modules/.bin）。
 
 > Node/npm 基线：Node 22 + npm 11（见仓库根 `.nvmrc`；本机 Node 26 也可用）。
 > CI 与 Docker 镜像统一 npm 11；`package.json` 的 `engines` 只做提示，不作为安装闸。
@@ -464,7 +464,8 @@ node tools/push-via-api-curl.mjs <本地分支> <远端分支>
    （调用点零改动），将来真要清理再单独做。
 3. **共享包独立发布 / 版本化** —— 阶段 8 已把 `session-sync-component.tsx` 改成
    工厂注入（不再依赖各端 `@/lib/session-sync` alias），共享包可独立 `tsc` 并进了 CI；
-   但**尚未**独立发布或独立版本化，仍按 `file:` 依赖使用。
+   阶段 11b 已随 npm workspaces 化改为 workspace 符号链接（不再是 `file:` 依赖），
+   但**尚未**独立发布或独立版本化。
 4. **守卫的 401/403 不进访问日志** —— Nest 的守卫在拦截器链**之外**执行，
    任何全局拦截器都盖不到。（**指标**无此缺口：阶段 11 已把 HTTP 指标
    挪到中间件层，守卫拒绝的请求也能统计到。）

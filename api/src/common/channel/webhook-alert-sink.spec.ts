@@ -42,26 +42,31 @@ describe('renderAlertPayload', () => {
   });
 
   it('definitive 为 true / 未定义时是 warning 而非 critical', () => {
-    expect(renderAlertPayload('generic', { ...baseEvent, definitive: true })['severity']).toBe('warning');
-    expect(renderAlertPayload('generic', { ...baseEvent, definitive: undefined })['severity']).toBe('warning');
+    expect(
+      renderAlertPayload('generic', { ...baseEvent, definitive: true })[
+        'severity'
+      ],
+    ).toBe('warning');
+    expect(
+      renderAlertPayload('generic', { ...baseEvent, definitive: undefined })[
+        'severity'
+      ],
+    ).toBe('warning');
   });
 
-  it('feishu 格式：msg_type=text', () => {
+  it('feishu 格式：msg_type=text，text 含告警全文', () => {
     const payload = renderAlertPayload('feishu', baseEvent);
-    expect(payload).toMatchObject({
-      msg_type: 'text',
-      content: { text: expect.stringContaining('出款提交失败') },
-    });
+    expect(payload.msg_type).toBe('text');
+    expect(payload.content.text).toContain('出款提交失败');
     // 告警文本不允许携带事件对象之外的任何东西（无原始 payload 泄露面）
     expect(Object.keys(payload)).toEqual(['msg_type', 'content']);
   });
 
-  it('dingtalk 格式：msgtype=text', () => {
+  it('dingtalk 格式：msgtype=text，content 含白名单字段', () => {
     const payload = renderAlertPayload('dingtalk', baseEvent);
-    expect(payload).toMatchObject({
-      msgtype: 'text',
-      text: { content: expect.stringContaining('referenceNo=PO-001') },
-    });
+    expect(payload.msgtype).toBe('text');
+    expect(payload.text.content).toContain('referenceNo=PO-001');
+    expect(payload.text.content).toContain('definitive=false');
   });
 
   it('renderAlertText 只渲染白名单字段', () => {
@@ -74,7 +79,14 @@ describe('renderAlertPayload', () => {
 });
 
 describe('WebhookAlertSink', () => {
-  let fetchSpy: jest.SpyInstance;
+  /** fetch 调用参数的显式元组（@types 升级后 global fetch 的 mock.calls 会退化成 any[]） */
+  type FetchCall = [input: string, init: RequestInit];
+  // spy 类型跟随全局 fetch 的真实签名——jest 30 的 SpyInstance 泛型是
+  // 「返回类型 + 参数」，手写函数签名做单泛型会把 mockResolvedValue 推成 never
+  let fetchSpy: jest.SpyInstance<
+    ReturnType<typeof global.fetch>,
+    Parameters<typeof global.fetch>
+  >;
   let warnSpy: jest.SpyInstance;
 
   const makeSink = (overrides?: { url?: string }) =>
@@ -103,11 +115,14 @@ describe('WebhookAlertSink', () => {
     await Promise.resolve();
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchSpy.mock.calls[0];
+    const calls = fetchSpy.mock.calls as unknown as FetchCall[];
+    expect(calls).toHaveLength(1);
+    const [url, init] = calls[0];
     expect(url).toBe('https://hooks.example.com/alert');
-    expect((init as RequestInit).method).toBe('POST');
+    expect(init.method).toBe('POST');
     // generic 是默认格式（renderAlertPayload 的用例已覆盖 feishu/dingtalk）
-    expect(JSON.parse(String((init as RequestInit).body))).toMatchObject({
+    // ⚠️ deliver 只会发 JSON.stringify 后的字符串，断言按 string 收敛
+    expect(JSON.parse(init.body as string)).toMatchObject({
       channel: 'sandbox',
       referenceNo: 'PO-001',
     });

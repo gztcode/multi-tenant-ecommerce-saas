@@ -54,12 +54,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: api/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm install -g npm@11
       - name: Install pg_trgm (迁移需要，service 容器无 init SQL)
         run: docker exec ${{ job.services.postgres.id }} psql -U ecommerce -d ecommerce -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;'
-      - run: npm ci
-        working-directory: api
+      # ⚠️ workspaces：单根 lockfile，只装 api 这个工作区（其余端不装，省时长）
+      - run: npm ci --workspace api
       # ⚠️ 先显式生成 Prisma Client，再类型检查：
       #    npm ci 时 @prisma/client 的 postinstall 可能生成，
       #    但那是隐式行为，干净检出时不能依赖。
@@ -91,14 +91,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: |
-            ${{ matrix.project }}/package-lock.json
-            packages/frontend-shared/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm install -g npm@11
-      - run: npm ci
-        working-directory: packages/frontend-shared
-      - run: npm ci
-        working-directory: ${{ matrix.project }}
+      - run: npm ci --workspace ${{ matrix.project }}
       - run: npx tsc --noEmit
         working-directory: ${{ matrix.project }}
       - run: npm test
@@ -122,10 +117,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: packages/frontend-shared/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm install -g npm@11
-      - run: npm ci
-        working-directory: packages/frontend-shared
+      - run: npm ci --workspace @ecom/frontend-shared
       - run: npx tsc --noEmit
         working-directory: packages/frontend-shared
 
@@ -175,10 +169,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: api/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm install -g npm@11
-      - run: npm ci
-        working-directory: api
+      - run: npm ci --workspace api
       - run: npx prisma generate
         working-directory: api
       # Prisma 会自动创建 ecommerce_test，再装迁移需要的扩展
