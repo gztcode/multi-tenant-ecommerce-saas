@@ -1173,6 +1173,48 @@ describe('认证 (e2e)', () => {
         .send({ refreshToken: body(regB).refreshToken })
         .expect(200);
     });
+
+    it('⚠️ 用一枚不存在的刷新令牌登出，不能把别人的会话一起吊销', async () => {
+      // 回归防护：原来的写法是 `where: { id: stored?.id, revokedAt: null }`。
+      // `stored` 为 null 时条件是 `id: undefined`，而 Prisma 会把值为 undefined
+      // 的过滤键**整个丢掉** → `updateMany` 退化成 `where: { revokedAt: null }`
+      // → 吊销全平台所有用户的未吊销令牌。登出只需要访问令牌，任何登录用户
+      // 传一枚格式合法但不存在的令牌就能把所有人踢下线。
+      const regA = await http(app)
+        .post('/api/v1/auth/register/merchant')
+        .send({
+          email: email(),
+          password: 'Passw0rd123',
+          merchantName: '登出者商家',
+          subdomain: subdomain(),
+          storeName: '登出者店铺',
+        })
+        .expect(201);
+
+      const regB = await http(app)
+        .post('/api/v1/auth/register/merchant')
+        .send({
+          email: email(),
+          password: 'Passw0rd123',
+          merchantName: '旁观者商家',
+          subdomain: subdomain(),
+          storeName: '旁观者店铺',
+        })
+        .expect(201);
+
+      // 令牌不存在时静默成功（不做「这枚令牌存在吗」的预言机）
+      await http(app)
+        .post('/api/v1/auth/logout')
+        .set('Authorization', `Bearer ${body(regA).accessToken}`)
+        .send({ refreshToken: 'x'.repeat(64) })
+        .expect(204);
+
+      // 旁观者的令牌必须仍然能换新令牌
+      await http(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: body(regB).refreshToken })
+        .expect(200);
+    });
   });
 
   describe('跨租户同邮箱登录的确定性', () => {

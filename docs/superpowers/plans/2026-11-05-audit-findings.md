@@ -107,22 +107,42 @@ api 剩 3 条 high 全来自 `deepmerge-ts`（经 `@prisma/config`，只影响 p
 - 并发用例的并发数要**小于连接池**（CI 2 核 → Prisma 默认池 = 5）。
 - **P2-B2 已在批次 8 完成**（闸 ③ 的 4 条用例 + P2002 双来源文案），本批未重复做。
 
-**实施期发现、随后已一并修掉的三项**（批次 11 收尾后追加）：
+**实施期发现、随后已一并修掉的五项**（批次 11 收尾后追加）：
 
 | 事项 | 提交 | 说明 |
 |---|---|---|
 | 库存流水中转原样透传 query | `20a952b` | P2-5 之后该接口开了 `forbidNonWhitelisted`，未知参数会被判 400；改为按白名单重建，测试用完整 URL 精确断言 |
 | `markEventProcessed` 的 `processedAt: new Date()` | `17213f7` | P2-15 的同类违反点；同时补了单测牙齿（原来只断言「调用过」，改回去也不会红） |
 | catalog e2e 按数组下标取 SKU | `56b55ba` | 两处同根因（「规格减少置 INACTIVE」+「重算 minPrice」）：同事务创建的 SKU `createdAt` 相同、返回顺序不固定 |
+| P2-15 的存量时钟（订单 / 认证 / 退款扫描） | `a7c0072` | 见下 |
+| ⚠️ **登出会吊销全平台会话**（新发现，不在原清单里） | `d42115f` | 见下 |
+
+**存量时钟收敛（`a7c0072`）**：`cancelOrder` 的 `cancelledAt`、`shipOrder` 的 `shippedAt`、
+`confirmReceipt` 的 `completedAt`、建单的 `payExpiresAt`、`releaseExpiredOrderInTx` 的 `now`、
+`logout` 的 `revokedAt`、`revokeTokenFamily` 的 `now`、`createRefreshToken` 的 `expiresAt`、
+`scanRefunding` 的默认时间，全部改用库时钟。
+口径：**事务内用 `tx` 的原生 `SELECT now()`**（调 `this.prisma` 会再借一条连接 → P2024），
+事务外用 `databaseNow()`。
+⚠️ **`payExpiresAt` 必须与超时释放的 `now` 一起改**：两者比大小，一个应用时钟一个库时钟，
+支付窗口会整体偏移。复核时正是靠「新注释声称同源、实际只有一侧改了」发现的。
+排除在外（不是落库时刻）：`deletedAt` 软删标记全仓 16 处、`generateOrderNo()` 的日期前缀。
+
+**⚠️ 登出缺陷（`d42115f`，严重度高于本清单剩余全部 P2）**：
+`logout()` 原来写 `where: { id: stored?.id, revokedAt: null }` —— 令牌不存在时
+`id: undefined`，而 **Prisma 会把值为 `undefined` 的过滤键整个丢掉**，
+`updateMany` 退化成 `where: { revokedAt: null }` → **吊销全平台所有用户的未吊销令牌**。
+登出只要访问令牌，任何登录用户传一枚长度合法但不存在的令牌就能把所有人踢下线。
+修法：不存在时直接 `return`（正是原注释写的「静默成功」），并补 e2e：
+A 用不存在的令牌登出后，B 的令牌仍能刷新；失败注入该用例变红。
 
 **仍未动（需另行决定）**：
 
-- `Plan.maxStores` 全仓没有执行点（没有创建店铺的接口），按外科手术式改动未扩范围；
-- `test/cart.e2e-spec.ts`「并发加购同一 SKU 两次」偶发其中一个请求返回 400
-  （实测两次隔离运行里红一次）→ 既有 flake，与本批改动无关，未修；
-- ⚠️ **P2-15 的「全仓唯一一处」表述不准确**（见 §P2-15 条目的更正）：`scanRefunding`
-  的默认参数、`order.service.ts` 的 cancelledAt/shippedAt/completedAt、
-  `auth.service.ts` 的 revokedAt 等都还在用应用进程时钟，属同类问题的存量部分。
+- `Plan.maxStores` 全仓没有执行点（没有创建店铺的接口）。⚠️ **产品已确认要多店铺**，
+  因此额度字段保留，等店铺创建接口落地时再接入执行点；
+- `test/cart.e2e-spec.ts`「并发加购同一 SKU 两次」偶发其中一个请求返回 400。
+  2026-11-07 复跑单用例 6 轮、整文件 4 轮、全量 4 轮**都没能复现**；静态分析也对不上
+  —— `addItem` 只有两处 400（SKU 查不到 / 超过上限 99），在这个用例的数据下都不该发生，
+  全局异常过滤器也不把 P2002 映射成 400。**未定位，保持观察**（临时探针已撤）。
 
 ### 批次 10 的实施记录（P2-A4）
 
@@ -829,7 +849,7 @@ api 剩 3 条 high 全来自 `deepmerge-ts`（经 `@prisma/config`，只影响 p
 | P2-11 | 账单支付单「先查后建」未处理 P2002（⚠️ 对抗验证 agent 因额度未跑，**主控已补核实：成立，级别 low**） | `payment.service.ts:407` | `obtainInvoicePayment`（`:399-445`）是 `findFirst({ invoiceId, channel })` → 查不到就 `create`，**没有 catch P2002**。同文件明明导入了 `isUniqueViolation` 并在 `:225` / `:686` / `:1993` 三处使用，**唯独这里漏了**。两个调用方可并发：`:330` `createInvoicePayment`（商家后台手动补付，HTTP 请求）与 `:506` `chargeAndSettle`（自动续费，BullMQ 定时 job）之间**没有任何互斥**（`:526` 注释自认「单副本假设，跨副本并发扫描未加锁」）→ 并发时双双查空、双双 create，输家撞 `payments_invoice_channel_uniq`（`20261025220000_add_billing_tables/migration.sql:176`）→ 全局过滤器不识别 Prisma 错误 → **500**。<br>**级别 low 的依据（主控核实）**：输家死在 `create`，发生在渠道调用**之前** → **不产生重复扣款、无资损**；赢家照常扣款；商家再点一次就走复用路径（`findFirst` 查到 PENDING/FAILED → 复用）→ **重试即自愈**，属瞬时 500。<br>**修法**：照 `:225` 的样子 catch `isUniqueViolation` → **事务外**重查走复用分支（本仓约定：P2002 必须在事务外处理）。 |
 | P2-12 | README「一键启动」不可用 | `README.md:138`、`infra/docker-compose.yml:119`、`api/Dockerfile:45` | 根因**不只** compose 那一行：`api/Dockerfile:45` 也有 `ENV NODE_ENV=production` → **只删 compose 第 119 行仍会崩**（实测：不给 NODE_ENV，镜像自带 ENV 触发同一报错）。且即使换掉真实 JWT_SECRET / 账目密钥，阶段 9 的 `assertProductionCredentials()` 仍会因 compose 默认 Postgres / MinIO 密码拒绝启动 → **「compose 默认值集合 + production」整体不兼容**，要真跑通必须同时提供 DB/Redis/MinIO 凭据 + 真实 JWT 密钥 |
 | P2-13 | 文档口径过时（AGENTS.md + README） | `AGENTS.md:217`、`README.md:461` | **AGENTS.md**：「三个前端没有共享包」与第 17-23、62 行矛盾。**README**：「阶段 4 验收发现的下一阶段优先项」第 1 条「给轮换后的旧令牌一个宽限期」**阶段 5c 已实现**（`auth.service.ts` 有 `REFRESH_GRACE_PERIOD_MS` / `graceExpiresAt` / `token-grace.worker.ts`），但 README 仍列为待办。⚠️ 更隐蔽的危害：AGENTS.md 的旧指引会让有人按「写一份 → `cp` → `diff`」改三端令牌逻辑，**三端薄壳目前没有任何一致性 CI 守卫** → 令牌刷新逻辑静默分叉 |
-| P2-15 | **一处违反「落库时刻用 `prisma.databaseNow()`」纪律** | `payment.service.ts:435` | `updatedAt: new Date()`，且 `Payment.updatedAt` 是 `@updatedAt`（Prisma 自动管理）→ 这个赋值**完全多余**。⚠️ 危害很低：`updatedAt` 只用于展示（支付方式列表、收款账户），**不参与任何财务归期或口径**。<br>✅ 已修（提交 `40e3c54`）。<br>⚠️ **原文「全仓唯一一处」不准确**（2026-11-06 复核更正）：`markEventProcessed` 的 `processedAt`（已随 `17213f7` 修掉）、`scanRefunding(now = new Date())`、`order.service.ts` 的 cancelledAt/shippedAt/completedAt、`auth.service.ts` 的 revokedAt 等都还是应用进程时钟。本条只清掉了「完全多余的那个赋值」，同类存量另排期。 |
+| P2-15 | **一处违反「落库时刻用 `prisma.databaseNow()`」纪律** | `payment.service.ts:435` | `updatedAt: new Date()`，且 `Payment.updatedAt` 是 `@updatedAt`（Prisma 自动管理）→ 这个赋值**完全多余**。⚠️ 危害很低：`updatedAt` 只用于展示（支付方式列表、收款账户），**不参与任何财务归期或口径**。<br>✅ 已修（提交 `40e3c54`）。<br>⚠️ **原文「全仓唯一一处」不准确**（2026-11-06 复核更正）：`markEventProcessed` 的 `processedAt`（已随 `17213f7` 修掉）、`scanRefunding(now = new Date())`、`order.service.ts` 的 cancelledAt/shippedAt/completedAt、`auth.service.ts` 的 revokedAt 等都还是应用进程时钟。本条只清掉了「完全多余的那个赋值」。<br>✅ **同类存量已于 2026-11-07 收敛**（提交 `a7c0072`）：订单 / 认证 / 退款扫描的落库时刻全部改用库时钟，口径与排除项见 §〇「批次 11 的实施记录」。 |
 | P2-16 | **保留子域名列表漏了 `merchant`** → 商家能注册一个访问不到的店铺 | `tenant-models.ts:25` vs `infra/nginx/platform.test.conf:117` | `RESERVED_SUBDOMAINS` 有 `admin` / `api` / `platform`，**唯独没有 `merchant`**（而 nginx 里 `merchant.platform.test` 是**精确匹配**的 server 名）。注册校验（`register-merchant.dto.ts:41`）只查这个集合 → 商家**能**注册子域名 `merchant` → 但 nginx 的精确匹配优先于租户正则 → 该店的店铺前台 `http://merchant.platform.test` 落到商家后台，**店铺打不开**。<br>⚠️ 不是安全漏洞（是可用性 + 枚举），修法：`RESERVED_SUBDOMAINS` 加 `merchant`。<br>（我核实过 nginx 的匹配顺序：精确 > 正则 > 通配符 > 默认 server） |
 | P2-14 | `test/rbac.e2e-spec.ts:17-21` 注释在骗人 | 同上 | 写「RolesGuard 由 AppModule 的 APP_GUARD 提供」，与 `app.module.ts:23-26` **直接矛盾** —— 这很可能就是漏挂能存活至今的原因 |
 

@@ -506,6 +506,16 @@ export class OrderService {
 
     const itemCount = merged.reduce((sum, item) => sum + item.quantity, 0);
 
+    // ⚠️ **支付期限的基准也必须取数据库时钟**：`payExpiresAt` 之后要与
+    //    `order-timeout.service.ts` 里的 `now`（那里的 now 是 `SELECT now()`）
+    //    比大小。一个用应用进程时钟、一个用库时钟，多副本部署时两边有偏差，
+    //    支付窗口就会整体偏移。
+    //    事务内只能用 `tx` 的原生 SQL —— 调 `this.prisma.databaseNow()` 会再借
+    //    一条连接（阶段 10 的 P2024 纪律）。
+    const nowRows = await tx.$queryRaw<
+      Array<{ now: Date }>
+    >`SELECT now() as now`;
+
     const order = await tx.order.create({
       data: {
         tenantId: rest.tenantId,
@@ -534,7 +544,7 @@ export class OrderService {
         //
         // 队列的 delayed job **不保证准时**，所以超时释放不能只看队列的调度，
         // 订单自己也得记住期限——两处都要判。
-        payExpiresAt: new Date(Date.now() + PAYMENT_TIMEOUT_MS),
+        payExpiresAt: new Date(nowRows[0].now.getTime() + PAYMENT_TIMEOUT_MS),
         receiverName: rest.address.receiver,
         receiverPhone: rest.address.phone,
         province: rest.address.province,
@@ -820,6 +830,13 @@ export class OrderService {
     const order = await this.findConsumerOrder(orderNo, customerId);
 
     await this.prisma.$transaction(async (tx) => {
+      // ⚠️ **时钟走 tx**：交互事务会独占一条连接，
+      // 用 `this.prisma.databaseNow()` 会再借一条 → 小连接池上死等（P2024）。
+      const nowRows = await tx.$queryRaw<Array<{ now: Date }>>`
+        SELECT now() as now
+      `;
+      const cancelledAt = nowRows[0].now;
+
       // 条件更新：只有还在 PENDING_PAYMENT 才会成功。
       // ⚠️ 这一步同时挡住了「已支付的订单被取消」与「两个取消并发时释放两次库存」。
       const won = await this.transitionInTx(
@@ -827,7 +844,7 @@ export class OrderService {
         order.id,
         OrderStatus.PENDING_PAYMENT,
         OrderStatus.CANCELLED,
-        { cancelledAt: new Date() },
+        { cancelledAt },
       );
       if (!won) {
         throw new ConflictException('订单当前状态不允许取消');
@@ -881,11 +898,14 @@ export class OrderService {
    */
   async shipOrder(orderNo: string, trackingNo: string): Promise<void> {
     const order = await this.findOrderByNo(orderNo);
+    // ⚠️ 取时钟在事务外、写入在事务内：`transition` 自己开事务。
+    // 这里只要求是**数据库时钟**，不要求与写入在同一快照。
+    const shippedAt = await this.prisma.databaseNow();
     const affected = await this.transition(
       order.id,
       OrderStatus.PAID,
       OrderStatus.SHIPPED,
-      { shippedAt: new Date(), trackingNo },
+      { shippedAt, trackingNo },
     );
     if (!affected) {
       throw new ConflictException('订单当前状态不允许发货');
@@ -900,11 +920,14 @@ export class OrderService {
     customerId: string | null,
   ): Promise<void> {
     const order = await this.findConsumerOrder(orderNo, customerId);
+    // ⚠️ 取时钟在事务外、写入在事务内：`transition` 自己开事务。
+    // 这里只要求是**数据库时钟**，不要求与写入在同一快照。
+    const completedAt = await this.prisma.databaseNow();
     const affected = await this.transition(
       order.id,
       OrderStatus.SHIPPED,
       OrderStatus.COMPLETED,
-      { completedAt: new Date() },
+      { completedAt },
     );
     if (!affected) {
       throw new ConflictException('订单当前状态不允许确认收货');

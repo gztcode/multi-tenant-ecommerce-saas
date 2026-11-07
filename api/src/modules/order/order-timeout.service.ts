@@ -66,7 +66,14 @@ export class OrderTimeoutService {
     tx: PrismaTransaction,
     orderId: string,
   ): Promise<boolean> {
-    const now = new Date();
+    // ⚠️ **时钟走 tx**：这个 `now` 要与 `order.payExpiresAt` 比较，
+    // 必须与 `payExpiresAt` 同源（都是数据库时钟），否则多副本部署时
+    // 各机器时钟有偏差，边界时刻会误判。
+    // 交互事务会独占一条连接，用 `this.prisma.databaseNow()` 会再借一条 → P2024。
+    const nowRows = await tx.$queryRaw<Array<{ now: Date }>>`
+      SELECT now() as now
+    `;
+    const now = nowRows[0].now;
 
     // ---- 1. 判支付期限 ----
     //

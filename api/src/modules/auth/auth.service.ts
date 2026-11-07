@@ -305,7 +305,7 @@ export class AuthService {
     // 同一枚令牌并发提交两次时，两个请求都会读到 revokedAt === null；
     // 条件更新让并发下只有一个请求的 count 为 1。
     const { refreshToken: newRefreshToken, expiresAt } =
-      this.createRefreshToken();
+      this.createRefreshToken(now);
 
     const rotated = await this.prisma.$transaction(async (tx) => {
       // ⚠️ **沿用入口那一次时钟**：事务内再取一次会让
@@ -476,18 +476,29 @@ export class AuthService {
 
     // 令牌不存在时静默成功：登出接口不该成为「这枚令牌存在吗」的预言机。
     //
+    // ⚠️ **这里必须直接 return，不能靠下面的 `id: stored?.id` 兜底**：
+    //    `stored` 为 null 时那条件是 `id: undefined`，而 Prisma 会把值为
+    //    `undefined` 的过滤键**整个丢掉** —— `updateMany` 退化成
+    //    `where: { revokedAt: null }`，**吊销全平台所有用户的未吊销令牌**。
+    //    登出只需要访问令牌，任何登录用户传一枚格式合法但不存在的令牌
+    //    就能把所有人踢下线（2026-11-06 复核发现）。
+    if (!stored) {
+      return;
+    }
+
     // 令牌存在但不属于当前用户则必须拒绝。少了这一步，任何人只要拿到
     // 别人的刷新令牌（哪怕是日志、截图里泄漏的），就能盲登出对方的会话，
     // 而登出端点本身不需要携带任何凭证即可调用。
-    if (stored && stored.userId !== userId) {
+    if (stored.userId !== userId) {
       throw new UnauthorizedException('刷新令牌不属于当前用户');
     }
 
     // 登出只吊销这一枚，不牵连该用户的其它设备。
+    const now = await this.prisma.databaseNow();
     await this.prisma.refreshToken.updateMany({
-      where: { id: stored?.id, revokedAt: null },
+      where: { id: stored.id, revokedAt: null },
       data: {
-        revokedAt: new Date(),
+        revokedAt: now,
         revokedReason: RefreshTokenRevokedReason.LOGOUT,
       },
     });
@@ -513,7 +524,7 @@ export class AuthService {
     userId: string,
     triggerTokenId: string,
   ): Promise<void> {
-    const now = new Date();
+    const now = await this.prisma.databaseNow();
     await this.prisma.$transaction([
       this.prisma.refreshToken.updateMany({
         where: {
@@ -588,9 +599,13 @@ export class AuthService {
   }
 
   /** 生成一枚刷新令牌与它的过期时刻（**不落库**，由调用方决定写到哪） */
-  private createRefreshToken(): { refreshToken: string; expiresAt: Date } {
+  private createRefreshToken(now: Date): {
+    refreshToken: string;
+    expiresAt: Date;
+  } {
     const refreshToken = generateRefreshToken();
-    const expiresAt = new Date();
+    // 复制基准时刻再改：直接改入参会污染调用方后续的时间判定
+    const expiresAt = new Date(now.getTime());
     expiresAt.setDate(
       expiresAt.getDate() + Number(process.env.REFRESH_TOKEN_TTL_DAYS ?? 30),
     );
@@ -599,7 +614,8 @@ export class AuthService {
 
   private async issueTokens(user: AuthUser): Promise<AuthResult> {
     const accessToken = await this.signAccessToken(user);
-    const { refreshToken, expiresAt } = this.createRefreshToken();
+    const now = await this.prisma.databaseNow();
+    const { refreshToken, expiresAt } = this.createRefreshToken(now);
 
     // RefreshToken 不是租户作用域模型，这里不需要（也不应该）切换上下文
     await this.prisma.refreshToken.create({
