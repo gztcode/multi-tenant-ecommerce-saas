@@ -1,5 +1,10 @@
 import { BadRequestException, ConflictException } from '@nestjs/common';
-import { OrderStatus, PaymentKind, PaymentStatus } from '@prisma/client';
+import {
+  InvoiceStatus,
+  OrderStatus,
+  PaymentKind,
+  PaymentStatus,
+} from '@prisma/client';
 import type { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import type { QueueService } from '../queue/queue.service';
 import type { OrderService } from '../order/order.service';
@@ -1444,5 +1449,132 @@ describe('退款路径：补救出口与双渠道（审计 P0-3 / P1-3）', () =
 
     expect(error).toBeInstanceOf(ConflictException);
     expect(fake.refund).toHaveBeenCalledTimes(0);
+  });
+});
+
+/**
+ * 账单支付单的并发建单（审计 P2-11）。
+ *
+ * 手动支付的 HTTP 路径与自动扣款的定时 job 会同时走到
+ * `obtainInvoicePayment`：两边都查空、都去建，输家撞
+ * `payments_invoice_channel_uniq`（P2002）。不处理的话全局过滤器
+ * 不认识 Prisma 错误 → 500。
+ */
+describe('PaymentService 账单支付单并发建单（审计 P2-11）', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalEnabled = process.env.PAYMENT_ENABLED_CHANNELS;
+
+  beforeAll(() => {
+    process.env.NODE_ENV = 'development';
+    process.env.PAYMENT_ENABLED_CHANNELS = 'fake';
+  });
+
+  afterAll(() => {
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+    if (originalEnabled === undefined) {
+      delete process.env.PAYMENT_ENABLED_CHANNELS;
+    } else {
+      process.env.PAYMENT_ENABLED_CHANNELS = originalEnabled;
+    }
+  });
+
+  /** 一张可支付的账单（`createInvoicePayment` 只接受 OPEN / FAILED） */
+  function openInvoice() {
+    return {
+      id: 'invoice-1',
+      number: 'INV-1',
+      amount: 2000,
+      status: InvoiceStatus.OPEN,
+      tenantId: TENANT_ID,
+    };
+  }
+
+  function setup() {
+    const fake = provider('fake', FAKE_CAPABILITIES);
+    fake.createPayment.mockResolvedValue({
+      providerTxnId: 'txn-1',
+      payload: { payUrl: 'https://pay.example/1' },
+    });
+    const prisma = prismaMock();
+    prisma.invoice.findFirst.mockResolvedValue(openInvoice());
+    const { service } = buildService(fake, prisma);
+    return { fake, prisma, service };
+  }
+
+  it('建支付单撞 P2002 后重查到同一笔 → 复用那一笔并正常返回', async () => {
+    const { fake, prisma, service } = setup();
+    // 第一次查空 → 去建 → 撞唯一约束；catch 里重查命中并发建的同一笔
+    prisma.payment.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: 'payment-raced',
+      invoiceId: 'invoice-1',
+      channel: 'fake',
+      amount: 2000,
+      status: PaymentStatus.PENDING,
+    });
+    prisma.payment.create.mockRejectedValue({ code: 'P2002' });
+
+    const result = await runForTenant(TENANT_ID, () =>
+      service.createInvoicePayment('INV-1', 'fake'),
+    );
+
+    expect(result.paymentId).toBe('payment-raced');
+    // 重查发生在事务外（这里根本没有事务），且确实查了两次
+    expect(prisma.payment.findFirst).toHaveBeenCalledTimes(2);
+    // 走的是「复用已有支付单」分支：把旧单重置为 PENDING，而不是再建一笔
+    expect(prisma.payment.create).toHaveBeenCalledTimes(1);
+    expect(prisma.payment.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'payment-raced' },
+        data: { status: PaymentStatus.PENDING, amount: 2000 },
+      }),
+    );
+    expect(fake.createPayment).toHaveBeenCalledTimes(1);
+  });
+
+  it('建支付单撞 P2002 但重查不到 → 原错误抛出（不吞）', async () => {
+    const { fake, prisma, service } = setup();
+    const uniqueViolation = { code: 'P2002' };
+    prisma.payment.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    prisma.payment.create.mockRejectedValue(uniqueViolation);
+
+    const error = await catchError(() =>
+      runForTenant(TENANT_ID, () =>
+        service.createInvoicePayment('INV-1', 'fake'),
+      ),
+    );
+
+    expect(error).toBe(uniqueViolation);
+    // 没有可复用的支付单 → 不调渠道
+    expect(fake.createPayment).toHaveBeenCalledTimes(0);
+  });
+
+  it('非 P2002 的错误原样抛出 → 不被「复用已有支付单」分支吞掉', async () => {
+    const { fake, prisma, service } = setup();
+    const dbError = { code: 'P2025' };
+    // 重查**能**查到一笔：若实现不看错误码、只要「重查命中」就复用，
+    // 这个真实的数据库故障会被静默吞掉，所以这条用例必须存在。
+    prisma.payment.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: 'payment-raced',
+      invoiceId: 'invoice-1',
+      channel: 'fake',
+      amount: 2000,
+      status: PaymentStatus.PENDING,
+    });
+    prisma.payment.create.mockRejectedValue(dbError);
+
+    const error = await catchError(() =>
+      runForTenant(TENANT_ID, () =>
+        service.createInvoicePayment('INV-1', 'fake'),
+      ),
+    );
+
+    expect(error).toBe(dbError);
+    expect(fake.createPayment).toHaveBeenCalledTimes(0);
   });
 });

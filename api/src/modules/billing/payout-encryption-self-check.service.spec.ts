@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import {
   isPlatformScope,
   tenantContext,
@@ -76,6 +77,28 @@ describe('PayoutEncryptionSelfCheck', () => {
     );
 
     await expect(service.check()).resolves.toBeUndefined();
+  });
+
+  it('库里没有可校验的行 → 显式 warn 提示密钥未经校验（不是静默通过）', async () => {
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    try {
+      const service = new PayoutEncryptionSelfCheck(
+        fakePrisma() as unknown as never,
+        new PayoutCipherService(),
+      );
+
+      await service.check();
+
+      // ⚠️ **只断言「不抛错」是没有牙齿的** —— 原实现就是静默通过，
+      //    这里必须断言告警文案的语义，否则等于没测。
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('密钥正确性未经校验'),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('密文解得开 → 不抛错', async () => {

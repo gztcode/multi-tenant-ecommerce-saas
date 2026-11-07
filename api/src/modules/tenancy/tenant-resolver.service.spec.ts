@@ -123,6 +123,10 @@ describe('TenantResolverService.extractSubdomain', () => {
       expect(RESERVED_SUBDOMAINS.has('admin')).toBe(true);
       expect(RESERVED_SUBDOMAINS.has('platform')).toBe(true);
       expect(RESERVED_SUBDOMAINS.has('www')).toBe(true);
+      // merchant 是 nginx 里精确匹配的商家后台入口，精确匹配优先于租户正则：
+      // 不保留的话商家能注册该子域名，其店铺前台会被路由到商家后台。
+      expect(RESERVED_SUBDOMAINS.has('merchant')).toBe(true);
+      expect(extract({}, 'merchant.platform.test')).toBeNull();
     });
   });
 

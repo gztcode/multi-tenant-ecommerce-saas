@@ -36,6 +36,7 @@ export const RESERVED_SUBDOMAINS = new Set<string>([
   'login',
   'mail',
   'media',
+  'merchant',
   'platform',
   'register',
   'static',

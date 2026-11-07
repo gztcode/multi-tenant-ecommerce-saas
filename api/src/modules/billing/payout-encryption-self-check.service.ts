@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   platformScope,
@@ -17,6 +17,8 @@ import { PayoutCipherService } from './payout-cipher.service';
  */
 @Injectable()
 export class PayoutEncryptionSelfCheck {
+  private readonly logger = new Logger(PayoutEncryptionSelfCheck.name);
+
   constructor(
     private readonly prisma: TenantPrismaService,
     private readonly cipher: PayoutCipherService,
@@ -65,8 +67,16 @@ export class PayoutEncryptionSelfCheck {
           '出款单收款账号快照',
         );
       }
-      // ⚠️ **两处都没有可校验的行 → 静默通过**：
-      //    新库、或还没跑迁移的库（全是版本 0）都不该因此起不来。
+      // ⚠️ **两处都没有可校验的行 → 只 warn，不失败**：
+      //    新库、或还没跑迁移的库（全是版本 0）都不该因此起不来；
+      //    但**不能静默**——否则「密钥配错」与「库里本来没数据」在启动日志里
+      //    完全一样，自检等于没跑过。
+      if (!account && !payout) {
+        this.logger.warn(
+          '账目加密自检：库中无已加密样本，密钥正确性未经校验' +
+            '（新库或尚未执行加密迁移时属正常；生产库出现此告警请确认迁移已执行）。',
+        );
+      }
     });
   }
 

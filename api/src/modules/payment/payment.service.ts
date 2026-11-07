@@ -404,22 +404,38 @@ export class PaymentService {
     amount: number,
     tenantId: string,
   ): Promise<{ payment: Payment; reused: boolean }> {
-    const existing = await this.prisma.payment.findFirst({
+    let existing = await this.prisma.payment.findFirst({
       where: { invoiceId, channel },
     });
 
     if (!existing) {
-      const payment = await this.prisma.payment.create({
-        data: {
-          tenantId,
-          kind: PaymentKind.SUBSCRIPTION,
-          invoiceId,
-          channel,
-          provider: providerName,
-          amount,
-        },
-      });
-      return { payment, reused: false };
+      try {
+        const payment = await this.prisma.payment.create({
+          data: {
+            tenantId,
+            kind: PaymentKind.SUBSCRIPTION,
+            invoiceId,
+            channel,
+            provider: providerName,
+            amount,
+          },
+        });
+        return { payment, reused: false };
+      } catch (error) {
+        // ⚠️ **并发发起时**（手动支付的 HTTP 路径与自动扣款的定时 job 同时到）
+        // 两个调用方都查空、都去建，输家撞 `payments_invoice_channel_uniq`。
+        // 这里在**事务外**重查一次，查到就走下面的「复用已有支付单」分支；
+        // 重查不到才把原错误抛出去。非 P2002 的错误一律原样抛出。
+        const raced = isUniqueViolation(error)
+          ? await this.prisma.payment.findFirst({
+              where: { invoiceId, channel },
+            })
+          : null;
+        if (!raced) {
+          throw error;
+        }
+        existing = raced;
+      }
     }
 
     if (existing.status === PaymentStatus.SUCCESS) {

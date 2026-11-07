@@ -40,7 +40,10 @@ export async function GET(request: Request) {
     );
   }
 
-  return new NextResponse(await response.text(), {
+  // 上游 CSV 自带 BOM（U+FEFF），但按 WHATWG 规定 response.text() 的
+  // TextDecoder 会把它剥掉，必须在这里补回去；否则 Windows 上按 GBK
+  // 代码页打开的中文 Excel 会把中文列名显示成乱码。
+  return new NextResponse(`\uFEFF${await response.text()}`, {
     status: 200,
     headers: {
       'content-type': 'text/csv; charset=utf-8',

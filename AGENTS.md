@@ -107,7 +107,8 @@ cd infra && docker compose up -d --build
 - e2e 使用 `BULLMQ_PREFIX=bull-e2e` 与开发队列隔离；**不要删 `bull:*`**。历史结论：跑 e2e 不需要停 api 容器。
 - 手工验收假支付/假出款网关时，api 必须用 `NODE_ENV=development` 跑。compose 默认 `NODE_ENV=production`；
   在 production 下打开 `FAKE_PAYMENT_ENABLED` / `FAKE_PAYOUT_ENABLED` 会被 `assertSecureConfig`
-  **拒绝启动**（两个开关默认关闭时，compose 的 api 能正常启动）。
+  **拒绝启动**。⚠️ 但**开关关着也起不来**：compose 自带 production 姿态 + 占位密钥/默认 DB 密码，
+  阶段 9 的凭据校验同样拒绝 → 用假网关联调只能走本机 `npm run start:dev`（见 README「全栈容器」）。
 - 假出款网关的渠道流水只存在**进程内存**，重启容器即丢；不要用它造跨重启的验收数据。
 - `infra/docker-compose.yml` 里的 `JWT_SECRET` / `AUTH_SECRET` 是明文固定值，仅供本机开发。
 
@@ -214,8 +215,9 @@ cd infra && docker compose up -d --build
   `npx eslint <file>`，要求零错误。CI 的 api job 跑全量 lint 作为门禁。
 - **三个前端 lint 已进 CI**（阶段 9），本地提交前建议跑 `npm run lint`。
 - **失败注入必须独占**：故意改坏源码验证测试时，不要同时跑任何其他测试（会互相污染，产生假回归）。
-- 三个前端没有共享包。同名文件靠「写一份 → `cp` → `diff`」保持一致：`components/ui/button.tsx` 三份逐字节相同，
-  `lib/jwt-callback.ts` 在 storefront / merchant-admin 两份逐字节相同。但三份 `lib/api-client.ts` **结构不同，
-  不要强行统一**，只保证语义一致。
+- 三个前端共用 `packages/frontend-shared`（`file:` 依赖，**不是 npm workspaces**，各端仍各自 `npm install`）。
+  未迁进共享包的同名文件靠「写一份 → `cp` → `diff`」保持一致：`components/ui/button.tsx` 三份逐字节相同。
+  `lib/jwt-callback.ts` 三端各只有一句 `export *`（薄壳），逻辑**单源在共享包**，不要按老办法手工同步。
+  但三份 `lib/api-client.ts` **结构不同，不要强行统一**，只保证语义一致。
 - 前端测试断言要具体：401 要同时断言没调后端；400 要断言错误文案；白名单要 `toEqual` 完整 body，
   不能只断言「不含某字段」。`vi.mock` 的路径必须与被测文件的 import 完全一致（`@/auth`、`@/lib/api-client`）。

@@ -34,6 +34,7 @@
 | 9 | **P0-3 支付回调状态机 + P1-3 双渠道退款** | `80dcc3c`、`474345c` | ✅ |
 | 10 | P2-A4 账目自检补货款冲回检查 | `6f02d30` | ✅ |
 | 11 | P2 各项（P2-9/9b/10 套餐额度、P2-5 三处 500、P2-15 时间戳纪律、P2-A3、P2-1/P2-1b/P2-2 依赖漏洞） | `40e3c54`、`b264ac5`、`ce98ae4`、`1c5d94c`、`3fb8550` | ✅ |
+| 12 | P2-11 账单支付单 P2002、P2-16 保留子域名、P2-A2 自检告警、P2-6 CSV BOM、P2-12/P2-13/P2-8 文档口径 | `67f5168`、`831d0d4`、`b65763b` | ✅ |
 
 ### 批次 11 的实施记录（P2 各项）
 
@@ -143,6 +144,58 @@ A 用不存在的令牌登出后，B 的令牌仍能刷新；失败注入该用�
   2026-11-07 复跑单用例 6 轮、整文件 4 轮、全量 4 轮**都没能复现**；静态分析也对不上
   —— `addItem` 只有两处 400（SKU 查不到 / 超过上限 99），在这个用例的数据下都不该发生，
   全局异常过滤器也不把 P2002 映射成 400。**未定位，保持观察**（临时探针已撤）。
+
+### 批次 12 的实施记录（P2 收尾与文档口径）
+
+批次 11 收尾后逐条回扫清单，剩下这七条确实没落地（此前误以为已随批次 11 覆盖）。
+
+**① P2-11 账单支付单 P2002（`67f5168`）**
+`obtainInvoicePayment` 的 `create` 包 try/catch：`isUniqueViolation(error)` 时在**事务外**
+重查 `(invoiceId, channel)`，查到就走既有的「复用支付单」分支（沿用该分支原有的口径：
+`SUCCESS` 抛 409，其余重置为 `PENDING`），查不到或非 P2002 才抛原错误。
+三条单测：并发命中复用、P2002 重查为空抛原错误、**非 P2002 即使重查能命中也必须抛**。
+失败注入：把 `isUniqueViolation(error) ? … : null` 改成无条件重查 → 第三条变红，恢复后全绿。
+
+**② P2-16 保留子域名补 `merchant`（`831d0d4`）**
+`RESERVED_SUBDOMAINS` 按字母序插入 `'merchant'`。依据是 nginx 的匹配顺序
+（精确 > 正则 > 通配符 > 默认 server）：`infra/nginx/platform.test.conf` 里
+`server_name merchant.platform.test;` 是精确匹配，而租户店铺走泛域名正则。
+不保留的话商家能注册该子域名，注册接口会通过，但店铺前台永远被路由到商家后台。
+测试侧：`it.each` 会按集合动态展开（新增条目自动进入），但**钉不住「被误删」**，
+所以在「保留名单非穷尽」用例里补了显式断言 + `extractSubdomain('merchant.platform.test')` 为 null。
+
+**③ P2-A2 加密自检无样本时告警（`831d0d4`）**
+`check()` 在两表都取不到 `encryptionVersion = 1` 的行时输出一条 `warn`
+（「库中无已加密样本，密钥正确性未经校验……」）。**没有改成硬失败** ——
+新库、还没跑迁移的库本来就不该因此起不来（原注释的判定仍然成立）；
+改的是「静默」：否则「密钥配错」与「库里本来没数据」在启动日志里完全一样，自检等于没跑过。
+日志直接打在服务内（`new Logger(...)`），因为启动调用点 `main.ts` 不消费返回值。
+
+**④ P2-6 结算单 CSV 的 BOM（`b65763b`）**
+上游控制器自己在响应体开头加 BOM（U+FEFF），但 BFF 用 `response.text()` 读，WHATWG 规定 TextDecoder
+会**剥掉 BOM** → 到浏览器就没了。`merchant-admin` 的商品导出是在 BFF 侧补的，
+两端写法早已漂移；本次统一到 BFF 侧补（在 `await response.text()` 前拼一个 `\uFEFF`），
+**没有动上游控制器**（别处可能直接把上游响应当 CSV 用）。
+测试必须按 `arrayBuffer()` 原始字节断言：`response.text()` 自己也会剥 BOM。
+除了「前 3 字节是 `EF BB BF`」，还断言第 4 字节是 `0xE7`（「结」的首字节）——
+只查前 3 字节发现不了加了两遍 BOM 的情况。失败注入：故意加两个 BOM → 用例变红。
+
+**⑤ P2-12 / P2-13 / P2-8 文档与注释口径（本提交）**
+- README「一键启动（Docker）」→「全栈容器（Docker）」，如实写明 compose 是 production 姿态
+  且内置默认凭据，命令原样跑不起来；本机联调走 `npm run start:dev`。
+  ⚠️ **没有改 `infra/docker-compose.yml` 的 `NODE_ENV`**：改成 development 会让非生产默认的
+  `fake` / `fake-payout` 渠道生效，属安全姿态变更，不在技术债清理范围。
+- README 阶段 4 优先项：删掉「刷新令牌宽限期」（阶段 5c 已实现），并注明原第 1 条已实现、其余顺延。
+- AGENTS.md：把「三个前端没有共享包」改为共用 `packages/frontend-shared`；同时改掉
+  「`lib/jwt-callback.ts` 两份逐字节相同」的旧指引（实测三端各只有一句 `export *`，
+  逻辑单源在共享包，按旧指引手工同步会让令牌逻辑静默分叉）。
+  另修正「两个开关关着 compose 的 api 就能正常启动」—— 阶段 9 的凭据校验同样会拒绝占位密钥。
+- `schema.prisma` 的 `InventoryMovement.operatorId` 注释改为「人工调整填操作人（店主 / 员工）id；
+  预占/释放一律为 null」（P2-8 的建议原文就是改注释）。
+
+**验证**：api `tsc --noEmit` 零错误；改动文件 `npx eslint` 零问题；`scan:tx-boundary` 0 处；
+三个相关 spec 共 119 条全绿；全量 e2e **45 suites / 716 passed**；平台端 vitest 3 条 +
+`tsc` + `eslint` 全绿；两次失败注入确认新用例有牙齿（见上）。
 
 ### 批次 10 的实施记录（P2-A4）
 

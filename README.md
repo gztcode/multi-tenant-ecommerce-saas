@@ -135,7 +135,7 @@
 
 ---
 
-## 一键启动（Docker）
+## 全栈容器（Docker）
 
 ```bash
 cd infra && docker compose up -d
@@ -149,8 +149,17 @@ cd infra && docker compose up -d
 
 子域名本地调试：把 `127.0.0.1 *.platform.test` 写进 `/etc/hosts`。
 
-> **注意**：compose 里的 `JWT_SECRET` / `AUTH_SECRET` 是明文固定值，**仅供本机开发**。
-> 真实部署必须换成外部注入的随机密钥。
+> **注意**：compose 默认是 **production 姿态**（`api/Dockerfile` 自带 `ENV NODE_ENV=production`，compose 也显式设 `NODE_ENV: production`），
+> 所以上面这条命令**原样跑不起来**。启动校验会拒绝 compose 内置的默认凭据：默认/空的 PostgreSQL、Redis、MinIO 密码，
+> 以及示例/默认的 `JWT_SECRET` / `AUTH_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY` 都会让进程启动即失败。
+> 要真跑通，必须通过环境变量提供真实的 `POSTGRES_PASSWORD` / `REDIS_PASSWORD` / `MINIO_ROOT_PASSWORD` 凭据，
+> 以及真实的 `JWT_SECRET` / `AUTH_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY`（其中 `JWT_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY` 至少 32 字符，可用 `openssl rand -base64 48` 生成）。
+>
+> 本机联调请走下面的「本地开发」路径（`cd api && npm run start:dev`，读 `api/.env`，`NODE_ENV` 不是 production，不触发这些拒绝）。
+> 也**不要**把 compose 的 `NODE_ENV` 改成 development 绕过：那会让非生产默认的假支付（`fake`）/ 假出款（`fake-payout`）渠道生效，
+> 属于安全姿态变更。
+>
+> compose 里的 `JWT_SECRET` / `AUTH_SECRET` 是明文固定值，**仅供本机开发**；真实部署必须换成外部注入的随机密钥。
 
 ---
 
@@ -455,30 +464,27 @@ node tools/push-via-api-curl.mjs <本地分支> <远端分支>
 ### 阶段 4 验收发现的下一阶段优先项（详见
 [验收记录 §七](docs/superpowers/plans/2026-10-25-plan-04-frontend-polish-acceptance.md)）：
 
-> ⚠️ 下面这份是**阶段 4 验收当时的原始清单**，保留作历史记录。
+> ⚠️ 下面这份源自**阶段 4 验收当时的原始清单**，保留作历史记录。
+> 原第 1 条「多标签页刷新竞态」已由阶段 5c（刷新令牌宽限期）实现，故不再列出，其余条目顺延编号。
 > 哪些已完成请看上面「阶段 7 之后的剩余技术债」一节。
 
-1. **修多标签页的「先后」刷新竞态** —— 优先级最高：本阶段实测发现，**商家只要同时开
-   两个后台标签页就会被踢出登录**（旧 refreshToken 被判成「真正的重放」→
-   吊销全设备登录）。需要后端配合：给轮换后的旧令牌一个**宽限期**，
-   或提供**幂等刷新端点**。
-2. **给 `merchant-admin` 补组件测试基建** —— 不补这套基建，`auth.ts` 的 `jwt` 回调
+1. **给 `merchant-admin` 补组件测试基建** —— 不补这套基建，`auth.ts` 的 `jwt` 回调
    **永远测不了**（失败注入 #6 / #8 证明：把「过期时刷新」整段删掉，75 条测试全绿）。
    护栏 3 / 5 现在只有手测在守。
-3. **把分组标量（字阶 / 间距 / 阴影 / 字重）在前台接上消费者** —— 商家改这些值，
+2. **把分组标量（字阶 / 间距 / 阴影 / 字重）在前台接上消费者** —— 商家改这些值，
    前台**纹丝不动且无提示**（实测 `--text-base` 变了，渲染出来的字号没变）。
    要么在 `@theme inline` 里补上映射，要么**先把这些输入框在前台隐藏掉**。
-4. **修字体 token 在服务端就失效** —— `@layer theme{...--font-sans:var(--font-sans)}`
+3. **修字体 token 在服务端就失效** —— `@layer theme{...--font-sans:var(--font-sans)}`
    是循环引用，`--font-geist-sans` 又只挂在 `<body>` 上 → **商家改字体前台从来没生效过**。
    要两端一起改。
-5. **统一前台的错误处理** —— 后端挂掉时页面把 Node 原始错误串 `fetch failed`
+4. **统一前台的错误处理** —— 后端挂掉时页面把 Node 原始错误串 `fetch failed`
    显示给了用户，没有重试按钮。
-6. **给商家后台做主题实时预览** —— 商家改主色时**自己都看不到变化**，
+5. **给商家后台做主题实时预览** —— 商家改主色时**自己都看不到变化**，
    只能切到另一个标签页看前台。
-7. **给 e2e 的队列做隔离 + 每轮清库** —— 否则每次跑 e2e 都要先停 api 容器，
+6. **给 e2e 的队列做隔离 + 每轮清库** —— 否则每次跑 e2e 都要先停 api 容器，
    会持续制造「实测报缺陷、复现不出来」的假象。
-8. **退货入库流程** —— 退款不回补库存是有意的取舍，但配套的退货入库始终没实现。
-9. **跨店会员** —— 等有了会员体系的需求再动。
+7. **退货入库流程** —— 退款不回补库存是有意的取舍，但配套的退货入库始终没实现。
+8. **跨店会员** —— 等有了会员体系的需求再动。
 
 阶段 3 遗留、本阶段仍未解决的（详见阶段 4 验收记录 §六）：
 跨店会员不支持、游客订单查不到、退款不回补库存、购物车金额是估算值、
