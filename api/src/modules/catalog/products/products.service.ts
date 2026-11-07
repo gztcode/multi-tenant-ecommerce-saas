@@ -406,11 +406,28 @@ export class ProductsService {
         case 'PUBLISH':
         case 'UNPUBLISH': {
           const status = dto.action === 'PUBLISH' ? 'PUBLISHED' : 'UNPUBLISHED';
+          // 首次转为 PUBLISHED 时才写 publishedAt；**已上架的保留原时间**。
+          //
+          // ⚠️ 这里必须与单条 update() 同一口径：update() 只在
+          // `product.status !== 'PUBLISHED'` 时写 publishedAt，
+          // 已经上架的商品再点一次「上架」不会刷新它。
+          // 原来批量是无条件 `publishedAt: new Date()` —— 同一件事两条路径两种结果，
+          // 而 publishedAt 是公开列表的默认排序键（public-catalog.service.ts
+          // 在 sort 既不是 price_asc 也不是 price_desc 时按 publishedAt 降序），
+          // 商家批量重新上架一批商品会把它们全顶到列表最前面。
+          //
+          // 用 where 的 status 条件做**条件更新**，而不是在应用侧分组：
+          // 条件更新天然幂等，也符合仓库既有的「状态流转用条件更新」纪律。
+          if (status === 'PUBLISHED') {
+            await tx.product.updateMany({
+              where: { id: { in: productIds }, status: { not: 'PUBLISHED' } },
+              data: { publishedAt: new Date() },
+            });
+          }
           await tx.product.updateMany({
             where: { id: { in: productIds } },
             data: {
               status,
-              ...(status === 'PUBLISHED' ? { publishedAt: new Date() } : {}),
               version: { increment: 1 },
             },
           });
