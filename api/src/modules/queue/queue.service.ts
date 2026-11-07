@@ -212,6 +212,21 @@ export class QueueService {
     }
   }
 
+  /**
+   * 查询某队列各状态的任务数（阶段 11 的 metrics 轮询用）。
+   *
+   * ⚠️ 与入队方法不同，这里**不加超时也不包装 503**——读计数是旁路观测，
+   * 调用方（MetricsService）自带 try/catch，Redis 抖动时缺一轮指标即可。
+   */
+  async jobCountsOf(queueName: QueueName): Promise<Record<string, number>> {
+    return this.queueOf(queueName).getJobCounts(
+      'waiting',
+      'active',
+      'delayed',
+      'failed',
+    );
+  }
+
   private queueOf(queueName: QueueName): Queue {
     const queue = this.queues.get(queueName);
     if (!queue) {

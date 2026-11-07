@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import type { Job } from 'bullmq';
 import { PAYOUT_QUEUE } from '../../common/queue/queue.constants';
+import { RedisLockService } from '../../common/lock/redis-lock.service';
 import { QueueService } from '../queue/queue.service';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { PayoutExecutionService } from '../billing/payout-execution.service';
@@ -90,6 +91,8 @@ export class PayoutWorker extends WorkerHost {
     //    必填的话那个 spec 的 20 处构造都要补参数（超出本 Task 的改动范围）。
     //    可选 → 现有用例一行不用改。
     private readonly reconciliation?: PayoutReconciliationService,
+    // 阶段 11：跨副本互斥锁（同上可选，spec 兼容）
+    private readonly lock?: RedisLockService,
   ) {
     super();
   }
@@ -501,6 +504,13 @@ export class PayoutWorker extends WorkerHost {
    *    钱可能已经打出去，重试 = 确定性地重复打款。
    */
   private async runScan(): Promise<void> {
+    // ⚠️ **跨副本互斥**（阶段 11）：救援扫描虽经队列单消费，但
+    //    「先回 APPROVED 再重投」的路径在多副本下可能并发；
+    //    抢不到锁 = 另一副本本轮在扫，直接跳过。
+    await this.withLockGuard('payout-scan', () => this.doRunScan());
+  }
+
+  private async doRunScan(): Promise<void> {
     const now = await this.prisma.databaseNow();
     const rescues = await this.execution.scanStuck(now);
     for (const { id, attemptCount } of rescues) {
@@ -579,6 +589,18 @@ export class PayoutWorker extends WorkerHost {
     if (!this.reconciliation) {
       return;
     }
+    // ⚠️ **「同一时间只允许一个对账任务」**（阶段 11 的跨副本互斥）：
+    //    队列的 jobSchedulerId 去重管「不重复调度」，管不了「不并发执行」
+    //    （手动触发、异常重投都可能撞上）。锁是最后一条防线。
+    await this.withLockGuard(`payout-reconcile:${channel}`, () =>
+      this.doRunReconcile(channel),
+    );
+  }
+
+  private async doRunReconcile(channel: string): Promise<void> {
+    if (!this.reconciliation) {
+      return;
+    }
     try {
       await this.reconciliation.runScheduled(channel);
     } catch (error) {
@@ -589,6 +611,24 @@ export class PayoutWorker extends WorkerHost {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+    }
+  }
+
+  /**
+   * 锁的统一包装（阶段 11）：无锁服务（spec 场景）直接执行；
+   * 有锁服务时抢不到就跳过本轮（周期任务错过一轮无损失）。
+   */
+  private async withLockGuard<T>(
+    key: string,
+    fn: () => Promise<T>,
+  ): Promise<void> {
+    if (!this.lock) {
+      await fn();
+      return;
+    }
+    const outcome = await this.lock.withLock(key, fn);
+    if (!outcome.acquired) {
+      this.logger.log(`另一副本持有锁，本轮跳过：${key}`);
     }
   }
 }

@@ -12,6 +12,8 @@ import { CommissionService } from './commission.service';
 import { ReceiptService } from './receipt.service';
 import { PlatformSettlementController } from './platform-settlement.controller';
 import { SettlementService } from './settlement.service';
+import { PayoutQueryService } from './payout-query.service';
+import { PayoutStateService } from './payout-state.service';
 import { PayoutService } from './payout.service';
 import { PayoutAccountService } from './payout-account.service';
 import { PayoutCipherService } from './payout-cipher.service';
@@ -69,6 +71,9 @@ import { MerchantStatementService } from './merchant-statement.service';
     ReceiptService,
     // 出款（阶段 5h-1）
     PayoutService,
+    // 阶段 11 拆分出的两个职责服务（PayoutService 现在只是 facade）
+    PayoutQueryService,
+    PayoutStateService,
     PayoutAccountService,
     // 收款账户字段加密（阶段 5j）
     // ⚠️ **刻意不导出** —— 本阶段只有本模块用，保持最小面。

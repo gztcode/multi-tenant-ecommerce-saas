@@ -23,6 +23,9 @@ services:
       # 迁移里的 CREATE EXTENSION 在托管数据库上会因权限不足失败，
       # 提前到建库阶段解决——详见该 SQL 文件里的注释。
       - ./postgres/init-extensions.sql:/docker-entrypoint-initdb.d/init-extensions.sql:ro
+      # 阶段 11：statement_timeout 等运行时调优（只在数据卷首次创建时执行；
+      # 已有库见 docs/DEPLOY.md 的手动 ALTER 步骤）
+      - ./postgres/init-tuning.sh:/docker-entrypoint-initdb.d/init-tuning.sh:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-ecommerce} -d ${POSTGRES_DB:-ecommerce}']
       interval: 5s
@@ -162,6 +165,11 @@ services:
       # 平台默认出款渠道优先读 platform_settings（平台后台），
       # PAYOUT_PLATFORM_DEFAULT_CHANNEL 只是 DB 无行时的兜底，生产允许不设。
       # CHANNEL_MODE=sandbox 在生产环境同样会拒绝启动。
+      # ---- 可观测性（阶段 11）----
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # 渠道告警 webhook（飞书/钉钉/自建值班群）。不配则告警只落日志。
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ALERT_WEBHOOK_FORMAT: ${ALERT_WEBHOOK_FORMAT:-generic}
     ports:
       - '127.0.0.1:${API_PORT:-3000}:3000'
     healthcheck:
@@ -295,6 +303,31 @@ services:
       retries: 3
       start_period: 10s
     mem_limit: 256m
+
+  # 数据库迁移工具（阶段 11：部署加固）。
+  #
+  # ⚠️ **为什么需要它**：api 的 runner 镜像只装生产依赖，而 prisma CLI
+  #    是 devDependency——生产容器里跑不了 `prisma migrate deploy`。
+  #    这个服务复用 api 的 **builder 阶段**（有完整 devDependencies + 源码），
+  #    平时不启动（profiles: tools），升级时显式执行：
+  #      docker compose --profile tools run --rm migrate
+  #
+  # 迁移策略：**迁移先行、应用后滚**。先跑本服务把库迁到位，
+  # 再重启 api（应用代码要兼容旧库结构才能安全滚动——本项目的迁移
+  # 都是加列/加索引类，兼容性成立；做破坏性迁移时要走 DEPLOY.md 的双阶段流程）。
+  migrate:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+      target: builder
+    profiles: ['tools']
+    restart: 'no'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ecommerce}:${POSTGRES_PASSWORD:-ecommerce}@postgres:5432/${POSTGRES_DB:-ecommerce}?schema=public
+    command: ['npx', 'prisma', 'migrate', 'deploy']
 
 volumes:
   pgdata:

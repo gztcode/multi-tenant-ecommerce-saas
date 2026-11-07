@@ -894,6 +894,43 @@ export class OrderService {
   }
 
   /**
+   * 游客订单查询（阶段 11）。
+   *
+   * ⚠️ **这是当初「订单号不是秘密」决策的受控例外**：订单控制器注释里写过
+   * 不支持游客读单的原因——按订单号就能读到他人姓名、地址、手机号。
+   * 这里的安全设计：
+   * - **双因子**：`orderNo` + `receiverPhone` 必须同时精确匹配，
+   *   手机号才是真正的钥匙（订单号在支付回调/日志里到处都是）；
+   * - **最小投影**：只返回状态/金额/件数/时间，`select` 里**没有**
+   *   收货人姓名、电话、地址——查到也不给，控制器层无二次泄露面；
+   * - 租户隔离由扩展自动附加（order 在租户白名单里），
+   *   控制器走 @Public()（从子域名建立上下文）。
+   */
+  async guestLookup(
+    orderNo: string,
+    phone: string,
+  ): Promise<{
+    orderNo: string;
+    status: OrderStatus;
+    totalAmount: number;
+    itemCount: number;
+    createdAt: Date;
+    paidAt: Date | null;
+  } | null> {
+    return this.prisma.order.findFirst({
+      where: { orderNo, receiverPhone: phone },
+      select: {
+        orderNo: true,
+        status: true,
+        totalAmount: true,
+        itemCount: true,
+        createdAt: true,
+        paidAt: true,
+      },
+    });
+  }
+
+  /**
    * 商家发货（`PAID` → `SHIPPED`）。
    */
   async shipOrder(orderNo: string, trackingNo: string): Promise<void> {

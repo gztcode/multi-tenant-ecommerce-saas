@@ -15,6 +15,8 @@ import { tenantContext } from '../../common/tenant/tenant-context';
 import { ApplyPayoutDto } from './dto/apply-payout.dto';
 import { LedgerService } from './ledger.service';
 import { PayoutService } from './payout.service';
+import { PayoutQueryService } from './payout-query.service';
+import { PayoutStateService } from './payout-state.service';
 import { PayoutCipherService } from './payout-cipher.service';
 import type { PayoutVerificationTarget } from '../../common/payment/payout-verification';
 
@@ -830,14 +832,18 @@ function makeService(
     typeof fakePlatformSettings
   > = fakePlatformSettings(),
 ): PayoutService {
-  return new PayoutService(
+  // 阶段 11 拆分：按依赖顺序组装两个子服务，再交给 facade
+  const ledger = new LedgerService(prisma as unknown as never);
+  const queries = new PayoutQueryService(prisma as unknown as never, ledger);
+  const states = new PayoutStateService(
     prisma as unknown as never,
     queues as unknown as never,
-    new LedgerService(prisma as unknown as never),
     verification,
     registry as unknown as never,
     platformSettings as unknown as never,
+    queries,
   );
+  return new PayoutService(queries, states);
 }
 
 /** 在租户上下文里调用（服务层靠 `getTenantContext()` 取租户与用户） */

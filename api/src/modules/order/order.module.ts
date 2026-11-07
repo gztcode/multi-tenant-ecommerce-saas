@@ -8,6 +8,7 @@ import { OrderTimeoutService } from './order-timeout.service';
 import { OrderTimeoutWorker } from './order-timeout.worker';
 import { OrderController } from './order.controller';
 import { MerchantOrderController } from './merchant-order.controller';
+import { GuestOrderController } from './guest-order.controller';
 
 /**
  * 订单模块（阶段 3）。
@@ -36,7 +37,7 @@ import { MerchantOrderController } from './merchant-order.controller';
  */
 @Module({
   imports: [AuthModule, CouponModule, BillingModule],
-  controllers: [OrderController, MerchantOrderController],
+  controllers: [OrderController, MerchantOrderController, GuestOrderController],
   providers: [
     OrderInventoryService,
     OrderService,
