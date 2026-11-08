@@ -6,7 +6,7 @@ import cookieParser from 'cookie-parser';
 import { AppModule } from '../src/app.module';
 import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.interceptor';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
-import { platformScope, tenantContext } from '../src/common/tenant/tenant-context';
+import { tenantContext } from '../src/common/tenant/tenant-context';
 import { http } from './helpers';
 import { createMerchant, unique } from './merchant-fixture';
 
@@ -97,9 +97,7 @@ describe('退货入库（阶段 11d）', () => {
         specs: [{ name: '规格', values: [{ value: '默认' }] }],
       })
       .expect(200);
-    const skuId = (
-      matrix.body as { skus: Array<{ id: string }> }
-    ).skus[0].id;
+    const skuId = (matrix.body as { skus: Array<{ id: string }> }).skus[0].id;
 
     await http(app)
       .patch(`/api/v1/catalog/products/${productId}/skus/${skuId}`)
@@ -165,9 +163,8 @@ describe('退货入库（阶段 11d）', () => {
   }
 
   function asTenant<T>(tenantId: string, fn: () => Promise<T>): Promise<T> {
-    return tenantContext.run(
-      { tenantId, userId: null, role: null },
-      async () => fn(),
+    return tenantContext.run({ tenantId, userId: null, role: null }, async () =>
+      fn(),
     );
   }
 
@@ -180,7 +177,7 @@ describe('退货入库（阶段 11d）', () => {
         where: { orderNo },
       });
       if (!rows) throw new Error(`order ${orderNo} not found`);
-      return rows as unknown as OrderBody & { id: string };
+      return rows;
     });
   }
 
