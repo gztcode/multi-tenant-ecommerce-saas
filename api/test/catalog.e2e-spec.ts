@@ -836,6 +836,64 @@ describe('商品 (e2e)', () => {
     }
   });
 
+  it('批量上架已上架过的商品：publishedAt 保留首次上架时间（与单条 update 一致）', async () => {
+    const merchant = await createMerchant(app, prisma);
+
+    const created = await createProduct(merchant.token, {
+      name: '批量上架口径商品',
+      slug: `bp-${unique()}`,
+    });
+
+    // 单条上架 → 写入 publishedAt（记为 T1）
+    const published = await http(app)
+      .patch(`/api/v1/catalog/products/${created.id}`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ status: 'PUBLISHED' })
+      .expect(200);
+    const firstPublishedAt = productBody(published).publishedAt;
+    expect(firstPublishedAt).toBeTruthy();
+
+    // 批量上架一个**已经上架**的商品 → publishedAt 必须保持 T1 不动。
+    //
+    // ⚠️ 这条口径与单条 update() 对齐：update() 只在 status !== 'PUBLISHED'
+    // 时写 publishedAt，已上架的再点一次「上架」不会刷新。
+    // 批量原来是无条件 `publishedAt: new Date()`，商家批量重新上架一批商品
+    // 会把它们全顶到公开列表最前面（publishedAt 是默认排序键）。
+    await http(app)
+      .post('/api/v1/catalog/products/batch')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ ids: [created.id], action: 'PUBLISH' })
+      .expect(200);
+
+    const afterBatch = await http(app)
+      .get(`/api/v1/catalog/products/${created.id}`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(200);
+    expect(productBody(afterBatch).publishedAt).toBe(firstPublishedAt);
+
+    // 反向口径也必须成立：下架后重新上架**要**刷新 publishedAt
+    // （这正是单条 update() 的行为，两条路径必须一致）。
+    await http(app)
+      .patch(`/api/v1/catalog/products/${created.id}`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ status: 'UNPUBLISHED' })
+      .expect(200);
+
+    await http(app)
+      .post('/api/v1/catalog/products/batch')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ ids: [created.id], action: 'PUBLISH' })
+      .expect(200);
+
+    const afterRepublish = await http(app)
+      .get(`/api/v1/catalog/products/${created.id}`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(200);
+    const republishedAt = productBody(afterRepublish).publishedAt;
+    expect(republishedAt).toBeTruthy();
+    expect(republishedAt).not.toBe(firstPublishedAt);
+  });
+
   it('批量操作不跨租户：B 的批量请求碰不到 A 的商品', async () => {
     const a = await createMerchant(app, prisma);
     const b = await createMerchant(app, prisma);
