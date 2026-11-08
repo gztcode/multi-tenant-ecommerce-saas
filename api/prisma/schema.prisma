@@ -350,6 +350,7 @@ enum InventoryMovementType {
   RESERVE
   RELEASE
   DEDUCT
+  RETURN
 }
 
 model InventoryMovement {

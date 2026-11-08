@@ -7,6 +7,7 @@ import {
 import { InventoryMovement, Sku } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
+import { ReturnStockDto } from './dto/return-stock.dto';
 import { requireTenantId } from '../../common/tenant/require-tenant';
 
 @Injectable()
@@ -109,6 +110,102 @@ export class InventoryService {
         throw new NotFoundException('SKU 不存在');
       }
       return { sku: updated, movement };
+    });
+  }
+
+  /**
+   * 退货入库（阶段 11d）。
+   *
+   * ## 业务定位
+   *
+   * 退款**不**自动回补库存是有意的取舍（设计 §十三 / README 遗留项）——
+   * 钱退了不代表货回来了。货真退回仓库时，商家在这里手动入库：
+   * - **只有 REFUNDED 的订单**能退（货没退回来之前谈不上升库存）；
+   * - 入库上限 = 该订单该 SKU 的购买量 − 已 RETURN 的量
+   *   （RETURN 流水带 orderId，SUM 出已入库量）——**重复入库会把库存
+   *   凭空加多**，上限校验是数据层的，不是靠调用方自觉；
+   * - 库存写入用 stockVersion 乐观锁（与手动调整同一套防丢失更新机制）；
+   * - 流水记**正数增量**（与 ADJUST_IN 同口径），带 orderId 供审计追溯。
+   */
+  async returnToStock(
+    dto: ReturnStockDto,
+    operatorId: string,
+  ): Promise<{ movements: InventoryMovement[] }> {
+    const tenantId = this.currentTenantId();
+
+    return this.prisma.$transaction(async (tx) => {
+      const order = await tx.order.findFirst({ where: { id: dto.orderId } });
+      if (!order) {
+        throw new NotFoundException('订单不存在');
+      }
+      if (order.status !== 'REFUNDED') {
+        throw new ConflictException('只有已退款（REFUNDED）的订单才能退货入库');
+      }
+
+      const orderItems = await tx.orderItem.findMany({
+        where: { orderId: order.id },
+      });
+      const orderedQty = new Map(orderItems.map((i) => [i.skuId, i.quantity]));
+
+      // 同一 SKU 在请求里出现多次时先合并（否则两次各 1 件能绕过单次校验）
+      const merged = new Map<string, number>();
+      for (const item of dto.items) {
+        merged.set(item.skuId, (merged.get(item.skuId) ?? 0) + item.quantity);
+      }
+
+      // 上限校验：购买量 − 已 RETURN 量 ≥ 本次入库量
+      for (const [skuId, quantity] of merged) {
+        const ordered = orderedQty.get(skuId);
+        if (ordered === undefined) {
+          throw new BadRequestException('该商品不在本订单中');
+        }
+        const returned = await tx.inventoryMovement.aggregate({
+          where: { skuId, orderId: order.id, type: 'RETURN' },
+          _sum: { quantity: true },
+        });
+        const already = returned._sum.quantity ?? 0;
+        if (quantity > ordered - already) {
+          throw new BadRequestException(
+            `该商品最多还能入库 ${ordered - already} 件（下单 ${ordered}，已入库 ${already}）`,
+          );
+        }
+      }
+
+      // 逐 SKU 入库：乐观锁改库存 + 记 RETURN 流水（带 orderId）
+      const movements: InventoryMovement[] = [];
+      for (const [skuId, quantity] of merged) {
+        const sku = await tx.sku.findFirst({ where: { id: skuId } });
+        if (!sku) {
+          throw new NotFoundException('SKU 不存在');
+        }
+        const stockBefore = sku.stock;
+        const affected = await tx.sku.updateMany({
+          where: { id: sku.id, stockVersion: sku.stockVersion },
+          data: {
+            stock: stockBefore + quantity,
+            stockVersion: { increment: 1 },
+          },
+        });
+        if (affected.count === 0) {
+          throw new ConflictException('库存已被他人修改，请重试');
+        }
+        movements.push(
+          await tx.inventoryMovement.create({
+            data: {
+              tenantId,
+              skuId,
+              type: 'RETURN',
+              quantity,
+              stockBefore,
+              stockAfter: stockBefore + quantity,
+              ...(dto.reason !== undefined ? { reason: dto.reason } : {}),
+              orderId: order.id,
+              operatorId,
+            },
+          }),
+        );
+      }
+      return { movements };
     });
   }
 
