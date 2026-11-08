@@ -810,13 +810,17 @@ export class RefundService {
    *
    * @returns 本轮处理了多少张（上限 `REFUND_SCAN_LIMIT`）
    */
-  async scanRefunding(now = new Date()): Promise<number> {
+  async scanRefunding(now?: Date): Promise<number> {
+    // ⚠️ **默认取库时钟**：要比较的 `refundRequestedAt` 是数据库时钟写入的，
+    //    基准若取应用进程时钟，两边的偏差会让阈值判定整体偏移。
+    //    显式传参只给测试 / 回放用，线上调用方一律不传。
+    const reference = now ?? (await this.prisma.databaseNow());
     // ⚠️ **阈值 10 分钟**：发起退款的 `refundRequestedAt` 早于它才算超时。
     //    短于一个支付回调的正常到达时间会把「还在路上」的退款误报。
     const thresholdMs = Number(
       process.env.REFUND_STUCK_THRESHOLD_MS ?? REFUND_SCAN_THRESHOLD_MS,
     );
-    const since = new Date(now.getTime() - thresholdMs);
+    const since = new Date(reference.getTime() - thresholdMs);
 
     const stuck = await tenantContext.run(platformScope(), async () =>
       this.prisma.payment.findMany({
