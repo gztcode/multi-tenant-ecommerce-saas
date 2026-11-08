@@ -182,3 +182,45 @@ jobs:
       # media 套件依赖 MinIO，CI 不启动 MinIO，只排除这一套
       - run: npm run test:e2e -- --testPathIgnorePatterns=media.e2e-spec.ts
         working-directory: api
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ecommerce
+          POSTGRES_PASSWORD: ecommerce
+          POSTGRES_DB: ecommerce
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U ecommerce"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 16380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm install -g npm@11
+      # 浏览器 e2e 用独立库 ecommerce_browser（避免测试库的历史出款快照触发密钥自检失败）
+      - run: docker exec ${{ job.services.postgres.id }} psql -U ecommerce -d postgres -c 'CREATE DATABASE ecommerce_browser;'
+      - run: docker exec ${{ job.services.postgres.id }} psql -U ecommerce -d ecommerce_browser -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;'
+      - run: npm ci
+      - run: npm run prisma:generate --workspace api
+      - run: npx playwright install --with-deps chromium
+      - run: npm test --workspace @ecom/browser-e2e

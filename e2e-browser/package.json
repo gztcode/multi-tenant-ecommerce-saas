@@ -1,0 +1,12 @@
+{
+  "name": "@ecom/browser-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "浏览器级端到端测试（Playwright）：真实浏览器走 storefront 全链路",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1"
+  }
+}
