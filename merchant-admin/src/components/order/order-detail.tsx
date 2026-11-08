@@ -20,6 +20,11 @@ import {
 export function OrderDetail({ initial }: { initial: MerchantOrder }) {
   const router = useRouter();
   const [trackingNo, setTrackingNo] = useState(initial.trackingNo ?? '');
+  // 退货入库（阶段 11d）：每个 SKU 的入库数量，默认=购买量
+  const [returnQty, setReturnQty] = useState<Record<string, number>>(() =>
+    Object.fromEntries((initial.items ?? []).map((i) => [i.skuId, i.quantity])),
+  );
+  const [returnReason, setReturnReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -90,6 +95,43 @@ export function OrderDetail({ initial }: { initial: MerchantOrder }) {
     }
   }
 
+  async function submitReturnStock() {
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const items = (initial.items ?? [])
+        .map((i) => ({ skuId: i.skuId, quantity: returnQty[i.skuId] ?? i.quantity }))
+        .filter((i) => i.quantity > 0);
+      if (items.length === 0) {
+        throw new Error('入库数量全为 0');
+      }
+      const response = await fetch(
+        `/api/orders/${initial.orderNo}/return-inventory`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            orderId: initial.id,
+            items,
+            ...(returnReason.trim() !== '' ? { reason: returnReason.trim() } : {}),
+          }),
+        },
+      );
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as {
+          message?: string;
+        };
+        throw new Error(payload.message ?? '退货入库失败');
+      }
+      setMessage('已入库（库存已按明细回补，可在库存流水里查看 RETURN 记录）');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '退货入库失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-col gap-1">
@@ -126,6 +168,60 @@ export function OrderDetail({ initial }: { initial: MerchantOrder }) {
               {busy ? '提交中…' : '确认发货'}
             </button>
           </form>
+        </section>
+      )}
+
+      {initial.status === 'REFUNDED' && (initial.items ?? []).length > 0 && (
+        <section className="flex flex-col gap-2 rounded-md border p-4">
+          <h3 className="font-semibold">退货入库</h3>
+          <p className="text-xs text-muted-foreground">
+            退款不会自动回补库存——货真退回仓库时，在这里按 SKU 填写入库数量。
+            上限为该订单的购买量（重复入库会被后端拒绝）。
+          </p>
+          {(initial.items ?? []).map((item) => (
+            <div
+              key={item.skuId}
+              className="flex flex-wrap items-end gap-2 text-sm"
+            >
+              <span className="min-w-40 flex-1">
+                {item.productName}（购买 {item.quantity} 件）
+              </span>
+              <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                入库数量
+                <input
+                  type="number"
+                  min={0}
+                  max={item.quantity}
+                  value={returnQty[item.skuId] ?? item.quantity}
+                  onChange={(event) =>
+                    setReturnQty((prev) => ({
+                      ...prev,
+                      [item.skuId]: Number(event.target.value),
+                    }))
+                  }
+                  className="w-20 rounded-md border px-2 py-1 text-sm"
+                />
+              </label>
+            </div>
+          ))}
+          <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+            备注（选填）
+            <input
+              value={returnReason}
+              onChange={(event) => setReturnReason(event.target.value)}
+              placeholder="如快递单号 / 退货原因"
+              maxLength={200}
+              className="rounded-md border px-2 py-1 text-sm"
+            />
+          </label>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={submitReturnStock}
+            className="w-fit rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-40"
+          >
+            {busy ? '提交中…' : '确认入库'}
+          </button>
         </section>
       )}
 

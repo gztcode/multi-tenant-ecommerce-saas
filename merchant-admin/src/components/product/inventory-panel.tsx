@@ -26,6 +26,10 @@ const TYPE_LABEL: Record<string, string> = {
   ADJUST_IN: '入库',
   ADJUST_OUT: '出库',
   CHECK: '盘点',
+  RESERVE: '预占',
+  RELEASE: '释放',
+  DEDUCT: '售出扣减',
+  RETURN: '退货入库',
 };
 
 /** 统一的中转路由响应解析：错误 message 直接可以显示给人看 */

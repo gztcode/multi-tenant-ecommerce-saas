@@ -9,6 +9,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { InventoryService } from './inventory.service';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
+import { ReturnStockDto } from './dto/return-stock.dto';
 import { InventoryMovementsQueryDto } from './dto/inventory-movements-query.dto';
 
 @ApiTags('inventory')
@@ -24,6 +25,17 @@ export class InventoryController {
   @ApiOperation({ summary: '库存调整（入库 / 出库 / 盘点）' })
   adjust(@Body() dto: AdjustStockDto, @CurrentUser() user: CurrentUserPayload) {
     return this.inventoryService.adjust(dto, user.userId);
+  }
+
+  @Post('returns')
+  @ApiOperation({
+    summary: '退货入库（REFUNDED 订单，上限=购买量−已入库量）',
+  })
+  returnStock(
+    @Body() dto: ReturnStockDto,
+    @CurrentUser() user: CurrentUserPayload,
+  ) {
+    return this.inventoryService.returnToStock(dto, user.userId);
   }
 
   @Get('movements')
