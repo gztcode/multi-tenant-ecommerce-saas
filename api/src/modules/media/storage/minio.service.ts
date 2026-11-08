@@ -152,6 +152,35 @@ export class MinioService implements OnModuleInit {
     }
   }
 
+  /**
+   * 读对象头部的前 `length` 个字节（阶段 11：媒体 magic-byte 校验用）。
+   *
+   * 用 S3 的 Range 请求只取文件头，不整对象下载——
+   * 目的是核对「文件内容真的是它声称的图片类型」：
+   * presigned PUT 的 Content-Type 由客户端自报，把一个改了扩展名的
+   * 非图片文件传上来是挡不住的，只有看字节头才作数。
+   *
+   * 对象不存在返回 null；读流失败按 null 处理（调用方按「校验不过」走）。
+   */
+  async readObjectHead(key: string, length = 16): Promise<Buffer | null> {
+    try {
+      const res = await this.internalClient.send(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+          Range: `bytes=0-${length - 1}`,
+        }),
+      );
+      const chunks: Buffer[] = [];
+      for await (const chunk of res.Body as AsyncIterable<Uint8Array>) {
+        chunks.push(Buffer.from(chunk));
+      }
+      return Buffer.concat(chunks);
+    } catch {
+      return null;
+    }
+  }
+
   /** 删除对象（清理孤儿用） */
   async deleteObject(key: string): Promise<void> {
     try {

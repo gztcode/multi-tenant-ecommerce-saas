@@ -23,20 +23,31 @@ import {
  * key/value 结构都安全放行。
  *
  * 通过 `Prisma.dmmf` 在运行时直接读 schema 元数据，无须另维护一份白名单。
+ *
+ * ⚠️ **按模型 memoize**（阶段 11）：本函数在每次 create / updateMany 的
+ *    拦截路径上都会被调用，而 DMMF 是进程内不变的元数据——
+ *    不缓存的话每次写入都在重建 Set，纯白干。
  */
+const relationFieldsCache = new Map<string, Set<string>>();
+
 function getRelationFieldNames(model: string): Set<string> {
+  const cached = relationFieldsCache.get(model);
+  if (cached) return cached;
   const modelDef = Prisma.dmmf.datamodel.models.find((m) => m.name === model);
-  if (!modelDef) return new Set();
-  return new Set(
-    modelDef.fields
-      .filter(
-        (field) =>
-          field.kind === 'object' &&
-          'relationName' in field &&
-          !!field.relationName,
+  const fields = modelDef
+    ? new Set(
+        modelDef.fields
+          .filter(
+            (field) =>
+              field.kind === 'object' &&
+              'relationName' in field &&
+              !!field.relationName,
+          )
+          .map((field) => field.name),
       )
-      .map((field) => field.name),
-  );
+    : new Set<string>();
+  relationFieldsCache.set(model, fields);
+  return fields;
 }
 
 function assertNoNestedWrites(

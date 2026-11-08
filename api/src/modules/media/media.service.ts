@@ -13,11 +13,42 @@ import {
   tenantContext,
 } from '../../common/tenant/tenant-context';
 import { MinioService } from './storage/minio.service';
+import { RedisLockService } from '../../common/lock/redis-lock.service';
 import { ALLOWED_MIME_TYPES, UploadUrlDto } from './dto/upload-url.dto';
 import { requireTenantId } from '../../common/tenant/require-tenant';
 
 /** 超过这个时间仍是 PENDING 的记录视为孤儿 */
 export const ORPHAN_AFTER_HOURS = 24;
+
+/**
+ * 图片 magic bytes 与 MIME 的比对（阶段 11）。
+ *
+ * 只覆盖 ALLOWED_MIME_TYPES 里的四种图片类型；`head` 不足长（空文件除外）
+ * 或完全不匹配 → false。比对只认前几个字节，容忍后续任意内容。
+ */
+export function isMagicMatched(head: Buffer | null, mime: string): boolean {
+  if (!head || head.length === 0) return false;
+  const startsWith = (...bytes: number[]): boolean =>
+    bytes.every((b, i) => head[i] === b);
+  const ascii = head.toString('latin1');
+  switch (mime) {
+    case 'image/jpeg':
+      // FFD8FF（JPEG SOI + 第一段 marker）
+      return startsWith(0xff, 0xd8, 0xff);
+    case 'image/png':
+      // 89 50 4E 47 0D 0A 1A 0A（PNG 签名）
+      return startsWith(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
+    case 'image/gif':
+      // GIF87a / GIF89a
+      return ascii.startsWith('GIF87a') || ascii.startsWith('GIF89a');
+    case 'image/webp':
+      // RIFF....WEBP（第 8-11 字节是 WEBP）
+      return ascii.startsWith('RIFF') && ascii.slice(8, 12) === 'WEBP';
+    default:
+      // 不在白名单的类型在上传签发处就被拒了；这里兜底拒绝
+      return false;
+  }
+}
 
 @Injectable()
 export class MediaService implements OnModuleInit, OnModuleDestroy {
@@ -26,6 +57,7 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly prisma: TenantPrismaService,
     private readonly minio: MinioService,
+    private readonly lock: RedisLockService,
   ) {}
 
   /**
@@ -172,6 +204,23 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
+    // ⛔ 复核文件头（阶段 11）：presigned PUT 的 Content-Type 也是客户端
+    //    自报的——把一个改了扩展名的可执行/HTML 文件以 image/png 传上来，
+    //    大小校验完全放行。看 magic bytes 才算数。
+    if (actualSize > 0) {
+      const head = await this.minio.readObjectHead(media.key);
+      if (!isMagicMatched(head, media.mime)) {
+        await this.minio.deleteObject(media.key);
+        await this.prisma.media.updateMany({
+          where: { id },
+          data: { status: 'ORPHANED' },
+        });
+        throw new BadRequestException(
+          '文件内容与声称的图片类型不符，已拒绝入库',
+        );
+      }
+    }
+
     await this.prisma.media.updateMany({
       where: { id },
       data: { status: 'READY', size: actualSize },
@@ -199,13 +248,17 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
       }),
       this.prisma.media.count(),
     ]);
-    // 媒体列表是给前端展示用的，逐个签发限时读 URL（bucket 私有）
-    const withUrls = await Promise.all(
-      items.map(async (item) => ({
-        ...item,
-        readUrl: await this.minio.createReadUrl(item.key),
-      })),
+    // 媒体列表是给前端展示用的，批量签发限时读 URL（bucket 私有）。
+    // ⚠️ 阶段 11：改用 createReadUrls 一次批量签名（一页 20 条就是
+    //    20 次 HMAC，逐条 await 虽然有 Promise.all 并发，仍省不下
+    //    客户端建立的连接开销；批量版在 storage 层一次循环内完成）。
+    const readUrls = await this.minio.createReadUrls(
+      items.map((item) => item.key),
     );
+    const withUrls = items.map((item, index) => ({
+      ...item,
+      readUrl: readUrls[index],
+    }));
     return { items: withUrls, total, page, pageSize };
   }
 
@@ -239,6 +292,16 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
    * 有精确的 `id` 过滤（下面每条都是按 id 更新的，不会误伤）。
    */
   async cleanupOrphans(): Promise<{ marked: number }> {
+    // ⚠️ **分布式锁**（阶段 11）：清理定时器是**每个副本各自的 setInterval**，
+    //    N 副本部署时本来会重复清理 N 遍（逐条 HEAD + updateMany）。
+    //    抢不到锁 = 另一副本在清，直接跳过本轮。
+    const outcome = await this.lock.withLock('media-orphan-cleanup', () =>
+      this.doCleanupOrphans(),
+    );
+    return outcome.acquired ? outcome.value : { marked: 0 };
+  }
+
+  private async doCleanupOrphans(): Promise<{ marked: number }> {
     const threshold = new Date(Date.now() - ORPHAN_AFTER_HOURS * 3600 * 1000);
 
     return tenantContext.run(platformScope(), async () => {

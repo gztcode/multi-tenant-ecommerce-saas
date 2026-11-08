@@ -22,12 +22,19 @@ export class LoggingInterceptor implements NestInterceptor {
     const startedAt = Date.now();
     const req = context.switchToHttp().getRequest<Request>();
     const { method, url } = req;
+    const requestId = req.requestId;
     return next.handle().pipe(
       tap({
         next: () => {
           const res = context.switchToHttp().getResponse<Response>();
-          this.logger.log(
-            `${method} ${url} ${res.statusCode} ${Date.now() - startedAt}ms`,
+          this.emit(
+            'log',
+            method,
+            url,
+            res.statusCode,
+            startedAt,
+            undefined,
+            requestId,
           );
         },
         error: (error: unknown) => {
@@ -36,11 +43,41 @@ export class LoggingInterceptor implements NestInterceptor {
           //    同一仓库两种口径会让日志变成信息泄露的口子。
           const status = (error as { status?: number })?.status ?? 500;
           const name = error instanceof Error ? error.name : 'UnknownError';
-          this.logger.warn(
-            `${method} ${url} ${status} ${Date.now() - startedAt}ms ${name}`,
-          );
+          this.emit('warn', method, url, status, startedAt, name, requestId);
         },
       }),
     );
+  }
+
+  /**
+   * 阶段 11：人读的字符串保留（本地开发直接看 docker logs），
+   * 同时把结构化字段作为第二个参数传给全局 Logger——
+   * 全局换成 PinoLoggerService 后这些字段会原样落进 JSON。
+   */
+  private emit(
+    level: 'log' | 'warn',
+    method: string,
+    url: string,
+    status: number,
+    startedAt: number,
+    errorName: string | undefined,
+    requestId: string | undefined,
+  ): void {
+    const fields = {
+      requestId,
+      method,
+      url,
+      status,
+      durationMs: Date.now() - startedAt,
+      ...(errorName !== undefined ? { errorName } : {}),
+    };
+    const line = `${method} ${url} ${status} ${fields.durationMs}ms${
+      errorName !== undefined ? ` ${errorName}` : ''
+    }`;
+    if (level === 'log') {
+      this.logger.log(line, fields);
+    } else {
+      this.logger.warn(line, fields);
+    }
   }
 }

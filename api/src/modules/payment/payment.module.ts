@@ -9,6 +9,10 @@ import { WebhookController } from './webhook.controller';
 import { FakePaymentController } from './fake-payment.controller';
 import { SubscriptionPaymentController } from './subscription-payment.controller';
 import { PaymentService } from './payment.service';
+import { PaymentLookupService } from './payment-lookup.service';
+import { OrderPaymentService } from './payment-order.service';
+import { RefundService } from './payment-refund.service';
+import { WebhookEventService } from './payment-webhook.service';
 import { PaymentMethodService } from './payment-method.service';
 import { RenewalService } from './renewal.service';
 import { RenewalWorker } from './renewal.worker';
@@ -32,6 +36,11 @@ import { PaymentProvider } from './payment-provider.interface';
 import { PaymentProviderRegistry } from './payment-provider.registry';
 import { PAYMENT_PROVIDER_LIST, PAYMENT_PROVIDERS } from './payment.constants';
 import { PayoutProvidersModule } from '../../common/payment/payout-providers.module';
+import {
+  CHANNEL_ALERT_SINK,
+  LoggingChannelAlertSink,
+} from '../../common/channel/channel-alert';
+import { WebhookAlertSink } from '../../common/channel/webhook-alert-sink';
 
 /**
  * 支付模块（阶段 3 Task 5）。
@@ -99,7 +108,23 @@ import { PayoutProvidersModule } from '../../common/payment/payout-providers.mod
   ],
   providers: [
     PaymentService,
+    // 阶段 11 拆分出的四个职责服务（PaymentService 现在只是 facade，
+    // 内部 new 这四个——但它们也要可注入，供将来直接注入具体服务用）。
+    PaymentLookupService,
+    OrderPaymentService,
+    RefundService,
+    WebhookEventService,
     PaymentMethodService,
+    // 渠道告警接收方（阶段 11）：配了 ALERT_WEBHOOK_URL 就推 webhook
+    // （飞书/钉钉/通用格式），否则退回打日志的默认实现。
+    // 注入点：PayoutReconciliationService 构造参数上的 @Optional()。
+    {
+      provide: CHANNEL_ALERT_SINK,
+      useFactory: () =>
+        process.env.ALERT_WEBHOOK_URL
+          ? new WebhookAlertSink()
+          : new LoggingChannelAlertSink(),
+    },
     RenewalService,
     RenewalWorker,
     WebhookWorker,

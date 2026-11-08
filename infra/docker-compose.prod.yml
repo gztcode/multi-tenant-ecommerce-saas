@@ -1,0 +1,44 @@
+# 生产部署的 compose 覆盖文件（阶段 11：部署加固）。
+#
+# 用法（在 infra/ 目录下）：
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# ## 与基础 compose 的差异（只覆盖必要的部分）
+#
+# - nginx：80/443 对外、挂载 TLS 证书与 prod 配置模板（BASE_DOMAIN 注入）
+# - 其余服务原样继承：端口仍绑回环（运维经 SSH 隧道访问）、健康检查、
+#   内存上限、日志轮转全部不变
+# - 数据库/Redis/MinIO 的宿主机端口在生产上建议直接删掉映射
+#   （把本文件里的注释块解开即可）——容器网内互访不需要它们
+#
+# ⚠️ 密钥一律经 infra/.env 注入（POSTGRES_PASSWORD / JWT_SECRET /
+#    AUTH_SECRET / PAYOUT_ACCOUNT_ENCRYPTION_KEY / MINIO_* / REDIS_PASSWORD），
+#    compose 内置的本地开发默认值在 api 启动守卫处会被**直接拒绝**
+#    （assert-secure-config 已知占位符名单），这不是文档恐吓，是硬失败。
+services:
+  nginx:
+    ports:
+      - '${BIND_HOST:-0.0.0.0}:80:80'
+      - '${BIND_HOST:-0.0.0.0}:443:443'
+    volumes:
+      # 官方 nginx 镜像会把 /etc/nginx/templates/*.template 经 envsubst
+      # 渲染到 /etc/nginx/conf.d/（只替换环境变量，nginx 变量不受影响）
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./certbot-www:/var/www/certbot:ro
+    environment:
+      BASE_DOMAIN: ${BASE_DOMAIN:?请在 infra/.env 里设置 BASE_DOMAIN（如 example.com）}
+
+  # 生产上不需要把数据服务暴露到宿主机（哪怕回环）：
+  # postgres:
+  #   ports: []
+  # redis:
+  #   ports: []
+  # minio:
+  #   ports:
+  #     - '127.0.0.1:${MINIO_PORT:-19000}:9000'   # presigned 直传要保留这个
+
+  # api 的健康检查依赖端口映射吗？不依赖——healthcheck 走容器内 127.0.0.1。
+  # 宿主机调试用（默认保留回环绑定）：
+  # api:
+  #   ports: []

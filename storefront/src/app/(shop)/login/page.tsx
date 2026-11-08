@@ -1,5 +1,7 @@
 'use client';
 
+import Link from 'next/link';
+
 import { useState } from 'react';
 import { signIn } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
@@ -79,6 +81,13 @@ export default function CustomerLoginPage() {
         <Button type="submit" disabled={pending}>
           {pending ? '登录中…' : '登录'}
         </Button>
+        {/* 阶段 11：游客订单查询入口——没账号也能查订单状态 */}
+        <p className="text-center text-sm text-muted-foreground">
+          只想查个订单？{' '}
+          <Link href="/orders/lookup" className="text-primary underline">
+            游客订单查询
+          </Link>
+        </p>
       </form>
     </main>
   );

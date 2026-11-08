@@ -21,6 +21,10 @@ import type {
 } from './payment-provider.interface';
 import { PaymentProviderRegistry } from './payment-provider.registry';
 import { PaymentService } from './payment.service';
+import { PaymentLookupService } from './payment-lookup.service';
+import { OrderPaymentService } from './payment-order.service';
+import { RefundService } from './payment-refund.service';
+import { WebhookEventService } from './payment-webhook.service';
 import { WebhookController } from './webhook.controller';
 
 /**
@@ -93,22 +97,57 @@ function buildController(providers: PaymentProvider[]) {
   const orderService = { transitionInTx: jest.fn() };
   const registry = new PaymentProviderRegistry(providers);
 
-  const paymentService = new PaymentService(
+  // 阶段 11 拆分后按依赖顺序组装四个子服务，再交给 facade
+  const lookup = new PaymentLookupService(
     prisma as unknown as TenantPrismaService,
-    orderService as unknown as OrderService,
-    { deductInTx: jest.fn() } as unknown as OrderInventoryService,
-    queue as unknown as QueueService,
-    { markUsedInTx: jest.fn() } as unknown as CouponRedemptionService,
-    { markInvoicePaid: jest.fn() } as unknown as InvoiceService,
-    {
-      recordCommissionInTx: jest.fn(),
-      recordReversalInTx: jest.fn(),
-    } as unknown as CommissionService,
-    {
-      recordReceiptInTx: jest.fn(),
-      recordReceiptReversalInTx: jest.fn(),
-    } as unknown as ReceiptService,
     registry,
+  );
+  const inventory = {
+    deductInTx: jest.fn(),
+  } as unknown as OrderInventoryService;
+  const couponRedemption = {
+    markUsedInTx: jest.fn(),
+  } as unknown as CouponRedemptionService;
+  const billingInvoices = {
+    markInvoicePaid: jest.fn(),
+  } as unknown as InvoiceService;
+  const commission = {
+    recordCommissionInTx: jest.fn(),
+    recordReversalInTx: jest.fn(),
+  } as unknown as CommissionService;
+  const receipt = {
+    recordReceiptInTx: jest.fn(),
+    recordReceiptReversalInTx: jest.fn(),
+  } as unknown as ReceiptService;
+  const webhookEvents = new WebhookEventService(
+    prisma as unknown as TenantPrismaService,
+    lookup,
+    orderService as unknown as OrderService,
+    inventory,
+    queue as unknown as QueueService,
+    couponRedemption,
+    billingInvoices,
+    commission,
+    receipt,
+  );
+  const orderPayments = new OrderPaymentService(
+    prisma as unknown as TenantPrismaService,
+    lookup,
+    webhookEvents,
+  );
+  const refunds = new RefundService(
+    prisma as unknown as TenantPrismaService,
+    lookup,
+    webhookEvents,
+    orderService as unknown as OrderService,
+    commission,
+    receipt,
+  );
+  const paymentService = new PaymentService(
+    lookup,
+    orderPayments,
+    refunds,
+    webhookEvents,
   );
 
   const controller = new WebhookController(paymentService, registry);

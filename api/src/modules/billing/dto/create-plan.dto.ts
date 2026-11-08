@@ -77,7 +77,8 @@ export class CreatePlanDto {
 
   @ApiProperty({
     required: false,
-    description: '店铺数上限。不填 = 不限',
+    description:
+      '店铺数上限。⚠️ 当前架构下一租户固定一店（subdomain 在 Tenant 上），此字段暂无代码路径消费，仅作存档',
     example: 1,
   })
   @IsOptional()

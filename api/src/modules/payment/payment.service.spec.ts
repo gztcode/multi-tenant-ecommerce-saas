@@ -20,6 +20,10 @@ import type {
 } from './payment-provider.interface';
 import { PaymentProviderRegistry } from './payment-provider.registry';
 import { PaymentService } from './payment.service';
+import { PaymentLookupService } from './payment-lookup.service';
+import { OrderPaymentService } from './payment-order.service';
+import { RefundService } from './payment-refund.service';
+import { WebhookEventService } from './payment-webhook.service';
 import { runForTenant } from '../../common/tenant/tenant-context';
 
 /**
@@ -142,8 +146,15 @@ function buildService(
     recordReceiptReversalInTx: jest.fn(),
   };
 
-  const service = new PaymentService(
+  // 阶段 11 拆分后按依赖顺序组装四个子服务，再交给 facade
+  const registry = new PaymentProviderRegistry([providerInstance]);
+  const lookup = new PaymentLookupService(
     prisma as unknown as TenantPrismaService,
+    registry,
+  );
+  const webhookEvents = new WebhookEventService(
+    prisma as unknown as TenantPrismaService,
+    lookup,
     orderService as unknown as OrderService,
     inventory as unknown as OrderInventoryService,
     queue as unknown as QueueService,
@@ -151,7 +162,25 @@ function buildService(
     billingInvoices as unknown as InvoiceService,
     commission as unknown as CommissionService,
     receipt as unknown as ReceiptService,
-    new PaymentProviderRegistry([providerInstance]),
+  );
+  const orderPayments = new OrderPaymentService(
+    prisma as unknown as TenantPrismaService,
+    lookup,
+    webhookEvents,
+  );
+  const refunds = new RefundService(
+    prisma as unknown as TenantPrismaService,
+    lookup,
+    webhookEvents,
+    orderService as unknown as OrderService,
+    commission as unknown as CommissionService,
+    receipt as unknown as ReceiptService,
+  );
+  const service = new PaymentService(
+    lookup,
+    orderPayments,
+    refunds,
+    webhookEvents,
   );
 
   return { service, orderService, inventory, commission, receipt };
@@ -819,9 +848,14 @@ describe('渠道交易号绑定（阶段 8b）', () => {
       provider('fake', FAKE_CAPABILITIES),
       prisma,
     );
-    const attach = (
-      service as unknown as { attachProviderTxnId: AttachFn }
-    ).attachProviderTxnId.bind(service);
+    // 阶段 11 拆分：attachProviderTxnId 归 WebhookEventService，
+    // 从 facade 的 webhookEvents 上取（facade 不再承载业务方法）
+    const webhookEvents = (
+      service as unknown as {
+        webhookEvents: { attachProviderTxnId: AttachFn };
+      }
+    ).webhookEvents;
+    const attach = webhookEvents.attachProviderTxnId.bind(webhookEvents);
     return { prisma, attach };
   }
 

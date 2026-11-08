@@ -8,6 +8,7 @@ import { assertSecureConfig } from './common/config/assert-secure-config';
 import { assertPayoutEncryptionKey } from './common/config/assert-payout-encryption-key';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { LoggingInterceptor } from './common/http/logging.interceptor';
+import { PinoLoggerService } from './common/logging/pino-logger.service';
 import { PayoutEncryptionSelfCheck } from './modules/billing/payout-encryption-self-check.service';
 
 async function bootstrap() {
@@ -26,6 +27,9 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, { rawBody: true });
 
   app.setGlobalPrefix('api/v1');
+  // 阶段 11：全局结构化日志。useLogger 之后，全仓 `new Logger()` 实例的
+  // 输出都会经 PinoLoggerService 落成 JSON（业务代码零改动）。
+  app.useLogger(app.get(PinoLoggerService));
   // 读取 cookie 必须有 cookie-parser 中间件：
   // Express 自带 res.cookies.set()（写），但 req.cookies（读）要靠它。
   // 游客购物车靠 cookie 里的 cart_token 标识，缺了它读不到 token。
@@ -41,8 +45,9 @@ async function bootstrap() {
   //    LoggingInterceptor 放**第一位**（最外层）才能记录到租户解析失败
   //    抛的 404（那是在 TenantContextInterceptor 里抛的）——放里面就看不见。
   //
-  // ⚠️ **已知缺口**：守卫的 401/403 不落日志——Nest 的守卫在拦截器链
-  //    **之外**执行，任何全局拦截器都盖不到。
+  // ⚠️ **已知缺口**：守卫的 401/403 不落**日志**——Nest 的守卫在拦截器链
+  //    **之外**执行，任何全局拦截器都盖不到。（HTTP **指标**没有这个缺口：
+  //    MetricsMiddleware 在中间件层注册，见 app.module.ts。）
   app.useGlobalInterceptors(
     app.get(LoggingInterceptor),
     app.get(TenantContextInterceptor),

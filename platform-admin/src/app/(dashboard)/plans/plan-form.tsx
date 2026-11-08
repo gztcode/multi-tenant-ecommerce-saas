@@ -372,7 +372,12 @@ export function PlanForm({ plan }: { plan?: Plan }) {
           </div>
 
           <div className="flex flex-col gap-1">
-            <Label htmlFor="plan-max-stores">店铺数上限（留空 = 不限）</Label>
+            {/* ⚠️ **当前架构下一租户一店**（阶段 11 标注）：`subdomain` 在
+                Tenant 模型上（schema 第 31 行），「一个商家多个店铺」需要把
+                子域名迁到 Store 上——那是一次租户上下文的架构改造（见 README
+                剩余技术债）。此字段仅作存档，**没有任何代码路径消费它**
+                （不存在「新增店铺」接口），改大改小都不影响行为。 */}
+            <Label htmlFor="plan-max-stores">店铺数上限（当前架构每租户固定 1 家，此字段暂不生效）</Label>
             <Input
               id="plan-max-stores"
               type="number"

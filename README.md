@@ -2,7 +2,38 @@
 
 前后端完全分离的多租户电商底座。一个实例服务多个商家：每个商家有自己的店铺、商品、订单与客户。
 
-**当前进度：阶段 10「事务边界与连接池收口」已完成并验收通过。**
+**当前进度：阶段 11「可观测性与生产部署加固」已完成并验收通过**
+（验收记录见
+[`docs/superpowers/plans/2026-11-07-plan-11-observability-deploy-acceptance.md`](docs/superpowers/plans/2026-11-07-plan-11-observability-deploy-acceptance.md)）。
+
+阶段 11 在阶段 10（并发正确性）之上补「看得见、上得去」的两块：
+
+- **可观测性**：pino 结构化日志（全局 `useLogger`，业务代码零改动；request-id
+  贯穿访问日志与响应头；敏感字段递归脱敏）+ Prometheus 指标
+  （`/api/v1/metrics`：HTTP RED、六队列深度、**卡单 gauge**
+  ——REFUNDING/PROCESSING 超 30 分钟的单数，正常恒为 0）+
+  `WebhookAlertSink`（`ALERT_WEBHOOK_URL` 配飞书/钉钉/自建机器人，
+  渠道告警从「打条日志没人看」变成真推送；去重 10 分钟 + 限频 10 条/分钟）。
+- **部署加固**：生产 TLS 模板（`infra/nginx/templates/prod.conf.template`，
+  泛域名证书 + ACME 路由 + HSTS）与 compose 生产 override
+  （`infra/docker-compose.prod.yml`）；网关 `limit_req` 限流；
+  `statement_timeout=8s`（防单租户慢查询拖垮共享库）；compose 新增
+  `migrate` 工具服务（builder 镜像带 prisma CLI，`--profile tools`）。
+  完整部署流程见 **[`docs/DEPLOY.md`](docs/DEPLOY.md)**。
+- **代码收口**：`payment.service.ts`（2636 行）拆为四个服务
+  （lookup / order / refund / webhook）+ 202 行 facade；
+  `payout.service.ts`（2052 行）拆为 `PayoutQueryService` + `PayoutStateService`
+  + 82 行 facade——外部调用点与类型导出均零改动；
+  媒体上传 confirm 增加 magic-byte 复核；媒体列表 readUrl 批量签发；
+  新增**游客订单查询**（订单号 + 收货手机号双因子、最小投影、
+  防爆破限流——「订单号不是秘密」决策的受控例外，见
+  `guest-order.controller.ts` 注释）。
+- **跨副本互斥**：`RedisLockService`（SET NX PX + Lua 比对删除，
+  抢不到 = 跳过本轮、Redis 不可用不抛出）套在 media 孤儿清理
+  （每副本各自的 setInterval，N 副本会清 N 遍）与出款救援/渠道对账
+  （「同一时间只允许一个对账任务」的双保险）上。
+- **指标收口**：HTTP 指标从拦截器挪到**中间件层**——守卫拒绝的
+  401/403 也能进指标了（拦截器在守卫之后执行，根本注册不上）。
 
 阶段 10 修的是并发写路径的**根因**：
 
@@ -131,7 +162,7 @@
 | `merchant-admin/` | 商家后台 | 3002 | Next.js 15 + NextAuth v5 + shadcn/ui |
 | `platform-admin/` | 平台超管后台 | 3003 | Next.js 15 + NextAuth v5 + shadcn/ui |
 | `infra/` | 容器编排与网关路由 | 80 | Docker Compose + Nginx |
-| `packages/frontend-shared/` | 三端共享包（`@ecom/frontend-shared`，`file:` 依赖） | —— | TypeScript + zod |
+| `packages/frontend-shared/` | 三端共享包（`@ecom/frontend-shared`，npm workspace） | —— | TypeScript + zod |
 
 ---
 
@@ -169,27 +200,27 @@ cd infra && docker compose up -d
 # 1. 数据库
 cd infra && docker compose up -d postgres redis
 
-# 2. 后端
-cd api
+# 2. 依赖（npm workspaces：仓库根一次装完，含共享包）
 npm install
+
+# 3. 后端
+cd api
 cp .env.example .env
 npm run prisma:deploy     # 应用迁移
 npm run prisma:seed      # 造平台超管 + 示例店铺 + 示例账号（见下）
 npm run start:dev
 
-# 3. 共享包（三端用 file: 依赖它，必须先装它自己的依赖）
-cd packages/frontend-shared && npm install
-
 # 4. 三个前端（各开一个终端）
-cd storefront     && npm install && cp .env.example .env && npm run dev   # :3001
-cd merchant-admin && npm install && cp .env.example .env && npm run dev   # :3002
-cd platform-admin && npm install && cp .env.example .env && npm run dev   # :3003
+cd storefront     && cp .env.example .env && npm run dev   # :3001
+cd merchant-admin && cp .env.example .env && npm run dev   # :3002
+cd platform-admin && cp .env.example .env && npm run dev   # :3003
 ```
 
-> ⚠️ **共享包是 `file:` 依赖**（`"file:../packages/frontend-shared"`）。npm 的
-> `file:` 链接**不会**把被链接包自身的依赖装进端的 `node_modules`，所以
-> `packages/frontend-shared` 必须先单独 `npm install`，否则三端的构建与测试
-> 会报共享包里的 `zod` / `react` 解析不到。CI 的三个前端 job 都有这一步。
+> ⚠️ **npm workspaces**（阶段 11b）：仓库根是一份 lockfile + 一个
+> node_modules（依赖提升），`@ecom/frontend-shared` 以 workspace 符号链接
+> 被三端引用。跑测试/构建用 `npm test --workspace api`、
+> `npm run build --workspace storefront`，或直接进各目录执行原脚本
+> （二进制会沿目录树向上解析到根 node_modules/.bin）。
 
 > Node/npm 基线：Node 22 + npm 11（见仓库根 `.nvmrc`；本机 Node 26 也可用）。
 > CI 与 Docker 镜像统一 npm 11；`package.json` 的 `engines` 只做提示，不作为安装闸。
@@ -264,8 +295,8 @@ PAYOUT_PLATFORM_DEFAULT_CHANNEL=fake-payout
 
 ```bash
 cd api
-npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，959 条 / 59 套件，3 条跳过）
-npm run test:e2e      # 端到端（663 条 / 40 个套件，串行）
+npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，1094 条 / 68 套件，3 条跳过）
+npm run test:e2e      # 端到端（702 条 / 41 个套件，串行）
 npm run test:cov:e2e  # 项目真实覆盖率
 ```
 
@@ -433,9 +464,11 @@ node tools/push-via-api-curl.mjs <本地分支> <远端分支>
    （调用点零改动），将来真要清理再单独做。
 3. **共享包独立发布 / 版本化** —— 阶段 8 已把 `session-sync-component.tsx` 改成
    工厂注入（不再依赖各端 `@/lib/session-sync` alias），共享包可独立 `tsc` 并进了 CI；
-   但**尚未**独立发布或独立版本化，仍按 `file:` 依赖使用。
+   阶段 11b 已随 npm workspaces 化改为 workspace 符号链接（不再是 `file:` 依赖），
+   但**尚未**独立发布或独立版本化。
 4. **守卫的 401/403 不进访问日志** —— Nest 的守卫在拦截器链**之外**执行，
-   任何全局拦截器都盖不到。
+   任何全局拦截器都盖不到。（**指标**无此缺口：阶段 11 已把 HTTP 指标
+   挪到中间件层，守卫拒绝的请求也能统计到。）
 5. **`Order.itemCount` 是下单时的快照** —— 件数总和；订单项当前无修改路径，
    若将来支持改单需回写。
 
@@ -443,21 +476,28 @@ node tools/push-via-api-curl.mjs <本地分支> <远端分支>
 
 1. **真实渠道接入**（微信 / 支付宝 / 银行）—— 本阶段只做适配层与沙箱；
    契约已经是异步形状，接真渠道时按「新渠道准入」跑一遍契约并通过 e2e。
-2. **告警系统落地** —— 只留了 `ChannelAlertSink` 钩子（卡住的出款单、退款问不出
-   结论、对账超预算都会调它），没有真正的告警通道（邮件 / IM / 值班）。
-3. **跨副本的分布式锁** —— 周期任务靠 BullMQ 的 `jobSchedulerId` 去重；
-   真正的跨副本互斥（例如「同一时间只允许一个对账任务」）还没做。
+2. **告警系统落地** —— 阶段 11 已补：`ALERT_WEBHOOK_URL` 配置飞书/钉钉/自建
+   机器人后，卡单/退款无结论/对账超预算会直接推送（带去重与限频）。
+3. **跨副本的分布式锁** —— 阶段 11 已补：`RedisLockService`
+   （`common/lock/`）套在 media 清理、出款救援、渠道对账上；
+   其余周期任务仍靠 BullMQ 单消费语义。
 4. **通用平台设置中心** —— `platform_settings` 目前只承载
    `payout.platformDefaultChannel` 一个 key。
 
 仍然存在的（沿用前几阶段的清单，未因阶段 6 变化）：
 
 1. **退货入库流程** —— 退款不回补库存是有意的取舍，但配套的退货入库始终没实现。
-2. **套餐的 `maxStores` 只声明不约束** —— 没有「新增店铺」接口，上限当前无处可施。
+2. **套餐的 `maxStores` 只声明不约束** —— 没有「新增店铺」接口，上限当前无处可施
+   （阶段 11 已在套餐表单与 DTO 上标注「当前架构每租户固定 1 家，此字段暂不生效」，
+   等多店需求落地时再动租户上下文架构）。
 3. **换套餐时账单的周期长度语义** —— 定价已按待生效套餐修正，周期长度按新套餐
    `periodDays` 算这一点仍未定论。
-4. **给商家后台做主题实时预览** —— 商家改主色时自己看不到变化。
-5. **跨店会员** / **游客订单查询** / **购物车金额是估算值** —— 阶段 3 遗留。
+4. **给商家后台做主题实时预览** —— **已完成**（核实于阶段 11 收尾）：主题表单
+   自带实时预览区（`theme-form.tsx` 的 `buildPreviewStyle` + `theme-preview`），
+   后台 globals.css 已做 `--color-primary: var(--brand-primary)` 映射，
+   预览注入的内联变量真实生效，3 条组件测试守护。
+5. **跨店会员** / **购物车金额是估算值** —— 阶段 3 遗留。
+   （游客订单查询在阶段 11 已补：订单号 + 收货手机号双因子，见 `GuestOrderController`。）
 6. **CSV 批量确认的严重级 / 状态筛选** —— 本阶段「筛选结果」= 该任务下全部
    A 类待处置项；若加筛选，扩展 `FILTER` 模式的固定条件即可。
 

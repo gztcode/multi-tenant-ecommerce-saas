@@ -1,0 +1,231 @@
+# 生产环境 Nginx 配置模板（阶段 11：部署加固）。
+#
+# ## 生效方式
+#
+# 官方 nginx 镜像的 entrypoint 会把 /etc/nginx/templates/*.template 经
+# envsubst 渲染到 /etc/nginx/conf.d/——且**只替换环境里存在的变量**，
+# $tenant / $host 这类 nginx 运行时变量不受影响。
+# 由 docker-compose.prod.yml 挂载本目录并注入 BASE_DOMAIN。
+#
+# ## 需要的环境变量（见 infra/.env.example 与 docs/DEPLOY.md）
+#
+# - BASE_DOMAIN：店铺子域名的基准域，如 `example.com`
+#   （店铺在 `<tenant>.${BASE_DOMAIN}`，证书需覆盖 `*.${BASE_DOMAIN}`——
+#    Let's Encrypt 用 DNS-01 challenge 签泛域名证书，见 DEPLOY.md §证书）
+# - 证书路径固定挂载到 /etc/nginx/certs/{fullchain.pem,privkey.pem}
+#
+# ## 与 platform.test.conf（本机开发）的差异
+#
+# - 443 TLS + 80 跳转（保留 /.well-known/acme-challenge/ 给续期）
+# - HSTS（只有全站确定走 https 后才开启；max-age 渐进：先 300 秒观察）
+# - 同款 limit_req（阈值与开发一致，上线后按流量调）
+# - rest_real_ip_from 注释保留：上 CDN/LB 时打开
+
+upstream api_backend {
+    server api:3000;
+}
+
+upstream storefront_backend {
+    server storefront:3000;
+}
+
+upstream merchant_admin_backend {
+    server merchant-admin:3000;
+}
+
+upstream platform_admin_backend {
+    server platform-admin:3000;
+}
+
+gzip on;
+gzip_types text/css application/javascript application/json image/svg+xml;
+gzip_min_length 1024;
+
+client_max_body_size 10m;
+proxy_read_timeout 60s;
+
+# 网关限流（阈值说明见 platform.test.conf 同名段落）
+limit_req_zone $binary_remote_addr zone=api_general:10m rate=20r/s;
+limit_req_zone $binary_remote_addr zone=api_auth:10m rate=10r/s;
+
+# TLS 会话复用与协议基线（http 级指令）
+ssl_session_cache shared:SSL:10m;
+ssl_session_timeout 1d;
+ssl_session_tickets off;
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers off;
+
+# ---- 80 端口：ACME 续期 + 全站跳转 ----
+
+# 未知 Host 一律断连（不给扫描器任何回音）
+server {
+    listen 80 default_server;
+    server_name _;
+    return 444;
+}
+
+# 已知域名的 80：证书签发/续期走 webroot，其余 301 到 https
+server {
+    listen 80;
+    server_name ${BASE_DOMAIN} *.${BASE_DOMAIN} api.${BASE_DOMAIN} merchant.${BASE_DOMAIN} admin.${BASE_DOMAIN};
+
+    # ACME http-01 challenge（certbot webroot 指向该卷）
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ---- 443：店铺子域名 ----
+# 通配符证书 *.${BASE_DOMAIN}（DNS-01 签发）；Host 反推租户子域名的
+# 逻辑与开发环境一致：网关注入并覆盖 X-Tenant-Subdomain。
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name ~^(?<tenant>[a-z0-9-]+)\.${BASE_DOMAIN}$;
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    # HSTS：先短 max-age 观察（300s），确认无 http 依赖后再加到 31536000
+    add_header Strict-Transport-Security "max-age=300" always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    location / {
+        proxy_pass http://storefront_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Tenant-Subdomain $tenant;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    location /api/v1/ {
+        proxy_pass http://api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Tenant-Subdomain $tenant;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        limit_req zone=api_general burst=40 nodelay;
+        limit_req_status 503;
+    }
+
+    location /_next/static/ {
+        proxy_pass http://storefront_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Tenant-Subdomain $tenant;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        add_header Strict-Transport-Security "max-age=300" always;
+        add_header X-Frame-Options SAMEORIGIN always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy strict-origin-when-cross-origin always;
+    }
+}
+
+# ---- 443：API 中心域名 ----
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name api.${BASE_DOMAIN};
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=300" always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    # Prometheus 抓取端点：只允许内网/监控网段（按部署环境改网段）。
+    # api 容器端口仍绑回环，抓取经本域名 + 网段白名单。
+    # location /api/v1/metrics {
+    #     allow 10.0.0.0/8;
+    #     deny all;
+    #     proxy_pass http://api_backend;
+    # }
+
+    location /api/v1/auth/ {
+        limit_req zone=api_auth burst=20 nodelay;
+        limit_req_status 503;
+        proxy_pass http://api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Tenant-Subdomain "";
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    location / {
+        proxy_pass http://api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Tenant-Subdomain "";
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        limit_req zone=api_general burst=40 nodelay;
+        limit_req_status 503;
+    }
+}
+
+# ---- 443：商家后台 ----
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name merchant.${BASE_DOMAIN};
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=300" always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    location / {
+        proxy_pass http://merchant_admin_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Tenant-Subdomain "";
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+
+# ---- 443：平台超管后台 ----
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name admin.${BASE_DOMAIN};
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=300" always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    location / {
+        proxy_pass http://platform_admin_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Tenant-Subdomain "";
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}

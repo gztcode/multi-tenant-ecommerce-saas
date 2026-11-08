@@ -1,5 +1,11 @@
 import { Module } from '@nestjs/common';
+import { MiddlewareConsumer, NestModule } from '@nestjs/common';
 import { LoggingInterceptor } from './common/http/logging.interceptor';
+import { RequestIdMiddleware } from './common/http/request-id.middleware';
+import { LockModule } from './common/lock/lock.module';
+import { PinoLoggerService } from './common/logging/pino-logger.service';
+import { MetricsMiddleware } from './common/metrics/metrics.middleware';
+import { MetricsModule } from './common/metrics/metrics.module';
 import { HealthModule } from './health/health.module';
 import { TenancyModule } from './modules/tenancy/tenancy.module';
 import { AuthModule } from './modules/auth/auth.module';
@@ -26,6 +32,8 @@ import { PlatformSettingsApiModule } from './modules/platform-settings/platform-
 // 改由 @Roles() 把守卫挂到方法元数据上，见 common/decorators/roles.decorator.ts。
 @Module({
   imports: [
+    MetricsModule,
+    LockModule,
     HealthModule,
     TenancyModule,
     AuthModule,
@@ -44,11 +52,19 @@ import { PlatformSettingsApiModule } from './modules/platform-settings/platform-
     // 平台默认渠道设置接口（阶段 6a Task 4）
     PlatformSettingsApiModule,
   ],
-  // HTTP 访问日志拦截器。
+  // HTTP 访问日志拦截器 + 全局结构化日志服务。
   //
-  // ⚠️ **必须注册成 provider**，main.ts 才能用 app.get() 拿它——
+  // ⚠️ **必须注册成 provider**，main.ts 才能用 app.get() 拿它们——
   //    未注册的类 app.get() 会抛 UnknownElementException，而单测/e2e
   //    都不加载 main.ts，这个坑在 CI 里跑不出来（API 会在启动阶段死掉）。
-  providers: [LoggingInterceptor],
+  providers: [LoggingInterceptor, PinoLoggerService],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  // 请求 ID 中间件（阶段 11）：在一切路由之前给每个请求挂 requestId，
+  // LoggingInterceptor / AllExceptionsFilter 的日志都带它。
+  // HTTP 指标中间件（阶段 11）：在守卫之前注册 res 'finish' 监听，
+  // 守卫拒绝的 401/403 也能进指标（拦截器版本做不到，见 metrics.module 注释）。
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(RequestIdMiddleware, MetricsMiddleware).forRoutes('*');
+  }
+}
