@@ -298,6 +298,9 @@ cd api
 npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等，1094 条 / 68 套件，3 条跳过）
 npm run test:e2e      # 端到端（702 条 / 41 个套件，串行）
 npm run test:cov:e2e  # 项目真实覆盖率
+
+# 浏览器级 e2e（Playwright，真实 Chromium 走 storefront 全链路）
+npm test --workspace @ecom/browser-e2e   # 登录→加购→下单→假网关支付→PAID
 ```
 
 > ✅ **跑 e2e 不需要停 api 容器**（阶段 5c 实测更正）。队列前缀隔离

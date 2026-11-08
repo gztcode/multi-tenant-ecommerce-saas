@@ -2,7 +2,7 @@
 
 多租户电商 SaaS 单仓：NestJS API + 三个 Next.js 15 应用 + Docker/Nginx。
 三个前端从阶段 7c 起共用 `packages/frontend-shared`（`@ecom/frontend-shared`），
-但**不是 npm workspaces**——各端仍各自 `npm install`。
+阶段 11b 起**是 npm workspaces**（仓库根一份 package.json + lockfile）。
 本文件只记录「看文件名和框架文档看不出来、但一踩就错」的事。
 
 ## 布局与入口
@@ -15,10 +15,11 @@
 | `platform-admin/` | 平台超管后台 | 3003 |
 | `infra/` | compose 全栈 + Nginx（:80）；网关按 Host 路由并注入 `X-Tenant-Subdomain` | 80 |
 
-- **根目录没有 `package.json`，也没有 workspaces**。依赖必须在各子目录里分别 `npm install`，lockfile 也是各子目录各一份。
-- **`packages/frontend-shared` 是 `file:` 依赖**（三端 package.json 里 `"file:../packages/frontend-shared"`）：
-  它的依赖要**单独 `npm install`**——npm 的 `file:` 链接不会把被链接包自身的依赖装进端的
-  `node_modules`，不装就会在构建/测试时报 `zod` / `react` 解析不到。CI 三个前端 job 都有这一步。
+- **npm workspaces（阶段 11b）**：仓库根一次 `npm install` 装全部；根 `package-lock.json`
+  是唯一 lockfile。跑单端用 `npm test --workspace api` / `npm run build --workspace storefront`，
+  或进子目录直接跑脚本（二进制沿目录树向上解析到根 `node_modules/.bin`）。
+  Docker 构建的 context 全部是**仓库根**（api 也要根 lockfile），见各 Dockerfile 注释。
+- **`packages/frontend-shared` 是 workspace 符号链接**（`node_modules/@ecom/frontend-shared`）。
   三端各有一份薄壳 `src/lib/*.ts` 只做 `export * from '@ecom/frontend-shared/...'`，
   **逻辑改动写共享包，不要写薄壳**。
 - 本机标准端口被占用，固定使用：PostgreSQL **15432**、Redis **16380**、MinIO **19000**（控制台 19001）。
@@ -54,18 +55,21 @@ cd infra && docker compose up -d --wait postgres redis minio
 docker exec -i ecommerce-postgres psql -U ecommerce -d postgres \
   -c "CREATE DATABASE ecommerce_test;"
 
+# 依赖：仓库根一次装完（workspaces）
+npm install
+
 # api（.env 已存在时不要覆盖，里面有本机 DATABASE_URL_TEST 等配置）
-cd api && npm install && { [ -f .env ] || cp .env.example .env; }
+cd api && { [ -f .env ] || cp .env.example .env; }
 npm run prisma:deploy && npm run prisma:seed   # 首次
 npm run start:dev
 
-# 共享包（三个前端都依赖它，必须先装它自己的依赖）
-cd packages/frontend-shared && npm install
-
 # 三个前端各开一个终端（同样只在 .env 不存在时复制）
-cd storefront     && npm install && ([ -f .env ] || cp .env.example .env) && npm run dev   # 3001
-cd merchant-admin && npm install && ([ -f .env ] || cp .env.example .env) && npm run dev   # 3002
-cd platform-admin && npm install && ([ -f .env ] || cp .env.example .env) && npm run dev   # 3003
+cd storefront     && ([ -f .env ] || cp .env.example .env) && npm run dev   # 3001
+cd merchant-admin && ([ -f .env ] || cp .env.example .env) && npm run dev   # 3002
+cd platform-admin && ([ -f .env ] || cp .env.example .env) && npm run dev   # 3003
+
+# 浏览器级 e2e（Playwright，独立库 ecommerce_browser，见 e2e-browser/playwright.config.ts）
+npm test --workspace @ecom/browser-e2e
 
 # 全栈容器
 cd infra && docker compose up -d --build

@@ -12,7 +12,8 @@
     "storefront",
     "merchant-admin",
     "platform-admin",
-    "packages/frontend-shared"
+    "packages/frontend-shared",
+    "e2e-browser"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",

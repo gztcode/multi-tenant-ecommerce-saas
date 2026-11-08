@@ -38,3 +38,4 @@ coverage/
 
 infra/backups/
 infra/backup.log
+test-results/
