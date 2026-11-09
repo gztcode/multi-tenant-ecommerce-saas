@@ -17,10 +17,24 @@ import { QueueService } from './queue.service';
  * 被 import 的那一刻）读取 `process.env.REDIS_URL`，不是应用启动时。
  *
  * 本项目没有注册 ConfigModule（约定：配置一律直读 process.env），
- * dev 流程 `nest start --watch` 也不加载 .env——dev 环境里的 .env 是被
- * `require('@prisma/client')` 内部的 dotenv 顺带加载的。
- * 因此这里依赖 `app.module.ts` 中 **TenancyModule 先于 QueueModule 被 import**：
- * TenancyModule → tenant-prisma.service → @prisma/client → dotenv 加载 .env。
+ * dev 流程 `nest start --watch` 也不加载 .env。
+ *
+ * ⚠️ **`.env` 的加载时机不能靠「副作用」**：历史上这里写着「dev 环境里的
+ *    .env 是被 `require('@prisma/client')` 内部的 dotenv 顺带加载的」——
+ *    **这个前提不成立**：Prisma 6 的 client 确实会在实例化时尝试加载
+ *    `.env`，但**加载哪个文件**取决于生成 client 时记录的 `schemaEnvPath`
+ *    ——那是「在哪生成 client」决定的副作用，换个目录重新
+ *    `prisma generate` 就会失效 → 同一份代码在不同机器上行为不同。
+ *    → `.env` 由**调用方显式加载**（`common/config/load-env.ts`），
+ *    且必须**先于**应用图被求值。
+ *
+ * ⚠️ **运维脚本尤其要注意**：`api/scripts/` 下的脚本要 import 整个应用图，
+ *    而**静态 import 会被提升到文件顶部** → 应用图在 `.env` 加载前就被求值
+ *    → `REDIS_URL` 是 undefined → 落到下面**不带密码**的 fallback
+ *    → 本机 Redis 开了 `requirepass` → `NOAUTH HELLO ...`
+ *    （报错说「认证失败」，真实原因却是「`.env` 没加载」）。
+ *    → 脚本必须用 `await import(...)` 延迟 import，护栏见
+ *    `common/config/env-import-order-scanner.ts`。
  *
  * ⚠️ 谁把 QueueModule 挪到 app.module.ts 的首位（或新增一个更早被 import 的模块），
  * REDIS_URL 就会静默变成 undefined，落到下面的 fallback 值——

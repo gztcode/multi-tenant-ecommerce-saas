@@ -13,13 +13,11 @@
  * 用法（在 api/ 目录下）：
  *   npm run payout:retry-pre-payout
  */
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-
 import { NestFactory } from '@nestjs/core';
+
+import { loadEnvFile } from '../src/common/config/load-env';
 import { PayoutStatus, UserRole } from '@prisma/client';
 
-import { AppModule } from '../src/app.module';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
 import {
   platformScope,
@@ -29,15 +27,24 @@ import { PayoutService } from '../src/modules/billing/payout.service';
 
 const RETRY_REASON = '批量重试：解密/渠道前置失败，已确认未打款';
 
-function loadEnv(): void {
-  const envPath = resolve(__dirname, '..', '.env');
-  if (existsSync(envPath)) {
-    process.loadEnvFile(envPath);
-  }
-}
-
 async function main(): Promise<void> {
-  loadEnv();
+  // ⚠️ **必须先加载 `.env`，再 import 应用图**（顺序不能反）。
+  //    静态 import 会被提升到文件顶部 → 应用图（含 `queue.module.ts`）
+  //    在 `.env` 加载前就被求值 → `BullModule.forRoot` 定死了没有密码的
+  //    Redis 地址 → `NOAUTH HELLO ...`。详见 `common/config/load-env.ts`。
+  loadEnvFile();
+
+  // ⚠️ **必须在这里（而不是文件顶部）加载应用图**：静态 import 会被提升到
+  //    文件顶部，`.env` 还没加载就被求值 —— 见上面的说明。
+  //
+  //    用 `require()` 而不是 `await import()`：本目录的脚本由 ts-node 以
+  //    **CommonJS** 运行（package.json 的 `--compiler-options '{"module":"CommonJS"}'`），
+  //    而 `await import()` 在 `tsc --noEmit` 的 `nodenext` 解析下要求**带扩展名**
+  //    的路径（`../src/app.module.js`）—— 那个路径在 CommonJS 运行期又找不到文件。
+  //    `require()` 两边都成立：运行期在调用点求值（位置正确），类型上用
+  //    `typeof import(...)` 拿到准确类型（无扩展名也能解析）。
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { AppModule } = require('../src/app.module') as typeof import('../src/app.module');
 
   const app = await NestFactory.createApplicationContext(AppModule, {
     logger: ['error', 'warn', 'log'],

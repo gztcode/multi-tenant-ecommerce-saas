@@ -35,7 +35,8 @@
     "migrate:payout-encryption": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/migrate-payout-encryption.ts",
     "payout:retry-pre-payout": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/retry-pre-payout-failures.ts",
     "scan:tx-boundary": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/scan-tx-boundary.ts",
-    "scan:controller-roles": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/scan-controller-roles.ts"
+    "scan:controller-roles": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/scan-controller-roles.ts",
+    "scan:env-import-order": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/scan-env-import-order.ts"
   },
   "prisma": {
     "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"

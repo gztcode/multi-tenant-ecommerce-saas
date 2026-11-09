@@ -31,17 +31,15 @@
  * ```
  * 有缺口时退出码为 1（可接进 CI / 部署前置检查）。
  */
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-
 import { NestFactory } from '@nestjs/core';
+
+import { loadEnvFile } from '../src/common/config/load-env';
 import {
   CommissionEntryType,
   PaymentStatus,
   ReceiptType,
 } from '@prisma/client';
 
-import { AppModule } from '../src/app.module';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
 import {
   platformScope,
@@ -52,19 +50,6 @@ import {
   type LedgerCheckResult,
   type LedgerPaymentIssue,
 } from '../src/modules/billing/ledger-check';
-
-/**
- * 加载 `.env`。
- *
- * ⚠️ **用 Node 内置的 `process.loadEnvFile`**（Node 20.12+）而不是 `dotenv`：
- * 仓库里没有 `dotenv` 依赖。文件不存在就跳过 —— 容器里的环境变量是直接注入的。
- */
-function loadEnv(): void {
-  const envPath = resolve(__dirname, '..', '.env');
-  if (existsSync(envPath)) {
-    process.loadEnvFile(envPath);
-  }
-}
 
 /**
  * 打印缺口明细（最多 20 条）。
@@ -124,7 +109,29 @@ function printPaymentIssues(label: string, issues: LedgerPaymentIssue[]): void {
 }
 
 async function main(): Promise<void> {
-  loadEnv();
+  // ⚠️ **必须先加载 `.env`，再 import 应用图**（顺序不能反）。
+  //
+  //    `AppModule` 的 import 原本是**静态**的 → 被提升到文件顶部 → 整个应用图
+  //    （含 `queue.module.ts`）在 `loadEnv()` 之前就被求值。
+  //    而 `BullModule.forRoot` 的参数是**模块装饰器求值时**定死的，
+  //    那时 `REDIS_URL` 还是 undefined → 落到不带密码的 fallback
+  //    → 本机 Redis 开了 `requirepass` → `NOAUTH HELLO ...`。
+  //
+  //    改成**在 `loadEnvFile()` 之后才加载应用图**后，模块求值被推迟
+  //    → `REDIS_URL` 有值 → 连得上。
+  loadEnvFile();
+
+  // ⚠️ **必须在这里（而不是文件顶部）加载应用图**：静态 import 会被提升到
+  //    文件顶部，`.env` 还没加载就被求值 —— 见上面的说明。
+  //
+  //    用 `require()` 而不是 `await import()`：本目录的脚本由 ts-node 以
+  //    **CommonJS** 运行（package.json 的 `--compiler-options '{"module":"CommonJS"}'`），
+  //    而 `await import()` 在 `tsc --noEmit` 的 `nodenext` 解析下要求**带扩展名**
+  //    的路径（`../src/app.module.js`）—— 那个路径在 CommonJS 运行期又找不到文件。
+  //    `require()` 两边都成立：运行期在调用点求值（位置正确），类型上用
+  //    `typeof import(...)` 拿到准确类型（无扩展名也能解析）。
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { AppModule } = require('../src/app.module') as typeof import('../src/app.module');
 
   const app = await NestFactory.createApplicationContext(AppModule, {
     // ⚠️ **不启 HTTP 服务**：这个脚本只需要应用上下文（拿 service），
