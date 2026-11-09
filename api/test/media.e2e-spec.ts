@@ -55,6 +55,26 @@ function mediaListBody(response: { body: unknown }): MediaListBody {
 }
 
 /**
+ * 构造一段「带真实 JPEG 文件头」的字节。
+ *
+ * ⚠️ 阶段 11 起 `confirm` 会复核 magic bytes：presigned PUT 的 Content-Type
+ * 是**客户端自报**的，只看它等于放行任意内容（改了扩展名的 HTML/可执行文件
+ * 照样能过）。所以测试里直传的对象必须带头，否则 confirm 会被 400 拦下，
+ * 用例根本走不到它真正要断言的那一步。
+ *
+ * 头是 JPEG SOI + JFIF（FF D8 FF E0），`isMagicMatched` 只认前三字节。
+ */
+function jpegBytes(size: number, fill = 0): Buffer<ArrayBuffer> {
+  // ⚠️ 用 `Buffer.alloc` + `set`，不要用 `Buffer.concat`：
+  // 后者返回 `Buffer<ArrayBufferLike>`，而 fetch 的 `BodyInit` 只收
+  // `Buffer<ArrayBuffer>`（tsc TS2769）。返回类型也要写全泛型参数，
+  // 写成裸 `Buffer` 同样会被摊宽成 ArrayBufferLike 而报错。
+  const bytes = Buffer.alloc(size, fill);
+  bytes.set([0xff, 0xd8, 0xff, 0xe0], 0);
+  return bytes;
+}
+
+/**
  * 媒体上传 (e2e)
  *
  * 这个套件要证明六件事：
@@ -266,7 +286,7 @@ describe('媒体上传 (e2e)', () => {
     });
 
     // 用后端自己的 fetch 直传（模拟浏览器 PUT）
-    const bytes = Buffer.alloc(1024, 7);
+    const bytes = jpegBytes(1024, 7);
     const put = await fetch(created.uploadUrl, {
       method: 'PUT',
       headers: { 'content-type': 'image/jpeg' },
@@ -304,7 +324,7 @@ describe('媒体上传 (e2e)', () => {
     });
     expect(created.media.size).toBe(999);
 
-    const bytes = Buffer.alloc(2048, 1);
+    const bytes = jpegBytes(2048, 1);
     const put = await fetch(created.uploadUrl, {
       method: 'PUT',
       headers: { 'content-type': 'image/jpeg' },
@@ -569,7 +589,7 @@ describe('媒体上传 (e2e)', () => {
     const put = await fetch(withObject.uploadUrl, {
       method: 'PUT',
       headers: { 'content-type': 'image/jpeg' },
-      body: Buffer.alloc(1024, 3),
+      body: jpegBytes(1024, 3),
     });
     expect(put.ok).toBe(true);
 
@@ -684,7 +704,7 @@ describe('媒体上传 (e2e)', () => {
     );
 
     // 直传一个超过 MEDIA_MAX_SIZE 的对象
-    const tooBig = Buffer.alloc(6 * 1024 * 1024, 7);
+    const tooBig = jpegBytes(6 * 1024 * 1024, 7);
     const put = await fetch(signed.uploadUrl, {
       method: 'PUT',
       headers: { 'content-type': 'image/jpeg' },
