@@ -1,9 +1,11 @@
+import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import * as ts from 'typescript';
 
 import {
   describeViolation,
+  listScriptFiles,
   scanProgram,
   type EnvImportOrderFinding,
 } from './env-import-order-scanner';
@@ -136,22 +138,47 @@ describe('全仓「.env 加载顺序」护栏', () => {
   jest.setTimeout(300_000);
 
   it('运维脚本不允许静态 import 应用图', () => {
-    const program = ts.createProgram(
-      [join(API_ROOT, 'scripts', 'check-ledger.ts')],
-      {
-        target: ts.ScriptTarget.ES2023,
-        module: ts.ModuleKind.NodeNext,
-        moduleResolution: ts.ModuleResolutionKind.NodeNext,
-        esModuleInterop: true,
-        experimentalDecorators: true,
-        emitDecoratorMetadata: true,
-        skipLibCheck: true,
-        strict: true,
-        noEmit: true,
-        setParentNodes: true,
-      },
-    );
+    const program = ts.createProgram(listScriptFiles(API_ROOT), {
+      target: ts.ScriptTarget.ES2023,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      esModuleInterop: true,
+      experimentalDecorators: true,
+      emitDecoratorMetadata: true,
+      skipLibCheck: true,
+      strict: true,
+      noEmit: true,
+      setParentNodes: true,
+    });
     const findings = scanProgram(program, API_ROOT);
     expect(findings.map(describeViolation)).toEqual([]);
+  });
+
+  it('扫描范围覆盖 scripts/ 下的全部脚本（护栏不能只看一个文件）', () => {
+    // ⚠️ **回归测试（2026-11-10 实测发现的缺陷）**：
+    //    原实现只把 `check-ledger.ts` 当 program 入口 →
+    //    `program.getSourceFiles()` 里 `scripts/` 下的文件**只有那一个** →
+    //    另外两个同样 import 应用图的脚本（`backfill-commission-entries.ts`、
+    //    `retry-pre-payout-failures.ts`）**完全不在扫描范围里** →
+    //    把它们改回「静态 import 应用图」，护栏仍报 0 处 → **假全仓**。
+    //
+    //    这条断言锁死「入口必须是全部脚本」，防止将来又退回单文件。
+    const files = listScriptFiles(API_ROOT);
+    const names = files.map((f) => f.split('/').pop());
+
+    // 三个会 import 应用图的运维脚本都必须在扫描范围里
+    expect(names).toEqual(
+      expect.arrayContaining([
+        'check-ledger.ts',
+        'backfill-commission-entries.ts',
+        'retry-pre-payout-failures.ts',
+      ]),
+    );
+
+    // ⚠️ **不能只有一个**：护栏若只扫一个文件，其余脚本就形同没护栏。
+    const scriptDir = join(API_ROOT, 'scripts');
+    const allScripts = readdirSync(scriptDir).filter((n) => n.endsWith('.ts'));
+    // 扫描器 CLI 自身不需要被扫（它 import 的是扫描器，不是应用图）
+    expect(files.length).toBe(allScripts.length - 1);
   });
 });

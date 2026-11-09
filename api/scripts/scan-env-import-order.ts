@@ -14,13 +14,14 @@ import * as ts from 'typescript';
 
 import {
   describeViolation,
+  listScriptFiles,
   scanProgram,
 } from '../src/common/config/env-import-order-scanner';
 
 const API_ROOT = join(__dirname, '..');
 
 const program = ts.createProgram(
-  [join(API_ROOT, 'scripts', 'check-ledger.ts')],
+  listScriptFiles(API_ROOT),
   {
     target: ts.ScriptTarget.ES2023,
     module: ts.ModuleKind.NodeNext,

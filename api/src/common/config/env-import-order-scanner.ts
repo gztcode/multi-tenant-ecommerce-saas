@@ -19,6 +19,9 @@
  *    脚本作者改一行无关代码就可能把问题带回来 → 需要静态护栏。
  */
 
+import { existsSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
 import * as ts from 'typescript';
 
 /** 一处「`.env` 加载顺序」问题 */
@@ -195,4 +198,34 @@ export function scanProgram(
 /** 把一条命中渲染成人能读的说明 */
 export function describeViolation(finding: EnvImportOrderFinding): string {
   return `${finding.file}:${finding.line} → ${finding.snippet}\n  ${finding.reason}`;
+}
+
+/**
+ * 枚举 `api/scripts/` 下的全部 `.ts` 脚本（护栏的扫描范围）。
+ *
+ * ⚠️ **为什么必须枚举全部，而不是写死一两个文件**：
+ *    `ts.createProgram` 的第一个参数是**入口文件列表**，
+ *    而 `program.getSourceFiles()` 只包含「从入口可达」的文件。
+ *    → 只把 `check-ledger.ts` 当入口时，`scripts/` 下**其他脚本**
+ *    （`backfill-commission-entries.ts` / `retry-pre-payout-failures.ts`）
+ *    **一个都不在 program 里** → 护栏扫不到它们 → 它们可以任意写回
+ *    「静态 import 应用图」而不被发现。
+ *    实测（2026-11-10）：把 `retry-pre-payout-failures.ts` 改回静态 import，
+ *    护栏仍报 0 处；只把入口换成全部脚本后才报出来。
+ *    → **入口必须是 `scripts/` 下的全部脚本**，否则护栏是「假全仓」。
+ *
+ * ⚠️ **排除扫描器自己**：`scan-env-import-order.ts` 是护栏的 CLI 入口，
+ *    它 import 的是扫描器而不是应用图，本来就合规；但把它当入口
+ *    会让 program 里多出一份无关文件，没有必要。
+ */
+export function listScriptFiles(apiRoot: string): string[] {
+  const scriptsDir = join(apiRoot, 'scripts');
+  if (!existsSync(scriptsDir)) {
+    return [];
+  }
+  return readdirSync(scriptsDir)
+    .filter((name) => name.endsWith('.ts'))
+    .filter((name) => name !== 'scan-env-import-order.ts')
+    .map((name) => join(scriptsDir, name))
+    .sort();
 }
