@@ -732,6 +732,22 @@ describe('PaymentService 退款状态机（阶段 6c）', () => {
   });
 
   describe('退款扫描 scanRefunding', () => {
+    it('不传参时默认取库时钟作基准（facade 不得用默认参数吞掉库时钟）', async () => {
+      const { fake, prisma, service } = setup();
+      // 让扫描拿到一张待处理单，确保整条路径真的跑完（空跑 0 条也可能让断言假绿）
+      prisma.payment.findMany.mockResolvedValue([
+        { id: 'p-1', tenantId: TENANT_ID, orderId: 'o-1', refundTxnId: null },
+      ]);
+
+      await service.scanRefunding();
+
+      // 阶段 11 拆分时 facade 曾写成 `scanRefunding(now = new Date())`，
+      // 子服务里 `now ?? databaseNow()` 的库时钟兜底因此永远不触发（审计 P2-15 回退）。
+      // 这条用例钉住：不传参 → 走 `databaseNow()`，而不是 `new Date()`。
+      expect(prisma.databaseNow).toHaveBeenCalled();
+      expect(fake.queryRefund).toHaveBeenCalledTimes(0);
+    });
+
     it('⚠️ 单轮最多处理 50 张（查询 take=50）', async () => {
       const { prisma, service } = setup();
       prisma.payment.findMany.mockImplementation(

@@ -162,7 +162,10 @@ export class MetricsService implements OnModuleInit, OnModuleDestroy {
 
   /** 卡单：跨租户统计，必须显式进 platform scope */
   private async pollStuckWork(): Promise<void> {
-    const threshold = new Date(Date.now() - STUCK_THRESHOLD_MS);
+    // ⚠️ `updatedAt` 是库时钟写的（P2-15），阈值基准也要用库时钟，
+    //    否则应用与数据库的时钟偏差会让「卡了多久」整体偏移。
+    const now = await this.prisma.databaseNow();
+    const threshold = new Date(now.getTime() - STUCK_THRESHOLD_MS);
     const stuckRefunding = await tenantContext.run(platformScope(), () =>
       this.prisma.payment.count({
         where: { status: 'REFUNDING', updatedAt: { lt: threshold } },

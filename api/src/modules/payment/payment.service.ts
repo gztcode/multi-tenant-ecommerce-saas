@@ -176,7 +176,10 @@ export class PaymentService {
     return this.refunds.applyRefundEvent(event, tenantId);
   }
   /** @see refunds#scanRefunding（阶段 11 拆分，逻辑见实现文件） */
-  async scanRefunding(now = new Date()): Promise<number> {
+  // ⚠️ **必须用可选参数直传，不能写 `now = new Date()` 默认值**：
+  //    子服务的实现里 `now ?? databaseNow()` 默认取**库时钟**（P2-15 时钟纪律），
+  //    facade 若用默认参数先把 `new Date()` 填进去，`??` 永远不会触发 → 库时钟被吞。
+  async scanRefunding(now?: Date): Promise<number> {
     return this.refunds.scanRefunding(now);
   }
   /** @see orderPayments#fakeConfirmPayment（阶段 11 拆分，逻辑见实现文件） */

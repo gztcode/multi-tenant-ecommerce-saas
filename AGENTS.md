@@ -219,7 +219,8 @@ cd infra && docker compose up -d --build
   `npx eslint <file>`，要求零错误。CI 的 api job 跑全量 lint 作为门禁。
 - **三个前端 lint 已进 CI**（阶段 9），本地提交前建议跑 `npm run lint`。
 - **失败注入必须独占**：故意改坏源码验证测试时，不要同时跑任何其他测试（会互相污染，产生假回归）。
-- 三个前端共用 `packages/frontend-shared`（`file:` 依赖，**不是 npm workspaces**，各端仍各自 `npm install`）。
+- 三个前端共用 `packages/frontend-shared`（阶段 11b 起是 **workspace 符号链接**，不再是 `file:` 依赖；
+  仓库根一次 `npm install`，各端不再单独装）。
   未迁进共享包的同名文件靠「写一份 → `cp` → `diff`」保持一致：`components/ui/button.tsx` 三份逐字节相同。
   `lib/jwt-callback.ts` 三端各只有一句 `export *`（薄壳），逻辑**单源在共享包**，不要按老办法手工同步。
   但三份 `lib/api-client.ts` **结构不同，不要强行统一**，只保证语义一致。

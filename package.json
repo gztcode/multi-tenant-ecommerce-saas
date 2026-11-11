@@ -19,5 +19,12 @@
     "build": "npm run build --workspaces --if-present",
     "test:api": "npm test --workspace api",
     "dev:install": "npm install"
+  },
+  "overrides": {
+    "@vitest/mocker": "4.1.12",
+    "body-parser": "2.4.0",
+    "multer": "2.5.0",
+    "postcss": "8.5.31",
+    "tinypool": "2.2.0"
   }
 }
