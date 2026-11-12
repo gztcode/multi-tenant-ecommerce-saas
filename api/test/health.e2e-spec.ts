@@ -1,7 +1,9 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import helmet from 'helmet';
 import { AppModule } from '../src/app.module';
 import { HealthService } from '../src/health/health.service';
+import { SECURITY_HEADERS_OPTIONS } from '../src/common/http/security-headers';
 import { http } from './helpers';
 
 interface HealthResponse {
@@ -46,6 +48,9 @@ describe('健康检查 (e2e)', () => {
         transform: true,
       }),
     );
+    // 安全响应头同理：`main.ts` 的 `app.use(helmet(...))` 在 e2e 里不会被调用，
+    // 不复刻的话下面那条断言测的是一份不存在的配置。
+    instance.use(helmet(SECURITY_HEADERS_OPTIONS));
     await instance.init();
     apps.push(instance);
     return instance;
@@ -82,5 +87,24 @@ describe('健康检查 (e2e)', () => {
     expect(response.status).toBe(503);
     expect(body.status).toBe('degraded');
     expect(body.checks.redis).toBe(false);
+  });
+
+  it('响应带安全头，且 Swagger UI 的内联脚本没被 CSP 拦掉', async () => {
+    const app = await build();
+    const response = await http(app).get('/health');
+
+    // 三项都是 helmet 的默认值。断言「等于具体值」而不是「存在」，
+    // 这样改配置时会被这条用例挡住，不会静默放宽。
+    expect(response.headers['x-content-type-options']).toBe('nosniff');
+    expect(response.headers['x-frame-options']).toBe('SAMEORIGIN');
+    expect(response.headers['referrer-policy']).toBe('no-referrer');
+
+    // ⚠️ **不能有 CSP**：带上 helmet 的默认 CSP 后 Swagger UI 会因内联脚本被禁而白屏。
+    //    这条断言就是「别顺手把 CSP 打开」的护栏。
+    expect(response.headers['content-security-policy']).toBeUndefined();
+
+    // HSTS 归 Nginx 管，应用层不该设：应用看不到真实的外部协议，
+    // 在这里发 HSTS 会把本地 http 开发环境也锁死。
+    expect(response.headers['strict-transport-security']).toBeUndefined();
   });
 });

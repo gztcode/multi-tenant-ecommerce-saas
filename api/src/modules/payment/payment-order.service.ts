@@ -80,41 +80,126 @@ export class OrderPaymentService {
       provider.channel,
     );
     if (existing) {
-      return this.toCreatedPayment(existing, order.orderNo);
+      // ⚠️ **`SUCCESS` 是真付过了，不能动**：重置成 PENDING 会让重复支付变可能。
+      if (existing.status === PaymentStatus.SUCCESS) {
+        return this.toCreatedPayment(existing, order.orderNo);
+      }
+
+      // ⚠️ **其余状态一律重置为 PENDING 再复用**（修复 2026-11-11 发现的洞）：
+      //    上一轮失败（回调把单置 `FAILED`）或没拿到支付页（停在 `PENDING`）时，
+      //    直接返回旧单会让用户拿着**已作废的**支付单再去付款，而
+      //    `WebhookEventService.attachProviderTxnId` 的 where 带
+      //    `status: PENDING` —— 旧单不是 PENDING 就写不进新交易号 → 返回 false →
+      //    回调直接退出 → **客户付了钱、订单永远卡在待支付**。
+      //
+      // ⚠️ **同时清掉上一轮的 `providerTxnId` / `rawResponse`**：旧交易号已作废，
+      //    留着会让 `(provider, providerTxnId)` 唯一索引拦住新交易号的写入。
+      //
+      // ⚠️ `rawResponse` 写 `{}` 而**不是** `Prisma.DbNull`：该列是
+      //    `Json @default("{}")` 且 **NOT NULL**，`DbNull` 会违反非空约束
+      //    → 整个请求 500（e2e「同一订单同一渠道只能有一笔支付单」抓到的就是它）。
+      //
+      // ⚠️ 只在 PENDING / FAILED 上重置：`REFUNDED` / `REFUNDING` / `CLOSED` /
+      //    `NEEDS_REFUND` 是「钱已经出过」的状态，重置回去等于把已退款的单
+      //    重新变成可支付，属资金风险。这些状态保持原样返回，由调用方看 `status`。
+      //
+      if (
+        existing.status === PaymentStatus.PENDING ||
+        existing.status === PaymentStatus.FAILED
+      ) {
+        // ⚠️⚠️ **状态改回 PENDING，但不一定清交易号** —— 分两种情况：
+        //
+        //   ① **号为空**：上一轮连渠道支付页都没创建成功，是干净的重试。
+        //      重置后重新调渠道拿新号。
+        //
+        //   ② **有号**：渠道侧**真的存在一笔交易**，用户可能已经付了、
+        //      只是回调没到（或回调先报了失败）。**绝不能再调一次渠道** ——
+        //      那会让同一笔订单产生第二笔真实交易，用户在新页面再付一次
+        //      = **扣两次钱**。所以只把状态改回 PENDING（让迟到的成功回调
+        //      能被 `attachProviderTxnId` 的 `status: PENDING` 条件接受），
+        //      然后**把上一轮的支付页原样还给用户**（URL 在 `rawResponse` 里）。
+        //
+        //    ⚠️ 不能用 `queryPayment` 来判「到底付没付」：它返回的是各渠道
+        //       自己的枚举字符串，没有统一的 paid / failed 语义。
+        // ⚠️ **重置也要防并发**：两个请求同时进来，都读到 `providerTxnId: null`
+        //    的话会**双双去调渠道** → 同一订单两笔真实交易。
+        //    （原实现靠「两个请求都 create、输家撞唯一索引」把并发收敛成一次渠道调用；
+        //      改成复用旧单后不再有那条索引碰撞，必须自己加条件更新。）
+        //
+        //    做法：号为空时把 `providerTxnId: null` 放进 where —— 这是**抢占**：
+        //    只有一个请求能把行改掉，另一个 `count === 0` → 重新读那一笔
+        //    （此时它已经有号了，走「复用支付页」分支，不会再调渠道）。
+        const claimed = await this.prisma.payment.updateMany({
+          where: existing.providerTxnId
+            ? { id: existing.id }
+            : // 只抢「还是空号」的那一行；别人抢到后这里 count 为 0
+              { id: existing.id, providerTxnId: null },
+          data: existing.providerTxnId
+            ? { status: PaymentStatus.PENDING }
+            : {
+                status: PaymentStatus.PENDING,
+                providerTxnId: null,
+                rawResponse: {},
+              },
+        });
+
+        if (existing.providerTxnId) {
+          // 渠道交易还在 → 复用原来的支付页，**不再下单**
+          return this.toCreatedPayment(
+            { ...existing, status: PaymentStatus.PENDING },
+            order.orderNo,
+          );
+        }
+        if (claimed.count === 0) {
+          // 没抢到重置权 → 另一个请求正在下单；重读后按现状复用，绝不再调渠道
+          return this.toCreatedPayment(
+            await this.lookup.readPaymentById(existing.id),
+            order.orderNo,
+          );
+        }
+        // 号为空且抢到了重置权 → 落到下面重新调渠道
+      } else {
+        return this.toCreatedPayment(existing, order.orderNo);
+      }
     }
 
-    // ---- 建支付单 ----
+    // ---- 建支付单（没有可复用的才建）----
     //
     // ⚠️ **先建支付单再调渠道**：渠道要拿到支付单 id 才能生成支付页面。
     // 调渠道失败时支付单留在 PENDING —— 那是「未支付」的正确语义，
     // 用户可以重新发起（唯一索引保证还是那一笔）。
     let payment: Payment;
-    try {
-      payment = await this.prisma.payment.create({
-        data: {
-          tenantId,
-          orderId: order.id,
-          channel: provider.channel,
-          provider: provider.provider,
-          status: PaymentStatus.PENDING,
-          amount,
-        },
-      });
-    } catch (error) {
-      // ⚠️ 并发发起时另一个请求已经建了同一笔 → 查出来返回它。
-      //
-      // ⚠️ P2002 必须在**事务外**处理：唯一约束冲突让 PostgreSQL 事务进入
-      // aborted 状态。这里本来就在事务外，重查也在 catch 里做。
-      if (isUniqueViolation(error)) {
-        const raced = await this.lookup.findPaymentByOrderAndChannel(
-          order.id,
-          provider.channel,
-        );
-        if (raced) {
-          return this.toCreatedPayment(raced, order.orderNo);
+    if (existing) {
+      // 已经在上面重置回 PENDING，这里只需重新取一次拿到最新字段
+      payment = await this.lookup.readPaymentById(existing.id);
+    } else {
+      try {
+        payment = await this.prisma.payment.create({
+          data: {
+            tenantId,
+            orderId: order.id,
+            channel: provider.channel,
+            provider: provider.provider,
+            status: PaymentStatus.PENDING,
+            amount,
+          },
+        });
+      } catch (error) {
+        // ⚠️ 并发发起时另一个请求已经建了同一笔 → 查出来返回它。
+        //
+        // ⚠️ P2002 必须在**事务外**处理：唯一约束冲突让 PostgreSQL 事务进入
+        // aborted 状态。这里本来就在事务外，重查也在 catch 里做。
+        if (isUniqueViolation(error)) {
+          const raced = await this.lookup.findPaymentByOrderAndChannel(
+            order.id,
+            provider.channel,
+          );
+          if (raced) {
+            return this.toCreatedPayment(raced, order.orderNo);
+          }
         }
+        throw error;
       }
-      throw error;
     }
 
     const subject = order.items[0]?.productName ?? `订单 ${order.orderNo}`;

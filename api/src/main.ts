@@ -2,12 +2,14 @@ import { NestFactory } from '@nestjs/core';
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { TenantContextInterceptor } from './modules/tenancy/tenant-context.interceptor';
 import { assertSecureConfig } from './common/config/assert-secure-config';
 import { assertPayoutEncryptionKey } from './common/config/assert-payout-encryption-key';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { LoggingInterceptor } from './common/http/logging.interceptor';
+import { SECURITY_HEADERS_OPTIONS } from './common/http/security-headers';
 import { PinoLoggerService } from './common/logging/pino-logger.service';
 import { PayoutEncryptionSelfCheck } from './modules/billing/payout-encryption-self-check.service';
 
@@ -27,6 +29,8 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, { rawBody: true });
 
   app.setGlobalPrefix('api/v1');
+  // 安全响应头。配置见 SECURITY_HEADERS_OPTIONS（e2e 复刻同一份配置）。
+  app.use(helmet(SECURITY_HEADERS_OPTIONS));
   // 阶段 11：全局结构化日志。useLogger 之后，全仓 `new Logger()` 实例的
   // 输出都会经 PinoLoggerService 落成 JSON（业务代码零改动）。
   app.useLogger(app.get(PinoLoggerService));

@@ -1300,3 +1300,88 @@ describe('payoutRetryDelayMs', () => {
     }
   });
 });
+
+/**
+ * 定时对账的分布式互斥（阶段 11）+ 抢不到锁时的行为。
+ *
+ * ⚠️ **这是设计取舍的显式记录，不是「测一个 bug 已被修复」**：
+ *    `RedisLockService` 的语义是「抢不到 = 跳过本轮，不等待不重试」，
+ *    对媒体清理这类旁路任务没有损失；但**定时对账是每天 24 小时一次、
+ *    窗口按「昨天」算** —— 跳过的那一轮，那一天的对账就永久缺失了
+ *    （下一轮的窗口已经是新的一天）。
+ *
+ *    下面的用例把「抢不到锁 → 直接返回、不触发对账」这个现状钉住：
+ *    如果哪天改成「抢不到就退避重试」，这里会变红，提醒重新审视语义。
+ */
+describe('定时对账：抢不到分布式锁时的行为', () => {
+  /** 只记录调用的假对账服务 */
+  function fakeReconciliation() {
+    return { runScheduled: jest.fn(() => Promise.resolve()) };
+  }
+
+  it('⚠️ 锁被别的副本持有 → 跳过本轮，不跑对账（当天窗口因此缺失）', async () => {
+    const reconciliation = fakeReconciliation();
+    const lock = {
+      withLock: jest.fn(() => Promise.resolve({ acquired: false } as const)),
+    };
+    const worker = new PayoutWorker(
+      fakeExecution(claim) as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      fakeRegistry(fakeProvider({ status: 'SUCCESS' })),
+      reconciliation as unknown as never,
+      lock as unknown as never,
+    );
+
+    await worker.process({
+      name: 'reconcile',
+      data: { channel: 'fake-payout' },
+    } as never);
+
+    // ⚠️ 现状：抢不到就什么都不做。BullMQ 视本轮为「成功」→ 不会重投。
+    expect(reconciliation.runScheduled).toHaveBeenCalledTimes(0);
+  });
+
+  it('⚠️ 没有注入锁（单副本 / 测试）→ 直接跑，不跳过', async () => {
+    const reconciliation = fakeReconciliation();
+    const worker = new PayoutWorker(
+      fakeExecution(claim) as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      fakeRegistry(fakeProvider({ status: 'SUCCESS' })),
+      reconciliation as unknown as never,
+    );
+
+    await worker.process({
+      name: 'reconcile',
+      data: { channel: 'fake-payout' },
+    } as never);
+
+    expect(reconciliation.runScheduled).toHaveBeenCalledTimes(1);
+  });
+
+  it('抢到锁 → 正常跑对账', async () => {
+    const reconciliation = fakeReconciliation();
+    const lock = {
+      withLock: jest.fn(async (_key: string, fn: () => Promise<void>) => {
+        await fn();
+        return { acquired: true, value: undefined } as const;
+      }),
+    };
+    const worker = new PayoutWorker(
+      fakeExecution(claim) as unknown as never,
+      fakePrisma() as unknown as never,
+      fakeQueues() as unknown as never,
+      fakeRegistry(fakeProvider({ status: 'SUCCESS' })),
+      reconciliation as unknown as never,
+      lock as unknown as never,
+    );
+
+    await worker.process({
+      name: 'reconcile',
+      data: { channel: 'fake-payout' },
+    } as never);
+
+    expect(reconciliation.runScheduled).toHaveBeenCalledTimes(1);
+  });
+});

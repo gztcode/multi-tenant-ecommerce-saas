@@ -16,10 +16,13 @@
     "baseUrl": "./",
     "incremental": true,
     "skipLibCheck": true,
-    "strictNullChecks": true,
+    // 一次打开全部严格族（含 strictFunctionTypes / strictPropertyInitialization /
+    // noImplicitThis / useUnknownInCatchVariables / alwaysStrict）。
+    // 原先只显式开了 strictNullChecks + noImplicitAny + strictBindCallApply 三项，
+    // 剩下的靠 `strict` 补齐——三个子项都由它蕴含，单独列出来只会让人误以为
+    // 「已经开了 strict」。
+    "strict": true,
     "forceConsistentCasingInFileNames": true,
-    "noImplicitAny": true,
-    "strictBindCallApply": true,
     "noFallthroughCasesInSwitch": true
   }
 }

@@ -2,7 +2,8 @@
 
 > 生成时间：2026-11-05（当日收尾更新）
 > 依据：主控独立核查 + 4 视角 RBAC 复核 + 7 维审计 workflow + 32 条对抗验证
-> 状态：**已按 §六 顺序修完批次 1-12（全部批次）**，进度见 §〇。每条都标注了验证方式与修法方向。
+> 状态：**已按 §六 顺序修完批次 1-12（全部批次）；批次 13-16 是阶段 11 重构后的回退补修与相邻洞**，进度见 §〇。
+> 每条都标注了验证方式与修法方向。
 >
 > **统计**：P0 **6** 条 / P1 **5** 条 / P2 **29** 条（其中 4 条已被对抗验证**推翻或升级**，
 > 实际待修 P2 为 **25** 条）。
@@ -35,6 +36,68 @@
 | 10 | P2-A4 账目自检补货款冲回检查 | `6f02d30` | ✅ |
 | 11 | P2 各项（P2-9/9b/10 套餐额度、P2-5 三处 500、P2-15 时间戳纪律、P2-A3、P2-1/P2-1b/P2-2 依赖漏洞） | `40e3c54`、`b264ac5`、`ce98ae4`、`1c5d94c`、`3fb8550` | ✅ |
 | 12 | P2-11 账单支付单 P2002、P2-16 保留子域名、P2-A2 自检告警、P2-6 CSV BOM、P2-12/P2-13/P2-8 文档口径 | `67f5168`、`831d0d4`、`b65763b` | ✅ |
+| 13 | **阶段 11 重构的三处回退**（P2-1 overrides 失效、P2-15 退款扫描库时钟、P2-15 metrics 卡单 gauge） | `93dabe7`、`fbe9814`、`d6c4980`、`bd8298c` | ✅ |
+| 14 | 相邻洞：`createPayment` 复用 FAILED/PENDING 支付单不重置（**客户付了钱、订单永远卡住**） | `4b53570` | ✅ |
+| 15 | 相邻洞：定时对账抢不到分布式锁时**静默跳过**（24 小时一轮 + 窗口按「昨天」算 → 那一轮永久缺失） | `ea1debc` | ✅ |
+| 16 | 阶段 11 遗留：`tsconfig` 假 `strict`（只开了三个子项）+ `helmet` 安全响应头 | 本次 | ✅ |
+
+### 批次 16 的实施记录（`strict` 与 helmet）
+
+这两项原本在已删除的 `chore/t0-t1-hardening` 分支上（`1f13b64`、`02df8a4`），
+删分支时没合入主线，一直不在 `main` 里。本次从游离提交取回并按今天的代码重新验证。
+
+**① `tsconfig` 的 `strict`**
+
+原先只显式开了 `strictNullChecks` / `noImplicitAny` / `strictBindCallApply` 三项，
+其余的严格族（`strictFunctionTypes`、`strictPropertyInitialization`、`noImplicitThis`、
+`useUnknownInCatchVariables`、`alwaysStrict`）一直是关的 —— 单看 tsconfig 会以为
+「已经开了 strict」。打开后代码有两处报错，**都是我上一轮（批次 14）新加的 mock**：
+
+```ts
+// ❌ 推断出的参数类型是 unknown，strictFunctionTypes 下参数位置逆变
+updateMany: jest.fn((arg?: unknown) => { void arg; return Promise.resolve({ count: 1 }); }),
+// 后面按 where 内容分流的写法就接不上了：
+//   mockImplementation((arg: { where: { providerTxnId?: null } }) => ...)  → TS2345
+```
+
+改成无参 `jest.fn().mockResolvedValue({ count: 1 })` 即可，签名回到宽松状态，
+与同文件 `findFirst`、`paymentWebhookEvent.updateMany` 的既有写法一致。
+**教训**：`jest.fn()` 里写显式参数标注会让整个 mock 的签名变严格，在 `strictFunctionTypes`
+下会反过来限制后续的 `mockImplementation`。宁可不标注。
+
+**② helmet 安全响应头**
+
+取回原提交后实测发现**注释与代码不符**：注释写「HSTS 不在这里配——那是 Nginx 的事」，
+但 helmet 8 的默认配置**就会发 HSTS**，且是 `max-age=31536000; includeSubDomains`（一年 + 全部子域）。
+而 `infra/nginx/templates/prod.conf.template` 特意用的是 **`max-age=300`** ——
+上线初期不敢锁一年，先用短值观察。
+
+两层都发的话浏览器收到**两个** `Strict-Transport-Security` 头，一年期的那个会盖掉
+运维刻意设的短值。一旦有子域还没上 HTTPS，一年内整个域名连不回来。
+→ 加 `strictTransportSecurity: false`，注释里写清为什么。
+
+**③ 让安全头可测**
+
+e2e 用 `Test.createTestingModule` 自建实例，**不走 `main.ts` 的 `bootstrap()`**，
+写在 `main.ts` 里的 `app.use(helmet(...))` 在 e2e 里根本不执行 —— 测不到。
+故把配置抽成 `api/src/common/http/security-headers.ts` 的 `SECURITY_HEADERS_OPTIONS`，
+`main.ts` 与 e2e 共用同一份，避免测试里复制一份字面量后两边漂移。
+
+`api/test/health.e2e-spec.ts` 新增一条用例断言：
+
+| 断言 | 防的是什么 |
+|---|---|
+| `x-content-type-options: nosniff` | 断言等于具体值而非「存在」，改配置会被挡住 |
+| `x-frame-options: SAMEORIGIN` | 同上 |
+| `referrer-policy: no-referrer` | 同上 |
+| **`content-security-policy` 不存在** | 别顺手把 CSP 打开 —— 会拦掉 Swagger UI 内联脚本导致 `/api/docs` 白屏 |
+| **`strict-transport-security` 不存在** | 应用层不得抢 Nginx 的 HSTS |
+
+失败注入确认有牙齿：去掉 `strictTransportSecurity: false` → 用例红；
+去掉 `contentSecurityPolicy: false` → 用例红（实收 helmet 的全套默认 CSP）。
+
+**顺带修的**：`api/src/common/metrics/metrics.service.spec.ts:25` 一处 prettier 格式错误
+（批次 13 改 `databaseNow` 时留下的），`npm run lint` 一直报错。
 
 ### 批次 11 的实施记录（P2 各项）
 
@@ -255,13 +318,105 @@ A 用不存在的令牌登出后，B 的令牌仍能刷新；失败注入该用�
 全部因模型额度耗尽（429）中止，**0 条有效结论**。上面的缺陷是主线程人工自查发现的，
 不代表审查已覆盖。
 
+### 阶段 11 重构对本清单的三处回退（2026-11-11 核验并修复）
+
+本清单修完后，另一会话在 2026-11-08/09 推进了「阶段 11」（payment/payout 巨石拆成 6 个子服务、
+npm workspaces 化）。合并后我做了一次对抗式核验：9 路按条目逐条比对 + 主线程抽查 15 项。
+**结论：P0/P1 全部 6+5 条、P2 的绝大多数都在**，但有三处被重构悄悄回退 —— 共同特征是
+「**实现代码还在，但已经变成死代码或口径错位**」，纯 grep 关键词发现不了。
+
+| 提交 | 回退了什么 | 为什么 grep 抓不到 |
+|---|---|---|
+| `93dabe7`、`fbe9814` | **P2-1 / P2-1b 依赖漏洞清理整体失效** | overrides 字段还在，只是**不在 npm 读取的位置** |
+| `d6c4980` | **P2-15 退款扫描的库时钟兜底** | `now ?? databaseNow()` 还在，但 `now` 永远不为空 |
+| `bd8298c` | **P2-15 metrics 卡单 gauge** | 新代码，与审计无关，但同样破坏时钟纪律 |
+
+**① npm 11 的 overrides 只读根 `package.json`**（`93dabe7`、`fbe9814`）
+官方文档原文：「Overrides are only considered in the root package.json file for a project.
+Overrides in installed dependencies (including npm workspaces) are not considered in
+dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四份子包的 overrides
+全部静默失效** —— lockfile 里 `multer` 解析成有洞的 2.4.0、`tinypool` 落回 **critical** 的
+1.1.1。`npm ls` 会把它们标成 `invalid: "2.5.0" from …`，但没人看那行输出。
+修法：五项 overrides 合并上提到根；**此外把 `multer` 提为 api 的直接依赖钉死 2.5.0** ——
+实测 overrides 在 workspaces 下穿透间接依赖不可靠，直接依赖才是确定手段。
+`tinypool`/`@vitest/mocker`、`postcss`、`glob`、`deepmerge-ts` 要根治需跨大版本
+（vitest 5 / next 16 / prisma 7），全在开发与构建工具链内、不在运行时面，**单列待办**。
+
+**② facade 的默认参数会吞掉子服务的 `??` 兜底**（`d6c4980`）
+拆 `PaymentService` 时 facade 写成 `scanRefunding(now = new Date())`，而子服务里是
+`const reference = now ?? (await this.prisma.databaseNow())` —— 默认参数让 `now` 永不为空，
+**库时钟兜底从此不再触发**，P2-15 在这条路径上等于回退。改回 `now?: Date` 直传，
+并补一条单测钉住「不传参 → 走 `databaseNow()`」（失败注入：改回默认参数 → 用例变红）。
+⚠️ **纪律**：拆分做「参数直传」的 facade 时，**可选参数不能带默认值**。
+
+**③ 新代码同样要守时钟纪律**（`bd8298c`）
+阶段 11 新增的卡单 gauge 用 `new Date(Date.now() - STUCK_THRESHOLD_MS)` 去比
+**库时钟写入的 `updatedAt`**，两边时钟偏差会让「卡了多久」整体偏移。改走 `databaseNow()`。
+危害仅是监控口径，不影响资金。
+
+**核验方法沉淀**：重构后不能只确认「实现还在」——默认参数、调用点改签名、依赖配置搬家
+都能让正确的实现在运行时变成死代码。本次两层都过才算数（workflow 逐条比对 + 主线程抽查）。
+
 ### 新发现、尚未修的相邻洞
 
-- **`createPayment` 复用 `FAILED` 支付单时不重置为 `PENDING`**（`payment.service.ts`）。
-  对比 `obtainInvoicePayment` 对账单有重置逻辑。后果：用户第二次点支付拿到同一个「已完成」
-  的支付单，后续的成功回调被 `attachProviderTxnId`（`where` 带 `status: PENDING`）丢弃
-  → **客户付了钱、订单永远卡在待支付**。
-  不在本审计清单内；修复需要独立设计（支付单复用语义 + 渠道幂等号），单列待办。
+- ~~**`createPayment` 复用 `FAILED` 支付单时不重置为 `PENDING`**~~ —— **已修（`4b53570`）**。
+  原描述：对比 `obtainInvoicePayment` 对账单有重置逻辑，订单支付这条路径漏了。
+  后果：用户第二次点支付拿到同一个「已完成」的支付单，后续的成功回调被
+  `attachProviderTxnId`（`where` 带 `status: PENDING`）丢弃 → **客户付了钱、订单永远卡在待支付**。
+
+  **实施结论（比原描述更深一层）**：不只是「不重置状态」，还有**旧交易号挡路**。
+  上一轮失败那笔渠道交易号仍留在 `providerTxnId` 上，而 `payments_provider_txn_uniq`
+  是 `(provider, providerTxnId)` 唯一索引 → 即便把状态改回 `PENDING`，新交易号写进去
+  仍会撞索引。所以修法必须**同时清掉 `providerTxnId` 与 `rawResponse`**。
+  （该索引的设计注释写明「`providerTxnId` 可空，NULL 不参与唯一判定，正好符合
+  『还没拿到渠道交易号的支付单可以有多条』」—— 置 null 与设计意图一致。）
+
+  **⚠️⚠️ 第一版修法本身有资金风险，被自己复核推翻（关键教训）**：
+  最初写成「`PENDING` / `FAILED` 一律重置为 `PENDING` 并清掉交易号、重新调渠道」。
+  问题是 **`PENDING` / `FAILED` 带着 `providerTxnId` 意味着渠道侧真的有一笔交易** ——
+  用户可能已经在那个支付页付了款，只是回调还没到（或回调先报了失败）。
+  清号重新下单 = 让用户在新页面再付一次 = **同一笔订单扣两次钱**。
+  而且 `queryPayment` **不能**用来判「到底付没付」：它只返回各渠道自己的枚举字符串，
+  没有统一的 paid / failed 语义。
+
+  **最终决策：按「有没有渠道交易号」分两种，而不是按状态**：
+  - **号为空** → 上一轮连渠道支付页都没建成，是**干净的重试**：
+    重置为 `PENDING`、清号、清 `rawResponse`，然后重新调渠道
+  - **有号** → 渠道交易还在：**只**把状态改回 `PENDING`，**绝不重新调渠道**，
+    把上一轮的支付页原样还给用户（URL 在 `rawResponse` 里）。
+    ⚠️ 状态必须改回 `PENDING`，否则迟到的成功回调会被
+    `attachProviderTxnId` 的 `status: PENDING` 条件挡掉 → 钱收了单子不流转（这正是原缺陷）
+  - `SUCCESS` → 原样返回，**不动**（重置会让重复支付变可能）
+  - `REFUNDED` / `REFUNDING` / `CLOSED` / `NEEDS_REFUND` → 原样返回，**不动**
+    （钱已经出过，重置回去等于把已退款的单变成可支付 = 资金风险）
+
+  **⚠️ 第三层问题（改完才想到）：复用旧单会丢掉原来的并发收敛**
+  原实现靠「两个并发请求都 `create`、输家撞 `payments_order_channel_uniq`」把并发
+  收敛成**一次**渠道调用。改成「复用旧单 + 重新调渠道」后不再有索引碰撞 ——
+  两个请求同时读到 `providerTxnId: null` 就会**双双去调渠道**，同一订单两笔真实交易。
+  修法：把重置做成**抢占式条件更新** —— 号为空时 `where` 带上 `providerTxnId: null`，
+  只有一个请求能改掉那行；另一个 `count === 0` → 重读（此时已有号）走复用分支，不再调渠道。
+
+  六条用例覆盖上述全部分支；三次失败注入确认有牙齿：
+  ① 去掉整体重置判断 → FAILED/PENDING 用例变红；
+  ② 去掉「有号就不重新调渠道」→ 两条防双重扣款的用例变红；
+  ③ **去掉抢占条件（`where` 里不带 `providerTxnId: null`）→ 并发用例变红**
+  （⚠️ 这条用例第一版是假绿：它无条件 `mockResolvedValue({ count: 0 })`，
+  无论 `where` 怎么写都通过。改成按 `where` 内容决定返回值、并用
+  `mockResolvedValueOnce` 区分「首次读旧单」与「抢输后重读」两个查询，才有牙齿）。
+
+  **实施期踩到的坑（值得记）**：第一版把 `rawResponse` 也置成 `Prisma.DbNull`，
+  但该列是 `Json @default("{}")` 且 **NOT NULL** → 违反非空约束 → **整个支付请求 500**。
+  单测发现不了（假 Prisma 不校验约束），是 `test/payment.e2e-spec.ts` 的
+  「同一订单同一渠道只能有一笔支付单」抓到的（第二次发起支付 500）。
+  → 必须写成 `{}`。**这说明：改 Prisma 写入字段时，`DbNull` / `undefined` / `{}`
+  三者在 `Json` 列上语义完全不同，且只有真库能验证。**
+
+  遗留（**未修，需独立设计**）：**渠道侧的幂等号仍未做**。现在同一订单连续发起两次支付
+  会拿到**两个不同的**渠道交易号（第一次的号被主动清掉了）。若用户在两个支付页上都付了款，
+  第二笔会走到 P1-3 的 `NEEDS_REFUND` 路径等人工退款 —— **有兜底但会先多收一次钱**。
+  根治需要渠道支持「同一业务单号幂等」，或本地记住上一笔交易号并先向渠道查单，
+  属独立设计，不在本次范围。
 
 ---
 

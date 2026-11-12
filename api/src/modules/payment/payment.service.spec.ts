@@ -109,7 +109,17 @@ function prismaMock() {
       findMany: jest.fn(),
       findFirst: jest.fn(),
       create: jest.fn(),
-      updateMany: jest.fn(),
+      // ⚠️ 默认返回 `{ count: 1 }`：`createPayment` 的重置是**抢占式条件更新**，
+      //    代码会读 `claimed.count` 判断有没有抢到。不给默认值的话
+      //    `undefined.count` 直接 TypeError。
+      //
+      // ⚠️ **不能写成 `jest.fn((arg?: unknown) => ...)`**：那样推断出的参数类型是
+      //    `unknown`，而 `strictFunctionTypes` 下参数位置是**逆变**的 ——
+      //    后面按 `where` 内容分流的 `mockImplementation((arg: { where: ... }) => ...)`
+      //    会因「`unknown` 不能赋给具体类型」报 TS2345。
+      //    用无参 `jest.fn()` + 默认 `mockResolvedValue`，签名才是宽松的
+      //    （与同文件 `findFirst`、`paymentWebhookEvent.updateMany` 一致）。
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
     invoice: { findFirst: jest.fn() },
     // ⚠️ `findFirst` 是退款落账时读「订单当前状态」用的
@@ -1139,17 +1149,16 @@ describe('支付回调分流：钱收了但订单没接住（审计 P0-3 / P1-3�
     // 重复投递时那次「查已有支付单」要查到那笔 SUCCESS 的
     prisma.payment.findMany.mockResolvedValue([successPaymentRow()]);
     prisma.payment.updateMany.mockImplementation(
-      (arg: { where?: { provider?: unknown; status?: unknown } }) => {
-        // 绑定渠道交易号那次（事务外，带 provider）
-        if (arg?.where?.provider !== undefined) {
-          return { count: 1 };
-        }
-        // ⚠️ 置 SUCCESS 那次（事务内，只按 PENDING 过滤）
-        if (arg?.where?.status === PaymentStatus.PENDING) {
-          return { count: paidCount };
-        }
-        return { count: 1 };
-      },
+      (arg: { where?: { provider?: unknown; status?: unknown } }) =>
+        Promise.resolve(
+          // 绑定渠道交易号那次（事务外，带 provider）
+          arg?.where?.provider !== undefined
+            ? { count: 1 }
+            : // ⚠️ 置 SUCCESS 那次（事务内，只按 PENDING 过滤）
+              arg?.where?.status === PaymentStatus.PENDING
+              ? { count: paidCount }
+              : { count: 1 },
+        ),
     );
     prisma.$transaction.mockImplementation(
       (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
@@ -1626,5 +1635,186 @@ describe('PaymentService 账单支付单并发建单（审计 P2-11）', () => {
 
     expect(error).toBe(dbError);
     expect(fake.createPayment).toHaveBeenCalledTimes(0);
+  });
+});
+
+/**
+ * 复用「上一轮失败」的支付单（2026-11-11 发现的相邻洞）。
+ *
+ * `createPayment` 查到已有支付单就直接返回它，**不重置状态**。
+ * 于是用户在渠道页面付款失败（回调把支付单置 `FAILED`）后再点一次支付：
+ * 拿到的是那张 `FAILED` 的旧单，重新调渠道拿到新交易号，但
+ * `attachProviderTxnId` 的 where 带 `status: PENDING` → 写不进去 →
+ * 返回 false → 回调直接退出 → **客户付了钱、订单永远卡在待支付**。
+ *
+ * 对照：`obtainInvoicePayment`（订阅支付）对非 SUCCESS 的单有重置逻辑，
+ * 订单支付这条路径漏了。
+ */
+describe('PaymentService 复用已有支付单（2026-11-11 相邻洞）', () => {
+  /** 一张待支付的订单 */
+  function pendingOrder() {
+    return {
+      id: 'order-1',
+      orderNo: 'SO-1',
+      status: OrderStatus.PENDING_PAYMENT,
+      totalAmount: 1000,
+      tenantId: TENANT_ID,
+      commissionRate: 0,
+      commissionAmount: 0,
+      items: [{ skuId: 'sku-1', quantity: 1, productName: '测试商品' }],
+    };
+  }
+
+  /** 上一轮留下的支付单 */
+  function oldPayment(status: PaymentStatus, providerTxnId: string | null) {
+    return {
+      id: 'payment-1',
+      orderId: 'order-1',
+      channel: 'fake',
+      provider: 'fake',
+      amount: 1000,
+      status,
+      providerTxnId,
+      rawResponse: providerTxnId ? { payUrl: 'https://pay.example/old' } : {},
+    };
+  }
+
+  function setup(payment: ReturnType<typeof oldPayment>) {
+    const fake = provider('fake', FAKE_CAPABILITIES);
+    fake.createPayment.mockResolvedValue({
+      providerTxnId: 'txn-new',
+      payload: { payUrl: 'https://pay.example/new' },
+    });
+    const prisma = prismaMock();
+    prisma.order.findMany.mockResolvedValue([pendingOrder()]);
+    prisma.payment.findMany.mockResolvedValue([payment]);
+    const { service } = buildService(fake, prisma);
+    return { fake, prisma, service };
+  }
+
+  it('⚠️ FAILED 且**没有**交易号 → 重置为 PENDING 并重新调渠道（干净重试）', async () => {
+    const { fake, prisma, service } = setup(
+      oldPayment(PaymentStatus.FAILED, null),
+    );
+
+    await runForTenant(TENANT_ID, () =>
+      service.createPayment('SO-1', 'fake', 'customer-1'),
+    );
+
+    // 号为空 = 上一轮连渠道支付页都没建成，是干净的重试。
+    // ⚠️ where 必须带 `providerTxnId: null` —— 那是**抢占**：
+    //    并发时只有一个请求能把行改掉，另一个 count=0 不再调渠道。
+    expect(prisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: 'payment-1', providerTxnId: null },
+      data: {
+        status: PaymentStatus.PENDING,
+        providerTxnId: null,
+        rawResponse: {},
+      },
+    });
+    expect(fake.createPayment).toHaveBeenCalledTimes(1);
+  });
+
+  it('⚠️ FAILED 但**有**交易号 → 只改状态、复用原支付页，绝不重新调渠道', async () => {
+    const { fake, prisma, service } = setup(
+      oldPayment(PaymentStatus.FAILED, 'txn-old'),
+    );
+
+    const result = await runForTenant(TENANT_ID, () =>
+      service.createPayment('SO-1', 'fake', 'customer-1'),
+    );
+
+    // ⚠️ 这是双重扣款的防线：渠道侧真的有一笔交易，再调一次 = 扣两次钱
+    expect(fake.createPayment).toHaveBeenCalledTimes(0);
+    // 状态必须改回 PENDING —— 否则迟到的成功回调会被
+    // attachProviderTxnId 的 `status: PENDING` 条件挡掉，钱收了单子不流转
+    expect(prisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: 'payment-1' },
+      data: { status: PaymentStatus.PENDING },
+    });
+    // 且把上一轮的支付页还给用户
+    expect(result.payUrl).toBe('https://pay.example/old');
+  });
+
+  it('⚠️ PENDING 且**有**交易号 → 同理，不重新调渠道（用户可能正在付款）', async () => {
+    const { fake, prisma, service } = setup(
+      oldPayment(PaymentStatus.PENDING, 'txn-old'),
+    );
+
+    await runForTenant(TENANT_ID, () =>
+      service.createPayment('SO-1', 'fake', 'customer-1'),
+    );
+
+    expect(fake.createPayment).toHaveBeenCalledTimes(0);
+    expect(prisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: 'payment-1' },
+      data: { status: PaymentStatus.PENDING },
+    });
+  });
+
+  it('⚠️ 并发：抢占式重置命中 0 行 → 不调渠道，重读后复用那一笔', async () => {
+    const { fake, prisma, service } = setup(
+      oldPayment(PaymentStatus.PENDING, null),
+    );
+
+    // ⚠️ **必须按 where 的真实内容来 mock，否则这条用例没有牙齿**：
+    //    无条件 `mockResolvedValue({ count: 0 })` 的话，
+    //    把「抢占条件」（where 里的 `providerTxnId: null`）删掉它照样绿 ——
+    //    那就测不出「并发时只有一个请求能调渠道」这件事。
+    prisma.payment.updateMany.mockImplementation(
+      (arg: { where: { providerTxnId?: null } }) =>
+        // 带抢占条件 = 「别人抢先了」；不带条件 = 无条件更新，必然成功
+        Promise.resolve(
+          'providerTxnId' in arg.where ? { count: 0 } : { count: 1 },
+        ),
+    );
+    // ⚠️ **必须用 mockResolvedValueOnce 区分两次查询**：
+    //    第一次是 `findPaymentByOrderAndChannel`（要读到**空号**的旧单，
+    //    才会走进抢占分支）；第二次是抢输后的重读（这时已经有号了）。
+    //    用 `mockResolvedValue` 一把覆盖的话，连第一次也会读到有号的单，
+    //    直接走「复用支付页」分支 —— 用例就绕开了被验证的代码路径。
+    prisma.payment.findMany
+      .mockResolvedValueOnce([oldPayment(PaymentStatus.PENDING, null)])
+      .mockResolvedValueOnce([oldPayment(PaymentStatus.PENDING, 'txn-winner')]);
+
+    await runForTenant(TENANT_ID, () =>
+      service.createPayment('SO-1', 'fake', 'customer-1'),
+    );
+
+    // ⚠️ 这是并发双重扣款的防线：没抢到重置权就绝不能再调一次渠道
+    expect(fake.createPayment).toHaveBeenCalledTimes(0);
+  });
+
+  it('已有 SUCCESS 支付单 → 不动、不调渠道（钱已经付过了）', async () => {
+    const { fake, prisma, service } = setup(
+      oldPayment(PaymentStatus.SUCCESS, 'txn-old'),
+    );
+
+    const result = await runForTenant(TENANT_ID, () =>
+      service.createPayment('SO-1', 'fake', 'customer-1'),
+    );
+
+    expect(result.status).toBe(PaymentStatus.SUCCESS);
+    // 绝不能把已成功的单重置回 PENDING —— 那会让重复支付变成可能
+    expect(prisma.payment.updateMany).not.toHaveBeenCalled();
+    expect(fake.createPayment).toHaveBeenCalledTimes(0);
+  });
+
+  it('⚠️ REFUNDED / CLOSED / REFUNDING 一律不动（钱已经出过，重置等于把已退款的单变成可支付）', async () => {
+    for (const status of [
+      PaymentStatus.REFUNDED,
+      PaymentStatus.CLOSED,
+      PaymentStatus.REFUNDING,
+    ]) {
+      const { fake, prisma, service } = setup(oldPayment(status, 'txn-old'));
+
+      const result = await runForTenant(TENANT_ID, () =>
+        service.createPayment('SO-1', 'fake', 'customer-1'),
+      );
+
+      expect(result.status).toBe(status);
+      expect(prisma.payment.updateMany).not.toHaveBeenCalled();
+      expect(fake.createPayment).toHaveBeenCalledTimes(0);
+    }
   });
 });

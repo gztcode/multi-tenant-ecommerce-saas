@@ -22,9 +22,7 @@ const makePrisma = (paymentCount: number, payoutCount: number) =>
     payment: { count: jest.fn().mockResolvedValue(paymentCount) },
     payout: { count: jest.fn().mockResolvedValue(payoutCount) },
     // 卡单阈值的基准时刻改用库时钟（与应用时钟解耦，见 pollStuckWork 注释）
-    databaseNow: jest
-      .fn()
-      .mockResolvedValue(new Date('2026-11-11T00:00:00Z')),
+    databaseNow: jest.fn().mockResolvedValue(new Date('2026-11-11T00:00:00Z')),
   }) as never;
 
 async function makeService(

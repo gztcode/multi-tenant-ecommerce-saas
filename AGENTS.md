@@ -212,6 +212,11 @@ cd infra && docker compose up -d --build
   `npm run db:fix-legacy-checksum`；**只在真报这个错时执行**，执行前先备份。
 - 改完 `schema.prisma` 要 `npx prisma generate`；开发库跑 `npm run prisma:deploy`，种子 `npm run prisma:seed`。
 - 商品搜索依赖 `pg_trgm`；托管数据库（RDS/Cloud SQL）上应用用户通常无权 `CREATE EXTENSION`，部署前让 DBA 先装。
+- **定时对账漏跑需要人工补**：`RedisLockService` 的语义是「抢不到锁 = 跳过本轮，不等待不重试」，
+  而定时对账是 24 小时一次、窗口按「昨天」算 —— 那一轮被跳过后**那一天的对账窗口永久缺失**
+  （下一轮算的是新的一天）。补救入口：平台端 `POST /api/v1/platform/payout-reconciliations`
+  可指定任意 `from`/`to` 手动补跑（不查幂等，跨 31 天内）。⚠️ 单副本部署不会触发（锁为空时直接跑），
+  多副本才有这个窗口。行为由 `payout-worker.spec.ts` 的「定时对账：抢不到分布式锁时的行为」钉住。
 
 ## lint 与验证纪律
 
