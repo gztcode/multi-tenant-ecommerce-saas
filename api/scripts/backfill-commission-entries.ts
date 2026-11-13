@@ -32,33 +32,33 @@
  * ⚠️ `backfill:commissions` 是它的转发别名 —— 运维的老命令名不用改，
  * 但**只有一份脚本**（两份脚本意味着两套逻辑要同步维护，早晚漂）。
  */
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-
 import { NestFactory } from '@nestjs/core';
 
-import { AppModule } from '../src/app.module';
+import { loadEnvFile } from '../src/common/config/load-env';
+
 import { ActivePayoutsError } from '../src/modules/billing/backfill-guard';
 import { CommissionService } from '../src/modules/billing/commission.service';
 import { ReceiptService } from '../src/modules/billing/receipt.service';
 
-/**
- * 加载 `.env`。
- *
- * ⚠️ **用 Node 内置的 `process.loadEnvFile`**（Node 20.12+）而不是 `dotenv`：
- * 仓库里没有 `dotenv` 依赖，而 `process.loadEnvFile` 是内置的。
- * 文件不存在就跳过 —— 容器里的环境变量是直接注入的，本来就没有 `.env`。
- */
-function loadEnv(): void {
-  const envPath = resolve(__dirname, '..', '.env');
-  if (existsSync(envPath)) {
-    process.loadEnvFile(envPath);
-  }
-}
-
 async function main(): Promise<void> {
-  loadEnv();
+  // ⚠️ **必须先加载 `.env`，再 import 应用图**（顺序不能反）。
+  //    静态 import 会被提升到文件顶部 → 应用图（含 `queue.module.ts`）
+  //    在 `.env` 加载前就被求值 → `BullModule.forRoot` 定死了没有密码的
+  //    Redis 地址 → `NOAUTH HELLO ...`。详见 `common/config/load-env.ts`。
+  loadEnvFile();
   const force = process.argv.includes('--force');
+
+  // ⚠️ **必须在这里（而不是文件顶部）加载应用图**：静态 import 会被提升到
+  //    文件顶部，`.env` 还没加载就被求值 —— 见上面的说明。
+  //
+  //    用 `require()` 而不是 `await import()`：本目录的脚本由 ts-node 以
+  //    **CommonJS** 运行（package.json 的 `--compiler-options '{"module":"CommonJS"}'`），
+  //    而 `await import()` 在 `tsc --noEmit` 的 `nodenext` 解析下要求**带扩展名**
+  //    的路径（`../src/app.module.js`）—— 那个路径在 CommonJS 运行期又找不到文件。
+  //    `require()` 两边都成立：运行期在调用点求值（位置正确），类型上用
+  //    `typeof import(...)` 拿到准确类型（无扩展名也能解析）。
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { AppModule } = require('../src/app.module') as typeof import('../src/app.module');
 
   const app = await NestFactory.createApplicationContext(AppModule, {
     // ⚠️ **不启 HTTP 服务**：这个脚本只需要应用上下文（拿 service），
