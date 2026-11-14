@@ -2,7 +2,7 @@
 
 > 生成时间：2026-11-05（当日收尾更新）
 > 依据：主控独立核查 + 4 视角 RBAC 复核 + 7 维审计 workflow + 32 条对抗验证
-> 状态：**已按 §六 顺序修完批次 1-12（全部批次）；批次 13-16 是阶段 11 重构后的回退补修与相邻洞**，进度见 §〇。
+> 状态：**已按 §六 顺序修完批次 1-12（全部批次）；批次 13-18 是阶段 11 重构后的回退补修与相邻洞**，进度见 §〇。
 > 每条都标注了验证方式与修法方向。
 >
 > **统计**：P0 **6** 条 / P1 **5** 条 / P2 **29** 条（其中 4 条已被对抗验证**推翻或升级**，
@@ -41,6 +41,66 @@
 | 15 | 相邻洞：定时对账抢不到分布式锁时**静默跳过**（24 小时一轮 + 窗口按「昨天」算 → 那一轮永久缺失） | `ea1debc` | ✅ |
 | 16 | 阶段 11 遗留：`tsconfig` 假 `strict`（只开了三个子项）+ `helmet` 安全响应头 | `fb1454e` | ✅ |
 | 17 | 支付渠道契约补 `createPayment` 幂等用例（新渠道准入闸，与出款侧对等） | `d23dd93` | ✅ |
+| 18 | 相邻洞：应用启动路径**从未显式加载** `.env`（队列模块注释与代码不符） | `f1ca672` | ✅ |
+
+### 批次 18 的实施记录（应用启动路径显式加载 `.env`）
+
+**「注释与代码不符」**：批次 17 之后我在核对 `queue.module.ts` 的注释时发现，
+它写着「`.env` 由**调用方显式加载**（`common/config/load-env.ts`），且必须
+**先于**应用图被求值」—— 但 #39 只在 `api/scripts/` 下兑现了这件事
+（`check-ledger.ts` / `backfill-commission-entries.ts` / `retry-pre-payout-failures.ts`
+三个脚本调用了 `loadEnvFile()`），**`main.ts` 从未调用**。
+
+应用启动路径实际是靠 **`require('@prisma/client')` 内部的 dotenv 顺带加载**
+`.env` —— 而加载哪个文件取决于生成 client 时记录的 `schemaEnvPath`
+（相对 `node_modules/.prisma/client`），换个目录重新 `prisma generate` 就会失效
+→ 同一份代码在不同机器上行为不同。这正是 `queue.module.ts` 注释里
+**明确点名要否定的那个前提**（「历史上这里写着『dev 环境里的 .env 是被
+`require('@prisma/client')` 内部的 dotenv 顺带加载的』—— **这个前提不成立**」），
+结果它自己在 `main.ts` 上又成立了。
+
+**判据：queue 的依赖链确实不触达 Prisma**
+
+注释警告成不成立，取决于「模块求值链会不会顺带加载 `.env`」。
+实测 `queue.module.ts` → `queue.service.ts` → `with-timeout.ts` / `queue.constants.ts`
+→ **零 `@prisma/client`**。所以注释警告**成立**：把 `QueueModule` 挪到
+`app.module.ts` 首位，`BullModule.forRoot` 的参数（模块装饰器求值时读的
+`process.env.REDIS_URL` / `BULLMQ_PREFIX`）就会在 `.env` 加载前被求值 →
+落到**不带密码**的 fallback → 本机 Redis 开了 `requirepass` → `NOAUTH HELLO ...`；
+容器里则是「队列连不通」，症状极难查。
+
+⚠️ 上一次实测「改了 import 顺序 env 仍就绪」是**假阴性**：那次只把
+`QueueModule` 提到了 `MetricsModule` **之前**（前面还有 16 条 import 已触达
+Prisma），**不是提到首位**。本次用 `dist` 产物做了决定性对照实验（见下）。
+
+**四组对照实验**（判定 env 是否加载只能看**布尔值**，不打印凭证）
+
+| 实验 | `JWT_SECRET` | `REDIS_URL` |
+|---|---|---|
+| ① 什么都不加载 | false | false |
+| ② 只 `require('./dist/load-env.js')` | true | true |
+| ③ **修复前对照**：只 `require('queue.module.js')` | — | **false** |
+| ④ **修复后**：`load-env` → `queue.module` | — | **true** |
+
+**改法**：新增副作用入口 `api/src/load-env.ts`（import 即执行），
+在 `main.ts` 的**第一条** import 引入。
+
+⚠️ **顺序只能靠 import 语句保证**：TypeScript 编译成 CommonJS 后，
+`require` 的顺序 = **`import` 语句的文本顺序**（不是 `imports: []` 数组顺序）。
+`bootstrap()` 是函数体，跑在**所有 import 之后** → 那时 `AppModule` 早已求值 →
+`BullModule.forRoot` 早已把 fallback 值定死 → **补救来不及**。
+所以「把 `loadEnvFile()` 加进 `bootstrap()`」这个看似更自然的写法是**错的**。
+
+`src/load-env.ts`（副作用入口）与 `common/config/load-env.ts`（库）**刻意不合并**：
+后者导出函数、由调用方决定何时加载；合并会让「库」在被 import 的那一刻就产生副作用，
+反而更难推理调用顺序。
+
+**验证**：`dist/main.js` 第 6 行 `require("./load-env")` 早于第 12 行
+`require("./app.module")`；`node dist/main.js` 启动成功；
+api 全量单测 72 套件 / 1128 用例通过；`tsc --noEmit` 与定向 ESLint 零问题。
+
+**未动**：容器里由 compose 注入的环境变量优先级更高 —— `process.loadEnvFile`
+的语义与 dotenv 一致（**不覆盖已存在的变量**），所以本改动对生产部署无影响。
 
 ### 批次 17 的实施记录（支付渠道契约补幂等闸）
 

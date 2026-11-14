@@ -1,3 +1,8 @@
+// ⚠️ **必须是本文件的第一条 import**：`.env` 必须在应用图被求值之前加载，
+//    否则 `queue.module.ts` 的 `BullModule.forRoot` 会把 `REDIS_URL` 定死成
+//    不带密码的 fallback 值。顺序为何必须靠 import 语句保证，见 `load-env.ts`。
+import './load-env';
+
 import { NestFactory } from '@nestjs/core';
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
