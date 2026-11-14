@@ -151,6 +151,29 @@ export function runPaymentProviderContract(
       expect(result.expiresAt.getTime()).toBeGreaterThan(Date.now());
     });
 
+    it('createPayment 幂等：同 referenceId 两次创建必须返回同一个渠道交易号', async () => {
+      // ⚠️ **referenceId 必须固定** —— 它就是渠道侧的幂等键
+      //    （服务层传的是**支付单 id**，复用旧单时不新建行 → 跨重试恒定）。
+      const input = samplePaymentInput();
+
+      const first = await provider.createPayment(input);
+      const second = await provider.createPayment(input);
+
+      // ⚠️ **必须返回同一个渠道交易号**：换号意味着渠道侧多了一笔待付款交易，
+      //    用户在两个页面各付一次 = **同一笔订单扣两次钱**。
+      //    第二笔只能靠 P1-3 的 `NEEDS_REFUND` 人工闸兜底（会先多收一次）。
+      //    这条与出款契约的「submit 幂等」对等 —— 出款侧重复打款比多收更糟，
+      //    但支付侧原先**没有**这条，等于新渠道接入时少一道准入闸。
+      expect(first.providerTxnId).toBe(second.providerTxnId);
+
+      // ⚠️ **金额一致性不在这里断言**：`payload` 是开放字典，各渠道形状不同
+      //    （微信给 `code_url`、支付宝给跳转 URL、假网关给 `payUrl`），
+      //    **都不承载金额语义**，渠道契约层拿不到统一的金额字段。
+      //    金额一致性由 service 层保证 —— 金额只从**库里**的订单读，
+      //    绝不从请求体读（见 `CreatePaymentInput.amount` 的注释），
+      //    渠道拿到的金额恒等于订单金额，压根不存在「两次金额不同」的可能。
+    });
+
     it('queryPayment 未知交易号不冒充成功', async () => {
       const result = await provider.queryPayment(
         `不存在的交易号-${randomUUID()}`,

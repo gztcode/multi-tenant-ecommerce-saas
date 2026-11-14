@@ -43,8 +43,9 @@ async function main(): Promise<void> {
   //    的路径（`../src/app.module.js`）—— 那个路径在 CommonJS 运行期又找不到文件。
   //    `require()` 两边都成立：运行期在调用点求值（位置正确），类型上用
   //    `typeof import(...)` 拿到准确类型（无扩展名也能解析）。
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { AppModule } = require('../src/app.module') as typeof import('../src/app.module');
+  const { AppModule } =
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require('../src/app.module') as typeof import('../src/app.module');
 
   const app = await NestFactory.createApplicationContext(AppModule, {
     logger: ['error', 'warn', 'log'],
