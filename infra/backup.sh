@@ -53,12 +53,15 @@ echo "[backup] postgres 备份校验通过"
 
 # 2) MinIO 数据卷热备（尽力而为：容器运行中 tar，可能有写入中的不一致，本机开发够用；
 #    compose 项目名来自中文目录名，卷名动态查，不硬编码）。
-# ⚠️ 先取卷清单：docker daemon 不可达时这一步直接失败退出，
-#    不能靠管道尾的 || true 把「查不到卷」和「docker 挂了」混为一谈。
-VOLUMES="$(docker volume ls --format '{{.Name}}')"
-# 管道尾 || true：grep 无匹配退出码 1 会被 pipefail 当整条失败，
-# 这里只放行「确实没有该卷」，不放行 docker 本身的失败（上面已先执行）。
-MINIO_VOL="$(printf '%s\n' "$VOLUMES" | grep -E 'minio-data$' | head -n1 || true)"
+# ⚠️ 卷名必须从容器反向查实际挂载，不能 grep 卷列表再取第一个：
+#    机器上若有其他项目残留的同名卷（如本机 `ecommerce_minio-data` 与
+#    `infra_minio-data` 并存），`grep 'minio-data$' | head -n1` 按字母序会取到
+#    没被挂载的残留卷 → 备份打到错误（且可能为空）的卷，真实数据没备。
+#    从容器 `ecommerce-minio` 反向查 `.Name`，取到的一定是这个 compose 项目
+#    实际挂载的卷（container_name 在 compose 里显式声明，可依赖）。
+# ⚠️ docker daemon 不可达时 `docker inspect` 直接失败退出，
+#    不能靠管道尾的 || true 把「查不到容器」和「docker 挂了」混为一谈。
+MINIO_VOL="$(docker inspect ecommerce-minio --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' 2>/dev/null)"
 if [ -z "$MINIO_VOL" ]; then
   echo "[backup] 找不到 minio-data 卷" >&2
   if [ "$ALLOW_MISSING_VOLUMES" != "1" ]; then
@@ -80,7 +83,8 @@ else
 fi
 
 # 3) Redis 数据卷热备（AOF 可能有写入中的不一致，本机开发够用）
-REDIS_VOL="$(printf '%s\n' "$VOLUMES" | grep -E 'redis-data$' | head -n1 || true)"
+#    同 2)：卷名从容器反向查实际挂载，不 grep 卷列表（理由见 MinIO 段）。
+REDIS_VOL="$(docker inspect ecommerce-redis --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' 2>/dev/null)"
 if [ -z "$REDIS_VOL" ]; then
   echo "[backup] 找不到 redis-data 卷" >&2
   if [ "$ALLOW_MISSING_VOLUMES" != "1" ]; then

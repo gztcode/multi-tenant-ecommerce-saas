@@ -56,6 +56,27 @@ export async function POST(request: Request) {
     );
   }
 
+  // ⚠️ **重建白名单 FormData** —— 不把客户端传来的 formData 原样透传。
+  //    后端 `ImportReconciliationDto` 只认这 5 个字段，多余字段（哪怕前端
+  //    正常不发，也防被篡改或将来加字段时误传）一律丢弃。
+  //    字段集与前端 `import-csv-form.tsx` 实际 append 的一致，且值已经过上面
+  //    的 file / columnMapping 校验，这里只放行不重验。
+  const allowed = new FormData();
+  allowed.set('file', file);
+  allowed.set('columnMapping', columnMapping);
+  const channel = formData.get('channel');
+  if (typeof channel === 'string' && channel !== '') {
+    allowed.set('channel', channel);
+  }
+  const from = formData.get('from');
+  if (typeof from === 'string' && from !== '') {
+    allowed.set('from', from);
+  }
+  const to = formData.get('to');
+  if (typeof to === 'string' && to !== '') {
+    allowed.set('to', to);
+  }
+
   try {
     const response = await fetch(
       `${API_BASE_URL}/platform/payout-reconciliations/import`,
@@ -63,7 +84,7 @@ export async function POST(request: Request) {
         method: 'POST',
         headers: { authorization: `Bearer ${session.accessToken}` },
         // ⚠️ **不设 content-type** —— 让 fetch 自动带 boundary
-        body: formData,
+        body: allowed,
       },
     );
     const payload = await response.json().catch(() => null);

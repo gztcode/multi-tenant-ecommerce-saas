@@ -56,6 +56,20 @@ function argsOf(mock: { mock: { calls: unknown[][] } }): QueryArgs {
   return (call ?? [])[0] as QueryArgs;
 }
 
+/**
+ * 唯一索引冲突（Prisma 的 P2002）。
+ *
+ * ⚠️ 必须是 `Error` 实例：仓库的 `isUniqueViolation` 只看 `error.code`，
+ *    但 lint 规则 `prefer-promise-reject-errors` 不接受拿普通对象去 reject。
+ */
+function uniqueViolation(): Error {
+  const error = new Error(
+    'Unique constraint failed on the fields: (`cartId`,`skuId`)',
+  );
+  Object.assign(error, { code: 'P2002' });
+  return error;
+}
+
 interface FakeOptions {
   /** 账号车的条目 */
   accountItems?: Array<{ id: string; skuId: string; quantity: number }>;
@@ -65,12 +79,19 @@ interface FakeOptions {
   sellableSkuIds?: string[];
   /** 账号车查不到（幂等场景用不到，这里主要是留扩展位） */
   guestCartFound?: boolean;
+  /**
+   * `createMany` 前几次以指定错误拒绝（模拟并发撞 `@@unique([cartId, skuId])`）。
+   *
+   * 每给一个错误就失败一次，之后恢复正常。
+   */
+  createManyRejects?: Error[];
 }
 
 function fakePrisma(options: FakeOptions = {}) {
   const accountItems = options.accountItems ?? [];
   const guestItems = options.guestItems ?? [];
   const sellable = new Set(options.sellableSkuIds ?? []);
+  const createManyRejects = [...(options.createManyRejects ?? [])];
 
   /**
    * 可售判定的假实现：返回「请求的 id ∩ 配置的可售集合」。
@@ -94,9 +115,13 @@ function fakePrisma(options: FakeOptions = {}) {
       findMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
         Promise.resolve(accountItems),
       ),
-      createMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
-        Promise.resolve({ count: 0 }),
-      ),
+      createMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() => {
+        const next = createManyRejects.shift();
+        if (next !== undefined) {
+          return Promise.reject(next);
+        }
+        return Promise.resolve({ count: 0 });
+      }),
       updateMany: jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
         Promise.resolve({ count: 0 }),
       ),
@@ -244,6 +269,64 @@ describe('CartService.merge', () => {
     expect(prisma.cart.deleteMany).not.toHaveBeenCalled();
   });
 
+  describe('并发合并撞唯一索引', () => {
+    it('撞 @@unique([cartId, skuId]) → 重跑一次，不冒成 500', async () => {
+      const { prisma, tx } = fakePrisma({
+        accountItems: [],
+        guestItems: [{ id: 'gi-1', skuId: 'sku-A', quantity: 2 }],
+        sellableSkuIds: ['sku-A'],
+        // 第一次 createMany 撞唯一索引：并发下对方先建好了同一条目
+        createManyRejects: [uniqueViolation()],
+      });
+      const service = makeService(prisma);
+
+      // ⚠️ 旧实现（没有重试）这里会抛 P2002 → 500，
+      //    而合并本来就承诺幂等（护栏 3）
+      await expect(
+        service.merge(TENANT, CUSTOMER, 'guest-token'),
+      ).resolves.toMatchObject({ id: ACCOUNT_CART_ID });
+
+      // 第一次事务撞索引 → 重跑一次（重跑会重读账号车，按 max 收敛）
+      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+      expect(tx.cartItem.createMany).toHaveBeenCalledTimes(2);
+    });
+
+    it('非唯一约束的异常原样抛出（不被重跑吞掉，也不重跑）', async () => {
+      const { prisma } = fakePrisma({
+        accountItems: [],
+        guestItems: [{ id: 'gi-1', skuId: 'sku-A', quantity: 2 }],
+        sellableSkuIds: ['sku-A'],
+        createManyRejects: [new Error('db down')],
+      });
+      const service = makeService(prisma);
+
+      await expect(
+        service.merge(TENANT, CUSTOMER, 'guest-token'),
+      ).rejects.toThrow('db down');
+      // 只有 P2002 才重跑
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('连续撞唯一索引超过重试上限 → 原样抛出 P2002，不无限重试', async () => {
+      const { prisma } = fakePrisma({
+        accountItems: [],
+        guestItems: [{ id: 'gi-1', skuId: 'sku-A', quantity: 2 }],
+        sellableSkuIds: ['sku-A'],
+        createManyRejects: [
+          uniqueViolation(),
+          uniqueViolation(),
+          uniqueViolation(),
+        ],
+      });
+      const service = makeService(prisma);
+
+      await expect(
+        service.merge(TENANT, CUSTOMER, 'guest-token'),
+      ).rejects.toMatchObject({ code: 'P2002' });
+      expect(prisma.$transaction).toHaveBeenCalledTimes(3);
+    });
+  });
+
   describe('护栏不变', () => {
     it('不可售 SKU 丢弃，账号车里的陈旧条目一并清掉', async () => {
       const { prisma, tx } = fakePrisma({
@@ -325,5 +408,97 @@ describe('CartService.merge', () => {
       expect(tx.cartItem.updateMany).not.toHaveBeenCalled();
       expect(tx.cart.deleteMany).not.toHaveBeenCalled();
     });
+  });
+});
+
+/**
+ * `addItem` 的并发判定（2026-11-19）。
+ *
+ * 背景：`test/cart.e2e-spec.ts` 的「并发加购同一 SKU 两次」偶发返回 400。
+ * 根因是 `addItem` 用「先 `updateMany`（返回 0 行说明要么行不存在、要么会超上限）
+ * → 再 `findFirst` 查一次区分两种情况」来判定，但**两次查询之间并发请求可能刚把
+ * 行插进去** —— 此时查到行就被误判成「超上限」。
+ *
+ * 这里把那个时序**精确构造**出来：e2e 只能靠概率撞到，单测可以稳定复现。
+ */
+describe('CartService.addItem', () => {
+  const SKU = 'sku-1';
+
+  function cart(): Cart {
+    return {
+      id: 'cart-1',
+      tenantId: TENANT,
+      customerId: CUSTOMER,
+      guestToken: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
+  /**
+   * 最小的假 Prisma：只覆盖 `addItem` 用到的四个方法。
+   * `updateMany` 按 `updateManyCounts` 依次返回，`findFirst` 的返回值由用例给定
+   * （模拟「两次查询之间行被插入」）。
+   */
+  function fakeAddItemPrisma(options: {
+    updateManyCounts: number[];
+    exists: { id: string; quantity: number } | null;
+  }) {
+    const updateMany = jest.fn<
+      Promise<{ count: number }>,
+      [args?: QueryArgs]
+    >();
+    for (const count of options.updateManyCounts) {
+      updateMany.mockResolvedValueOnce({ count });
+    }
+    updateMany.mockResolvedValue({ count: 0 });
+    const findFirst = jest
+      .fn<
+        Promise<{ id: string; quantity: number } | null>,
+        [args?: QueryArgs]
+      >()
+      .mockResolvedValue(options.exists);
+    const create = jest.fn<Promise<unknown>, [args?: QueryArgs]>(() =>
+      Promise.resolve({}),
+    );
+
+    const prisma = {
+      sku: {
+        findFirst: jest.fn<Promise<{ id: string }>, [args?: QueryArgs]>(() =>
+          Promise.resolve({ id: SKU }),
+        ),
+      },
+      cartItem: { updateMany, findFirst, create },
+    };
+    return { prisma, updateMany, findFirst, create };
+  }
+
+  it('updateMany 返回 0 行后行才被并发插入：重试自增，不误报超上限', async () => {
+    const { prisma, updateMany, create } = fakeAddItemPrisma({
+      // 第一次：并发方还没插行 → 0 行；第二次（竞态后重试）：自增成功
+      updateManyCounts: [0, 1],
+      exists: { id: 'item-1', quantity: 1 },
+    });
+    const service = makeService(prisma as unknown as never);
+
+    await expect(service.addItem(cart(), SKU, 1)).resolves.toBeUndefined();
+
+    expect(updateMany).toHaveBeenCalledTimes(2);
+    // 行是别人插的，不该再 create 一次
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('行已存在且再自增就超上限 → 400', async () => {
+    const { prisma, create } = fakeAddItemPrisma({
+      // 两次条件自增都因超上限拿不到行
+      updateManyCounts: [0, 0],
+      exists: { id: 'item-1', quantity: 99 },
+    });
+    const service = makeService(prisma as unknown as never);
+
+    await expect(service.addItem(cart(), SKU, 1)).rejects.toThrow(
+      '同一商品的加购总量不能超过 99',
+    );
+    expect(create).not.toHaveBeenCalled();
   });
 });

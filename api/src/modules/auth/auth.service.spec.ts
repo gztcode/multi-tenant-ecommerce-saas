@@ -5,7 +5,9 @@
 jest.mock('@nestjs/jwt', () => ({ JwtService: class JwtService {} }));
 
 import { HttpException, HttpStatus } from '@nestjs/common';
+import { UserRole } from '@prisma/client';
 import * as argon2 from 'argon2';
+import { tenantContext } from '../../common/tenant/tenant-context';
 import { AuthService } from './auth.service';
 import { LoginThrottleService } from './login-throttle.service';
 import { LoginScope } from './dto/login.dto';
@@ -137,5 +139,155 @@ describe('AuthService.login：失败限流（审计 P2-3）', () => {
     await expect(service.login(WRONG, null)).rejects.toThrow(
       /登录失败次数过多/,
     );
+  });
+});
+
+/**
+ * 注册路径用的 prisma mock。
+ *
+ * 只桩出注册流程真正用到的方法：少一个桩就会在用例里以
+ * 「undefined is not a function」的形式炸出来，比断言失败更难读。
+ */
+function makeRegisterService() {
+  const prisma = {
+    databaseNow: jest.fn().mockResolvedValue(DB_NOW),
+    tenant: {
+      findFirst: jest.fn().mockResolvedValue(null),
+      create: jest.fn().mockResolvedValue({ id: 'tenant-1' }),
+      deleteMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
+    user: {
+      findFirst: jest.fn().mockResolvedValue(null),
+      findMany: jest.fn().mockResolvedValue([]),
+      create: jest.fn().mockResolvedValue({
+        id: 'user-1',
+        email: 'someone@example.test',
+        displayName: '某人',
+        role: 'CUSTOMER',
+        tenantId: 'tenant-1',
+      }),
+    },
+    store: {
+      create: jest.fn().mockResolvedValue({ id: 'store-1' }),
+    },
+    refreshToken: {
+      findFirst: jest.fn().mockResolvedValue(null),
+      updateMany: jest.fn(),
+      create: jest.fn().mockResolvedValue({ id: 'refresh-token-1' }),
+    },
+    $transaction: jest.fn(),
+  };
+  const jwt = { signAsync: jest.fn().mockResolvedValue('access-token') };
+
+  return {
+    prisma,
+    service: new AuthService(
+      prisma as never,
+      jwt as never,
+      new LoginThrottleService(),
+    ),
+  };
+}
+
+/**
+ * 注册路径的唯一约束兜底。
+ *
+ * ⚠️ P2002 一路冒到全局异常过滤器会变成 500「服务器内部错误」，
+ *    所以「先查后建」的竞态必须在 service 层就地翻译成 409。
+ */
+describe('AuthService.registerMerchant：租户创建的 P2002 兜底', () => {
+  const MERCHANT_DTO = {
+    email: 'owner@example.test',
+    password: 'Passw0rd123',
+    merchantName: '示例商户',
+    subdomain: 'acme-shop',
+    storeName: 'Acme 官方旗舰店',
+  };
+
+  it('租户创建撞唯一约束（P2002）→ 409，不是 500', async () => {
+    const { service, prisma } = makeRegisterService();
+    prisma.tenant.create.mockRejectedValue({ code: 'P2002' });
+
+    const promise = service.registerMerchant(MERCHANT_DTO);
+
+    await expect(promise).rejects.toThrow(HttpException);
+    await expect(promise).rejects.toMatchObject({
+      status: HttpStatus.CONFLICT,
+    });
+    // 租户根本没建出来 → 没有可回滚的租户，绝不能去删别人的租户
+    expect(prisma.tenant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('租户创建抛非唯一约束错误 → 原样抛出，不被翻译成 409', async () => {
+    const { service, prisma } = makeRegisterService();
+    const boom = new Error('数据库连接断了');
+    prisma.tenant.create.mockRejectedValue(boom);
+
+    await expect(service.registerMerchant(MERCHANT_DTO)).rejects.toBe(boom);
+  });
+
+  it('租户建出来、后续建店主失败 → 仍然回滚租户（既有行为不回退）', async () => {
+    const { service, prisma } = makeRegisterService();
+    prisma.user.create.mockRejectedValue(new Error('建店主失败'));
+
+    await expect(service.registerMerchant(MERCHANT_DTO)).rejects.toThrow(
+      '建店主失败',
+    );
+
+    expect(prisma.tenant.deleteMany).toHaveBeenCalledWith({
+      where: { id: 'tenant-1' },
+    });
+  });
+});
+
+describe('AuthService.registerCustomer：邮箱查重与 P2002 兜底', () => {
+  const CUSTOMER_DTO = {
+    email: 'buyer@example.test',
+    password: 'Passw0rd123',
+    displayName: '小张',
+  };
+
+  /** 消费者注册必须跑在租户上下文里（租户由子域名解析） */
+  function register(service: AuthService) {
+    return tenantContext.run(
+      { tenantId: 'tenant-1', userId: null, role: UserRole.CUSTOMER },
+      async () => service.registerCustomer(CUSTOMER_DTO),
+    );
+  }
+
+  it('查重条件与数据库索引对齐：邮箱大小写不敏感 + 角色含店员', async () => {
+    const { service, prisma } = makeRegisterService();
+
+    await register(service);
+
+    // 必须逐项对上 users_customer_email_ci_key：
+    // (LOWER(email), tenantId) WHERE role IN ('CUSTOMER', 'MERCHANT_STAFF')
+    expect(prisma.user.findFirst).toHaveBeenCalledWith({
+      where: {
+        email: { equals: 'buyer@example.test', mode: 'insensitive' },
+        role: { in: [UserRole.CUSTOMER, UserRole.MERCHANT_STAFF] },
+      },
+    });
+  });
+
+  it('创建用户撞唯一约束（P2002）→ 409，不是 500', async () => {
+    const { service, prisma } = makeRegisterService();
+    prisma.user.create.mockRejectedValue({ code: 'P2002' });
+
+    const promise = register(service);
+
+    await expect(promise).rejects.toThrow(HttpException);
+    await expect(promise).rejects.toMatchObject({
+      status: HttpStatus.CONFLICT,
+    });
+    await expect(promise).rejects.toThrow('该邮箱已注册');
+  });
+
+  it('创建用户抛非唯一约束错误 → 原样抛出，不被翻译成 409', async () => {
+    const { service, prisma } = makeRegisterService();
+    const boom = new Error('数据库连接断了');
+    prisma.user.create.mockRejectedValue(boom);
+
+    await expect(register(service)).rejects.toBe(boom);
   });
 });

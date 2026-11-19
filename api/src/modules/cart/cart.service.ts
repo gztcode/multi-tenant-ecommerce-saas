@@ -49,6 +49,16 @@ export { MAX_CART_QUANTITY };
 const MAX_MERGE_ITEMS = 200;
 
 /**
+ * 合并购物车时最多重跑几次。
+ *
+ * ⚠️ **只针对并发撞唯一索引**：第一次失败说明**对方已经建好了同一条目**，
+ *    重跑会读到最新状态（走「取 max 更新」或「游客车已不存在 → 直接返回账号车」
+ *    两条路），最终结果与串行执行一致。给 3 次是为了覆盖
+ *    「多个游客车同时并入同一个账号车」这种三方竞争。
+ */
+const MAX_MERGE_ATTEMPTS = 3;
+
+/**
  * 购物车服务。
  *
  * ⚠️ **跨店会员不支持**（设计 §十三 遗留项 1）：
@@ -140,8 +150,39 @@ export class CartService {
    *    游客车的陈旧内容不该让登录失败。
    * 3. **幂等**（护栏 3）：游客车不存在时直接返回账号车，不报错。
    *    前端在登录后会调一次这个接口，网络重试或用户手快点两次都很常见。
+   *
+   * ⚠️ **并发合并会撞 `@@unique([cartId, skuId])]`**：账号车的条目是在
+   *    **事务外**读的，两个并发请求可能都读到「账号车没有这个 sku」→
+   *    都把同一条塞进事务内的 `createMany` → 输家撞唯一索引 → P2002 → 500。
+   *    合并本来就承诺幂等（护栏 3），所以这里**重跑**而不是报错。
+   *
+   * ⚠️ **P2002 只能在事务外翻译**：事务内抛出会让整个事务回滚，
+   *    在事务里 catch 等于白 catch —— 所以重试放在这一层（`mergeOnce` 之外）。
    */
   async merge(
+    tenantId: string,
+    customerId: string,
+    guestToken: string | null,
+  ): Promise<Cart> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= MAX_MERGE_ATTEMPTS; attempt++) {
+      try {
+        return await this.mergeOnce(tenantId, customerId, guestToken);
+      } catch (error) {
+        if (!isUniqueViolation(error)) {
+          throw error;
+        }
+        // 并发下对方先建好了同一条目 → 重跑，重新读账号车后按 max 收敛
+        lastError = error;
+      }
+    }
+    // 重跑完还是撞（极罕见：同一瞬间有更多并发合并）→ 原样抛出，
+    // 不伪装成别的错误（与 payout-account.service.ts 同款约定）。
+    throw lastError;
+  }
+
+  /** 合并的一次尝试（重试逻辑在 `merge` 那层） */
+  private async mergeOnce(
     tenantId: string,
     customerId: string,
     guestToken: string | null,
@@ -356,26 +397,24 @@ export class CartService {
 
     // 原子自增：把「读-改-写」压成一条 UPDATE。
     // 条件带上限，数量用 increment —— 并发请求各自 +N，不会互相覆盖。
-    const updated = await this.prisma.cartItem.updateMany({
-      where: {
-        cartId: cart.id,
-        skuId,
-        quantity: { lte: MAX_CART_QUANTITY - quantity },
-      },
-      data: { quantity: { increment: quantity } },
-    });
-    if (updated.count === 1) {
+    if (await this.tryIncrement(cart.id, skuId, quantity)) {
       return;
     }
 
-    // 0 行：要么行不存在，要么会超上限 —— 查一次区分这两种情况。
+    // 0 行：要么行不存在，要么再自增就超上限。
     const exists = await this.prisma.cartItem.findFirst({
       where: { cartId: cart.id, skuId },
     });
     if (exists) {
-      throw new BadRequestException(
-        `同一商品的加购总量不能超过 ${MAX_CART_QUANTITY}`,
-      );
+      // ⚠️ **查到行不等于超上限**：上面那次 updateMany 与这次 findFirst 之间，
+      //    并发请求可能刚把行插进去（此时数量离上限还很远）。再试一次条件自增，
+      //    仍以受影响行数为准 —— 这一次还是 0 行，才是真的会超上限。
+      if (!(await this.tryIncrement(cart.id, skuId, quantity))) {
+        throw new BadRequestException(
+          `同一商品的加购总量不能超过 ${MAX_CART_QUANTITY}`,
+        );
+      }
+      return;
     }
 
     try {
@@ -387,20 +426,35 @@ export class CartService {
         throw error;
       }
       // 并发插入：另一个请求刚建了行 → 重试一次自增（此时行一定存在）
-      const retried = await this.prisma.cartItem.updateMany({
-        where: {
-          cartId: cart.id,
-          skuId,
-          quantity: { lte: MAX_CART_QUANTITY - quantity },
-        },
-        data: { quantity: { increment: quantity } },
-      });
-      if (retried.count === 0) {
+      if (!(await this.tryIncrement(cart.id, skuId, quantity))) {
         throw new BadRequestException(
           `同一商品的加购总量不能超过 ${MAX_CART_QUANTITY}`,
         );
       }
     }
+  }
+
+  /**
+   * 条件自增：数量再 +N 会超上限时拿不到行（返回 `false`），否则自增成功（`true`）。
+   *
+   * 条件和增量都写进同一条 UPDATE，所以并发请求各自 +N 不会互相覆盖，
+   * 也不会突破上限。返回「有没有更新到行」而不是读回数量，避免多一次查询
+   * 和「读到的数量已过期」的判定问题。
+   */
+  private async tryIncrement(
+    cartId: string,
+    skuId: string,
+    quantity: number,
+  ): Promise<boolean> {
+    const updated = await this.prisma.cartItem.updateMany({
+      where: {
+        cartId,
+        skuId,
+        quantity: { lte: MAX_CART_QUANTITY - quantity },
+      },
+      data: { quantity: { increment: quantity } },
+    });
+    return updated.count === 1;
   }
 
   /** 改购物车条目的数量 */

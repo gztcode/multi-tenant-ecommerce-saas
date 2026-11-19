@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Logger } from '@nestjs/common';
 import {
   InvoiceStatus,
   OrderStatus,
@@ -827,6 +827,47 @@ describe('PaymentService 退款状态机（阶段 6c）', () => {
       expect(handled).toBe(1);
       expect(orderService.transitionInTx).toHaveBeenCalledTimes(1);
       expect(commission.recordReversalInTx).toHaveBeenCalledTimes(1);
+    });
+
+    it('⚠️ B-1：queryRefund 返回金额与实付不符 → 拒绝落账、不冲回', async () => {
+      // 审计 B-1：渠道侧金额核对形同虚设（fake/sandbox 的 queryRefund 不返回
+      // amount，`result.amount !== undefined` 恒为 false，少退/多退的钱会被
+      // 静默落账为 REFUNDED）。修复后：查到金额 ≠ 实付额 → 保持 REFUNDING。
+      const { fake, prisma, service, orderService, commission } = setup();
+      prisma.payment.findMany.mockImplementation(
+        (arg: { where?: { status?: unknown } }) =>
+          arg?.where?.status === PaymentStatus.REFUNDING
+            ? [
+                {
+                  id: 'p-1',
+                  tenantId: TENANT_ID,
+                  orderId: 'o-1',
+                  refundTxnId: 'rt-1',
+                },
+              ]
+            : [paidOrder()],
+      );
+      prisma.payment.findFirst.mockResolvedValue({
+        id: 'p-1',
+        orderId: 'order-1',
+        amount: 1000,
+        status: PaymentStatus.REFUNDING,
+        channel: 'fake',
+        refundTxnId: 'rt-1',
+      });
+      // 实付 1000，渠道却报退了 999（少退）—— 必须拒绝落账
+      fake.queryRefund.mockResolvedValue({
+        status: 'SUCCESS',
+        amount: 999,
+        refundTxnId: 'rt-1',
+      });
+
+      const handled = await service.scanRefunding();
+
+      expect(fake.queryRefund).toHaveBeenCalledWith('rt-1');
+      expect(handled).toBe(1);
+      expect(orderService.transitionInTx).toHaveBeenCalledTimes(0);
+      expect(commission.recordReversalInTx).toHaveBeenCalledTimes(0);
     });
 
     it('有受理号但渠道回 UNKNOWN → 状态不变、不冲回', async () => {
@@ -1816,5 +1857,271 @@ describe('PaymentService 复用已有支付单（2026-11-11 相邻洞）', () =>
       expect(prisma.payment.updateMany).not.toHaveBeenCalled();
       expect(fake.createPayment).toHaveBeenCalledTimes(0);
     }
+  });
+});
+
+/**
+ * 订阅自动扣款的失败分支**不得覆盖支付单的终态**（2026-11-16 发现的相邻洞）。
+ *
+ * 缺陷现场：`payment-order.service.ts` 的 `chargeInvoice` 失败分支写的是
+ * `updateMany({ where: { id }, data: { status: FAILED } })` ——
+ * `where` 里**没有 status 条件**（成功分支有，两边不对称）。
+ *
+ * 渠道调用是一次**网络往返**，这个窗口里支付单完全可能被别的路径推进到终态：
+ * - 并发的续费扫描 job 扣款成功 → `SUCCESS`
+ * - 支付回调（webhook）确认成功 → `SUCCESS`
+ * - 退款完成 → `REFUNDED`
+ * - 支付单被关单 → `CLOSED`
+ *
+ * 这些终态会被这一条无条件更新**改回 FAILED**。危害：
+ * `renewal.service.ts` 的「扣款成功但结算失败」幂等兜底是靠查
+ * `payment.status = SUCCESS` 找已成功扣款的 —— 状态被改回 FAILED 后，
+ * 下一轮扫描会再扣一次（渠道侧按 referenceId 幂等，不真扣两次钱，
+ * 但本地台账与支付单状态不可信）。
+ *
+ * 修法与成功分支对称：`where` 带 `status: { in: [PENDING, FAILED] }`，
+ * 并且**读 `updateMany` 的返回行数**——没命中要 `logger.warn` 留痕，不能静默。
+ */
+describe('OrderPaymentService.chargeInvoice：终态不可被失败分支覆盖（2026-11-16 相邻洞）', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalEnabled = process.env.PAYMENT_ENABLED_CHANNELS;
+
+  beforeAll(() => {
+    // 注册表按环境变量判定「已启用」：非生产没设变量时默认启用 `fake`
+    process.env.NODE_ENV = 'development';
+    process.env.PAYMENT_ENABLED_CHANNELS = 'fake';
+  });
+
+  afterAll(() => {
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+    if (originalEnabled === undefined) {
+      delete process.env.PAYMENT_ENABLED_CHANNELS;
+    } else {
+      process.env.PAYMENT_ENABLED_CHANNELS = originalEnabled;
+    }
+  });
+
+  /** 支付单的一行（状态可变，用来模拟并发改写） */
+  interface PaymentRow {
+    id: string;
+    invoiceId: string;
+    channel: string;
+    status: PaymentStatus;
+    providerTxnId: string | null;
+    amount: number;
+  }
+
+  /** 条件更新的入参 */
+  interface UpdateArgs {
+    where?: {
+      id?: string;
+      status?: PaymentStatus | { in?: PaymentStatus[] };
+      providerTxnId?: string | null;
+    };
+    data?: {
+      status?: PaymentStatus;
+      providerTxnId?: string;
+      amount?: number;
+    };
+  }
+
+  /**
+   * 造一套「会算条件更新命中行数」的假 Prisma。
+   *
+   * ⚠️ **必须按 where 的真实内容判定命中** —— 若 mock 成无条件的
+   *    `{ count: 1 }`，把 where 里的 status 条件删掉用例照样绿，
+   *    那这条用例就没有牙齿。
+   */
+  function statefulPrisma(row: PaymentRow) {
+    const prisma = prismaMock();
+    prisma.invoice.findFirst.mockResolvedValue({
+      id: 'inv-1',
+      number: 'INV-1',
+      amount: 1000,
+      status: InvoiceStatus.OPEN,
+      tenantId: TENANT_ID,
+    });
+    // 没有旧支付单 → 走「建单」分支（不复用、不重置状态）
+    prisma.payment.findFirst.mockResolvedValue(null);
+    prisma.payment.create.mockImplementation(() => Promise.resolve({ ...row }));
+    prisma.payment.findMany.mockImplementation(
+      (arg?: { where: { id: string } }) =>
+        Promise.resolve(arg?.where?.id === row.id ? [{ ...row }] : []),
+    );
+    prisma.payment.updateMany.mockImplementation((arg: UpdateArgs) => {
+      const where = arg?.where ?? {};
+      const data = arg?.data ?? {};
+      if (where.id !== undefined && where.id !== row.id) {
+        return Promise.resolve({ count: 0 });
+      }
+      // 「抢占式写交易号」：where 带 `providerTxnId: null` 时，
+      // 只有当前交易号也为空才算命中
+      if (
+        'providerTxnId' in where &&
+        where.providerTxnId !== row.providerTxnId
+      ) {
+        return Promise.resolve({ count: 0 });
+      }
+      const statusFilter = where.status;
+      if (statusFilter !== undefined) {
+        const allowed =
+          typeof statusFilter === 'string'
+            ? [statusFilter]
+            : (statusFilter.in ?? []);
+        if (!allowed.includes(row.status)) {
+          return Promise.resolve({ count: 0 });
+        }
+      }
+      if (data.status !== undefined) {
+        row.status = data.status;
+      }
+      if (data.providerTxnId !== undefined) {
+        row.providerTxnId = data.providerTxnId;
+      }
+      if (data.amount !== undefined) {
+        row.amount = data.amount;
+      }
+      return Promise.resolve({ count: 1 });
+    });
+    return prisma;
+  }
+
+  function setup(options: {
+    /** 渠道返回的状态 */
+    channelStatus: string;
+    /** 渠道调用期间支付单被推进到的状态（模拟并发 / 支付回调） */
+    statusDuringCharge?: PaymentStatus;
+  }) {
+    const row: PaymentRow = {
+      id: 'pay-1',
+      invoiceId: 'inv-1',
+      channel: 'fake',
+      status: PaymentStatus.PENDING,
+      providerTxnId: null,
+      amount: 1000,
+    };
+    const fake = provider('fake', FAKE_CAPABILITIES);
+    fake.chargeAuthorized.mockImplementation(() => {
+      // ⚠️ 渠道调用是一次网络往返 —— 这个窗口里支付单可能被别的路径改写
+      if (options.statusDuringCharge !== undefined) {
+        row.status = options.statusDuringCharge;
+      }
+      return Promise.resolve({
+        providerTxnId: 'txn-1',
+        status: options.channelStatus,
+      });
+    });
+    const prisma = statefulPrisma(row);
+    const { service } = buildService(fake, prisma);
+    return { fake, prisma, row, service };
+  }
+
+  let warnSpy: jest.SpyInstance;
+  /**
+   * 收集告警文案。
+   *
+   * ⚠️ **不直接索引 `warnSpy.mock.calls`**：那是 `any`，lint 会报
+   *    `no-unsafe-member-access`；用收集数组断言更直白。
+   */
+  let warnMessages: string[];
+
+  beforeEach(() => {
+    warnMessages = [];
+    warnSpy = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation((message: unknown) => {
+        warnMessages.push(String(message));
+      });
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('⚠️ 渠道失败、期间支付单已被并发改成 SUCCESS → 不得改回 FAILED', async () => {
+    const { row, service } = setup({
+      channelStatus: 'FAILED',
+      statusDuringCharge: PaymentStatus.SUCCESS,
+    });
+
+    const result = await runForTenant(TENANT_ID, () =>
+      service.chargeInvoice('INV-1', 'fake', 'pm-token-1'),
+    );
+
+    expect(result.status).toBe('FAILED');
+    // ⚠️ 核心断言：终态不被失败分支覆盖
+    expect(row.status).toBe(PaymentStatus.SUCCESS);
+  });
+
+  it('⚠️ 渠道失败、期间支付单已是 REFUNDED / CLOSED → 不得改写', async () => {
+    for (const terminal of [PaymentStatus.REFUNDED, PaymentStatus.CLOSED]) {
+      const { row, service } = setup({
+        channelStatus: 'FAILED',
+        statusDuringCharge: terminal,
+      });
+
+      await runForTenant(TENANT_ID, () =>
+        service.chargeInvoice('INV-1', 'fake', 'pm-token-1'),
+      );
+
+      expect(row.status).toBe(terminal);
+    }
+  });
+
+  it('条件更新没命中时要留痕（不能静默吞掉），warn 里带支付单 id', async () => {
+    const { service } = setup({
+      channelStatus: 'FAILED',
+      statusDuringCharge: PaymentStatus.SUCCESS,
+    });
+
+    await runForTenant(TENANT_ID, () =>
+      service.chargeInvoice('INV-1', 'fake', 'pm-token-1'),
+    );
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnMessages.join('\n')).toContain('pay-1');
+  });
+
+  it('正常路径：没人抢、渠道失败 → PENDING 推进到 FAILED（不能改过头）', async () => {
+    const { row, service } = setup({ channelStatus: 'FAILED' });
+
+    await runForTenant(TENANT_ID, () =>
+      service.chargeInvoice('INV-1', 'fake', 'pm-token-1'),
+    );
+
+    expect(row.status).toBe(PaymentStatus.FAILED);
+    // 条件更新命中了 → 不该有告警
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('正常路径：没人抢、渠道成功 → PENDING 推进到 SUCCESS（不能改过头）', async () => {
+    const { row, service } = setup({ channelStatus: 'SUCCESS' });
+
+    const result = await runForTenant(TENANT_ID, () =>
+      service.chargeInvoice('INV-1', 'fake', 'pm-token-1'),
+    );
+
+    expect(result.status).toBe('SUCCESS');
+    expect(row.status).toBe(PaymentStatus.SUCCESS);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('⚠️ 渠道成功、期间支付单已是 SUCCESS → 状态不变，但必须留痕', async () => {
+    const { row, service } = setup({
+      channelStatus: 'SUCCESS',
+      statusDuringCharge: PaymentStatus.SUCCESS,
+    });
+
+    await runForTenant(TENANT_ID, () =>
+      service.chargeInvoice('INV-1', 'fake', 'pm-token-1'),
+    );
+
+    expect(row.status).toBe(PaymentStatus.SUCCESS);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnMessages.join('\n')).toContain('pay-1');
   });
 });

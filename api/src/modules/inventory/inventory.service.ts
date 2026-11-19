@@ -239,13 +239,23 @@ export class InventoryService {
     return { items, total, page, pageSize };
   }
 
-  /** 库存汇总：按商品列出各 SKU 的当前库存 */
+  /**
+   * 库存汇总：按商品列出各 SKU 的当前库存。
+   *
+   * ⚠️ **`productId` 必须有值**：Prisma 会把 `where: { productId: undefined }`
+   * 这个键整个丢掉，where 于是退化成无条件查询 → 返回**该租户下所有 SKU**。
+   * 控制器已用 DTO 拦了 HTTP 入口，这里再判一次是因为 service 也可能被
+   * 内部调用方直接调（不经过 ValidationPipe）。
+   */
   async summary(
     productId: string,
   ): Promise<
     Array<{ skuId: string; code: string | null; stock: number; status: string }>
   > {
     this.currentTenantId();
+    if (!productId) {
+      throw new BadRequestException('productId 不能为空');
+    }
     const skus = await this.prisma.sku.findMany({
       where: { productId },
       orderBy: { createdAt: 'desc' },

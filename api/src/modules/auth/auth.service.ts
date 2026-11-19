@@ -6,6 +6,10 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { Prisma, RefreshTokenRevokedReason, UserRole } from '@prisma/client';
 import * as argon2 from 'argon2';
+import {
+  isUniqueViolation,
+  rethrowIfUniqueViolation,
+} from '../../common/errors/unique-constraint';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   getTenantContext,
@@ -92,9 +96,20 @@ export class AuthService {
       throw new ConflictException('该邮箱已注册商家账号');
     }
 
-    const tenant = await this.prisma.tenant.create({
-      data: { name: dto.merchantName, subdomain },
-    });
+    // ⚠️ **上面的查重挡不住并发**：两个请求用同一个子域名同时注册时，
+    //    两个查重都能查到「不存在」，于是都去建租户，输家撞上
+    //    tenants.subdomain 的全局唯一索引 → P2002。
+    //    P2002 一路冒到全局异常过滤器会变成 500「服务器内部错误」，
+    //    这里就地翻译成 409，文案与上面的查重分支一致。
+    //
+    // ⚠️ **create 必须留在 try 之外**：租户没建出来时 catch 里的
+    //    tenant.deleteMany 没有可删的 id。
+    //    建店成功、后续建店主/店铺失败时的回滚逻辑保持原样。
+    const tenant = await this.prisma.tenant
+      .create({ data: { name: dto.merchantName, subdomain } })
+      .catch((error: unknown) =>
+        rethrowIfUniqueViolation(error, `子域名 ${dto.subdomain}`),
+      );
 
     try {
       // 用户与店铺都属于租户作用域模型，必须在租户上下文内创建，
@@ -162,26 +177,48 @@ export class AuthService {
     // 但「以顾客身份下单」是另一个角色、另一个账号，不构成身份冲突。
     // 若这里不按角色收窄，店主就永远无法在自己店里购物。
     //
-    // ⚠️ 这条按角色的检查必须与数据库约束保持一致：users_email_ci_key
-    // 原本是 (LOWER(email), tenantId) 唯一且**不含角色**，同租户内
-    // 店主与消费者同邮箱会在建表约束上直接冲突。迁移
-    // add_customer_email_ci_unique 已把它收窄到 role = 'CUSTOMER'。
+    // ⚠️ **这条检查必须与数据库约束逐项对齐**，否则查重会漏检，
+    //    然后在 create 上撞唯一索引 → P2002 → 500。
+    //    现状是 users_customer_email_ci_key = (LOWER(email), tenantId)，
+    //    条件 role IN ('CUSTOMER', 'MERCHANT_STAFF')（见迁移
+    //    narrow_customer_email_ci_unique）：
+    //    ① 角色要**同时**包含 CUSTOMER 与 MERCHANT_STAFF——店员与顾客
+    //       同属店铺内的普通账号，同租户同邮箱本就该互斥；
+    //    ② 邮箱按 **LOWER(email)** 比较（mode: 'insensitive'）——
+    //       索引按小写折叠，早于索引建立写入的大写邮箱行同样占着索引位，
+    //       精确匹配查不到它，create 就会撞 P2002。
+    //
+    // ⚠️ 查重**不能**收窄到包含 MERCHANT_OWNER：店主必须能在自己开的店里
+    //    以消费者身份下单（这正是上面那段注释要保住的设计）。
     const existing = await this.prisma.user.findFirst({
-      where: { email, role: UserRole.CUSTOMER },
+      where: {
+        email: { equals: email, mode: 'insensitive' },
+        role: { in: [UserRole.CUSTOMER, UserRole.MERCHANT_STAFF] },
+      },
     });
     if (existing) {
       throw new ConflictException('该邮箱已注册');
     }
 
-    const user = await this.prisma.user.create({
-      data: {
-        email,
-        passwordHash,
-        displayName: dto.displayName,
-        role: UserRole.CUSTOMER,
-        tenantId: context.tenantId,
-      },
-    });
+    // 并发下两个请求的查重都可能落空（都查到「不存在」），输家会撞上
+    // users_customer_email_ci_key → P2002 → 500。这里兜底成 409，
+    // 文案与上面的查重分支逐字一致（因此不用通用助手重新拼一句）。
+    const user = await this.prisma.user
+      .create({
+        data: {
+          email,
+          passwordHash,
+          displayName: dto.displayName,
+          role: UserRole.CUSTOMER,
+          tenantId: context.tenantId,
+        },
+      })
+      .catch((error: unknown) => {
+        if (isUniqueViolation(error)) {
+          throw new ConflictException('该邮箱已注册');
+        }
+        throw error;
+      });
 
     return this.issueTokens(user);
   }

@@ -622,7 +622,23 @@ function realResolver(prisma: unknown): PayoutReconciliationResolver {
         })
         .then((result) => result.count > 0),
   };
-  return new PayoutReconciliationResolver(execution as never, prisma as never);
+  // ⚠️ **构造器第 3 参（审计 §九 第 2 处）**：`manualCorrectToPaid` 现在
+  //    在单子渠道为 null 时解析平台默认渠道。默认假 Prisma 的单子渠道是
+  //    `FAKE_PAYOUT_CHANNEL`（非 null）→ 通常不触达这里；但 mock 仍要能
+  //    解析，避免某个 `payoutChannel = null` 的用例意外抛 409。
+  const settings = {
+    getPayoutDefaultChannel: jest.fn<
+      Promise<{ channel: string; source: string }>,
+      []
+    >(() =>
+      Promise.resolve({ channel: FAKE_PAYOUT_CHANNEL, source: 'DATABASE' }),
+    ),
+  };
+  return new PayoutReconciliationResolver(
+    execution as never,
+    prisma as never,
+    settings as never,
+  );
 }
 
 /**

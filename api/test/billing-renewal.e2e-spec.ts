@@ -434,6 +434,18 @@ describe('账单、续费与订阅付款 (e2e)', () => {
     );
     expect(invoice).not.toBeNull();
 
+    // ⚠️ **审计批次 20（payment-2）fail-closed**：订阅成功回调要求账单下
+    //    必须有订阅支付单，否则**不付清账单**（「钱收了、服务没开」的防呆）。
+    //    M11 原本只 `subscribe()+generateInvoice()` 就直接投 webhook
+    //    （阶段 5e 时 `markInvoicePaid` 不要求支付单，碰巧通过）；
+    //    现在必须先把订阅支付单建出来（同「续费回调成功」对照组），
+    //    否则首次回调就被拒付清，`becamePaid` 恒为 false。
+    await http(app)
+      .post(`/api/v1/billing/invoices/${invoice!.number}/pay`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ channel: FAKE_CHANNEL })
+      .expect(201);
+
     const before = await readSubscription(merchant.tenantId);
     const eventId = `evt-${unique()}`;
     const payload = {
@@ -505,6 +517,18 @@ describe('账单、续费与订阅付款 (e2e)', () => {
       }),
     );
     expect(invoice).not.toBeNull();
+
+    // ⚠️ **审计批次 20（payment-2）fail-closed**：订阅成功回调要求账单下
+    //    必须有订阅支付单，否则**不付清账单**（「钱收了、服务没开」的防呆）。
+    //    M11 原本只 `subscribe()+generateInvoice()` 就直接投 webhook
+    //    （阶段 5e 时 `markInvoicePaid` 不要求支付单，碰巧通过）；
+    //    现在必须先把订阅支付单建出来（同「续费回调成功」对照组），
+    //    否则首次回调就被拒付清，`becamePaid` 恒为 false。
+    await http(app)
+      .post(`/api/v1/billing/invoices/${invoice!.number}/pay`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ channel: FAKE_CHANNEL })
+      .expect(201);
 
     const before = await readSubscription(merchant.tenantId);
 

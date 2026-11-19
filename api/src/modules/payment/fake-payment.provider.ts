@@ -130,9 +130,9 @@ export class FakePaymentProvider implements PaymentProvider {
     if (!isFakePaymentEnabled()) {
       throw new ServiceUnavailableException('本地假支付网关未启用');
     }
-    // ⚠️ 参数照收不用——真实渠道要用它们（退款单号、金额、原因），
-    // 这里记一笔免得 IDE 报「未使用」。
-    void amount;
+    // ⚠️ `reason` 照收不用——真实渠道要用它（退款原因），
+    // 这里记一笔免得 IDE 报「未使用」。（`amount` 是真实要用的：processing
+    // 分支会存下来，`queryRefund` 据此带回渠道侧金额供调用方核对。）
     void reason;
 
     const refundTxnId = `fake-refund-${paymentId}`;
@@ -144,6 +144,9 @@ export class FakePaymentProvider implements PaymentProvider {
       case 'processing':
         // 记下这笔「处理中」的退款，`queryRefund` 据此返回终态
         this.processingRefunds.set(refundTxnId, Date.now());
+        // ⚠️ B-1：渠道侧声称的退款金额，`queryRefund` 必须原样带回，
+        //     调用方才能做金额核对（否则核对条件恒被跳过）。
+        this.refundAmounts.set(refundTxnId, amount);
         return Promise.resolve({ status: 'PROCESSING', refundTxnId });
       case 'reject':
         return Promise.resolve({
@@ -174,7 +177,13 @@ export class FakePaymentProvider implements PaymentProvider {
   queryRefund(refundTxnId: string): Promise<RefundQueryResult> {
     if (this.processingRefunds.has(refundTxnId)) {
       this.processingRefunds.delete(refundTxnId);
-      return Promise.resolve({ status: 'SUCCESS', refundTxnId });
+      // ⚠️ B-1：带回渠道侧声称的退款金额（success 分支退款是同步成功，
+      //     查询路径通常只覆盖 processing → SUCCESS 的异步流程）。
+      return Promise.resolve({
+        status: 'SUCCESS',
+        refundTxnId,
+        amount: this.refundAmounts.get(refundTxnId),
+      });
     }
     return Promise.resolve({ status: 'UNKNOWN', refundTxnId });
   }
@@ -197,6 +206,9 @@ export class FakePaymentProvider implements PaymentProvider {
 
   /** 处于「处理中」的退款（`queryRefund` 下一次查询返回成功） */
   private readonly processingRefunds = new Map<string, number>();
+
+  /** 退款对应的渠道侧声称金额（B-1：`queryRefund` 原样带回供金额核对） */
+  private readonly refundAmounts = new Map<string, number>();
 
   /**
    * 用已授权的支付方式扣款（自动续费）。

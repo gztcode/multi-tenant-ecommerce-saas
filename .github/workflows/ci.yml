@@ -179,8 +179,30 @@ jobs:
         working-directory: api
       - name: Install pg_trgm (e2e 测试库)
         run: docker exec ${{ job.services.postgres.id }} psql -U ecommerce -d ecommerce_test -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;'
-      # media 套件依赖 MinIO，CI 不启动 MinIO，只排除这一套
-      - run: npm run test:e2e -- --testPathIgnorePatterns=media.e2e-spec.ts
+      # media 套件（18 条）会真实 PUT 到 MinIO，所以 CI 也要起一个真 MinIO。
+      # ⚠️ 用 `docker run` 而不是 services：services 的 options 只能透传 docker create
+      #    参数，没法表达「给 /data 挂 tmpfs」，而 MinIO 在跨设备的 /data 上初始化会因
+      #    `rename .minio.sys/tmp` 失败直接退出（匿名卷落在容器可写层时就是这样）。
+      #    `--tmpfs /data` 提供单文件系统；2026-11-19 用下面这条命令在本机跑通，
+      #    对接它的 media 套件 18/18 通过。
+      - name: 启动 MinIO（media e2e 依赖）
+        run: |
+          docker run -d --name ci-minio --tmpfs /data \
+            -e MINIO_ROOT_USER=ecommerce \
+            -e MINIO_ROOT_PASSWORD=ecommerce-minio-secret \
+            -p 19000:9000 \
+            cgr.dev/chainguard/minio@sha256:ad134b2dd572ae0d989d6807c3e45516cc75a34883a8021db2ff04be5d1d496a \
+            server /data --console-address ":9001"
+          # ⚠️ 就绪探针失败必须让本步直接红：MinIO 没起来时 media 会集体报错，
+          #    若只在测试里失败容易被当成偶发；这里顺手把容器日志打出来。
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:19000/minio/health/live >/dev/null && exit 0
+            sleep 1
+          done
+          echo "MinIO 未在 30 秒内就绪" >&2
+          docker logs ci-minio >&2
+          exit 1
+      - run: npm run test:e2e
         working-directory: api
 
   browser:

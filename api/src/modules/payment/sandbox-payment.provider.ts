@@ -161,6 +161,8 @@ export class SandboxPaymentProvider implements PaymentProvider {
       refundTxnId?: string;
       definitive?: boolean;
       failureReason?: string;
+      /** 渠道侧声称的退款金额（B-1：必须透传，调用方才能做金额核对） */
+      amount?: number;
     }>('GET', `/refund/${encodeURIComponent(refundTxnId)}`, undefined, {
       allowNotFound: true,
     });
@@ -170,7 +172,12 @@ export class SandboxPaymentProvider implements PaymentProvider {
     switch (response.status) {
       case 'SUCCESS':
       case 'PROCESSING':
-        return { status: response.status, refundTxnId };
+        // ⚠️ B-1：原样带回渠道侧金额（mock 服务端已存 `amount`）
+        return {
+          status: response.status,
+          refundTxnId,
+          amount: response.amount,
+        };
       case 'FAILED':
         return {
           status: 'FAILED',

@@ -9,6 +9,7 @@ import {
   platformScope,
   tenantContext,
 } from '../../common/tenant/tenant-context';
+import { PlatformSettingService } from '../../common/platform-settings/platform-setting.service';
 import { PayoutExecutionService } from '../billing/payout-execution.service';
 import type { ReconcileDiff } from './payout-reconcile.engine';
 
@@ -47,6 +48,7 @@ export class PayoutReconciliationResolver {
   constructor(
     private readonly execution: PayoutExecutionService,
     private readonly prisma: TenantPrismaService,
+    private readonly settings: PlatformSettingService,
   ) {}
 
   /**
@@ -116,13 +118,21 @@ export class PayoutReconciliationResolver {
     const { payoutId } = input;
     return tenantContext.run(platformScope(), async () => {
       const paidAt = await this.prisma.databaseNow();
-      const channel = await this.prisma.payout.findFirst({
+      const payout = await this.prisma.payout.findFirst({
         where: { id: payoutId },
         select: { payoutChannel: true },
       });
+      // ⚠️ **渠道必须在事务外解析一次**（审计 §九「出款与结算口径」）——
+      //    单子渠道为 null（阶段 5m 之前的遗留单）时**回落平台默认渠道**；
+      //    平台未配置 → `getPayoutDefaultChannel` 抛 409（fail-closed 不猜渠道）。
+      //    ⚠️ 与 `payout-execution.service.ts` 的 `confirmPaidAfterReconciliation`
+      //    同一原则：**写库渠道必须来自真值，绝不 `?? 'fake-payout'`**。
+      const channel =
+        payout?.payoutChannel ??
+        (await this.settings.getPayoutDefaultChannel()).channel;
       const ok = await this.execution.markPaid(payoutId, {
         providerTxnId: input.channelTxnId ?? '',
-        channel: channel?.payoutChannel ?? 'fake-payout',
+        channel,
         paidAt,
       });
       if (!ok) {

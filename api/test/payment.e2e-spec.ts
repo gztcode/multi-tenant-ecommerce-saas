@@ -60,6 +60,7 @@ interface PayBody {
   provider: string;
   status: string;
   payUrl: string;
+  providerTxnId: string | null;
 }
 
 interface PaymentRow {
@@ -557,10 +558,18 @@ describe('支付与 webhook (e2e)', () => {
 
     // 两次返回**同一笔**支付单
     expect(payBody(second).paymentId).toBe(payBody(first).paymentId);
+    // 渠道交易号也必须一致 —— 用户两次拿到的是**同一个支付页**。
+    // ⚠️ 这条断言钉的是「响应里交易号稳定」，**不是**「第二次没调渠道」：
+    //    假渠道用支付单 id 当交易号（`providerTxnId: referenceId`），
+    //    重调渠道也会得到相同的号。「有号 → 不调渠道」由单测钉住
+    //    （`payment.service.spec.ts`：`createPayment` 调用 0 次）。
+    expect(payBody(first).providerTxnId).toBeTruthy();
+    expect(payBody(second).providerTxnId).toBe(payBody(first).providerTxnId);
 
     // ⚠️ 查库确认只有一行
     const rows = await readPayments(merchant.tenantId, order.id);
     expect(rows).toHaveLength(1);
+    expect(rows[0]?.providerTxnId).toBe(payBody(first).providerTxnId);
   });
 
   it('发起支付：订单不是 PENDING_PAYMENT 时被拒', async () => {

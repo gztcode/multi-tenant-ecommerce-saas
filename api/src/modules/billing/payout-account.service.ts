@@ -4,6 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { requireTenantId } from '../../common/tenant/require-tenant';
 import {
@@ -155,21 +156,63 @@ export class PayoutAccountService {
       throw new BadRequestException('首次设置收款账户时必须填写银行账号');
     }
 
-    const created = await this.prisma.merchantPayoutAccount.create({
-      data: {
-        tenantId,
-        accountName: input.accountName,
-        bankName: input.bankName,
-        // ⚠️ **账号落库即密文** —— 库里不该再有完整账号的明文副本。
-        accountNoCipher: this.cipher.encrypt(accountNo),
-        // ⚠️ **掩码串单独存**：密文长度 ≠ 明文长度，
-        //    而掩码要按明文长度打星 → 不解密就还原不出掩码。
-        maskedAccountNo: maskAccountNo(accountNo),
-        encryptionVersion: 1,
-        preferredChannel: storedPreferredChannel || null,
-      },
-    });
-    return this.toView(created);
+    // ⚠️ **「先查后插」挡不住并发**：`merchant_payout_accounts.tenantId`
+    //    是唯一索引（一商家一账户），两个请求同时进来时都查到「没有」，
+    //    都会走到这里插 → 输家撞唯一索引 → P2002 一路冒成 500。
+    //    商家看到的是一句「服务器内部错误」，而他完全有权设置账户。
+    //
+    //    撞了说明**对方已经建好了**，也就是「有则更新」那条分支该走的路
+    //    —— 所以在事务外补跑一次更新，让并发结果与串行结果一致。
+    try {
+      const created = await this.prisma.merchantPayoutAccount.create({
+        data: {
+          tenantId,
+          accountName: input.accountName,
+          bankName: input.bankName,
+          // ⚠️ **账号落库即密文** —— 库里不该再有完整账号的明文副本。
+          accountNoCipher: this.cipher.encrypt(accountNo),
+          // ⚠️ **掩码串单独存**：密文长度 ≠ 明文长度，
+          //    而掩码要按明文长度打星 → 不解密就还原不出掩码。
+          maskedAccountNo: maskAccountNo(accountNo),
+          encryptionVersion: 1,
+          preferredChannel: storedPreferredChannel || null,
+        },
+      });
+      return this.toView(created);
+    } catch (error) {
+      if (!isUniqueViolation(error)) {
+        throw error;
+      }
+      // 并发下对方先建好了 → 按「已存在」重新走一遍更新
+      const raced = await this.prisma.merchantPayoutAccount.findFirst({
+        where: {},
+        select: { id: true },
+      });
+      if (!raced) {
+        // 查不到说明撞的不是 tenantId 唯一索引（或对方又删了）——
+        // 不能伪装成「账户已存在」，那会把真实故障说成一句重复设置，
+        // 排查方向全错。原样重抛（与 settlement.service.ts 同款约定）。
+        throw error;
+      }
+      await this.prisma.merchantPayoutAccount.updateMany({
+        where: { id: raced.id },
+        data: {
+          accountName: input.accountName,
+          bankName: input.bankName,
+          accountNoCipher: this.cipher.encrypt(accountNo),
+          maskedAccountNo: maskAccountNo(accountNo),
+          encryptionVersion: 1,
+          preferredChannel: storedPreferredChannel || null,
+        },
+      });
+      const account = await this.prisma.merchantPayoutAccount.findFirst({
+        where: {},
+      });
+      if (!account) {
+        throw new NotFoundException('收款账户不存在');
+      }
+      return this.toView(account);
+    }
   }
 
   /** 单条记录 → 对外字段（账号脱敏 + 默认渠道解析） */

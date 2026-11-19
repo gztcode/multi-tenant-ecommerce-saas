@@ -172,11 +172,15 @@ async function main(): Promise<void> {
 
       // ⚠️ **枚举用常量而不是字符串字面量**：字符串比较在枚举扩容时会静默漏掉
       // （`CommissionEntryType.COMMISSION` 才是权威值）。
+      // ⚠️ **`amount` 必须一起取**（审计 §九「订单金额口径」，2026-11-17）：
+      // `checkLedger` 的判定升级为「存在 **且** 金额相等」——取不到金额，
+      // 流水金额写错（如把 `totalAmount` 写成 `commissionAmount`、冲回符号写反）
+      // 也报「✅ 流水完整」。
       const commissionEntries = await prisma.commissionEntry.findMany({
-        select: { orderId: true, type: true },
+        select: { orderId: true, type: true, amount: true },
       });
       const receiptEntries = await prisma.merchantReceipt.findMany({
-        select: { orderId: true, type: true },
+        select: { orderId: true, type: true, amount: true },
       });
 
       // ⚠️ **必须读 `payments` 表**（审计 P0-3 / P1-3）：
@@ -222,6 +226,32 @@ async function main(): Promise<void> {
         reversalReceiptOrderIds: receiptEntries
           .filter((e) => e.type === ReceiptType.SALE_REVERSAL)
           .map((e) => e.orderId),
+        // ⚠️ **金额映射**（审计 §九「订单金额口径」）：把「有流水」升级为
+        // 「有流水 **且** 金额等于期望」。期望值由 `checkLedger` 内部按
+        // `@@unique([orderId, type])`（每单每类型至多一行）严格比对：
+        //   SALE=`+totalAmount`、SALE_REVERSAL=`-totalAmount`、
+        //   COMMISSION=`+commissionAmount`、REVERSAL=`-commissionAmount`。
+        // `Object.fromEntries` 把多条流水（理论上一单一行）映射为 orderId→amount。
+        commissionAmountByOrderId: Object.fromEntries(
+          commissionEntries
+            .filter((e) => e.type === CommissionEntryType.COMMISSION)
+            .map((e) => [e.orderId, e.amount]),
+        ),
+        reversalAmountByOrderId: Object.fromEntries(
+          commissionEntries
+            .filter((e) => e.type === CommissionEntryType.REVERSAL)
+            .map((e) => [e.orderId, e.amount]),
+        ),
+        receiptAmountByOrderId: Object.fromEntries(
+          receiptEntries
+            .filter((e) => e.type === ReceiptType.SALE)
+            .map((e) => [e.orderId, e.amount]),
+        ),
+        reversalReceiptAmountByOrderId: Object.fromEntries(
+          receiptEntries
+            .filter((e) => e.type === ReceiptType.SALE_REVERSAL)
+            .map((e) => [e.orderId, e.amount]),
+        ),
         payments: payments.map((p) => ({
           id: p.id,
           orderId: p.orderId,

@@ -510,23 +510,51 @@ export class OrderPaymentService {
       // 条件更新只把 PENDING/FAILED 推进到 SUCCESS，不覆盖已有的终态；
       // 真正的重复扣款防护靠渠道按 referenceId 的幂等（支付单与
       // providerTxnId 不重置）—— 单副本假设，跨副本并发扫描未加锁。
-      await this.prisma.payment.updateMany({
+      const succeeded = await this.prisma.payment.updateMany({
         where: {
           id: payment.id,
           status: { in: [PaymentStatus.PENDING, PaymentStatus.FAILED] },
         },
         data: { status: PaymentStatus.SUCCESS },
       });
+      if (succeeded.count === 0) {
+        // ⚠️ **没命中不是「没事」，是「有别的事发生过」**：
+        // 渠道调用是一次网络往返，这个窗口里支付单可能已被并发扫描 /
+        // 支付回调推进到终态。**不能静默** —— 静默就看不出
+        // 「本地状态与渠道实际结果对不上」，只能靠人去查。
+        this.logger.warn(
+          `扣款成功但支付单状态未更新（支付单 ${payment.id}，渠道 ${channel}）：` +
+            `支付单已被其他路径推进到终态，不改写`,
+        );
+      }
     } else {
       // ⚠️ **扣款没成功 → 支付单置 FAILED**。
       //
       // 不落这个状态的话，支付单永远停在 `PENDING`：
       // - 状态上看不出来「扣款失败了」
       // - 下次扫描复用它时无从判断上一轮到底扣没扣成功
-      await this.prisma.payment.updateMany({
-        where: { id: payment.id },
+      //
+      // ⚠️ **条件更新必须与成功分支对称**：只按 id 写的话，
+      //    这条无条件更新会把**已经推进到终态**的支付单改回 FAILED ——
+      //    而渠道调用是一次网络往返，窗口里支付单完全可能被并发的
+      //    续费扫描 / 支付回调 / 退款流程改成 SUCCESS / REFUNDED / CLOSED。
+      //    终态被抹掉 → 「已扣款」这个事实从本地消失，
+      //    `renewal.service.ts` 的「扣款成功但结算失败」幂等兜底随之失效。
+      const failed = await this.prisma.payment.updateMany({
+        where: {
+          id: payment.id,
+          status: { in: [PaymentStatus.PENDING, PaymentStatus.FAILED] },
+        },
         data: { status: PaymentStatus.FAILED },
       });
+      if (failed.count === 0) {
+        // ⚠️ 同样**不能静默**：没命中说明状态已经被别的路径推进过了，
+        //    这条「扣款未成功」的结果与库里的终态不一致，要留痕。
+        this.logger.warn(
+          `扣款未成功但支付单状态未更新（支付单 ${payment.id}，渠道 ${channel}）：` +
+            `支付单已被其他路径推进到终态，不改写`,
+        );
+      }
     }
 
     // ⚠️ **返回库里真正存着的那个渠道交易号**。
