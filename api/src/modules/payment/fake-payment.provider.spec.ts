@@ -41,6 +41,8 @@ describe('FakePaymentProvider 退款剧本', () => {
 
     const queried = await provider.queryRefund(first.refundTxnId!);
     expect(queried.status).toBe('SUCCESS');
+    // ⚠️ B-1：查询结果必须带回渠道侧金额，调用方才能做金额核对
+    expect(queried.amount).toBe(9900);
   });
 
   it('reject 剧本：FAILED + definitive=true（渠道明确拒付，可重试）', async () => {

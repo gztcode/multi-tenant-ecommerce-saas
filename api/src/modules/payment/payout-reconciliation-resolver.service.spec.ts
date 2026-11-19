@@ -1,6 +1,8 @@
+import { ConflictException } from '@nestjs/common';
 import { PayoutOperationAction } from '@prisma/client';
 import type { PayoutExecutionService } from '../billing/payout-execution.service';
 import type { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
+import type { PlatformSettingService } from '../../common/platform-settings/platform-setting.service';
 import { PayoutReconciliationResolver } from './payout-reconciliation-resolver.service';
 import type { ReconcileDiff } from './payout-reconcile.engine';
 
@@ -30,7 +32,32 @@ function aDiff(over: Partial<ReconcileDiff> = {}): ReconcileDiff {
   };
 }
 
-function makeMocks(options: { markPaid?: boolean; itemHit?: boolean } = {}) {
+/**
+ * 平台默认渠道的设置 mock。
+ *
+ * ⚠️ **默认解析为 `platform-default`**（不是 `fake-payout`）：
+ * 单子渠道为 null 时必须走平台默认渠道，若 mock 默认给 `fake-payout`，
+ * 会掩盖「`?? 'fake-payout'` 猜渠道」的缺陷（与单子渠道撞名，永远不触发）。
+ */
+function fakeSettings(channel = 'platform-default') {
+  return {
+    getPayoutDefaultChannel: jest.fn<
+      Promise<{ channel: string; source: string }>,
+      []
+    >(() => Promise.resolve({ channel, source: 'DATABASE' })),
+  };
+}
+
+function makeMocks(
+  options: {
+    markPaid?: boolean;
+    itemHit?: boolean;
+    /** 单子的 `payoutChannel`（`findFirst` 返回值）；默认 `fake-payout` */
+    payoutChannel?: string | null;
+    /** 平台默认出款渠道；默认 `platform-default` */
+    platformChannel?: string;
+  } = {},
+) {
   const execution = {
     markPaid: jest.fn<Promise<boolean>, [string, unknown]>(() =>
       Promise.resolve(options.markPaid === undefined ? true : options.markPaid),
@@ -41,8 +68,16 @@ function makeMocks(options: { markPaid?: boolean; itemHit?: boolean } = {}) {
       Promise.resolve(new Date('2026-03-08T00:00:00.000Z')),
     ),
     payout: {
-      findFirst: jest.fn<Promise<{ payoutChannel: string } | null>, [unknown]>(
-        () => Promise.resolve({ payoutChannel: 'fake-payout' }),
+      findFirst: jest.fn<
+        Promise<{ payoutChannel: string | null } | null>,
+        [unknown]
+      >(() =>
+        Promise.resolve({
+          payoutChannel:
+            options.payoutChannel === undefined
+              ? 'fake-payout'
+              : options.payoutChannel,
+        }),
       ),
     },
     payoutOperation: {
@@ -58,11 +93,13 @@ function makeMocks(options: { markPaid?: boolean; itemHit?: boolean } = {}) {
       ),
     },
   };
+  const settings = fakeSettings(options.platformChannel);
   const resolver = new PayoutReconciliationResolver(
     execution as unknown as PayoutExecutionService,
     prisma as unknown as TenantPrismaService,
+    settings as unknown as PlatformSettingService,
   );
-  return { resolver, execution, prisma };
+  return { resolver, execution, prisma, settings };
 }
 
 describe('PayoutReconciliationResolver（阶段 6a）', () => {
@@ -156,6 +193,47 @@ describe('PayoutReconciliationResolver（阶段 6a）', () => {
 
       expect(ok).toBe(true);
       expect(prisma.payoutReconciliationItem.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('⚠️ null 存量单 → 写库渠道 = 平台默认（不猜 fake-payout）', async () => {
+      const { resolver, execution } = makeMocks({ payoutChannel: null });
+
+      const ok = await resolver.manualCorrectToPaid({
+        payoutId: 'p-1',
+        channelTxnId: 'txn-1',
+        action: PayoutOperationAction.RECONCILE_TO_PAID,
+        operatorId: 'system:reconciliation',
+        reason: '渠道对账自动纠正',
+        reconciliationId: 'rec-1',
+      });
+
+      expect(ok).toBe(true);
+      const arg = execution.markPaid.mock.calls[0][1] as { channel: string };
+      expect(arg.channel).toBe('platform-default');
+      expect(arg.channel).not.toBe('fake-payout');
+    });
+
+    it('⚠️ null 存量单且平台未配置默认渠道 → fail-closed（不猜渠道，不调 markPaid）', async () => {
+      const { resolver, execution, settings } = makeMocks({
+        payoutChannel: null,
+      });
+      settings.getPayoutDefaultChannel = jest.fn(() =>
+        Promise.reject(
+          new ConflictException('平台未配置默认出款渠道：请在超管后台设置'),
+        ),
+      );
+
+      await expect(
+        resolver.manualCorrectToPaid({
+          payoutId: 'p-1',
+          channelTxnId: 'txn-1',
+          action: PayoutOperationAction.RECONCILE_TO_PAID,
+          operatorId: 'system:reconciliation',
+          reason: '渠道对账自动纠正',
+          reconciliationId: 'rec-1',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(execution.markPaid).not.toHaveBeenCalled();
     });
   });
 

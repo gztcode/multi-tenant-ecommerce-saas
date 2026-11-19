@@ -409,6 +409,69 @@ describe('收款账户：写（有则更新、无则新建）', () => {
     ).rejects.toBeInstanceOf(NotFoundException);
   });
 
+  it('⚠️ create 撞唯一索引（P2002）→ 按「已存在」补更新，不是 500', async () => {
+    // 修之前：两个并发请求都查到「还没有账户」，都去 create，
+    // 输家撞 `merchant_payout_accounts.tenantId` 唯一索引 → P2002 → 500。
+    const prisma = fakePrisma({ account: null });
+    // 开头查「有没有账户」→ 没有；P2002 之后补查 → 对方建的那条；
+    // 更新完再查一次 → 同一个视图
+    prisma.merchantPayoutAccount.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(payoutAccount())
+      .mockResolvedValueOnce(payoutAccount({ accountName: '张三' }));
+    prisma.merchantPayoutAccount.create.mockRejectedValueOnce({
+      code: 'P2002',
+    });
+
+    const service = makeService(prisma);
+
+    const view = await asTenant(() =>
+      service.set({
+        accountName: '张三',
+        bankName: '招商银行',
+        accountNo: '6225880000000000',
+      }),
+    );
+
+    // 并发结果必须与串行结果一致：账户最终被写进去，调用方拿到视图
+    expect(view.accountName).toBe('张三');
+    // 走的是「更新对方建的那条」，而不是再 create 一次
+    const updateCall = argsOf(prisma.merchantPayoutAccount.updateMany);
+    expect(updateCall.where).toEqual({ id: 'acct-a' });
+    expect((updateCall.data as Record<string, unknown>).encryptionVersion).toBe(
+      1,
+    );
+    expect(prisma.merchantPayoutAccount.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('⚠️ create 撞的唯一索引不是 tenantId（补查也查不到）→ 原样抛出', async () => {
+    // 不能把任何 P2002 都伪装成「账户已存在」—— 那会把真实故障
+    // （比如别的唯一索引坏了）说成一句「重复设置了账户」，
+    // 排查时方向全错。
+    const prisma = fakePrisma({ account: null });
+    prisma.merchantPayoutAccount.create.mockRejectedValueOnce({
+      code: 'P2002',
+      meta: { target: ['somethingElse'] },
+    });
+    // 开头查「有没有账户」→ 没有；P2002 之后补查 → 还是查不到
+    prisma.merchantPayoutAccount.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+
+    const service = makeService(prisma);
+
+    await expect(
+      asTenant(() =>
+        service.set({
+          accountName: '张三',
+          bankName: '招商银行',
+          accountNo: '6225880000000000',
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'P2002' });
+    expect(prisma.merchantPayoutAccount.updateMany).not.toHaveBeenCalled();
+  });
+
   it('⚠️ set 里的 findFirst 也不手写 tenantId', async () => {
     const prisma = fakePrisma({ account: payoutAccount() });
     const service = makeService(prisma);

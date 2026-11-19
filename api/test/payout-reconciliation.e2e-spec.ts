@@ -35,7 +35,9 @@ import { resetPayoutData, seedPayout } from './payout-fixture';
  * | **B 类**（渠道说已打、本地记成了 `FAILED`） | **人工处置** `FAILED → PAID`（四道闸） | ⚠️ **闸没过必须拒绝**（机器不许改一笔钱的状态） |
  *
  * ⚠️ **B 类这里只验「闸 ① 挡住」** —— 其余三道闸（金额笔数、被他人占用、
- *    渠道核实 + 结算单状态）在 Task 7 / Task 8 补。
+ *    渠道核实 + 结算单状态）不在本文件补，由单测覆盖：
+ *    `payout-execution.service.spec.ts` 的「闸 ②」`/「闸 ③」/「闸 ④」用例组。
+ *    （原注释写「在 Task 7 / Task 8 补」有误 —— Task 7 是解卡闸、Task 8 是对账服务与 API。）
  *
  * ⚠️ **造数直接插 `payouts` 行** —— 正常流程造不出这些形状
  *    （「卡在 PROCESSING 的单」「记成失败的单」）。

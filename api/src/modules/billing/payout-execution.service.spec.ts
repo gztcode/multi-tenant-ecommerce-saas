@@ -1782,6 +1782,78 @@ describe('PayoutExecutionService', () => {
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
 
+    it('⚠️ null 存量单 → 核实渠道 = 写入渠道 = 平台默认（不猜 fake-payout）', async () => {
+      // ⚠️ **回归测试** —— 修复前写库写死 `?? 'fake-payout'`：
+      //    单子没有 `payoutChannel`（阶段 5m 之前的遗留单）时，核实内部回落到
+      //    平台默认渠道 X，但记录渠道被标成 fake-payout → **核实渠道 ≠ 写入渠道**
+      //    → 单子实际渠道与记录不符。这里钉住「两者必须共用同一个解析值」。
+      const prisma = fakePrisma(
+        bClassOptions({
+          topPayout: { ...defaultTopPayout(), payoutChannel: null },
+        }),
+      );
+      const verification = fakeVerification('PAID');
+      // ⚠️ **平台默认渠道不是 fake-payout** —— 只有用不同的值才能抓出
+      //    「写库猜成 fake-payout」这个 bug（用同一个值则新旧都通过）。
+      const service = makeService(
+        prisma,
+        verification,
+        fakeRegistry({ enabled: ['platform-default'] }),
+        fakeSettings('platform-default'),
+      );
+
+      const ok = await service.confirmPaidAfterReconciliation('payout-a', {
+        reason: '渠道确认已打款',
+        operatorId: 'admin-1',
+      });
+
+      expect(ok).toBe(true);
+      // ⚠️ **核实渠道 = 平台默认**（非 fake-payout，非 null）
+      const target = verification.verify.mock.calls[0][0];
+      expect(target.payoutChannel).toBe('platform-default');
+      // ⚠️ **写入渠道 = 平台默认**，绝不猜成 fake-payout
+      const written = argsOf(prisma.tx()!.payout.updateMany).data as {
+        payoutChannel: string;
+      };
+      expect(written.payoutChannel).toBe('platform-default');
+      expect(written.payoutChannel).not.toBe('fake-payout');
+    });
+
+    it('⚠️ null 存量单且平台未配置默认渠道 → 409 fail-closed（不猜渠道）', async () => {
+      // ⚠️ **fail-closed**：渠道不明时不得猜渠道（AGENTS.md 纪律）。
+      //    修复前 `?? 'fake-payout'` 会在「无任何配置」时硬编码一个渠道名，
+      //    而该渠道可能根本没启用 → 记录与实际不符。
+      const prisma = fakePrisma(
+        bClassOptions({
+          topPayout: { ...defaultTopPayout(), payoutChannel: null },
+        }),
+      );
+      const settings = fakeSettings();
+      settings.getPayoutDefaultChannel = jest.fn(() =>
+        Promise.reject(
+          new ConflictException(
+            '平台未配置默认出款渠道：请在超管后台设置，或配置环境变量 PAYOUT_PLATFORM_DEFAULT_CHANNEL。',
+          ),
+        ),
+      );
+      const service = makeService(
+        prisma,
+        fakeVerification('PAID'),
+        fakeRegistry(),
+        settings,
+      );
+
+      await expect(
+        service.confirmPaidAfterReconciliation('payout-a', {
+          reason: '渠道确认已打款',
+          operatorId: 'admin-1',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      // ⚠️ **fail-closed 不许动账** —— 事务压根没开
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
     // ---- 闸 ③：明细未被他人占用 ----
 
     it('⚠️ 闸 ③：明细已被同期的另一个出款单占用 → 拒绝，不动钱', async () => {

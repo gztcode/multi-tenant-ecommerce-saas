@@ -366,6 +366,36 @@ describe('库存流水 (e2e)', () => {
     expect(rows[0].stock).toBe(7);
   });
 
+  it('库存汇总：缺 productId → 400，不返回全租户库存', async () => {
+    const merchant = await createMerchant(app, prisma);
+    await createSku(merchant.token, 10);
+
+    // ⚠️ 修之前：裸 `@Query('productId')` 拿到 undefined，
+    //    Prisma 把 `where: { productId: undefined }` 整个丢掉 →
+    //    接口返回该租户下**所有** SKU，与「按商品查」的语义不符。
+    const res = await http(app)
+      .get('/api/v1/inventory/summary')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(400);
+    expect(res.body as { message?: unknown }).toMatchObject({
+      statusCode: 400,
+    });
+
+    // 空串同理：`@IsNotEmpty()` 挡住，不能当成「查所有」
+    await http(app)
+      .get('/api/v1/inventory/summary?productId=')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(400);
+
+    // ⚠️ 这条才是「参数真的走了 DTO」的证词：全局 ValidationPipe 开了
+    //    `forbidNonWhitelisted`，只有类实例 DTO 才会剔除/拒绝白名单外的键。
+    //    裸 `@Query('productId')` 下多余参数会被静默忽略，返回 200。
+    await http(app)
+      .get('/api/v1/inventory/summary?productId=whatever&all=true')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(400);
+  });
+
   it('枚举里留位但本阶段不开放的类型被拒绝', async () => {
     const merchant = await createMerchant(app, prisma);
     const sku = await createSku(merchant.token, 10);

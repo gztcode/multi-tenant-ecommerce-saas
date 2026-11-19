@@ -2,11 +2,12 @@
 
 > 生成时间：2026-11-05（当日收尾更新）
 > 依据：主控独立核查 + 4 视角 RBAC 复核 + 7 维审计 workflow + 32 条对抗验证
-> 状态：**已按 §六 顺序修完批次 1-12（全部批次）；批次 13-18 是阶段 11 重构后的回退补修与相邻洞**，进度见 §〇。
+> 状态：**批次 1-22 全部完成** —— 1-12 按 §六 顺序修复，13-22 是阶段 11 重构后的回退补修、
+> 相邻洞与护栏补强，进度见 §〇。
 > 每条都标注了验证方式与修法方向。
 >
 > **统计**：P0 **6** 条 / P1 **5** 条 / P2 **29** 条（其中 4 条已被对抗验证**推翻或升级**，
-> 实际待修 P2 为 **25** 条）。
+> 审计当时的实际待修 P2 为 **25** 条 —— 截至 2026-11-19 全部条目均已处理，逐条状态见 §〇 进度表）。
 > P1-5、P0-6、P0-7 是对抗验证与第二轮资金链路 workflow 阶段**后补**的；
 > 原 P0-1（领券超发）经对抗验证**实测复现后降级为 P2-17**（low）；
 > P2-B3 被对抗验证**推翻并降级**，P2-B5 升级为 P1-5，
@@ -16,7 +17,7 @@
 > **验证收尾状态（2026-11-05 晚）**：对抗验证 32 条中 **31 条交卷**（下文「第 N 条」按交卷到达序计），
 > 唯一没跑的第 31 个 agent（账单支付单并发 P2002）由主控补核实 —— 结论已并入 **P2-11**（判定成立，级别 low）。
 > 其余未完成的验证（8 个完整性批判 agent、第二轮资金链路 4 向中的 3 向、前端 BFF/nginx 扫描 5 向）
-> 均因模型额度耗尽（429）中止 —— 未覆盖面如实记在**九**。
+> 均因模型额度耗尽（429）中止 —— 未覆盖面如实记在**九**（**该 3 类方向已由主控手工逐项补齐，§九 对应行全部 ✅，2026-11-17/18**）。
 > P1-3 经对抗验证（到达序第 31 条）判定为 **medium**：触发前提是同订单双渠道各付一次，
 > 当前生产形态没有任何可启用渠道；保持 P1 编号（资损性质），修法与 P0-3 是同一处。
 
@@ -42,6 +43,203 @@
 | 16 | 阶段 11 遗留：`tsconfig` 假 `strict`（只开了三个子项）+ `helmet` 安全响应头 | `fb1454e` | ✅ |
 | 17 | 支付渠道契约补 `createPayment` 幂等用例（新渠道准入闸，与出款侧对等） | `d23dd93` | ✅ |
 | 18 | 相邻洞：应用启动路径**从未显式加载** `.env`（队列模块注释与代码不符） | `f1ca672` | ✅ |
+| 19 | 相邻洞：注册路径并发 P2002 冒成 500、顾客邮箱查重口径与索引不一致、库存汇总缺参返回全租户库存、收款账户「先查后插」并发撞唯一索引 | `75d9d73`、`bb24177`、`60603d2` | ✅ |
+| 20 | 相邻洞：地址取消默认写入顺序、购物车合并并发撞唯一索引、支付订阅状态与交易号、软删 SKU 库存回写、nginx 443 缺 default_server、备份恢复解包原子性、限流覆盖与注释订正 | `1da2995`、`2f2febe`、`fe94e2b`、`d3a3582`、`a8a2fc9`、`3291a56`、`5f2c3d8` | ✅ |
+| 21 | P2-1 依赖面收口（§一① 的「跨大版本待办」）：`tinypool` 强制 2.2.0、`test-exclude` 下 glob 升 10.5.0、`postcss` 收敛、`@vitest/mocker` 移出受影响区间 | `30f6041` | ✅（详见批次 21 实施记录） |
+| 22 | P2-B1 CI 排除 media 套件：起真 MinIO（`--tmpfs /data`）+ 恢复全量 e2e | `baf3db8` | ✅（详见批次 22 实施记录）；本机全量 e2e 47 suites / 730 passed，`--tmpfs` 在托管 runner 上的表现待推送后确认 |
+
+### 批次 22 的实施记录（P2-B1：CI 恢复 media 套件）
+
+**问题**：阶段 9 的设计明确取舍为「CI 不跑 media 套件」（设计文档
+`2026-11-04-plan-09-tech-debt-cleanup-design.md:126`），于是 presigned URL 的 host 可达性、
+上传后 size 复核、越限文件被删并标 `ORPHANED` 这几条安全逻辑在 CI 里一直是零覆盖 ——
+而这恰好是唯一会因为 `MINIO_ENDPOINT`（默认 `localhost:19000`）与 compose 注入的
+`minio:9000` 是两套地址而出错的路径。
+
+**为什么不是「加一个 MinIO service 容器」**：GitHub Actions 的 `services.<id>.options`
+只把字符串透传给 `docker create`，表达不了「给 `/data` 挂 tmpfs」。而 MinIO 拒绝在
+跨设备的 `/data` 上初始化（`rename .minio.sys/tmp` 失败后直接退出）—— 匿名卷落在容器
+可写层时就是这种情况。这也是原设计里「加个 service 就好了」一直没落地的真正原因。
+
+**做法**：e2e job 里加一个普通 `docker run` 步骤，用 `--tmpfs /data` 提供单文件系统；
+镜像沿用 compose 钉死的 digest（`cgr.dev/chainguard/minio@sha256:ad134b…`），
+端口发布 `19000:9000` 对齐 `MINIO_ENDPOINT` 的默认值，root user/secret 与
+`minio.service.ts:60-61` 的默认值一致，因此**无需给 job 加任何 `MINIO_*` 环境变量**。
+随后 `curl /minio/health/live` 轮询 30 秒；超时则打印 `docker logs` 并 `exit 1`，
+把「容器没起来」和「测试偶发失败」分开。测试步骤改回 `npm run test:e2e`（不再带排除参数）。
+
+**验证（本机，2026-11-19）**：
+
+- 用与 CI 相同的 `docker run` 命令（临时端口 19077）起容器 → **2 秒就绪**，日志无 error / rename 字样；
+- 对该容器单独跑 `test/media.e2e-spec.ts` → **18 passed / 18 total**（真实 PUT，非 mock）；
+- **更贴近 CI 的一轮**：对着本机常驻 MinIO 跑**全量** `npm run test:e2e` →
+  **47 suites / 730 passed / 82 秒**，且 47 恰等于 `api/test/` 下 `*.e2e-spec.ts` 文件数，
+  `test/media.e2e-spec.ts` 在其中 —— 证明 media 与其余套件**共享测试库与 MinIO 串行混跑**也不互相污染
+  （这是单跑 media 验不出来的部分）；
+- `js-yaml` 解析 `ci.yml` 通过，e2e job 步骤序列为 …→`Install pg_trgm`→`启动 MinIO`→`npm run test:e2e`。
+
+**未验证面（如实记录）**：`--tmpfs` 在 GitHub 托管 runner 上的实际表现只能等推送后的一轮 CI 确认。
+本机验证覆盖了除「托管 runner 的 docker 版本 / 权限」以外的全部环节；此外该步独立且失败时带容器日志，
+不会把「MinIO 没起来」混进测试结论。
+
+### 批次 21 的实施记录（P2-1 依赖面收口）
+
+**背景**：§一① 把 `tinypool`/`@vitest/mocker`、`postcss`、`glob`、`deepmerge-ts`
+列为「要根治需跨大版本（vitest 5 / next 16 / prisma 7）」的待办。本次按「先摸清
+audit 到底报了什么，再决定要不要跨大版本」的思路推进 —— **结论是跨大版本这一步
+基本不必要**。
+
+**⚠️ 前置纪律：本机 `npm audit` 对腾讯镜像报 404**，必须
+`npm audit --registry=https://registry.npmjs.org`，否则拿不到任何 advisory 数据，
+会误判成「无漏洞」。（这一条原本只记在批次 11 的记录里，实测又踩一次。）
+
+**归并方法**：audit 报 67~68 条，但按 `via[].url` 去重后**只有 5 条底层 advisory**。
+audit 的条目数是沿依赖链的**投影**，且某节点的级别取链上最大值 —— 所以一条
+**moderate** 的根公告（如 `vitest` 路径穿越）会在下游被显示成 **high**，因为链路上
+穿了 `picomatch`。不归并就会高估问题数量、也高估严重度。
+（「67~68」这个区间不是笔误：同一状态下连跑 6 次，底层 advisory 恒为 5，
+但投影出的节点数在 67 / 68 之间漂移 —— 比较前后结果要看**归并后的 advisory 列表**，
+不要比 metadata 的 total。）
+
+**⚠️ 关键教训：`npm` 的 `fixAvailable` 是误导性的。** 它给的是**链条入口包**的版本
+（如 `vitest@5.1.1`、`@nestjs/cli@12.0.13`），不代表升到那个版本真的修掉了叶子包。
+`picomatch` 的 `fixAvailable=vitest@5.1.1` 在隔离环境里实测**完全无效**：
+vitest 5.1.1 自己的 `dependencies` 里就写着 `"picomatch": "^4.0.7"`。
+**动手前必须用隔离 install 验一遍前提**，否则会把一次跨大版本升级的成本花光，
+却没修掉任何一条高危。
+
+| advisory | 包 | 级别 | range | 处置 |
+|---|---|---|---|---|
+| `GHSA-82fw-gwwq-j7x9` | vitest 路径穿越（经 `@vitest/mocker`） | moderate | `>=2.1.0 <4.1.11` | ✅ **运行时已修**（`@vitest/mocker` 3.2.7 → 4.1.12），但 audit 仍会报，见下方说明 |
+| `GHSA-5j98-mcp5-4vw2` | **glob CLI `-c/--cmd` 命令注入**（CVSS 9.9） | **high** | `>=10.2.0 <10.5.0` | ✅ `test-exclude` 下 glob 10.4.5 → 10.5.0 |
+| `GHSA-fc5q-39xc-vjpf` | picomatch ReDoS | high | `<=4.0.7` | ⛔ **无任何补丁版**（registry latest 就是 4.0.7） |
+| `GHSA-3g3m-2fjr-6pw4` | glob AbortSignal 绕过 | moderate | `>=9.0.0 <=14.0.1` | ⛔ range 覆盖到 14.0.1，patch 升级无效 |
+| `GHSA-g3hv-75wg-m249` | minimatch globparts DoS | moderate | `>=7.0.0 <11.0.1` | ⛔ 同上 |
+| `GHSA-ggr8-5vv4-36mx` | deepmerge-ts 栈溢出 | high | `<8.0.0` | ⛔ 需 Prisma 7，仅影响 prisma CLI，**有意不修** |
+
+**⚠️ 修好了但 audit 不认的那一条**：`GHSA-82fw` 的修复确实生效了 —— `vitest@3.2.7`
+自己声明 `@vitest/mocker@3.2.7`（在受影响区间内），是根 `overrides` 把它强制到了 4.1.12。
+**运行时用的是 4.1.12，已含修复**；但 `npm audit` 仍按**入口包 `vitest` 自身的版本区间**
+把这条公告挂在 `vitest` 节点上报出来。所以看到「audit 还在报 vitest」不等于没修好，
+要看的是 `@vitest/mocker` 的实际解析版本。**判断口径：以叶子包的解析版本为准，
+不要以 audit 的条目数为准。**
+
+**两条值得记的过程修正**：
+
+1. **`test-exclude` 下 glob 10.4.5 → 10.5.0 起初被当成「`npm update glob` 的无关副作用」
+   而回退了 —— 这个判断是错的。** 它其实是本次收益最大的一条：修掉的正是 CVSS 9.9 的
+   命令注入。回退前后各跑一次 audit 立刻显形（high 56 ↔ 57）。
+   教训：**「副作用」要先确认它改变了什么**，别因为 diff 外科手术式的洁癖而丢一条高危修复。
+2. **`npm update glob` 修不了根上的 `glob@13.0.6`**：它只动声明区间尚未满足的子树。
+   而 `jest`/`@nestjs/cli` 声明的是 `^13.0.6`，13.0.6 已满足区间 → npm 拒绝移动。
+   与「`npm install` 在区间已满足时不套用 `overrides`」是同一个规则。
+
+**为何不需要跨大版本**：`picomatch` 的全部实例 `dev=True`
+（`jest` / `vite` / `vitest` / `@parcel/watcher` / `@dotenvx` 链路），
+不进 api 服务或前端生产构建 —— **这条不可修的 high 实际暴露面为零**。
+`deepmerge-ts` 只在 prisma CLI 运行时。`tinypool` 的 critical 已由根 `overrides`
+强制到 2.2.0（批次 13 已修，本批确认生效）。所以 vitest 5 / next 16 / prisma 7
+三个大版本升级带来的安全收益，**全部可以不用它们拿到**。
+
+**验证**：api 76 suites / 1173 passed / 3 skipped；三端前端 vitest 288 / 562 / 534
+全绿；`storefront next build` 通过。（全量测试在 `30f6041` 提交前完成；本次仅改文档，
+lockfile 未再变动。）
+
+### 批次 19 的实施记录（唯一约束兜底与入参校验）
+
+**本批次的候选来源丢失（过程事实，如实记录）**：批次 19 原计划由一批扫描 workflow
+（10 个 agent）产出「相邻洞」候选清单，再逐条实施。该 workflow **全部因模型额度
+429 失败**（`alive_count: 0, total: 0, report: null`），随后派出的 5 个实施代理
+同样全部 429 —— **任务书原文与候选来源彻底丢失**，转录里只剩压缩摘要。
+
+因此本批次**不凭猜测造条目**：改为由主线程自己重扫、自己实施、自己验证。
+下述 4 条全部是主线程读代码读出来的**实证缺口**，每条都有对应代码位置。
+
+**① 注册路径并发 P2002 冒成 500（`auth.service.ts`）**
+
+商家注册靠「先查后插」挡重复子域名，**但查重挡不住并发**：两个请求用同一子域名
+同时注册 → 两个查重都查到「不存在」→ 都去建租户 → 输家撞 `tenants.subdomain`
+的全局唯一索引 → P2002 → 全局异常过滤器**不处理** P2002 → 一路冒成 500。
+
+修法分两处，**都不是「包一层 try 就完事」**：
+
+- 租户 `create` **必须留在 try 之外**。原来的 try 块里带着「建店主/店铺失败 →
+  回滚租户」的逻辑（`tenant.deleteMany`）；若把 `create` 也包进去，catch 里
+  根本没有可删的租户 id → 会误删**别人**的租户。改法是给 `create` 单独挂
+  `.catch()` → 翻译成 409，文案与既有查重分支逐字一致
+  （`子域名 X 已被占用`）。
+- 顾客注册的查重口径**与数据库约束逐项对齐**：`users_customer_email_ci_key`
+  是 `(LOWER(email), tenantId)` 且条件为 `role IN ('CUSTOMER','MERCHANT_STAFF')`
+  （迁移 `narrow_customer_email_ci_unique`）。改前查重是
+  `{ email, role: CUSTOMER }` —— 精确匹配 + 只查顾客 → **两处漏检**：
+  ① 漏 `MERCHANT_STAFF`（店员与顾客同属店铺内普通账号，同租户同邮箱本就该互斥）；
+  ② 漏大小写不敏感（索引按 `LOWER(email)` 折叠，早于索引建立写入的大写邮箱行
+  同样占着索引位，精确匹配查不到它 → `create` 撞 P2002）。
+  查重**不能**收窄到包含 `MERCHANT_OWNER`：店主必须能在自己开的店里以消费者
+  身份下单（这正是该方法自己注释里要保住的设计）。
+- `create` 再兜一层 P2002 → 409（并发查重落空时的输家）。
+
+**② 顾客邮箱查重 + ③ 收款账户并发（同款 P2002 家族）**
+
+`payout-account.service.ts` 的 `set()` 是同一形状的缺口：`merchant_payout_accounts.tenantId`
+唯一（一商家一账户），两个请求同时设置账户 → 都查到「没有」→ 都去 insert →
+输家撞 P2002 → 500，而商家完全有权设置账户。
+
+修法与 ① 的差别值得记：**撞了唯一约束不等于「已存在」**。这里补跑一次
+「查 → 更新」（与「有则更新」分支同口径），让并发结果与串行结果一致；
+但**补查不到记录时原样重抛**（与 `settlement.service.ts` 同款约定）——
+不能把真实故障说成「账户已存在」，排查方向全错。
+
+⚠️ **P2002 必须在事务外处理**：唯一约束冲突会中断事务，事务内翻译异常没有意义。
+
+**④ 库存汇总缺参返回全租户库存（`inventory.controller.ts`）**
+
+`GET /inventory/summary` 用裸 `@Query('productId')` 取参，缺参时拿到 `undefined`，
+而 **Prisma 会把 `where: { productId: undefined }` 这个键整个丢掉** → where 退化成
+无条件查询 → **返回该租户下所有 SKU 的库存**，与「按商品查」的语义不符。
+
+修法与同文件 `movements` 同款：查询参数走**类实例 DTO**。关键在于
+全局 `ValidationPipe` 的 `whitelist` / `forbidNonWhitelisted` **只对类实例 DTO 生效**
+（`toValidate()` 排除原始类型）—— 裸 `@Query` 连「缺参」都发现不了。
+
+service 层再判一次空值：service 也可能被内部调用方直接调，不经过 `ValidationPipe`。
+
+**e2e 用例里的「证词」写法**：新增用例除了断言「缺参 → 400」「空串 → 400」，
+还断言 **`?productId=whatever&all=true` → 400**。这条是「参数真的走了 DTO」的
+证据 —— 裸 `@Query` 下多余参数会被静默忽略、返回 200。
+
+**验证**：`npx tsc --noEmit` 零错误；定向 ESLint 零问题（prettier 折行后回改一次）；
+`npm run scan:tx-boundary` **0 处可疑点**；api 单测 auth + payout-account
+**51 条通过**；e2e `inventory.e2e-spec.ts` **15 条通过**。
+**三次失败注入确认用例有牙齿**：
+① 库存汇总改回裸 `@Query('productId')` → e2e 1 failed；
+② 去掉 `isUniqueViolation` 判断 → 单测 1 failed；
+③ 收款账户补查短路 → 单测 1 failed。
+
+**批次 20 起发现的相邻洞**（审计时主线程已复核、当时尚未实施；**2026-11-16 已全部修完**，见下节实施记录）：
+地址取消默认的写入顺序（先设别人、本条仍为 true → 必撞默认地址唯一索引）、
+购物车合并的 `createMany` 并发撞 `@@unique([cartId, skuId])`、
+软删 SKU 的库存回写、支付订阅路径的状态与交易号、nginx 443 缺 `default_server`、
+限流覆盖与注释订正、备份恢复脚本的解包原子性。
+
+### 批次 20 的实施记录（相邻洞收口）
+
+**全部 7 项已实施并验证**（2026-11-16，分支 `gzt/电商项目` 直接提交，docs 单独 commit）：
+
+| 缺陷 | 提交 | 验证方式 |
+|------|------|---------|
+| 地址取消默认的写入顺序 | `1da2995` | 单测（默认地址唯一索引冲突复现） |
+| 购物车合并的 `createMany` 并发撞唯一索引 | `2f2febe` | 单测（唯一约束重跑） |
+| 支付订阅路径的状态与交易号 | `fe94e2b` + `d3a3582` | 单测（条件更新未命中留痕） |
+| 软删 SKU 的库存回写 | `a8a2fc9` | 单测（`$executeRaw` 绕过软删过滤） |
+| nginx 443 缺 `default_server` | `3291a56` | docker 行为验证（未知 Host 000 / 已知 502） |
+| 备份恢复脚本的解包原子性 | `5f2c3d8` | docker 行为验证（损坏 tgz 不清空卷） |
+| 限流覆盖与注释订正 | 阶段 11 已实现 | 读代码确认，无需再改 |
+
+**过程事实**：nginx 与 restore 属配置/脚本类缺陷，仓库无 nginx 测试、本机无 nginx
+二进制，用 `docker run nginx:1.27-alpine nginx -t` + 行为验证替代（见上文 nginx-1 与
+restore-1 的验证说明）；restore 修法为「解包前 `tar tzf` 预检 + 解包到卷内临时目录、
+全部成功才清空替换」，与 `backup.sh` 的校验语义对称。
 
 ### 批次 18 的实施记录（应用启动路径显式加载 `.env`）
 
@@ -278,14 +476,34 @@ api 剩 3 条 high 全来自 `deepmerge-ts`（经 `@prisma/config`，只影响 p
 修法：不存在时直接 `return`（正是原注释写的「静默成功」），并补 e2e：
 A 用不存在的令牌登出后，B 的令牌仍能刷新；失败注入该用例变红。
 
-**仍未动（需另行决定）**：
+**遗留项收口**：
 
 - `Plan.maxStores` 全仓没有执行点（没有创建店铺的接口）。⚠️ **产品已确认要多店铺**，
   因此额度字段保留，等店铺创建接口落地时再接入执行点；
-- `test/cart.e2e-spec.ts`「并发加购同一 SKU 两次」偶发其中一个请求返回 400。
-  2026-11-07 复跑单用例 6 轮、整文件 4 轮、全量 4 轮**都没能复现**；静态分析也对不上
-  —— `addItem` 只有两处 400（SKU 查不到 / 超过上限 99），在这个用例的数据下都不该发生，
-  全局异常过滤器也不把 P2002 映射成 400。**未定位，保持观察**（临时探针已撤）。
+  **本次核实后决定暂不加 `POST /stores` 执行点，原因（架构阻塞，不是遗漏）**：
+  - 全仓 `storeId` 出现 **0 次** —— 商品、分类、订单、库存全部按 `tenantId` 关联，
+    `Store` 目前只是租户的展示档案（`name` / `slug` / `status` / `themeTokens`）；
+    `paymentConfig` 字段连读写点都没有（schema 默认值之外全仓无人引用）。
+  - `Store` 的唯一创建点是**注册**（`auth.service.ts:144`）；生产代码里的读取点
+    （`public-catalog.service.ts` / `stores.service.ts` ×2 / `theme.service.ts`）
+    **全部是 `findFirst` 取「该租户的第一家店」**，隐含「一租户一店」不变式。
+  - 此时加 `POST /stores` 只会写出一行**没有任何代码路径读取**的数据，并打破上面那个不变式；
+    `assertWithinQuota('STORE', ...)` 挡住的也只是这些僵尸行。
+  - 真正的多店要先做架构改造：把 `subdomain` 从 `Tenant` 迁到 `Store`（租户上下文由店铺定），
+    并让商品 / 订单按店归属。在那之前，`maxStores` 的执行点接了也是空转。
+  - 因此：**不改代码、不加 `orderBy`**（今天加是投机性改动）；额度字段保留，
+    等店铺创建接口与店铺级数据归属一起设计时再接入。
+- ✅ **`test/cart.e2e-spec.ts`「并发加购同一 SKU 两次」偶发 400：已定位并修复（`c661929`）**。
+  2026-11-07 的复跑没能复现只是运气（实际约 1/5 概率）；11-19 用临时探针（已撤）抓到
+  失败响应体是 `同一商品的加购总量不能超过 99`。根因是 **TOCTOU**：`addItem` 先跑条件自增
+  `updateMany`（返回 0 行），再用 `findFirst` 区分「行不存在」与「会超上限」——
+  **两次查询之间并发请求可能刚把行插进去**，此时 `findFirst` 查到行，就被误判成超上限。
+  原文那句「只有两处 400」按语义分是两类原因（SKU 查不到 / 超过上限），实际抛出点有四处
+  ——漏掉的不是分支，是**时序**。
+  修法：查到行时**再试一次条件自增**，仍以 `updateMany` 的受影响行数为准，只有这次也拿不到行
+  才是真的超上限；三处重复的条件自增抽成私有方法 `tryIncrement`。
+  验证：`cart.service.spec.ts` 新增两条单测（把那个时序精确构造出来，e2e 只能靠概率撞到）+
+  `cart.e2e-spec.ts` 复跑 15 轮全绿（未修复时连续 15 轮全绿的概率约 3.5%）。
 
 ### 批次 12 的实施记录（P2 收尾与文档口径）
 
@@ -395,7 +613,8 @@ A 用不存在的令牌登出后，B 的令牌仍能刷新；失败注入该用�
 
 **⚠️ 未完成的自动化审查**：批次 9 派出的 5 个对抗式审查代理（4 维度 × 反驳 + 汇总）
 全部因模型额度耗尽（429）中止，**0 条有效结论**。上面的缺陷是主线程人工自查发现的，
-不代表审查已覆盖。
+不代表审查已覆盖。（阶段 11 合并后已补一次对抗式核验：9 路逐条比对 + 主线程抽查 15 项，
+见下文「阶段 11 重构对本清单的三处回退」——P0/P1 全部在，仅 3 处回退已修。）
 
 ### 阶段 11 重构对本清单的三处回退（2026-11-11 核验并修复）
 
@@ -420,6 +639,11 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
 实测 overrides 在 workspaces 下穿透间接依赖不可靠，直接依赖才是确定手段。
 `tinypool`/`@vitest/mocker`、`postcss`、`glob`、`deepmerge-ts` 要根治需跨大版本
 （vitest 5 / next 16 / prisma 7），全在开发与构建工具链内、不在运行时面，**单列待办**。
+→ **2026-11-18 复核后推翻**：这批「待办」里其实没有一条必须跨大版本，
+见 §〇 批次 21 实施记录。要点是 npm 的 `fixAvailable` 会指错包（把 `picomatch` 的修复
+写成 `vitest@5.1.1`），而 vitest 5.1.1 自己就依赖 `picomatch@^4.0.7`，升级无效；
+且 `picomatch` 全部实例 `dev=True`，不进运行时。唯一真正值得升级的 `glob` CLI 命令注入
+（CVSS 9.9）是 `test-exclude` 下 `^10.4.1` 内的一个普通 patch，`npm update glob` 就修好了。
 
 **② facade 的默认参数会吞掉子服务的 `??` 兜底**（`d6c4980`）
 拆 `PaymentService` 时 facade 写成 `scanRefunding(now = new Date())`，而子服务里是
@@ -436,7 +660,7 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
 **核验方法沉淀**：重构后不能只确认「实现还在」——默认参数、调用点改签名、依赖配置搬家
 都能让正确的实现在运行时变成死代码。本次两层都过才算数（workflow 逐条比对 + 主线程抽查）。
 
-### 新发现、尚未修的相邻洞
+### 新发现、已修的相邻洞
 
 - ~~**`createPayment` 复用 `FAILED` 支付单时不重置为 `PENDING`**~~ —— **已修（`4b53570`）**。
   原描述：对比 `obtainInvoicePayment` 对账单有重置逻辑，订单支付这条路径漏了。
@@ -491,11 +715,25 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
   → 必须写成 `{}`。**这说明：改 Prisma 写入字段时，`DbNull` / `undefined` / `{}`
   三者在 `Json` 列上语义完全不同，且只有真库能验证。**
 
-  遗留（**未修，需独立设计**）：**渠道侧的幂等号仍未做**。现在同一订单连续发起两次支付
-  会拿到**两个不同的**渠道交易号（第一次的号被主动清掉了）。若用户在两个支付页上都付了款，
-  第二笔会走到 P1-3 的 `NEEDS_REFUND` 路径等人工退款 —— **有兜底但会先多收一次钱**。
-  根治需要渠道支持「同一业务单号幂等」，或本地记住上一笔交易号并先向渠道查单，
-  属独立设计，不在本次范围。
+  遗留（**结论已更正**，见上「批次 17 的实施记录」）：原先记「渠道侧的幂等号仍未做，
+  同一订单连发两次会拿到两个不同的渠道交易号」—— **不成立**。
+  服务层传给渠道的 `referenceId` 是支付单 id，复用旧单时**不新建行**，
+  所以这个幂等键跨重试恒定；渠道按它幂等即可保证同一笔。
+  契约闸已在 `d23dd93` 落地（支付 `createPayment` 按 `referenceId` 幂等，
+  失败注入确认有牙齿），假网关与 mock 渠道天然满足。
+
+  ⚠️ **真正的残余窗口**不是「换了号」，而是「渠道已建交易、本地 `providerTxnId` 为空」：
+  调渠道成功后、写号之前进程崩溃 / 写号失败。此时本地没有交易号，
+  再次发起会带着**同一个** `referenceId` 重调渠道 —— 由渠道侧幂等兜住，
+  不会产生第二笔真实交易，但要求渠道**必须**按 `referenceId` 幂等（这正是契约闸的作用）。
+  `queryPayment` 仍然**没有生产调用点**：`QueryPaymentResult.status` 是各渠道自己的
+  开放字符串，没有统一的 paid / failed 语义，不能用来判「到底付没付」。
+
+  行为钉死：e2e「同一订单同一渠道只能有一笔支付单」补了「两次响应的 `providerTxnId`
+  一致」；「有号 → 绝不重调渠道」由单测钉住（`payment.service.spec.ts` 断言
+  `createPayment` 调用 0 次）。⚠️ e2e 那条**测不出**「有没有重调渠道」——
+  假渠道直接用支付单 id 当交易号，重调也会得到同一个号（失败注入实测：把复用分支
+  短路掉它照样绿）。
 
 ---
 
@@ -1068,11 +1306,11 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
 
 | # | 问题 | 位置 | 备注 |
 |---|---|---|---|
-| P2-A1 | **生产环境一个渠道都不配也能启动** | `assert-secure-config.ts:206` | `assertChannelConfig` 的两个校验都是 `for (const channel of enabledByKind[kind])` → **启用列表为空时循环体一次都不执行 → 没有任何断言触发**。`CHANNEL_MODE` 不设也直接放行。第三方实测：`NODE_ENV=production` + 合法全部凭据 + 不配任何渠道 → `assertSecureConfig()` **不抛错**。<br>⚠️ **严重级别是 low，不是 high**（第三方纠正）：运行时全链路 **fail-closed**，**无资损无越权** —— 支付：`PaymentProviderRegistry.get()`（`payment-provider.registry.ts:74`）在渠道未启用时抛 409，**不建支付单、不扣款**；出款审批：`resolveChannelForApproval()` → 注册表 409 → **审批当场失败，不产出打不出钱的单**（符合 AGENTS.md「渠道已停用 → 409 且不审批」）；出款执行：`payout.worker.ts` 的 `claim.channelError` 分支 → `markFailed(failedBeforePayout: true)` → **渠道从未被调用，钱确定没出去**。<br>→ 真实危害只是「**故障推迟到第一笔交易才暴露**」（生产容器正常起来、队列正常消费），属可观测性问题。修法：生产分支加「启用列表为空 → 拒绝启动」，并要求 `CHANNEL_MODE` 显式声明。<br>⚠️ **对抗验证第 30 条补充的消费者侧文案问题（我已核实）**：`payment.service.ts:2302` 的 `listChannels()` 走的是 `registry.registeredChannels()` —— 注释明写「**已注册的渠道名（含未启用，排查用）**」，**不区分是否启用**。而 `payment.controller.ts:91-97` 的 `defaultChannel()` 用它挑默认渠道 → 生产零渠道时它仍返回 `['fake']` → 消费者看到的报错是「**支付渠道 fake 未启用**」而不是「**没有可用的支付渠道**」。<br>→ 修这条时**只加启动断言是不够的**，还要让 `defaultChannel()` 只从**已启用**渠道里挑（`registry` 里已有 `isChannelEnabled` 过滤的变体，见 `payment-provider.registry.ts:95-97`），否则消费者侧的文案仍然误导。 |
-| P2-A2 | **账目加密自检在无样本时静默通过** | `payout-encryption-self-check.service.ts:42` | 自检只取「商家收款账户一行 + 出款单快照一行」。库为空时**一行都不取** → 密钥配错（换了 `PAYOUT_ACCOUNT_ENCRYPTION_KEY`、或把 compose 默认值复制到生产）**完全不会被发现**，进程照常启动、CI 与监控全绿 → 直到第一笔出款逐单落 `FAILED`。⚠️ 这条**我原判定为「有意设计」**（注释明写「两处都没有可校验的行 → 静默通过：新库、或还没跑迁移的库都不该因此起不来」）——**该判定仍然成立**（不能改成硬失败），但**缺一条显式 warn** 是真缺陷：「当前库中无已加密样本，密钥正确性未经校验」 |
-| P2-A3 | **加密迁移脚本与自检的时序窗口**（对抗验证补充的残余风险） | `api/scripts/migrate-payout-encryption.ts` | 对抗验证第 20 条判本条「not-a-bug」：自检静默通过是设计取舍，且**有密文时是 fail-fast**（跨密钥解密必抛 AES-GCM 认证标签不匹配 → 进程非零退出）。但它指出一个**残余风险**：<br>① 迁移脚本**读不到 compose 注入的环境变量**（脚本跑在 `npm run` 里，只能读本地 `api/.env`，见脚本 `:11-16`）；<br>② 若运维在 api **已启动之后**才用错误的密钥执行 `npm run migrate:payout-encryption -- --force`，存量行会被**用错密钥加密**，而自检已在启动时通过 → **要等下次重启才暴露**。<br>后果可控：出款落 `FAILED` 且 `failedBeforePayout: true`（钱**没打出去**，可安全重试），且写路径另有两道版本闸（`payout.service.ts:318` 申请、`:611` 审批）在 `encryptionVersion !== 1` 时直接 400/409。<br>→ **不构成资金损失**，但运维顺序错误会造成「批量出款失败 + 需人工重跑迁移」。<br>**建议**：迁移脚本执行后**立即**手动触发一次自检（或让脚本自己调用一次解密校验），不要依赖「下次重启」。 |
-| P2-A4 | ✅ **账目自检漏检货款冲回**（已修，提交 `6f02d30`） | `api/src/modules/billing/ledger-check.ts:46` | `reversalReceiptOrderIds` 声明了、`scripts/check-ledger.ts:136` 也传进来了，但**全文件从未被读取**（已 grep 确认）；第 126 行只检查抽佣冲回（`reversalSet`）。<br>**失效场景**：订单已退款但缺 `SALE_REVERSAL` 流水 → `npm run check:ledger` 报「✅ 流水完整」exit 0 → 出款时 `receiptAmount` = `merchant_receipts` 求和（`payout.service.ts:1507`），退款冲回缺失 → 只算到 +10000 没有 -10000 → 商家按未退款全额申请出款。<br>⚠️ **严重级别是 medium，不是 P1**（我核实 + 对抗验证第 23 条实测）：① **退款路径本身健全** —— `applyRefundInTx`（`payment.service.ts:1259-1288`）把「订单转 REFUNDED（写 `refundedAt`）+ 抽佣冲回 + 货款冲回」放在**同一个 `$transaction`** 里；② 对抗验证进一步收窄触发前提 —— 正常退款路径**产生不了**这种状态，唯一可达路径是 `receipt.service.ts:268` 与 `:300` 两条**独立的非事务写入**被中断（`backfill()` 外层只有 `tenantContext.run`，**没有 `$transaction`**）或手工改库 → 是「**数据已经坏了**」不是「**数据会坏**」；③ 该脚本**不接任何自动闸门**（`.github/workflows/ci.yml`、`infra/`、`README.md` 均无引用）→ 退出码 0 今天**不会阻止任何发布动作**，其原始用途（5i 切报表口径）已于 2026-10-30 完成。<br>**修法**：补一条「已退款订单必须有 SALE_REVERSAL 流水」的检查。⚠️ **谓词必须用 `totalAmount` 而不是 `commissionAmount`** —— 货款侧的 `shouldBackfillReceiptReversal(refunded, refundedAt, totalAmount)` 按 `totalAmount` 判零额（`receipt.service.ts:66-81`），抽佣侧才按 `commissionAmount`；照抄成 `commissionAmount` 会把「零佣金但有货款」的正常订单误报成缺口 → **脚本永远 exit 1**。另：修好后 `undatedRefundCount` 口径要顺手对齐（货款侧与抽佣侧的「无归期」分开统计）。<br>→ **已按此修**：判定顺序加第 7 步，谓词用 `totalAmount`；`undatedRefundCount` 拆成两侧分开统计。实施记录见 §〇「批次 10 的实施记录」。 |
-| P2-17 | **领券总量闸只比较自增前的老值 → 超发（⚠️ 原 P0-1，对抗验证实测后降级）** | `api/src/modules/coupon/coupon.service.ts:562` | **机制**：`where: { claimedCount: { lt: totalLimit } }` 只比较自增前的值，
+| P2-A1 | **生产环境一个渠道都不配也能启动** | `assert-secure-config.ts:247-258` | ✅ **已修（批次 4，`ab213d4`）**：2026-11-19 复核 —— `assert-secure-config.ts:247-258` 在生产环境遍历 `enabledByKind`，空列表直接抛「生产环境必须配置至少一个 ${kind} 渠道：请设置 ${envKey}。」（`:232`/`:259` 是遍历处，`:256` 是这句文案）；`payment.controller.ts:91-98`、`subscription-payment.controller.ts:110` 取 `listEnabledChannels()`，为空返回 503。<br>`assertChannelConfig` 的两个校验都是 `for (const channel of enabledByKind[kind])` → **启用列表为空时循环体一次都不执行 → 没有任何断言触发**。`CHANNEL_MODE` 不设也直接放行。第三方实测：`NODE_ENV=production` + 合法全部凭据 + 不配任何渠道 → `assertSecureConfig()` **不抛错**。<br>⚠️ **严重级别是 low，不是 high**（第三方纠正）：运行时全链路 **fail-closed**，**无资损无越权** —— 支付：`PaymentProviderRegistry.get()`（`payment-provider.registry.ts:74`）在渠道未启用时抛 409，**不建支付单、不扣款**；出款审批：`resolveChannelForApproval()` → 注册表 409 → **审批当场失败，不产出打不出钱的单**（符合 AGENTS.md「渠道已停用 → 409 且不审批」）；出款执行：`payout.worker.ts` 的 `claim.channelError` 分支 → `markFailed(failedBeforePayout: true)` → **渠道从未被调用，钱确定没出去**。<br>→ 真实危害只是「**故障推迟到第一笔交易才暴露**」（生产容器正常起来、队列正常消费），属可观测性问题。修法：生产分支加「启用列表为空 → 拒绝启动」，并要求 `CHANNEL_MODE` 显式声明。<br>⚠️ **对抗验证第 30 条补充的消费者侧文案问题（我已核实）**：`payment.service.ts:2302` 的 `listChannels()` 走的是 `registry.registeredChannels()` —— 注释明写「**已注册的渠道名（含未启用，排查用）**」，**不区分是否启用**。而 `payment.controller.ts:91-97` 的 `defaultChannel()` 用它挑默认渠道 → 生产零渠道时它仍返回 `['fake']` → 消费者看到的报错是「**支付渠道 fake 未启用**」而不是「**没有可用的支付渠道**」。<br>→ 修这条时**只加启动断言是不够的**，还要让 `defaultChannel()` 只从**已启用**渠道里挑（`registry` 里已有 `isChannelEnabled` 过滤的变体，见 `payment-provider.registry.ts:95-97`），否则消费者侧的文案仍然误导。 |
+| P2-A2 | **账目加密自检在无样本时静默通过** | `payout-encryption-self-check.service.ts:42` | ✅ **已修（批次 12，`b65763b`）**：2026-11-19 复核 —— `payout-encryption-self-check.service.ts:70-76` 取不到样本时不再静默通过，改为打 WARN「库中已无已加密样本，密钥正确性未经校验」。<br>自检只取「商家收款账户一行 + 出款单快照一行」。库为空时**一行都不取** → 密钥配错（换了 `PAYOUT_ACCOUNT_ENCRYPTION_KEY`、或把 compose 默认值复制到生产）**完全不会被发现**，进程照常启动、CI 与监控全绿 → 直到第一笔出款逐单落 `FAILED`。⚠️ 这条**我原判定为「有意设计」**（注释明写「两处都没有可校验的行 → 静默通过：新库、或还没跑迁移的库都不该因此起不来」）——**该判定仍然成立**（不能改成硬失败），但**缺一条显式 warn** 是真缺陷：「当前库中无已加密样本，密钥正确性未经校验」 |
+| P2-A3 | **加密迁移脚本与自检的时序窗口**（对抗验证补充的残余风险） | `api/scripts/migrate-payout-encryption.ts` | ✅ **已修（批次 11，见 §〇 进度表第 11 行）**：2026-11-19 复核 —— `migrate-payout-encryption.ts:26-38` 头注释写明「④ 迁移前、迁移后各跑一次解密自检」，`:222-235` 迁移后自检失败即抛「迁移后自检失败：库里的密文用当前密钥解不开」并中止。<br>对抗验证第 20 条判本条「not-a-bug」：自检静默通过是设计取舍，且**有密文时是 fail-fast**（跨密钥解密必抛 AES-GCM 认证标签不匹配 → 进程非零退出）。但它指出一个**残余风险**：<br>① 迁移脚本**读不到 compose 注入的环境变量**（脚本跑在 `npm run` 里，只能读本地 `api/.env`，见脚本 `:11-16`）；<br>② 若运维在 api **已启动之后**才用错误的密钥执行 `npm run migrate:payout-encryption -- --force`，存量行会被**用错密钥加密**，而自检已在启动时通过 → **要等下次重启才暴露**。<br>后果可控：出款落 `FAILED` 且 `failedBeforePayout: true`（钱**没打出去**，可安全重试），且写路径另有两道版本闸（`payout.service.ts:318` 申请、`:611` 审批）在 `encryptionVersion !== 1` 时直接 400/409。<br>→ **不构成资金损失**，但运维顺序错误会造成「批量出款失败 + 需人工重跑迁移」。<br>**建议**：迁移脚本执行后**立即**手动触发一次自检（或让脚本自己调用一次解密校验），不要依赖「下次重启」。 |
+| P2-A4 | ✅ **账目自检漏检货款冲回**（已修，提交 `6f02d30`） | `api/src/modules/billing/ledger-check.ts:46` | ✅ **已修（批次 10，`6f02d30`）**：2026-11-19 复核 —— `ledger-check.ts:214` 检查清单新增第 7 条（货款冲回单 `totalAmount !== 0` 且不在 `reversalReceiptOrderIds` 里 → 记 `receiptReversalMissing`），`:243` 建集合、`:329` push、`:347` 汇入结论；`ledger-check.spec.ts:100/206/227` 有对应用例。<br>`reversalReceiptOrderIds` 声明了、`scripts/check-ledger.ts:136` 也传进来了，但**全文件从未被读取**（已 grep 确认）；第 126 行只检查抽佣冲回（`reversalSet`）。<br>**失效场景**：订单已退款但缺 `SALE_REVERSAL` 流水 → `npm run check:ledger` 报「✅ 流水完整」exit 0 → 出款时 `receiptAmount` = `merchant_receipts` 求和（`payout.service.ts:1507`），退款冲回缺失 → 只算到 +10000 没有 -10000 → 商家按未退款全额申请出款。<br>⚠️ **严重级别是 medium，不是 P1**（我核实 + 对抗验证第 23 条实测）：① **退款路径本身健全** —— `applyRefundInTx`（`payment.service.ts:1259-1288`）把「订单转 REFUNDED（写 `refundedAt`）+ 抽佣冲回 + 货款冲回」放在**同一个 `$transaction`** 里；② 对抗验证进一步收窄触发前提 —— 正常退款路径**产生不了**这种状态，唯一可达路径是 `receipt.service.ts:268` 与 `:300` 两条**独立的非事务写入**被中断（`backfill()` 外层只有 `tenantContext.run`，**没有 `$transaction`**）或手工改库 → 是「**数据已经坏了**」不是「**数据会坏**」；③ 该脚本**不接任何自动闸门**（`.github/workflows/ci.yml`、`infra/`、`README.md` 均无引用）→ 退出码 0 今天**不会阻止任何发布动作**，其原始用途（5i 切报表口径）已于 2026-10-30 完成。<br>**修法**：补一条「已退款订单必须有 SALE_REVERSAL 流水」的检查。⚠️ **谓词必须用 `totalAmount` 而不是 `commissionAmount`** —— 货款侧的 `shouldBackfillReceiptReversal(refunded, refundedAt, totalAmount)` 按 `totalAmount` 判零额（`receipt.service.ts:66-81`），抽佣侧才按 `commissionAmount`；照抄成 `commissionAmount` 会把「零佣金但有货款」的正常订单误报成缺口 → **脚本永远 exit 1**。另：修好后 `undatedRefundCount` 口径要顺手对齐（货款侧与抽佣侧的「无归期」分开统计）。<br>→ **已按此修**：判定顺序加第 7 步，谓词用 `totalAmount`；`undatedRefundCount` 拆成两侧分开统计。实施记录见 §〇「批次 10 的实施记录」。 |
+| P2-17 | **领券总量闸只比较自增前的老值 → 超发（⚠️ 原 P0-1，对抗验证实测后降级）** | `api/src/modules/coupon/coupon.service.ts:562` | ✅ **已修（批次 7，`ddb3703`）**：2026-11-19 复核 —— `coupon.service.ts:571` 改为 `? { claimedCount: { lte: totalLimit - quantity } }`，`:564-570` 注释写明「不是 `{ lt: totalLimit }`」的理由（`lt` 只保证还剩 1 份额度，一次领多张会冲破总量）。<br>**机制**：`where: { claimedCount: { lt: totalLimit } }` 只比较自增前的值，
   而 `data: { claimedCount: { increment: quantity } }` 一次加 `quantity` 张。
   `quantity` 的 DTO 上限是 `@Max(10)`。<br>- **失效场景**：商家建 `totalLimit=1`、`value=100000` 分的券 →
   消费者 `POST /coupons/claim {couponId, quantity: 10}` →
@@ -1110,35 +1348,35 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
 
 | # | 问题 | 位置 | 备注 |
 |---|---|---|---|
-| P2-B1 | **CI 把唯一的 media 套件整份排除**（媒体链路的**部分**覆盖为零） | `.github/workflows/ci.yml:190` | ⚠️ **修正**：这条被第三方验证**推翻过一半** —— 我原写「`src/modules/media` 在 CI 里零覆盖」是**错的**。实际 CI 仍跑：`api/test/catalog.e2e-spec.ts:714`「设置商品媒体：跨租户的媒体不可引用」（该文件不在排除范围）、`api/test/catalog-public.e2e-spec.ts:308`（前台读媒体列表）、`merchant-admin/test/app/api/body-whitelist.test.ts:133`（上传凭证接口 body 白名单）。<br>✅ **成立的部分**：排除 media 套件本身是**阶段 9 评审过的显式取舍**（设计文档 `2026-11-04-plan-09-tech-debt-cleanup-design.md:126`），不是漏掉的角落；被排除的套件覆盖的「presigned URL 的 host 必须浏览器可达」「上传后 confirm 的 size 复核」「越限文件被删并标 ORPHANED」等**安全逻辑确实零覆盖**，且这是唯一会因为 `MINIO_ENDPOINT`（本机 `localhost:19000`）与 compose 注入的 `minio:9000` 是两套地址而出错的路径。修法：e2e job 加 MinIO service 容器 |
-| P2-B2 | **防重复打款的闸 ③ 零测试**，且 DB 兜底的报错文案误导 | `payout-execution.service.ts:666` | 单测里**已备好钩子**（`payout-execution.service.spec.ts:130` 声明 `occupiedEntries?`，`:255` 用它伪造 `payoutEntry.findMany` 返回值），但**没有任何一个用例配置它** → 那句「这批流水已被同期的另一个出款单占用」文案只在源码出现。<br>⚠️ **修正**：闸 ③ 放行后 `tx.payoutEntry.createMany({ skipDuplicates: false })`（`:732`）会撞 `payout_entries_entryId_key`（全局唯一索引）→ **DB 层兜住了，状态不会被改坏**（第三方验证在 `ecommerce_test` 库 `\d payout_entries` 确认索引仍在）。<br>✅ **成立的真问题**：catch 分支（`:808-812`）把 P2002 统一翻成「出款单状态已变（商家可能已重新申请同一期），无法标记为已付款」—— 这句描述的是 `payouts` 的部分唯一索引，**与实际撞的 `payout_entries_entryId_key` 不符** → 操作员拿不到设计里那句「疑似重复付款，需人工退款处理」的明确指向，**关键信号被错误措辞掩盖**。<br>⚠️ 另有「计划承诺未兑现」：阶段 5m 的 e2e 文件头写明闸 ②③④ 的测试「在 Task 7 / Task 8 补」，而 Task 7 实为解卡闸、Task 8 实为对账服务与 API → **闸 ②③④ 的测试最终从未补上**。 |
-| P2-B3 | ~~**`/platform/payout-reconciliations/*` 零 403/401 用例**~~ → **已被对抗验证推翻** | `platform-payout-reconciliation.controller.ts:59` | **推翻（对抗验证第 19 条，real=false）** —— 机制经实测有效：控制器类级挂 `@Roles(PLATFORM_ADMIN)`，展开为 `UseGuards(JwtAuthGuard, RolesGuard)`，控制器内无任何 `@Public()` 覆盖 → 8 条路由全部继承。对运行中的 api 容器（127.0.0.1:3000）实测：**未登录全部 401、商家令牌（MERCHANT_OWNER）全部 403**（含 multipart 的 import 端点 —— 守卫先于 `FileInterceptor` 执行）。<br>且「其他每个平台前缀都有 403/401 用例」的**前提本身不准确**：`platform/plans` 与 `platform/coupons` 也缺 401 用例。<br>✅ **仅保留一条可选补充**：`api/test/payout-reconciliation-service.e2e-spec.ts` 加「商家令牌 → 403」+「未登录 → 401」两条，走通用探针 `api/test/rbac.e2e-spec.ts:117-137` 的同一机制即可。<br>（本条降级为「补测建议」，不再是缺陷。） |
-| P2-B4 | ~~**对账的两条写路由 HTTP 层零测试**~~ → **已被对抗验证实测推翻** | `platform-payout-reconciliation.controller.ts:217` / `:249` | 对抗验证第 24 条（real=false）**临时写了真实 e2e 实测**（`Test.createTestingModule` + supertest，跑完已删除）：<br>batch-confirm —— 缺 `note` → 400「note must be longer than or equal to 1 characters」；`mode=IDS` 合法 → 200 `{succeeded:[...],failed:[],nextCursor:null}`；`mode=FILTER` → 200；多传 `bogus` → 400「property bogus should not exist」；任务不存在 → 409「只有账单文件导入的对账任务支持批量确认」。<br>confirm-paid —— 缺 `reason` → 400；传旧字段 `payoutNo` → 400「property payoutNo should not exist」；正常入参 → 409（闸①「明细无法复原」）；出款单不存在 → 404；非 UUID → 400。<br>另跑了两个 DTO 的 `@ValidateIf` 分支矩阵（IDS 缺 `itemIds` → 400、`mode` 缺失/非法 → 400、`limit=201` → 400、多余字段 → 400），**全部符合 DTO 注释里的设计意图，没有一条分支走错，也没有 500**。<br>**且不存在「恒真断言」**：服务层断言是实的（`payout-reconciliation.service.spec.ts:1580-1760` 断言具体 id、`PROCESSING→PAID`、留痕 `action=RECONCILE_TO_PAID_BY_FILE`、FILTER 游标越过失败项、并发两方合计不多改单、非 FILE → 409 且 `payout.updateMany` 未被调用），前端侧也有 `platform-admin/test/reconciliation-batch-confirm-route.test.ts`（断言 200/400/401、`toEqual` 完整 body、失败时 `expect(apiFetchMock).not.toHaveBeenCalled()`）。<br>✅ **仅保留一条「回归加固」建议**（不是缺陷）：这两条路由的 DTO 接线（`@Body() dto` 的类型、`@HttpCode(200)`、`@Roles` 守卫、`@Param`）**没有任何自动化测试锚定** → 若将来有人把 `@Body() dto` 改成内联 TS 类型（那样 `ValidationPipe` 会**直接跳过校验**），或去掉 `@HttpCode` 让响应码从 200 变 201，api 侧不会立刻报警（前端那个测试连的是 mock 的 `apiFetch`，根本不碰后端）。 |
-| P2-B5 | ~~**「每租户一个默认支付方式」零测试**~~ → **升级为 P1-5** | `payment-method.service.ts:134` | 对抗验证第 18 条把「零测试」推翻为**真缺陷**：问题不是缺测试，是 `setDefault` **会真的清空默认卡**、且 `payment_methods` 表上没有部分唯一索引。已拆出为 **P1-5**（medium）。本条作废，保留在 P1-5 的修法里一并处理。 |
+| P2-B1 | **CI 把唯一的 media 套件整份排除**（媒体链路的**部分**覆盖为零） | `.github/workflows/ci.yml:190` | ⚠️ **修正**：这条被第三方验证**推翻过一半** —— 我原写「`src/modules/media` 在 CI 里零覆盖」是**错的**。实际 CI 仍跑：`api/test/catalog.e2e-spec.ts:714`「设置商品媒体：跨租户的媒体不可引用」（该文件不在排除范围）、`api/test/catalog-public.e2e-spec.ts:308`（前台读媒体列表）、`merchant-admin/test/app/api/body-whitelist.test.ts:133`（上传凭证接口 body 白名单）。<br>✅ **成立的部分**：排除 media 套件本身是**阶段 9 评审过的显式取舍**（设计文档 `2026-11-04-plan-09-tech-debt-cleanup-design.md:126`），不是漏掉的角落；被排除的套件覆盖的「presigned URL 的 host 必须浏览器可达」「上传后 confirm 的 size 复核」「越限文件被删并标 ORPHANED」等**安全逻辑确实零覆盖**，且这是唯一会因为 `MINIO_ENDPOINT`（本机 `localhost:19000`）与 compose 注入的 `minio:9000` 是两套地址而出错的路径。<br>✅ **已修（批次 22，`baf3db8`）**：原写的「加 MinIO service 容器」**不可行** —— `services.<id>.options` 只透传 `docker create` 参数，表达不了给 `/data` 挂 tmpfs，而 MinIO 在跨设备 `/data` 上初始化会因 `rename .minio.sys/tmp` 失败直接退出。实际改用 e2e job 里的普通 `docker run --tmpfs /data` 步骤 + `curl /minio/health/live` 就绪探针，测试步骤恢复为全量 `npm run test:e2e`。本机同命令验证：2 秒就绪；media 单跑 18/18，全量 e2e 47 suites / 730 passed（media 在内）；CI 实际结果待推送后确认 |
+| P2-B2 | **防重复打款的闸 ③ 零测试**，且 DB 兜底的报错文案误导 | `payout-execution.service.ts:666` | 单测里**已备好钩子**（`payout-execution.service.spec.ts:130` 声明 `occupiedEntries?`，`:255` 用它伪造 `payoutEntry.findMany` 返回值），但**没有任何一个用例配置它** → 那句「这批流水已被同期的另一个出款单占用」文案只在源码出现。<br>⚠️ **修正**：闸 ③ 放行后 `tx.payoutEntry.createMany({ skipDuplicates: false })`（`:732`）会撞 `payout_entries_entryId_key`（全局唯一索引）→ **DB 层兜住了，状态不会被改坏**（第三方验证在 `ecommerce_test` 库 `\d payout_entries` 确认索引仍在）。<br>✅ **成立的真问题**：catch 分支（`:808-812`）把 P2002 统一翻成「出款单状态已变（商家可能已重新申请同一期），无法标记为已付款」—— 这句描述的是 `payouts` 的部分唯一索引，**与实际撞的 `payout_entries_entryId_key` 不符** → 操作员拿不到设计里那句「疑似重复付款，需人工退款处理」的明确指向，**关键信号被错误措辞掩盖**。<br>⚠️ 另有「计划承诺未兑现」：阶段 5m 的 e2e 文件头写明闸 ②③④ 的测试「在 Task 7 / Task 8 补」，而 Task 7 实为解卡闸、Task 8 实为对账服务与 API → **闸 ②③④ 的测试最终从未补上**。<br>✅ **已修（批次 8，提交 `b371bae`）**：闸 ③ 现有 4 条用例（`payout-execution.service.spec.ts:1859` / `:1896` / `:1914` / `:1943`，分别覆盖「被同租户同期占用 → 拒绝且不动钱」「只查本单释放的明细并排除本单自己」「别的租户占用 → 放行」「同期之外占用 → 放行」）；catch 分支（`payout-execution.service.ts:818-833`）已按 `isUniqueViolation` 区分两个 P2002 来源，文案同时给出「出款单状态已变」与「明细已被别的出款单占用（疑似重复付款，需人工退款处理）」两条指向。<br>✅ **文档口径也已更正（`17c7bbc`）**：`api/test/payout-reconciliation.e2e-spec.ts` 头注释原本写「其余三道闸…在 Task 7 / Task 8 补」，现改为指向单测的用例组，并注明「Task 7 是解卡闸、Task 8 是对账服务与 API」的原口径有误。 |
+| P2-B3 | ~~**`/platform/payout-reconciliations/*` 零 403/401 用例**~~ → **已被对抗验证推翻** | `platform-payout-reconciliation.controller.ts:59` | **推翻（对抗验证第 19 条，real=false）** —— 机制经实测有效：控制器类级挂 `@Roles(PLATFORM_ADMIN)`，展开为 `UseGuards(JwtAuthGuard, RolesGuard)`，控制器内无任何 `@Public()` 覆盖 → 8 条路由全部继承。对运行中的 api 容器（127.0.0.1:3000）实测：**未登录全部 401、商家令牌（MERCHANT_OWNER）全部 403**（含 multipart 的 import 端点 —— 守卫先于 `FileInterceptor` 执行）。<br>且「其他每个平台前缀都有 403/401 用例」的**前提本身不准确**：`platform/plans` 与 `platform/coupons` 也缺 401 用例。<br>✅ **仅保留一条可选补充**：`api/test/payout-reconciliation-service.e2e-spec.ts` 加「商家令牌 → 403」+「未登录 → 401」两条，走通用探针 `api/test/rbac.e2e-spec.ts:117-137` 的同一机制即可。<br>（本条降级为「补测建议」，不再是缺陷。）<br>✅ **已落地（批次 8，`14778d9`）**：`api/test/payout-reconciliation-routes.e2e-spec.ts` 的「两条路由：未登录 → 401」「两条路由：商家令牌 → 403」两例就是本条建议的落地形态 —— 前一条不传 token，后一条传 `MERCHANT_OWNER` 令牌并断言 403 + 无权访问文案，本项不再是「可选补充」。2026-11-19 单独实跑该文件：**12 passed / 12 total**。 |
+| P2-B4 | ~~**对账的两条写路由 HTTP 层零测试**~~ → **已被对抗验证实测推翻** | `platform-payout-reconciliation.controller.ts:217` / `:249` | 对抗验证第 24 条（real=false）**临时写了真实 e2e 实测**（`Test.createTestingModule` + supertest，跑完已删除）：<br>batch-confirm —— 缺 `note` → 400「note must be longer than or equal to 1 characters」；`mode=IDS` 合法 → 200 `{succeeded:[...],failed:[],nextCursor:null}`；`mode=FILTER` → 200；多传 `bogus` → 400「property bogus should not exist」；任务不存在 → 409「只有账单文件导入的对账任务支持批量确认」。<br>confirm-paid —— 缺 `reason` → 400；传旧字段 `payoutNo` → 400「property payoutNo should not exist」；正常入参 → 409（闸①「明细无法复原」）；出款单不存在 → 404；非 UUID → 400。<br>另跑了两个 DTO 的 `@ValidateIf` 分支矩阵（IDS 缺 `itemIds` → 400、`mode` 缺失/非法 → 400、`limit=201` → 400、多余字段 → 400），**全部符合 DTO 注释里的设计意图，没有一条分支走错，也没有 500**。<br>**且不存在「恒真断言」**：服务层断言是实的（`payout-reconciliation.service.spec.ts:1580-1760` 断言具体 id、`PROCESSING→PAID`、留痕 `action=RECONCILE_TO_PAID_BY_FILE`、FILTER 游标越过失败项、并发两方合计不多改单、非 FILE → 409 且 `payout.updateMany` 未被调用），前端侧也有 `platform-admin/test/reconciliation-batch-confirm-route.test.ts`（断言 200/400/401、`toEqual` 完整 body、失败时 `expect(apiFetchMock).not.toHaveBeenCalled()`）。<br>✅ **仅保留一条「回归加固」建议**（不是缺陷）：这两条路由的 DTO 接线（`@Body() dto` 的类型、`@HttpCode(200)`、`@Roles` 守卫、`@Param`）**没有任何自动化测试锚定** → 若将来有人把 `@Body() dto` 改成内联 TS 类型（那样 `ValidationPipe` 会**直接跳过校验**），或去掉 `@HttpCode` 让响应码从 200 变 201，api 侧不会立刻报警（前端那个测试连的是 mock 的 `apiFetch`，根本不碰后端）。<br>✅ **已落地（批次 8，`14778d9`）**：`api/test/payout-reconciliation-routes.e2e-spec.ts` 的 12 条用例逐条锚定这四条接线 —— `@Body()` DTO 7 条（缺 note / 多传 bogus / IDS 缺 itemIds / mode 非法 / limit=201 / 缺 reason / 旧字段 payoutNo）、`@HttpCode(200)` 1 条（成功路径断言 200 且 `toEqual` 完整响应体）、`@Roles` 2 条（两条路由未登录 401 / 商家令牌 403）、`@Param` 2 条（batch-confirm 与 confirm-paid 各一条「两个 id → 两种互斥结果」）。2026-11-19 单独实跑该文件：**12 passed / 12 total**。 |
+| P2-B5 | ~~**「每租户一个默认支付方式」零测试**~~ → **升级为 P1-5** | `payment-method.service.ts:134` | 对抗验证第 18 条把「零测试」推翻为**真缺陷**：问题不是缺测试，是 `setDefault` **会真的清空默认卡**、且 `payment_methods` 表上没有部分唯一索引。已拆出为 **P1-5**（medium）。本条作废，保留在 P1-5 的修法里一并处理。P1-5 已在批次 7 `2968d82` 修完（`payment_methods` 部分唯一索引 + 归属校验），本条无需再动。 |
 | P2-B6 | ~~**套餐列表的 `total` 断言恒真**~~ → **已被变异测试推翻** | `api/test/billing.e2e-spec.ts:389`（另一处 `:520`） | 对抗验证第 21 条（real=false）用**变异测试**推翻：断言的 `listed.total` 来自**服务端响应体**、`listed.items.length` 由**客户端**从响应数组算出 → 两者来自不同代码路径，**有真实区分度**。实测 5 次变异全部被抓：`total: items.length` → `999999`（2 failed）、`listActive` 改用 `plan.count()`（含已下架套餐，1 failed）、`listAll` 改 `+1`（1 failed）、删掉 `total` 字段（1 failed）、去掉 `status: ACTIVE` 过滤（被另一条断言抓到）。<br>我原写「结构上必然成立」是把**当前实现的属性**当成了**断言的性质** —— 错。<br>⚠️ 附带事实（报告者未提、变异验证补充）：该接口**当前完全无分页**（控制器无分页 DTO、service 的 `findMany` 无 `take/skip`）→ 对不分页列表而言 `total === items.length` **就是语义正确的契约本身**。 |
 
 ### P2-C 其余
 
 | # | 问题 | 位置 | 备注 |
 |---|---|---|---|
-| P2-1 | 三端依赖 4 条（2 critical + 2 high） | 三端 `package.json` | 具体：`tinypool`（critical，RCE）、`vitest`（critical，路径穿越 —— 实际在 `@vitest/mocker` 与 `tinypool` 上）、`postcss`（high，XSS）、`body-parser`（high，DoS；前端经 `shadcn → @modelcontextprotocol/sdk → express` 引入）。**无需升 vitest/next 大版本**：实测 `overrides: {"@vitest/mocker":"4.1.12","tinypool":"2.2.0","postcss":"8.5.31","body-parser":"2.4.0"}` → audit critical/high 全清，storefront 228/228 测试通过 + `next build` 通过。⚠️ `@vitest/mocker@4.1.12` 与 `vitest@3.2.7` 跨大版本，**另两个前端也要各自跑一遍测试确认** |
-| P2-1b | **后端依赖 6 个 high** | `api/package.json` | 3 个根因：`multer@2.4.0`（DoS，`<2.5.0` 有洞，**装在 `@nestjs/platform-express/node_modules` 下**）、`body-parser`（见 P2-2，lock 里是 2.3.0）、`deepmerge-ts`（栈溢出，只被 `@prisma/config` 用 → **仅 prisma CLI 运行时受影响，不在 api 服务里**）。前两个 `overrides` 即可修；`deepmerge-ts` 要修只能升 prisma 到 7（**大版本，且 Prisma 6 → 7 迁移成本高，不建议**） |
-| P2-2 | `api/package-lock.json` 与实际安装不一致 | `api/package-lock.json` | **已精确确认**：lock 记 `body-parser@2.3.0`（**有 high 漏洞**），实际装 `2.4.0`（已修）。全量比对 1200+ 个包，**只有这 1 处不一致**。CI 用 `npm ci`（严格按 lock 装）→ **CI 跑的是有漏洞版本，本机跑的是修好的版本**。⚠️ `npm audit` 报的正是 lock 的版本，可用它直接验证这条 |
-| P2-3 | 登录无限流 + 无失败计数 | `infra/nginx/platform.test.conf:68`、`auth.service.ts:199` | nginx 的 `location /api/v1/` **无 `limit_req` / `limit_conn`**（全文件只有 6 个 location，一个限流指令都没有）；api 无 `@nestjs/throttler`；`auth.service.ts` 里 grep 不到任何失败计数/锁定字段。**真实风险是撞库不是 DoS**（argon2 实测热态 23ms、20 并发 318ms、事件循环未阻塞）。⚠️ 修法要注意：不能给整个 `/api/v1/` 加限流（会误伤商家批量操作），应对**登录路径**单独设 location |
-| P2-5 | 畸形查询参数 → 500（对抗验证第 4、12、32 条**实测确认并补充**） | `api/src/modules/catalog/products/products.controller.ts:63-64`、`api/src/modules/inventory/inventory.controller.ts:35-36`、`api/src/modules/order/merchant-order.controller.ts:60-61` | 仓库已有 `toIntOr` 工具（12 个控制器在用），这 2 处分页参数漏了 → `Number('abc')` = NaN → `skip: NaN` → 500。`merchant-order` 的分页参数用了 `toIntOr`，但**时间参数用 `new Date(from)`** → `Invalid Date` → 500。⚠️ 这 3 处**已由第三方在运行中的栈上实测确认 500**（`?from=garbage` / `?to=notadate`）。<br>⚠️ **根因在后端，不是前端中转（对抗验证纠正）**：修 merchant-admin 的中转路由**消除不了 500** —— 实测**直连 api** 的 `/api/v1/inventory/movements?page=abc` 同样 500（`apiFetch` 在服务端直连 `API_BASE_URL`、根本不经 nginx）。**改 api 一处即可挡住全部路径**（含直接 curl api 的路径）。<br>⚠️ **`status` 枚举也不校验（对抗验证第 12 条发现）**：`?status=FOO` → 500（`Invalid value for argument 'status'. Expected ProductStatus.`）—— 控制器把 `status` 标注成 `ProductStatus`，但**裸 `@Query` 没有 DTO** → 全局 `ValidationPipe` 的 `toValidate()` 排除原始类型 → **不校验**；且编译产物 `design:paramtypes` 是 `[String, String, ...]` → **枚举校验根本不生效**（对抗验证直接调 `ValidationPipe` 验证过：`status=FOO -> OK "FOO"`）。<br>⚠️ **仓库自身约定已把它定性为缺陷**：`api/src/common/http/pagination.ts:19-25` 明确写了裸 `@Query` 不走 ValidationPipe；同仓 `platform-report.controller.ts:45-50` 走 `ReportQueryDto` 的 `@IsDateString()`、`payout-reconciliation.dto.ts:23,27` 同款 → **有现成正确范式可照抄**。<br>⚠️ **触发路径要写准**：merchant-admin 的 `GET /api/products` 中转**没有应用内生产调用方**（商家商品列表是 Server Component 直接调 `apiFetch`），但**商品列表页的客户端筛选路径**与**库存流水页**是可达的；`merchant/orders` 的时间参数**前端页面层已用 `Date.parse` 过滤**（`orders/page.tsx:51,54`，注释明写「后端 new Date('乱七八糟') 会得到 Invalid Date」）→ **UI 路径不会送出坏日期，但直接 curl api 会**。 |
-| P2-6 | CSV 导出丢 BOM → Excel 乱码 | `platform-admin/.../settlements/export/route.ts:43` | 后端 `platform-settlement.controller.ts:71` 用 `﻿` 加 BOM，但 BFF 用 `response.text()` 读 → **WHATWG 规范要求 TextDecoder 剥除 BOM** → BOM 丢失。⚠️ `merchant-admin` 是**在 BFF 侧加** BOM，两端写法已漂移 → 修法应统一在 BFF 侧加。只影响 Windows + GBK 代码页的 Excel；金额是纯 ASCII 不会乱码 |
-| P2-6b | **结算单 CSV 导出超 100 条截断**（⚠️ **不是「静默」**） | `settlement.service.ts:928` | ⚠️ **被第三方验证推翻过一半**：截断在事实上成立（`pageSize: MAX_PAGE_SIZE`=100），但**「静默」不成立** —— 页面**恒等**提示：`platform-admin/.../settlements/page.tsx:116-120` 显示「共 {list.total} 张（本页显示 {items.length} 张）。超过 100 张时请按周期筛选」，而 `list.total` 是真实的 `count`（`settlement.service.ts:913`）不是 `items.length` → **凡截断必触发提示**；且 `platform-settlement.controller.ts:67` 的 Swagger 摘要写明「（最多 100 条）」；服务层注释明写「与列表页文案口径一致」。<br>✅ **成立的部分**：① 不筛选周期时的文件名是 `settlements-all.csv`（`:73`）—— **字面看是全量、实为前 100 行**，运营若绕过页面直接调接口并把文件转交财务，唯一的告知只剩文件名与 Swagger 摘要；② CSV **文件内容本身**没有「共 N 张 / 已截断」说明行；③ `exportCsv` 确实无直接单测、`api/test/settlement.e2e-spec.ts` 也无导出用例（但按主控规则「缺测试本身不算缺陷」，且转义与公式注入的核心逻辑已有 `api/src/common/http/csv.spec.ts` 覆盖）。<br>⚠️ 整个 100 条上限是**阶段 9 已评审结项的设计决策**（设计文档 `:205` 明确「不做跨页全量导出」），属「已记录的已知限制」。 |
-| P2-7 | 全新部署 MinIO bucket 不自动创建 | `minio.service.ts:34` | 全仓无 `CreateBucket` 调用；compose 镜像里**没有 `mc`**（注释明写「这个镜像里没有 mc / curl / wget」）→ 没有别的创建途径。实测：presigned URL 签发成功但 PUT 返回 404 `NoSuchBucket`。<br>⚠️ **对抗验证第 22 条（real=true, sev=medium）实测复现并补充了四点**：<br>① **链路完整**：`media.service.ts:117-130` 先 `prisma.media.create` 落一行 `status:'PENDING'`，**再**签 uploadUrl → 「签发成功但 PUT 404」成立，PENDING 行确实留下（24 小时后被 `cleanupOrphans` 标为 `ORPHANED`，但 **media 行从不被硬删** → 垃圾行无限累积）。<br>② **本机现有环境不受影响**：`minio-data` 卷里已有 `ecommerce-media` 目录（2026-10-22 由 plan 02a 的人工 Step 1.5 建的，该 plan 3704-3740 行明写「MinIO 不会自动建 bucket」）→ **只有全新机器 / 全新卷 / 不含该卷的备份恢复才触发**。<br>③ **有一条现成的检测手段被关掉了**：`api/test/media.e2e-spec.ts:270-275` 会真 PUT 并断言 `put.ok`，本来能抓住这个 bug —— 但 `.github/workflows/ci.yml:190` **整条排除了 media 套件**（即 P2-B1）。两条是同一个问题的两面。<br>④ **修起来很轻**：`@aws-sdk/client-s3` **已是 api 的运行时依赖**（`api/package.json:43`）→ 在 `onModuleInit` 里补一次 `HeadBucket` + `CreateBucketCommand` 即可，**无需新增依赖**。<br>⑤ 严重级别 medium：无资损、无越权；商品创建不强制带图（`mediaIds` 走独立接口且 `@ArrayMinSize(0)`）→ 下单/支付链路不受阻，属功能降级；失败显性可诊断（商家立刻看到「上传失败 HTTP 404」）。 |
-| P2-8 | 库存流水记下消费者 id（对抗验证第 9 条**实测确认**，并收窄定性） | `api/src/modules/inventory/inventory.controller.ts:19` → `inventory.service.ts:101` | schema 注释写「阶段 2 的库存调整是**商家手动操作，填店主 id**」，但控制器传的是 `user.userId`。因为 P1-1（缺 `@Roles`），**消费者的 userId 会被写进「店主操作」的审计字段**（对抗验证实测：消费者令牌 `POST /api/v1/inventory/adjustments` → **HTTP 201**，响应体 `movement.operatorId = "<消费者 user id>"`）。修完 P1-1 自动消失。<br>⚠️ **定性要收窄（对抗验证纠正）**：这个洞的真正危害是**授权缺失**本身，不是 `operatorId` 字段语义 —— 消费者能改 SKU 价格为 1 分才是资损链（属 P1-1）。而且 **`operatorId` 全仓没有任何消费方**（我已 grep 确认：三个前端都不展示、后端也不读；`schema.prisma:370` 的 `operatorId String?` 只写不读）→ **它目前只是一条没人看的审计痕迹**。<br>→ **建议**：字段语义在 schema 注释里写明「人工调整填操作人 id，RESERVE/RELEASE 为 null」；顺带考虑是否真的需要存这个字段。 |
-| P2-9 | 替换规格矩阵可击穿 `maxSkus`（对抗验证第 28 条**实测复现**） | `api/src/modules/catalog/specs/spec-matrix.service.ts:82` | DTO 上限 2 维度 × 20 值 = **400 个组合**；额度检查比的是「当前 SKU 数」。<br>⚠️ **对抗验证实测**（测试库 `ecommerce_test`，套餐 `maxSkus=10`，商家订阅后替换规格矩阵）：**响应 200、租户 SKU 计数 400**，上限 10 被击穿。全仓 `api/src` 里 `sku.create/createMany/upsert` **只有 `spec-matrix.service.ts:284` 这一处** → 唯一创建 SKU 的路径；`maxSkus` 只有 `quota.service.ts:94` 一处被消费；**没有每商品 SKU 上限、没有数据库约束**，租户扩展只做行作用域隔离，挡不住。前端 `merchant-admin/src/app/api/products/[id]/specs/route.ts` 只校验 2 维 × 20 值与文本长度，同样不设额度闸。<br>**设计意图已被违背**：`docs/superpowers/specs/2026-10-25-plan-05b-billing-design.md:536` 写明「maxSkus｜创建 SKU 时｜当前 SKU 数 ≥ 上限 → 拒绝」，且 `grep -rn "maxSkus" api/test/` **零命中** → 无回归覆盖。<br>⚠️ **比「额度绕过」更严重的是「击穿后不可恢复」**（对抗验证补充）：超限后所有替换规格请求一律 409，**缩小矩阵也被拒**（`:82` 的检查只看既有 SKU 数）；软删商品**不释放额度**（`ProductsService.remove()` 只写 `product.deletedAt`，全仓无任何地方软删 SKU）；多余的 SKU 只置 `INACTIVE` 不软删（`:304-310`）→ **SKU 计数只增不减**，商家只能靠平台抬高 `maxSkus` 才能恢复 → **规格编辑功能被永久锁死**。<br>⚠️ **额度检查在事务外**（检查在 `:82`，事务在 `:124` 才开）→ 并发放大：**3 个并发请求实测全部 200、写出 1200 个 SKU**（上限 10）。<br>⚠️ 种子里的试用套餐 `maxSkus=50`（`prisma/seed.ts:415`）且 demo 商家已订阅 → **开箱即达**。<br>严重级别 medium：付费套餐额度绕过（试用档 50 实际可拿 400，约 8 倍）叠加商家自伤型且不可恢复的锁死，但不跨租户、不动钱、不破坏数据。 |
-| P2-9b | **INACTIVE 的 SKU 仍占套餐额度**（与 P2-9 同根因，建议一起修） | `api/src/modules/billing/quota.service.ts:118` | `sku.count({ where: { tenantId } })` **不带 `status` 过滤**；租户扩展只自动合并 `deletedAt: null`，而 `INACTIVE` 不是软删 → 商家反复改规格，每次留下一批 INACTIVE 的旧 SKU 虚占额度，最终一个 SKU 都加不了（用户可见的功能性阻塞）。<br>⚠️ 我已核实 `ProductsService.remove()`（`products.service.ts:264-274`）**只写 `product.deletedAt`**，全仓**无任何地方软删 SKU** → **软删商品不释放 SKU 额度**。这一条与 P2-9 构成一条完整的「额度只增不减」链：**P2-9 让额度能被击穿，P2-9b 让击穿后无法恢复**。<br>**修法**：① 额度检查移到**事务内**（消除并发放大）；② `sku.count` 排除 `INACTIVE`，或改用「只数活跃 SKU」的口径；③ 软删商品时**级联软删其 SKU**（否则商品删了额度还在）。 |
-| P2-10 | 套餐额度检查「先查后判」不在事务内（对抗验证第 29 条**实测复现**） | `api/src/modules/billing/quota.service.ts:85` | **实测**：`maxProducts=1` 的套餐，商家订阅后**并发**打 10 个 `POST /api/v1/catalog/products` → 状态分布 `[201,201,201,201,201,201,409,409,409,409]`，**201 计数 6**，库内该租户 `product.count = 6` → **上限 1 的套餐实际建出 6 个商品**（50 并发时建出 3 个）。<br>**代码路径**：`quota.service.ts:85` `assertWithinQuota` → `:99` `countUsage` → `:100` `current >= limit` 判定 → **之后才**在 `products.service.ts:169` 执行 `product.create` → 纯「先查后判」。<br>**逐条排查挡住它的机制，全部不存在**：① `products.service.ts` 的 `create()` 内**没有 `$transaction`**（该文件仅 `:317`/`:375`/`:467` 三处事务，都不在 create 路径）；② `quota.service.ts:113` 的 `countUsage` 签名是 `private async countUsage(tenantId, kind)`，**根本没有 `client` 参数**（对比同文件 `:46` 的 `currentPlan(tenantId, client = this.prisma)` 就有）→ **物理上无法接进事务**；③ SKU 路径 `spec-matrix.service.ts:82` 的检查同样位于 `:124` 的 `$transaction` 之前；④ `products` 表只有 `@@index([tenantId,status])` 与 `@@index([tenantId,categoryId])`，**无计数相关唯一索引/触发器**，全仓 grep 无 advisory / Serializable / isolationLevel / Redis 锁，`prisma/migrations/**` 无 trigger；⑤ `infra/nginx/platform.test.conf` 全文无 `limit_req`/`limit_conn`，api 无 `@nestjs/throttler` → **无限流阻碍**。<br>⚠️ **必须并发才触发**，单发请求会被正确拒绝（409）→ 现有 `billing-quota.e2e-spec.ts:417` 的 M13 用例**不是假绿**，它只覆盖串行路径，缺的是**并发用例**。<br>**修法**：① `countUsage` 加**可选 `client` 参数**（照 `currentPlan` 的写法）→ 接进事务；② 额度检查与创建**放进同一个 `$transaction`**；③ 修的时候**两个调用点都要覆盖**（`PRODUCT` 在 `products.service.ts:161`、`SKU` 在 `spec-matrix.service.ts:82`）；④ 加并发 e2e 用例。<br>**本仓库已有正确范式可参照**：`coupon.service.ts:331` 的「必须用条件更新，不能先查后改」+ `updateMany({ where: { claimedCount: { lt: totalLimit } }, data: { increment } })`，**受影响行数为 0 即额度已满**。<br>严重级别 medium：影响限于单租户自身套餐额度，不跨租户、无数据泄漏、无资损 → 属套餐档位的销售漏损 + 运营可见的额度失真，量级受并发窗口约束；但**无限流且触发条件极简单**（10 个并发 POST 即可）→ 可利用性很高。 |
-| P2-11 | 账单支付单「先查后建」未处理 P2002（⚠️ 对抗验证 agent 因额度未跑，**主控已补核实：成立，级别 low**） | `payment.service.ts:407` | `obtainInvoicePayment`（`:399-445`）是 `findFirst({ invoiceId, channel })` → 查不到就 `create`，**没有 catch P2002**。同文件明明导入了 `isUniqueViolation` 并在 `:225` / `:686` / `:1993` 三处使用，**唯独这里漏了**。两个调用方可并发：`:330` `createInvoicePayment`（商家后台手动补付，HTTP 请求）与 `:506` `chargeAndSettle`（自动续费，BullMQ 定时 job）之间**没有任何互斥**（`:526` 注释自认「单副本假设，跨副本并发扫描未加锁」）→ 并发时双双查空、双双 create，输家撞 `payments_invoice_channel_uniq`（`20261025220000_add_billing_tables/migration.sql:176`）→ 全局过滤器不识别 Prisma 错误 → **500**。<br>**级别 low 的依据（主控核实）**：输家死在 `create`，发生在渠道调用**之前** → **不产生重复扣款、无资损**；赢家照常扣款；商家再点一次就走复用路径（`findFirst` 查到 PENDING/FAILED → 复用）→ **重试即自愈**，属瞬时 500。<br>**修法**：照 `:225` 的样子 catch `isUniqueViolation` → **事务外**重查走复用分支（本仓约定：P2002 必须在事务外处理）。 |
-| P2-12 | README「一键启动」不可用 | `README.md:138`、`infra/docker-compose.yml:119`、`api/Dockerfile:45` | 根因**不只** compose 那一行：`api/Dockerfile:45` 也有 `ENV NODE_ENV=production` → **只删 compose 第 119 行仍会崩**（实测：不给 NODE_ENV，镜像自带 ENV 触发同一报错）。且即使换掉真实 JWT_SECRET / 账目密钥，阶段 9 的 `assertProductionCredentials()` 仍会因 compose 默认 Postgres / MinIO 密码拒绝启动 → **「compose 默认值集合 + production」整体不兼容**，要真跑通必须同时提供 DB/Redis/MinIO 凭据 + 真实 JWT 密钥 |
-| P2-13 | 文档口径过时（AGENTS.md + README） | `AGENTS.md:217`、`README.md:461` | **AGENTS.md**：「三个前端没有共享包」与第 17-23、62 行矛盾。**README**：「阶段 4 验收发现的下一阶段优先项」第 1 条「给轮换后的旧令牌一个宽限期」**阶段 5c 已实现**（`auth.service.ts` 有 `REFRESH_GRACE_PERIOD_MS` / `graceExpiresAt` / `token-grace.worker.ts`），但 README 仍列为待办。⚠️ 更隐蔽的危害：AGENTS.md 的旧指引会让有人按「写一份 → `cp` → `diff`」改三端令牌逻辑，**三端薄壳目前没有任何一致性 CI 守卫** → 令牌刷新逻辑静默分叉 |
-| P2-15 | **一处违反「落库时刻用 `prisma.databaseNow()`」纪律** | `payment.service.ts:435` | `updatedAt: new Date()`，且 `Payment.updatedAt` 是 `@updatedAt`（Prisma 自动管理）→ 这个赋值**完全多余**。⚠️ 危害很低：`updatedAt` 只用于展示（支付方式列表、收款账户），**不参与任何财务归期或口径**。<br>✅ 已修（提交 `40e3c54`）。<br>⚠️ **原文「全仓唯一一处」不准确**（2026-11-06 复核更正）：`markEventProcessed` 的 `processedAt`（已随 `17213f7` 修掉）、`scanRefunding(now = new Date())`、`order.service.ts` 的 cancelledAt/shippedAt/completedAt、`auth.service.ts` 的 revokedAt 等都还是应用进程时钟。本条只清掉了「完全多余的那个赋值」。<br>✅ **同类存量已于 2026-11-07 收敛**（提交 `a7c0072`）：订单 / 认证 / 退款扫描的落库时刻全部改用库时钟，口径与排除项见 §〇「批次 11 的实施记录」。 |
-| P2-16 | **保留子域名列表漏了 `merchant`** → 商家能注册一个访问不到的店铺 | `tenant-models.ts:25` vs `infra/nginx/platform.test.conf:117` | `RESERVED_SUBDOMAINS` 有 `admin` / `api` / `platform`，**唯独没有 `merchant`**（而 nginx 里 `merchant.platform.test` 是**精确匹配**的 server 名）。注册校验（`register-merchant.dto.ts:41`）只查这个集合 → 商家**能**注册子域名 `merchant` → 但 nginx 的精确匹配优先于租户正则 → 该店的店铺前台 `http://merchant.platform.test` 落到商家后台，**店铺打不开**。<br>⚠️ 不是安全漏洞（是可用性 + 枚举），修法：`RESERVED_SUBDOMAINS` 加 `merchant`。<br>（我核实过 nginx 的匹配顺序：精确 > 正则 > 通配符 > 默认 server） |
-| P2-14 | `test/rbac.e2e-spec.ts:17-21` 注释在骗人 | 同上 | 写「RolesGuard 由 AppModule 的 APP_GUARD 提供」，与 `app.module.ts:23-26` **直接矛盾** —— 这很可能就是漏挂能存活至今的原因 |
+| P2-1 | 三端依赖 4 条（2 critical + 2 high） | 三端 `package.json` | ✅ **已修（批次 11 `ce98ae4` → 批次 13 `93dabe7`/`fbe9814` → 批次 21 `30f6041`）**：2026-11-19 复核 —— 根 `package.json` 的 `overrides` 五项齐全（`@vitest/mocker` 4.1.12、`body-parser` 2.4.0、`multer` 2.5.0、`postcss` 8.5.31、`tinypool` 2.2.0）；`package-lock.json` 实装 `node_modules/body-parser` 2.4.0、`node_modules/multer` 2.5.0、`node_modules/tinypool` 2.2.0、`node_modules/@vitest/mocker` 4.1.12，全树 5 个嵌套 postcss 条目均为 8.5.31（无顶层条目 —— postcss 不是任何 workspace 的直接依赖，收敛靠嵌套解析）。<br>具体：`tinypool`（critical，RCE）、`vitest`（critical，路径穿越 —— 实际在 `@vitest/mocker` 与 `tinypool` 上）、`postcss`（high，XSS）、`body-parser`（high，DoS；前端经 `shadcn → @modelcontextprotocol/sdk → express` 引入）。**无需升 vitest/next 大版本**：实测 `overrides: {"@vitest/mocker":"4.1.12","tinypool":"2.2.0","postcss":"8.5.31","body-parser":"2.4.0"}` → audit critical/high 全清，storefront 228/228 测试通过 + `next build` 通过。⚠️ `@vitest/mocker@4.1.12` 与 `vitest@3.2.7` 跨大版本，**另两个前端也要各自跑一遍测试确认** |
+| P2-1b | **后端依赖 6 个 high** | `api/package.json` | ✅ **已修（批次 11 + 批次 21）**：2026-11-19 复核 —— `api/package.json:69` 直接钉 `"multer": "2.5.0"`，根 `overrides` 再兜一层（见 P2-1）。<br>3 个根因：`multer@2.4.0`（DoS，`<2.5.0` 有洞，**装在 `@nestjs/platform-express/node_modules` 下**）、`body-parser`（见 P2-2，lock 里是 2.3.0）、`deepmerge-ts`（栈溢出，只被 `@prisma/config` 用 → **仅 prisma CLI 运行时受影响，不在 api 服务里**）。前两个 `overrides` 即可修；`deepmerge-ts` 要修只能升 prisma 到 7（**大版本，且 Prisma 6 → 7 迁移成本高，不建议**） |
+| P2-2 | `api/package-lock.json` 与实际安装不一致 | `api/package-lock.json` | ✅ **已修（批次 11，`ce98ae4`）**：2026-11-19 复核 —— lock 与实装已一致（`node_modules/body-parser` 2.4.0），与 P2-1 同一批核对。<br>**已精确确认**：lock 记 `body-parser@2.3.0`（**有 high 漏洞**），实际装 `2.4.0`（已修）。全量比对 1200+ 个包，**只有这 1 处不一致**。CI 用 `npm ci`（严格按 lock 装）→ **CI 跑的是有漏洞版本，本机跑的是修好的版本**。⚠️ `npm audit` 报的正是 lock 的版本，可用它直接验证这条 |
+| P2-3 | 登录无限流 + 无失败计数 | `infra/nginx/platform.test.conf:43-44`、`auth.service.ts:241-300` | ✅ **已修（批次 5，`dc3cbdd`）**：2026-11-19 复核 —— `infra/nginx/platform.test.conf:43-44` 定义 `limit_req_zone api_general` 20r/s 与 `api_auth` 10r/s，`:91-92`/`:121-122`/`:139-140` 三处 `limit_req` + `limit_req_status 503`；`login-throttle.service.ts:4/7`（5 次 / 15 分钟），`auth.service.ts:241-300` 按 scope + 账号计数，账号不存在也计数，成功后 reset。<br>nginx 的 `location /api/v1/` **无 `limit_req` / `limit_conn`**（全文件只有 6 个 location，一个限流指令都没有）；api 无 `@nestjs/throttler`；`auth.service.ts` 里 grep 不到任何失败计数/锁定字段。**真实风险是撞库不是 DoS**（argon2 实测热态 23ms、20 并发 318ms、事件循环未阻塞）。⚠️ 修法要注意：不能给整个 `/api/v1/` 加限流（会误伤商家批量操作），应对**登录路径**单独设 location |
+| P2-5 | 畸形查询参数 → 500（对抗验证第 4、12、32 条**实测确认并补充**） | `api/src/modules/catalog/products/products.controller.ts:63-64`、`api/src/modules/inventory/inventory.controller.ts:35-36`、`api/src/modules/order/merchant-order.controller.ts:60-61` | ✅ **已修（批次 11，`b264ac5`）**：2026-11-19 复核 —— 三个查询 DTO 已加数值校验：`product-list-query.dto.ts:12`、`inventory-movements-query.dto.ts:11`、`merchant-order-list-query.dto.ts:12`；`api/test/query-validation.e2e-spec.ts` 12 个用例钉住非法输入 400。<br>仓库已有 `toIntOr` 工具（12 个控制器在用），这 2 处分页参数漏了 → `Number('abc')` = NaN → `skip: NaN` → 500。`merchant-order` 的分页参数用了 `toIntOr`，但**时间参数用 `new Date(from)`** → `Invalid Date` → 500。⚠️ 这 3 处**已由第三方在运行中的栈上实测确认 500**（`?from=garbage` / `?to=notadate`）。<br>⚠️ **根因在后端，不是前端中转（对抗验证纠正）**：修 merchant-admin 的中转路由**消除不了 500** —— 实测**直连 api** 的 `/api/v1/inventory/movements?page=abc` 同样 500（`apiFetch` 在服务端直连 `API_BASE_URL`、根本不经 nginx）。**改 api 一处即可挡住全部路径**（含直接 curl api 的路径）。<br>⚠️ **`status` 枚举也不校验（对抗验证第 12 条发现）**：`?status=FOO` → 500（`Invalid value for argument 'status'. Expected ProductStatus.`）—— 控制器把 `status` 标注成 `ProductStatus`，但**裸 `@Query` 没有 DTO** → 全局 `ValidationPipe` 的 `toValidate()` 排除原始类型 → **不校验**；且编译产物 `design:paramtypes` 是 `[String, String, ...]` → **枚举校验根本不生效**（对抗验证直接调 `ValidationPipe` 验证过：`status=FOO -> OK "FOO"`）。<br>⚠️ **仓库自身约定已把它定性为缺陷**：`api/src/common/http/pagination.ts:19-25` 明确写了裸 `@Query` 不走 ValidationPipe；同仓 `platform-report.controller.ts:45-50` 走 `ReportQueryDto` 的 `@IsDateString()`、`payout-reconciliation.dto.ts:23,27` 同款 → **有现成正确范式可照抄**。<br>⚠️ **触发路径要写准**：merchant-admin 的 `GET /api/products` 中转**没有应用内生产调用方**（商家商品列表是 Server Component 直接调 `apiFetch`），但**商品列表页的客户端筛选路径**与**库存流水页**是可达的；`merchant/orders` 的时间参数**前端页面层已用 `Date.parse` 过滤**（`orders/page.tsx:51,54`，注释明写「后端 new Date('乱七八糟') 会得到 Invalid Date」）→ **UI 路径不会送出坏日期，但直接 curl api 会**。 |
+| P2-6 | CSV 导出丢 BOM → Excel 乱码 | `platform-admin/.../settlements/export/route.ts:43` | ✅ **已修（批次 12，见 §〇 进度表第 12 行）**：2026-11-19 复核 —— `platform-admin/src/app/api/billing/settlements/export/route.ts:46` 与 `merchant-admin/src/app/api/products/export/route.ts:106` 的 CSV 都在首部补了 BOM（`\uFEFF`）。<br>后端 `platform-settlement.controller.ts:71` 用 `﻿` 加 BOM，但 BFF 用 `response.text()` 读 → **WHATWG 规范要求 TextDecoder 剥除 BOM** → BOM 丢失。⚠️ `merchant-admin` 是**在 BFF 侧加** BOM，两端写法已漂移 → 修法应统一在 BFF 侧加。只影响 Windows + GBK 代码页的 Excel；金额是纯 ASCII 不会乱码 |
+| P2-6b | **结算单 CSV 导出超 100 条截断**（⚠️ **不是「静默」**） | `settlement.service.ts:928` | ⏸️ **不修（阶段 9 评审后的设计决策）**：2026-11-19 复核 —— `settlement.service.ts:922-926` 注释写明「仍受 `MAX_PAGE_SIZE` 限制：不做跨页全量导出，超过上限时按周期筛选，与列表页文案口径一致」。<br>⚠️ **被第三方验证推翻过一半**：截断在事实上成立（`pageSize: MAX_PAGE_SIZE`=100），但**「静默」不成立** —— 页面**恒等**提示：`platform-admin/.../settlements/page.tsx:116-120` 显示「共 {list.total} 张（本页显示 {items.length} 张）。超过 100 张时请按周期筛选」，而 `list.total` 是真实的 `count`（`settlement.service.ts:913`）不是 `items.length` → **凡截断必触发提示**；且 `platform-settlement.controller.ts:67` 的 Swagger 摘要写明「（最多 100 条）」；服务层注释明写「与列表页文案口径一致」。<br>✅ **成立的部分**：① 不筛选周期时的文件名是 `settlements-all.csv`（`:73`）—— **字面看是全量、实为前 100 行**，运营若绕过页面直接调接口并把文件转交财务，唯一的告知只剩文件名与 Swagger 摘要；② CSV **文件内容本身**没有「共 N 张 / 已截断」说明行；③ `exportCsv` 确实无直接单测、`api/test/settlement.e2e-spec.ts` 也无导出用例（但按主控规则「缺测试本身不算缺陷」，且转义与公式注入的核心逻辑已有 `api/src/common/http/csv.spec.ts` 覆盖）。<br>⚠️ 整个 100 条上限是**阶段 9 已评审结项的设计决策**（设计文档 `:205` 明确「不做跨页全量导出」），属「已记录的已知限制」。 |
+| P2-7 | 全新部署 MinIO bucket 不自动创建 | `minio.service.ts:34` | ✅ **已修（批次 5，`dc3cbdd`）**：2026-11-19 复核 —— `minio.service.ts:3`/`:6` 导入 `HeadBucketCommand`/`CreateBucketCommand`，`:97` 先 HeadBucket、`:117` 桶不存在则 CreateBucket（启动时自建桶）。<br>全仓无 `CreateBucket` 调用；compose 镜像里**没有 `mc`**（注释明写「这个镜像里没有 mc / curl / wget」）→ 没有别的创建途径。实测：presigned URL 签发成功但 PUT 返回 404 `NoSuchBucket`。<br>⚠️ **对抗验证第 22 条（real=true, sev=medium）实测复现并补充了四点**：<br>① **链路完整**：`media.service.ts:117-130` 先 `prisma.media.create` 落一行 `status:'PENDING'`，**再**签 uploadUrl → 「签发成功但 PUT 404」成立，PENDING 行确实留下（24 小时后被 `cleanupOrphans` 标为 `ORPHANED`，但 **media 行从不被硬删** → 垃圾行无限累积）。<br>② **本机现有环境不受影响**：`minio-data` 卷里已有 `ecommerce-media` 目录（2026-10-22 由 plan 02a 的人工 Step 1.5 建的，该 plan 3704-3740 行明写「MinIO 不会自动建 bucket」）→ **只有全新机器 / 全新卷 / 不含该卷的备份恢复才触发**。<br>③ **有一条现成的检测手段被关掉了**：`api/test/media.e2e-spec.ts:270-275` 会真 PUT 并断言 `put.ok`，本来能抓住这个 bug —— 此前 `.github/workflows/ci.yml` 曾整条排除 media 套件（即 P2-B1），**批次 22（`baf3db8`）起已恢复**，这条检测手段重新生效。两条是同一个问题的两面。<br>④ **修起来很轻**：`@aws-sdk/client-s3` **已是 api 的运行时依赖**（`api/package.json:43`）→ 在 `onModuleInit` 里补一次 `HeadBucket` + `CreateBucketCommand` 即可，**无需新增依赖**。<br>⑤ 严重级别 medium：无资损、无越权；商品创建不强制带图（`mediaIds` 走独立接口且 `@ArrayMinSize(0)`）→ 下单/支付链路不受阻，属功能降级；失败显性可诊断（商家立刻看到「上传失败 HTTP 404」）。 |
+| P2-8 | 库存流水记下消费者 id（对抗验证第 9 条**实测确认**，并收窄定性） | `api/src/modules/inventory/inventory.controller.ts:19` → `inventory.service.ts:101` | ✅ **已修（批次 12，文档口径）**：2026-11-19 复核 —— `api/prisma/schema.prisma:365-371` 的 operatorId 注释已改写为「系统行为留 null，不填 system」，与代码一致。<br>schema 注释写「阶段 2 的库存调整是**商家手动操作，填店主 id**」，但控制器传的是 `user.userId`。因为 P1-1（缺 `@Roles`），**消费者的 userId 会被写进「店主操作」的审计字段**（对抗验证实测：消费者令牌 `POST /api/v1/inventory/adjustments` → **HTTP 201**，响应体 `movement.operatorId = "<消费者 user id>"`）。修完 P1-1 自动消失。<br>⚠️ **定性要收窄（对抗验证纠正）**：这个洞的真正危害是**授权缺失**本身，不是 `operatorId` 字段语义 —— 消费者能改 SKU 价格为 1 分才是资损链（属 P1-1）。而且 **`operatorId` 全仓没有任何消费方**（我已 grep 确认：三个前端都不展示、后端也不读；`schema.prisma:370` 的 `operatorId String?` 只写不读）→ **它目前只是一条没人看的审计痕迹**。<br>→ **建议**：字段语义在 schema 注释里写明「人工调整填操作人 id，RESERVE/RELEASE 为 null」；顺带考虑是否真的需要存这个字段。 |
+| P2-9 | 替换规格矩阵可击穿 `maxSkus`（对抗验证第 28 条**实测复现**） | `api/src/modules/catalog/specs/spec-matrix.service.ts:82` | ✅ **已修（批次 11）**：2026-11-19 复核 —— `spec-matrix.service.ts:306-310` 把额度检查移到「写完组合之后、事务之内」。<br>DTO 上限 2 维度 × 20 值 = **400 个组合**；额度检查比的是「当前 SKU 数」。<br>⚠️ **对抗验证实测**（测试库 `ecommerce_test`，套餐 `maxSkus=10`，商家订阅后替换规格矩阵）：**响应 200、租户 SKU 计数 400**，上限 10 被击穿。全仓 `api/src` 里 `sku.create/createMany/upsert` **只有 `spec-matrix.service.ts:284` 这一处** → 唯一创建 SKU 的路径；`maxSkus` 只有 `quota.service.ts:94` 一处被消费；**没有每商品 SKU 上限、没有数据库约束**，租户扩展只做行作用域隔离，挡不住。前端 `merchant-admin/src/app/api/products/[id]/specs/route.ts` 只校验 2 维 × 20 值与文本长度，同样不设额度闸。<br>**设计意图已被违背**：`docs/superpowers/specs/2026-10-25-plan-05b-billing-design.md:536` 写明「maxSkus｜创建 SKU 时｜当前 SKU 数 ≥ 上限 → 拒绝」，且 `grep -rn "maxSkus" api/test/` **零命中** → 无回归覆盖。<br>⚠️ **比「额度绕过」更严重的是「击穿后不可恢复」**（对抗验证补充）：超限后所有替换规格请求一律 409，**缩小矩阵也被拒**（`:82` 的检查只看既有 SKU 数）；软删商品**不释放额度**（`ProductsService.remove()` 只写 `product.deletedAt`，全仓无任何地方软删 SKU）；多余的 SKU 只置 `INACTIVE` 不软删（`:304-310`）→ **SKU 计数只增不减**，商家只能靠平台抬高 `maxSkus` 才能恢复 → **规格编辑功能被永久锁死**。<br>⚠️ **额度检查在事务外**（检查在 `:82`，事务在 `:124` 才开）→ 并发放大：**3 个并发请求实测全部 200、写出 1200 个 SKU**（上限 10）。<br>⚠️ 种子里的试用套餐 `maxSkus=50`（`prisma/seed.ts:415`）且 demo 商家已订阅 → **开箱即达**。<br>严重级别 medium：付费套餐额度绕过（试用档 50 实际可拿 400，约 8 倍）叠加商家自伤型且不可恢复的锁死，但不跨租户、不动钱、不破坏数据。 |
+| P2-9b | **INACTIVE 的 SKU 仍占套餐额度**（与 P2-9 同根因，建议一起修） | `api/src/modules/billing/quota.service.ts:118` | ✅ **已修（批次 11）**：2026-11-19 复核 —— `quota.service.ts:176` 只统计 `ACTIVE` 的 SKU（注释标「审计 P2-9b」）。<br>`sku.count({ where: { tenantId } })` **不带 `status` 过滤**；租户扩展只自动合并 `deletedAt: null`，而 `INACTIVE` 不是软删 → 商家反复改规格，每次留下一批 INACTIVE 的旧 SKU 虚占额度，最终一个 SKU 都加不了（用户可见的功能性阻塞）。<br>⚠️ 我已核实 `ProductsService.remove()`（`products.service.ts:264-274`）**只写 `product.deletedAt`**，全仓**无任何地方软删 SKU** → **软删商品不释放 SKU 额度**。这一条与 P2-9 构成一条完整的「额度只增不减」链：**P2-9 让额度能被击穿，P2-9b 让击穿后无法恢复**。<br>**修法**：① 额度检查移到**事务内**（消除并发放大）；② `sku.count` 排除 `INACTIVE`，或改用「只数活跃 SKU」的口径；③ 软删商品时**级联软删其 SKU**（否则商品删了额度还在）。 |
+| P2-10 | 套餐额度检查「先查后判」不在事务内（对抗验证第 29 条**实测复现**） | `api/src/modules/billing/quota.service.ts:85` | ✅ **已修（批次 11）**：2026-11-19 复核 —— `quota.service.ts:85` 要求在事务内传 `tx`，`:150-167` 用 `SELECT … FOR UPDATE` 锁额度行；`products.service.ts:167` 检查与创建同事务。<br>**实测**：`maxProducts=1` 的套餐，商家订阅后**并发**打 10 个 `POST /api/v1/catalog/products` → 状态分布 `[201,201,201,201,201,201,409,409,409,409]`，**201 计数 6**，库内该租户 `product.count = 6` → **上限 1 的套餐实际建出 6 个商品**（50 并发时建出 3 个）。<br>**代码路径**：`quota.service.ts:85` `assertWithinQuota` → `:99` `countUsage` → `:100` `current >= limit` 判定 → **之后才**在 `products.service.ts:169` 执行 `product.create` → 纯「先查后判」。<br>**逐条排查挡住它的机制，全部不存在**：① `products.service.ts` 的 `create()` 内**没有 `$transaction`**（该文件仅 `:317`/`:375`/`:467` 三处事务，都不在 create 路径）；② `quota.service.ts:113` 的 `countUsage` 签名是 `private async countUsage(tenantId, kind)`，**根本没有 `client` 参数**（对比同文件 `:46` 的 `currentPlan(tenantId, client = this.prisma)` 就有）→ **物理上无法接进事务**；③ SKU 路径 `spec-matrix.service.ts:82` 的检查同样位于 `:124` 的 `$transaction` 之前；④ `products` 表只有 `@@index([tenantId,status])` 与 `@@index([tenantId,categoryId])`，**无计数相关唯一索引/触发器**，全仓 grep 无 advisory / Serializable / isolationLevel / Redis 锁，`prisma/migrations/**` 无 trigger；⑤ `infra/nginx/platform.test.conf` 全文无 `limit_req`/`limit_conn`，api 无 `@nestjs/throttler` → **无限流阻碍**。<br>⚠️ **必须并发才触发**，单发请求会被正确拒绝（409）→ 现有 `billing-quota.e2e-spec.ts:417` 的 M13 用例**不是假绿**，它只覆盖串行路径，缺的是**并发用例**。<br>**修法**：① `countUsage` 加**可选 `client` 参数**（照 `currentPlan` 的写法）→ 接进事务；② 额度检查与创建**放进同一个 `$transaction`**；③ 修的时候**两个调用点都要覆盖**（`PRODUCT` 在 `products.service.ts:161`、`SKU` 在 `spec-matrix.service.ts:82`）；④ 加并发 e2e 用例。<br>**本仓库已有正确范式可参照**：`coupon.service.ts:331` 的「必须用条件更新，不能先查后改」+ `updateMany({ where: { claimedCount: { lt: totalLimit } }, data: { increment } })`，**受影响行数为 0 即额度已满**。<br>严重级别 medium：影响限于单租户自身套餐额度，不跨租户、无数据泄漏、无资损 → 属套餐档位的销售漏损 + 运营可见的额度失真，量级受并发窗口约束；但**无限流且触发条件极简单**（10 个并发 POST 即可）→ 可利用性很高。 |
+| P2-11 | 账单支付单「先查后建」未处理 P2002（⚠️ 对抗验证 agent 因额度未跑，**主控已补核实：成立，级别 low**） | `payment-order.service.ts:363` | ✅ **已修（批次 12，`67f5168`）**：2026-11-19 复核 —— 阶段 11 拆文件后逻辑落在 `payment-order.service.ts:363`，`:363-400` 在 P2002 时事务外重查，查不到才抛。<br>`obtainInvoicePayment`（`:363-400`）是 `findFirst({ invoiceId, channel })` → 查不到就 `create`，**没有 catch P2002**。同文件明明导入了 `isUniqueViolation` 并在 `:225` / `:686` / `:1993` 三处使用，**唯独这里漏了**。两个调用方可并发：`:330` `createInvoicePayment`（商家后台手动补付，HTTP 请求）与 `:506` `chargeAndSettle`（自动续费，BullMQ 定时 job）之间**没有任何互斥**（`:526` 注释自认「单副本假设，跨副本并发扫描未加锁」）→ 并发时双双查空、双双 create，输家撞 `payments_invoice_channel_uniq`（`20261025220000_add_billing_tables/migration.sql:176`）→ 全局过滤器不识别 Prisma 错误 → **500**。<br>**级别 low 的依据（主控核实）**：输家死在 `create`，发生在渠道调用**之前** → **不产生重复扣款、无资损**；赢家照常扣款；商家再点一次就走复用路径（`findFirst` 查到 PENDING/FAILED → 复用）→ **重试即自愈**，属瞬时 500。<br>**修法**：照 `:225` 的样子 catch `isUniqueViolation` → **事务外**重查走复用分支（本仓约定：P2002 必须在事务外处理）。 |
+| P2-12 | README「一键启动」不可用 | `README.md:138`、`infra/docker-compose.yml:119`、`api/Dockerfile:45` | ✅ **已修（批次 12，文档口径）**：2026-11-19 复核 —— `README.md:183-193` 写明 compose 是 production 姿态、本机联调走 `cd api && npm run start:dev`、不要改 `NODE_ENV` 绕过；`infra/docker-compose.yml:161-166` 也注明了为什么故意不设渠道变量。<br>根因**不只** compose 那一行：`api/Dockerfile:45` 也有 `ENV NODE_ENV=production` → **只删 compose 第 119 行仍会崩**（实测：不给 NODE_ENV，镜像自带 ENV 触发同一报错）。且即使换掉真实 JWT_SECRET / 账目密钥，阶段 9 的 `assertProductionCredentials()` 仍会因 compose 默认 Postgres / MinIO 密码拒绝启动 → **「compose 默认值集合 + production」整体不兼容**，要真跑通必须同时提供 DB/Redis/MinIO 凭据 + 真实 JWT 密钥 |
+| P2-13 | 文档口径过时（AGENTS.md + README） | `AGENTS.md:217`、`README.md:461` | **AGENTS.md**：「三个前端没有共享包」与第 17-23、62 行矛盾。**README**：「阶段 4 验收发现的下一阶段优先项」第 1 条「给轮换后的旧令牌一个宽限期」**阶段 5c 已实现**（`auth.service.ts` 有 `REFRESH_GRACE_PERIOD_MS` / `graceExpiresAt` / `token-grace.worker.ts`），但 README 仍列为待办。⚠️ 更隐蔽的危害：AGENTS.md 的旧指引会让有人按「写一份 → `cp` → `diff`」改三端令牌逻辑，**三端薄壳目前没有任何一致性 CI 守卫** → 令牌刷新逻辑静默分叉<br>✅ **已修（批次 12，见 §〇 进度表第 12 行）**：2026-11-19 复核当前文件 —— `AGENTS.md:227` 已写「三个前端共用 `packages/frontend-shared`（阶段 11b 起是 workspace 符号链接）」，`:230` 已把 `lib/jwt-callback.ts` 的旧指引改成「三端各只有一句 `export *`，逻辑单源在共享包」；`README.md:515` 已注明「原第 1 条『多标签页刷新竞态』已由阶段 5c（刷新令牌宽限期）实现，故不再列出」。全仓 grep `两份逐字节` / `没有共享包` 均无命中，旧口径无残留。 |
+| P2-15 | **一处违反「落库时刻用 `prisma.databaseNow()`」纪律** | ~~`payment.service.ts:435`~~（阶段 11 拆文件前的行号；该冗余赋值已整条删除，现无对应行） | ✅ **已修（批次 11 `40e3c54` + 批次 13 `d6c4980`/`bd8298c`）**：2026-11-19 复核 —— `grep -rn "updatedAt: new Date()" api/src/` 只剩 3 处测试 fixture（`address.service.spec.ts:139`、`cart.service.spec.ts:28`、`:39`），业务代码全部走 `prisma.databaseNow()`。<br>`updatedAt: new Date()`，且 `Payment.updatedAt` 是 `@updatedAt`（Prisma 自动管理）→ 这个赋值**完全多余**。⚠️ 危害很低：`updatedAt` 只用于展示（支付方式列表、收款账户），**不参与任何财务归期或口径**。<br>✅ 已修（提交 `40e3c54`）。<br>⚠️ **原文「全仓唯一一处」不准确**（2026-11-06 复核更正）：`markEventProcessed` 的 `processedAt`（已随 `17213f7` 修掉）、`scanRefunding(now = new Date())`、`order.service.ts` 的 cancelledAt/shippedAt/completedAt、`auth.service.ts` 的 revokedAt 等都还是应用进程时钟。本条只清掉了「完全多余的那个赋值」。<br>✅ **同类存量已于 2026-11-07 收敛**（提交 `a7c0072`）：订单 / 认证 / 退款扫描的落库时刻全部改用库时钟，口径与排除项见 §〇「批次 11 的实施记录」。 |
+| P2-16 | **保留子域名列表漏了 `merchant`** → 商家能注册一个访问不到的店铺 | `tenant-models.ts:39` vs `infra/nginx/platform.test.conf:117` | ✅ **已修（批次 12，`831d0d4`）**：2026-11-19 复核 —— `tenant-models.ts:39` 的 `merchant` 已在 `RESERVED_SUBDOMAINS` 里。<br>`RESERVED_SUBDOMAINS` 有 `admin` / `api` / `platform`，**唯独没有 `merchant`**（而 nginx 里 `merchant.platform.test` 是**精确匹配**的 server 名）。注册校验（`register-merchant.dto.ts:41`）只查这个集合 → 商家**能**注册子域名 `merchant` → 但 nginx 的精确匹配优先于租户正则 → 该店的店铺前台 `http://merchant.platform.test` 落到商家后台，**店铺打不开**。<br>⚠️ 不是安全漏洞（是可用性 + 枚举），修法：`RESERVED_SUBDOMAINS` 加 `merchant`。<br>（我核实过 nginx 的匹配顺序：精确 > 正则 > 通配符 > 默认 server） |
+| P2-14 | `test/rbac.e2e-spec.ts:17-21` 注释在骗人 | `api/test/rbac.e2e-spec.ts:17-30` | ✅ **已修（2026-11-19 核实，无独立提交）**：`api/test/rbac.e2e-spec.ts:17-30` 的注释开头已改为「⚠️ **RolesGuard 不是全局守卫**（这条注释以前写反了，审计 P2-14）」，并写明真正的挂载点是 `@Roles()` 装饰器。<br>写「RolesGuard 由 AppModule 的 APP_GUARD 提供」，与 `app.module.ts:23-26` **直接矛盾** —— 这很可能就是漏挂能存活至今的原因 |
 
 ## 四、护栏建议（P1，价值最高）
 
@@ -1175,8 +1413,9 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
 > ⚠️ **三条修法要动数据库，建议合并成一次手写迁移**：
 > - **P0-2**：改 `orders_tenant_idempotency_uniq` → `(tenantId, customerId, idempotencyKey)`
 > - **P1-5**：新增 `payment_methods_tenant_default_uniq`（部分唯一索引）
-> - **P0-7（待确认产品意图后）**：改 `coupon_redemptions_coupon_active_uniq`
->   → `(couponId, customerId)`
+> - **P0-7**：改 `coupon_redemptions_coupon_active_uniq`
+>   → `(couponId, customerId)` —— ✅ **已完成**（`2ef9676`，迁移
+>   `20261105190000_coupon_redemption_customer_scope`）
 > 三处都是 `prisma/migrations/` 下的**新文件**（已落库的迁移不能改，checksum 会变），
 > 用 `npx prisma migrate diff` 核对后再 `npx prisma migrate deploy`。
 > **改索引前务必先在有真实数据量的库上试**（见第九节）。
@@ -1201,12 +1440,18 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
    ③ 才是真正的凭证（没经验签端点登记的 job 一律不生效）。
 5. **P1-4 MinIO CORS 变量名**（compose + `.env.example` 两处）
    + **P2-7 bucket 自动创建** + **P2-3 登录限流**
-6. **P0-7 券跨用户失效** —— ⚠️ **动手前必须先确认产品意图**（见 P0-7 条目的三种修法）：
-   - 若「一券一实例」**不是**产品要求 → 改部分唯一索引为 `(couponId, customerId)`（**新增迁移**）
-     + `findCandidateCoupons` 按 `customerId` 过滤；
-   - 若是产品要求 → 至少让 `listMine` 的 `used` 口径与 `findCandidateCoupons` 一致
-     （消除「我的券显示可用却用不了」的自相矛盾）。
-   ⚠️ **改错了会让「限 50 张」的券实际只能用 1 张** → 别急着动，先问清楚。
+6. **P0-7 券跨用户失效** —— ✅ **已完成（`2ef9676`）**，产品意图已确认：
+   「一券一实例」不是产品要求 —— `totalLimit`（总发放份数）、`perUserLimit`（每用户份数）、
+   `coupon_claims.quantity`（该用户领了几份）全是**份数**语义，正确模型是「一份券给一个用户用一次」。
+   落地方式即下面第一种：迁移 `20261105190000_coupon_redemption_customer_scope` 把部分唯一索引
+   改为 `(couponId, customerId)`，`findCandidateCoupons` / `listMine` / 核销判据全部按 `customerId` 过滤；
+   e2e 见 `api/test/order-discount.e2e-spec.ts:881` 的「P0-7：券的核销不跨用户波及」用例组。
+   ~~以下是当时的决策文本，保留备查：~~
+   - ~~若「一券一实例」**不是**产品要求 → 改部分唯一索引为 `(couponId, customerId)`（**新增迁移**）
+     + `findCandidateCoupons` 按 `customerId` 过滤；~~
+   - ~~若是产品要求 → 至少让 `listMine` 的 `used` 口径与 `findCandidateCoupons` 一致
+     （消除「我的券显示可用却用不了」的自相矛盾）。~~
+   ~~⚠️ **改错了会让「限 50 张」的券实际只能用 1 张** → 别急着动，先问清楚。~~
 7. **P2-17 领券总量闸**（1 行）+ **P1-5 默认支付方式不变式**（部分唯一索引 + 归属校验）
 8. **护栏**：AST 静态扫描器（规则要区分「应当有角色限定的路由」与「按设计就不该有的」，
    见第四节）+ e2e 断言（CUSTOMER 令牌 → 403）
@@ -1215,6 +1460,9 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
    `@Body() dto` 改成内联 TS 类型会让 `ValidationPipe` 直接跳过校验）
    （P2-B3 已降级为补测建议，P2-B4 已被实测推翻但留加固建议，
    P2-B5 已升级为 P1-5，P2-B6 已被变异测试推翻）
+   —— **P2-B4 加固已于批次 8 落地**：`14778d9` 新增
+   `api/test/payout-reconciliation-routes.e2e-spec.ts`（12 条，2026-11-19 实跑 12 passed），
+   上面「两条对账写路由的 DTO 接线无测试锚定」一句自该提交起不再成立
 9. **P0-3 支付回调状态机 + P1-3 双渠道退款** —— 同一处结构性修复：
    订单流转失败时按订单真实状态分流（已 PAID = 重复投递、已 CLOSED/CANCELLED = 迟到扣款需退款），
    并把多渠道的第二笔 SUCCESS 支付单纳入退款路径。改动面较大，需单独设计。
@@ -1240,14 +1488,14 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
 
 | 区域 | 为什么没深挖 | 建议 |
 |---|---|---|
-| **三端的组件测试** | storefront/merchant-admin/platform-admin 的测试主要是 BFF 与 lib 层；组件测试只在部分文件用 jsdom | 阶段 9 记录的「merchant-admin 缺组件测试基建」就是这条 |
-| **Next.js 15 / React 19 的运行时行为** | 依赖漏洞之外没查框架自身的边界（Server Component 的缓存、`revalidate` 语义） | 与前端 BFF 一起看 |
-| **nginx 的其他 server 块** | 只读了 `location /api/v1/` 与 5 个 server 块的骨架 | 5 个 server 块（主站 / api / storefront / merchant / platform）之间的路由分流没逐条验<br>⚠️ **部分已被对抗验证覆盖**：它经 nginx 网关（`Host: demo.platform.test`）实测了领券接口，**确认 `/api/v1/` 是直通、storefront BFF 的 `quantity` 白名单只挡 UI 路径不挡手写 API** |
-| **三端 BFF 路由的系统扫描**（71 个 route.ts） | 专项扫描 workflow（5 个维度）因模型额度耗尽 **0/5 中止** | ✅ **已覆盖的抽查全通过**：主控逐字段核对 6 个关键路由（`stores/me`、`tenants/[id]/status`、`billing/settlements`、两处批量上限 200）；对抗验证顺带实测了导出 BOM（P2-1）、商品列表参数键白名单、订单列表日期转发、storefront 券 `quantity` 丢弃<br>⚠️ merchant-admin 的 35 个路由只过了上面几个，**未逐个过白名单** |
-| **第二轮资金链路的 3 个方向** | 专项 workflow 因额度耗尽 **3/4 中止**（出款与结算口径 / 退款与冲回链路 / 订单金额口径） | 跑完的那 1 向产出了 P0-7（券跨用户失效）并经主控核实；**3 个未跑的方向不算已验证**，后续动手前值得补 |
-| **Prisma 迁移在生产数据上的实际行为** | 只核对了索引定义与迁移清单，没在有真实数据量的库上跑 `migrate deploy` | 改 P0-2 的索引前，务必先在有数据的库上试<br>⚠️ 本机 `ecommerce` 与 `ecommerce_test` 两库的 `payment_methods` **都是 0 行** → P1-5 的部分唯一索引在本机可以直接建，但**不代表生产库没有「同租户多个默认」的存量** |
-| **真实渠道的接入** | 仓库只有 fake / sandbox 实现，真渠道（微信 / 支付宝）**一行代码都没有** | 上生产前必须走「新渠道准入」的契约套件 |
-| **备份与恢复脚本** | `infra/backup.sh` / `restore.sh` 读过文件名，没逐行审 | 平台自管备份的可用性是另一条线 |
+| **三端的组件测试** | storefront/merchant-admin/platform-admin 的测试主要是 BFF 与 lib 层；组件测试只在部分文件用 jsdom | ✅ **已补齐（2026-11-18）**：三端 vitest 基建完整——全局环境 `node`、组件测试逐文件 `// @vitest-environment jsdom` 切换（`storefront` 16 个 jsdom 文件 / `merchant-admin` 14 个 / `platform-admin` 4 个，共 34 个）；**34 个 jsdom 组件测试文件全部用 RTL `render`/`screen` 真实渲染断言，无空壳**；merchant-admin 5 个 + platform-admin 8 个「无 jsdom」的 `.test.tsx` 是 **Server Component 元素树测试**（直接 `await Page(...)` 拿元素树遍历 `props.children`，**不渲染 DOM**，node 环境即可——有意策略，非缺口，且非空壳：`payouts-page.test.tsx` 等有 20+ 真实断言）；三端全量本地全绿（storefront 35 文件/288 测试、merchant-admin 41/562、platform-admin 25/534）；CI `frontend` 矩阵（`ci.yml:75-109`）三端都跑 `npm test`（= vitest 全量）且有 `npx tsc --noEmit` 门禁，`include` glob `test/**/*.test.{ts,tsx}` 覆盖全部 `.test.tsx`。**无缺陷**。阶段 9「merchant-admin 缺组件测试基建」的旧记录已被本次实测推翻——基建与规模均正常 |
+| **Next.js 15 / React 19 的运行时行为** | 依赖漏洞之外没查框架自身的边界（Server Component 的缓存、`revalidate` 语义） | ✅ **已补齐（2026-11-18）**：三端 Next 15.5.28 / React 19.1.0 / react-dom 19.1.0；`next.config.ts` 三份相同——仅 `output: 'standalone'` + `transpilePackages: ['@ecom/frontend-shared']` + `webpack` externals 推 `vitest`（防 next build 编译测试），**未启用任何 Next 缓存体系**（grep `revalidate`/`dynamic`/`cache`/`generateStaticParams`/`generateMetadata` 等零命中）→ 无 `revalidate` 语义需要验证的静态缓存路径；三端完整 `next build`（`rm -rf .next` 后，避免增量缓存误判）全通过：storefront 28 路由 / merchant-admin 42 路由 / platform-admin 33 路由，**全部业务页面与 Route Handler 均为 `ƒ (Dynamic)`**，仅 `/login` 与 `/_not-found` 是 `○ (Static)`。结论：三端走**全动态渲染**（Server Component 每次请求实时从 BFF 取数），**没有任何静态预渲染页面被缓存**，不存在「静态缓存污染实时数据」的 Next 15/React 19 边界风险。**无缺陷** |
+| **nginx 的其他 server 块** | 只读了 `location /api/v1/` 与 5 个 server 块的骨架 | ✅ **已补齐（2026-11-17）**：逐 server 块核对 `infra/nginx/platform.test.conf`——5 个块（default 444 / storefront 子域名 / api / merchant / platform）结构完整无遗漏；storefront 块 `/`→storefront、`/api/v1/`→api（注入 `X-Tenant-Subdomain`）、`/_next/static/`→storefront（immutable 缓存）；三个中心域名块均显式置空 `X-Tenant-Subdomain`（与 AGENTS.md「中心域名无店铺子域名」一致）；安全头继承、`X-Forwarded-*`、限流 zone 分配均符合设计。**无缺陷**。<br>✅ 对抗验证顺带实测了领券接口：**确认 `/api/v1/` 是直通、storefront BFF 的 `quantity` 白名单只挡 UI 路径不挡手写 API** |
+| **三端 BFF 路由的系统扫描**（71 个 route.ts） | 专项扫描 workflow（5 个维度）因模型额度耗尽 **0/5 中止** | ✅ **已补齐（2026-11-17）**：三端写路由逐个读源码确认**无「body 原样透传」缺陷**（带 body 的路由全部做白名单重建，空 body 路由不接收参数）；**42 个无测试写路由已全部钉住**（storefront 9 / merchant-admin 18 / platform-admin 15，新增 117 个护栏用例，见三端 `test/app/api/write-ops-guard.test.ts`），钉住「未登录 401 且不调后端、打到正确后端路径、body 白名单重建（`toEqual` 完整 body）」；`billing/plans/[id]` 已由现有 `billing-whitelist.test.ts` 覆盖，未重复写<br>✅ 对抗验证顺带实测了导出 BOM（P2-1）、商品列表参数键白名单、订单列表日期转发、storefront 券 `quantity` 丢弃 |
+| **第二轮资金链路的 3 个方向** | 专项 workflow 因额度耗尽 **3/4 中止**（出款与结算口径 / 退款与冲回链路 / 订单金额口径） | 跑完的那 1 向产出了 P0-7（券跨用户失效）并经主控核实；**「订单金额口径」已补齐（2026-11-17）**：手工逐行核对 `checkLedger` 判定 + 两个 `backfill()` 的金额语义 + `@@unique([orderId, type])`（每单每类型至多一行）→ **判定口径全部合规，仅发现 1 个真实测试缺口**——`checkLedger` 只做 `Set.has` 存在性检查，**从不比较流水金额与订单金额**（`ledger-check.ts`），流水金额写错（把 `totalAmount` 写成 `commissionAmount`、冲回符号写反）也报「✅ 流水完整」。<br>✅ **已按 TDD 修复**（39 用例全绿，见 `ledger-check.spec.ts` 新增 describe「流水金额一致性（审计 §九）」）：`LedgerCheckInput` 新增 4 个可选金额映射（`commissionAmountByOrderId` / `reversalAmountByOrderId` / `receiptAmountByOrderId` / `reversalReceiptAmountByOrderId`，`Record<string, number>`），判定升级为「存在 **且** 金额相等」（期望值逐字来自 `backfill()`：SALE=`+totalAmount`、SALE_REVERSAL=`-totalAmount`、COMMISSION=`+commissionAmount`、REVERSAL=`-commissionAmount`）；`scripts/check-ledger.ts` 取数加 `amount` 并构造 4 个映射，实际运行时金额校验永远生效。✅ **「出款与结算口径」已补齐（2026-11-18）**：沿「人工确认已付款 → 单子改 PAID → 结算单联动」链路逐处核对渠道取值，**发现 3 处真实缺陷**——`confirmPaidAfterReconciliation`、`manualCorrectToPaid`、`importCsv` 各有一处 `?? 'fake-payout'`，把「渠道不明」硬编码成假渠道，违反 fail-closed（不猜渠道）原则，导致单子的**真实渠道与记录不符**（核实走 A 渠道、单子记成 B 渠道，对账 / 重试会看错渠道）。<br>✅ **已按 TDD 修复**（105 用例全绿，见 `payout-execution.service.spec.ts` / `payout-reconciliation-resolver.service.spec.ts` / `platform-payout-reconciliation.controller.spec.ts`）：三处均改为「单子渠道为 null 时解析平台默认渠道（未配置抛 409）」或「渠道不明传空串让服务层 400」，写库渠道一律来自真值，绝不 `?? 'fake-payout'`。<br>✅ **「退款与冲回链路」已补齐（2026-11-18）**：沿「发起退款 / 退款扫描 / 退款事件」三条路径的收敛点（`confirmRefundSuccess` → `applyRefundInTx`）逐处核对 → **判定口径全部合规**，未发现真实缺陷。核对要点：① 冲回金额正确取负——`commission.recordReversalInTx` 用 `-order.commissionAmount`（`commission.service.ts`）、`receipt.recordReceiptReversalInTx` 用 `-order.totalAmount`（`receipt.service.ts`），流水里冲回恒为负、报表取负归一为正；② 退款核对基准与冲回基准恒等——`payment.amount === order.totalAmount`（`createPayment` 读 `order.totalAmount`，下单后不变），`settleRefundResult` 用 `payment.amount` 核对、事件路径 `event.amount !== payment.amount` 拒绝流转，三者一致；③ 幂等双层保证——`@@unique([orderId, type])` + `applyRefundInTx` 第一道闸条件更新（`REFUNDING → REFUNDED`，count=0 跳过），冲回方法「先查后插」；④ 订单状态分支正确——PAID/SHIPPED 转 REFUNDED + 记冲回，CLOSED/CANCELLED 只退钱不改订单不冲回（那单从没结算过），REFUNDED 跳过；⑤ 测试真实钉住——`payment.e2e-spec.ts` 走**真实退款 API** 断言抽佣冲回 `-100`（1117 行）与货款冲回 `-2000`（1221 行）且 `occurredAt`=退款时间，`billing-report.e2e-spec.ts` 走 `recordReversalInTx` 断言 `-150`，单测（`payment.service.spec.ts`）钉住金额不符拒绝落账（B-1）、并发条件更新抢不到不抛异常、双渠道多笔退款只冲回一次。<br>**三个方向至此全部补齐** |
+| **Prisma 迁移在生产数据上的实际行为** | 只核对了索引定义与迁移清单，没在有真实数据量的库上跑 `migrate deploy` | ✅ **已补齐（2026-11-18）**：核对两处迁移在**有数据量**的库上的实际行为。<br>① **P1-5**（`20261105210000_payment_method_default_uniq`，`payment_methods` 部分唯一索引）：迁移自带存量清理（`WITH ranked` 按 `createdAt DESC, id DESC` 给每个租户的默认卡编号，只留 `rn=1` 最新那张，其余置 `isDefault=false`），再建 `payment_methods_tenant_default_uniq`。**临时可丢弃库实测**（先删索引模拟迁移前状态 → 造「tenantA 3 个默认 / tenantB 2 个默认」违规存量 → 跑清理 SQL）：清理正确保留**最新创建**的默认（tenantA 留 `violate-a3`、tenantB 留 `violate-b2`，与 `create` 语义「新绑卡成为默认」一致），随后**建索引成功**；再插第 4 张默认卡被唯一索引**拒绝**（`duplicate key value violates unique constraint`），不变式确实生效。**清理逻辑在真实违规存量下不会失败**——生产库若有「同租户多个默认」存量，迁移能安全收敛。<br>② **P0-2**（`20261105100000_orders_idempotency_customer_scope`，改 `orders_tenant_idempotency_uniq` → `(tenantId, customerId, idempotencyKey)`）：`DROP INDEX IF EXISTS` + `CREATE UNIQUE INDEX ... WHERE "idempotencyKey" IS NOT NULL`，**带数据时先 DROP 旧索引再建新索引，无存量冲突**（幂等键列在 `placeOrder` 强制登录下恒非空，`WHERE` 条件与旧索引的隐式行为一致）。<br>✅ 验证：两处迁移均已在开发库与测试库应用（`_prisma_migrations` 确认）；测试库 `payment_methods` 25 行按租户分布**无「同租户多个默认」违规**（多行租户都是 `f`+`t` 各一）；临时库整体 `migrate deploy` 全迁移成功。**本机两库无真实业务数据量**（开发库 orders=1/payment_methods=0、测试库为 seed 造数），故「清理逻辑被真实存量触发」用**构造违规存量实测**替代——结论：**迁移在有数据（含违规）的库上可安全执行**，无需改迁移本身。**无缺陷** |
+| **真实渠道的接入** | 仓库只有 fake / sandbox 实现，真渠道（微信 / 支付宝）**一行代码都没有** | ✅ **已补齐（2026-11-18）**：核对现状——支付只有 `fake-payment.provider.ts` + `sandbox-payment.provider.ts`、出款只有 `fake-payout.provider.ts` + `sandbox-payout.provider.ts`（+ registry / interface / spec），**无任何真渠道代码**（无微信 / 支付宝 / Stripe）。<br>① **契约套件真实存在且会跑**：`api/test/channel-contract/` 有 `runPaymentProviderContract`（`payment-provider.contract.ts:129`）与 `runPayoutProviderContract`（`payout-provider.contract.ts:97`），两套件各自被 `*.spec.ts` 复用；jest `roots` 显式含 `<rootDir>/test/channel-contract`（`package.json`），走默认 `npm test`，**实测 41 通过 / 3 跳过**（跳过的是异步用例在同步渠道上的能力声明，符合「`it.skip` 并注明」约定）——套件本身是绿的、有强制力。<br>② **准入约定写死在 AGENTS.md「新渠道准入」**（158-164 行）：任何新渠道必须先通过共享契约套件；契约不过 = 不允许接入；**不要改 provider 来迁就契约**（契约要能抓出真实缺陷）；确实不适用的单条用 `it.skip` 并写明原因。<br>③ **渠道名单单源**（`channel-config.ts` 的 `DEV_DEFAULT_CHANNELS` / `DEV_ONLY_CHANNELS`）：生产 `getEnabledChannels()` 返回 `[]`，真渠道未接入前生产配置里只有假网关兜底路径，`assertSecureConfig` 拒绝非法渠道。<br>结论：当前无真渠道代码，**「新渠道准入」风险已被契约套件 + 准入约定覆盖**——未来接微信 / 支付宝时，契约套件是强制门禁。**无缺陷（当前无真渠道）** |
+| **备份与恢复脚本** | `infra/backup.sh` / `restore.sh` 读过文件名，没逐行审 | ✅ **已补齐（2026-11-18）**：两个脚本逐行审读，**发现并修复 1 个真实缺陷**——卷名解析取错卷。原实现用 `grep -E '<name>-data$' | head -n1` 从 `docker volume ls` 取卷名，按字母序取第一个；机器上若有其他项目残留的同名卷（本机 `ecommerce_minio-data` 与 `infra_minio-data` 并存，前者无容器挂载、为空），会取到**没被挂载的残留卷** → 备份打到错误（且可能为空）的卷，真实数据没备上。修法：卷名从容器反向查实际挂载（`docker inspect <container> --format '{{range .Mounts}}...'`），container_name 在 compose 里显式声明（`ecommerce-minio` / `ecommerce-redis`），可依赖。<br>✅ 顺带修复 1 个历史 bug：`restore.sh` 的 `$VOL` 后紧贴全角字符（`$VOL（失败不清空）`），bash 3.2（macOS 自带）在 `set -u` 下把首字节吞进变量名（`$VOL（` → 查 `VOL�`）→ minio/redis 的 dry-run 误报 `VOL: unbound variable`；改 `${VOL}` 显式大括号。<br>✅ 验证：shellcheck `-S warning` 零告警、`bash -n` 通过、实测 `backup.sh` 完整跑通（`minio volume: infra_minio-data` / `redis volume: infra_redis-data` 正确，三文件 gzip 校验通过）、`restore.sh` 三个 dry-run 均正常退出 0。**平台自管备份的可用性这一线已覆盖** |
 
 ---
 
@@ -1266,7 +1514,8 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
   覆盖了资金链路、权限、并发、配置、测试护栏五个维度，
   但**不等于穷尽**。三个后台 workflow 已全部终局：对抗验证 31/32 交卷
   （缺的 1 条主控补核实）、第二轮资金链路 1/4、前端 BFF/nginx 扫描 0/5 ——
-  后两者因模型额度耗尽（429）中止，未跑完的方向见**九**，不算已验证。
+  后两者因模型额度耗尽（429）中止，未跑完的方向见**九**，workflow 层面不算已验证；
+  **但该 3 类方向已由主控手工逐项补齐（§九 全部 ✅，2026-11-17/18），未覆盖面已消解**。
 - **验证用的临时产物已清干净**：对抗验证 agent 留下的 7 个 `api/test/tmp-audit-coupon*.e2e-spec.ts`
   与 1 个 `api/test/zz-a31-repro.e2e-spec.ts` 探针文件已删除；
   `git status` 除本清单文件外干净。
@@ -1282,7 +1531,7 @@ dependency tree resolution.」阶段 11b 把 lockfile 收归仓库根后，**四
 | 主控（我） | 逐条读代码 + **4 条隔离环境实测复现** | 全部 39 条 |
 | 对抗验证 workflow（`wf_d02ac039-66a`） | 怀疑者逐条推翻，39 个 agent 中 **31 个交卷**（32 条声明 + 7 个完整性批判；批判与 1 条验证因额度 429 中止，缺的那条由主控补核实） | 前 32 条 |
 | 7 维度审计 workflow（`wf_6a19d5a2-152`） | 22 个 agent，14 条高危对抗验证 | 全仓 |
-| 资金链路 + 遗漏猎手 workflow（`wf_d2ac816c-2c5`） | 11 维度 + 对抗验证 | 进行中 |
+| 资金链路 + 遗漏猎手 workflow（`wf_d2ac816c-2c5`） | 11 维度 + 对抗验证 | ✅ **已收口**：产出 P0-7（券跨用户失效，critical）并经主控逐行核实确认成立；其余方向因额度中止的部分已由主控手工补齐（见 §九「第二轮资金链路的 3 个方向」，三个方向全部补齐） |
 
 **交叉核对带出的 12 处修正**（都是第三方发现的，我原判断不够准）：
 

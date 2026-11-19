@@ -679,14 +679,26 @@ export class PayoutExecutionService {
       //    由调用方传入 → 传别的单的号就能核实别的单 → **闸 ④ 被完全绕过**
       //    （渠道说「那单打了」→ 放行 → 这张单被改成已付款 → 重复付款）。
       //    → `input.payoutNo` 已从签名删除，核实对象不再受调用方影响。
+      // ⚠️ **渠道必须在事务外解析一次**（审计 §九「出款与结算口径」）——
+      //    「核实渠道」与「写入渠道」必须是**同一个值**：之前 verify 收到
+      //    `payout.payoutChannel`（可能 null → verify 内部回落平台默认渠道），
+      //    但写库写死 `?? 'fake-payout'` → 核实走 A 渠道、单子记成 B 渠道，
+      //    单子的**真实渠道与记录不符**（渠道对账 / 重试都会看错渠道）。
+      //    → 解析一次，verify 与 updateMany 共用 `channel`。
+      //    ⚠️ **fail-closed 不猜渠道**：null 存量单解析平台默认渠道，
+      //      未配置 → `getPayoutDefaultChannel` 抛 409（不回落、不猜 fake-payout）。
+      const channel =
+        payout.payoutChannel ??
+        (await this.settings.getPayoutDefaultChannel()).channel;
       const verdict = await this.verification.verify({
         id: payout.id,
         payoutNo: payout.payoutNo,
         payoutTxnId: payout.payoutTxnId,
         // ⚠️ **阶段 6a：带上单子的渠道** —— 核实必须与打款取**同一渠道**，
         //    否则「钱打到 A、核实查 B」→ B 说没打 → 放行解卡 → 重复打款。
-        //    （单子可能没有 `payoutChannel`：阶段 5m 之前的遗留单）
-        payoutChannel: payout.payoutChannel,
+        //    （单子可能没有 `payoutChannel`：阶段 5m 之前的遗留单，
+        //    现在由上面的 `channel` 解析统一。）
+        payoutChannel: channel,
       });
       if (verdict.verdict !== 'PAID') {
         throw new ConflictException(
@@ -748,7 +760,7 @@ export class PayoutExecutionService {
             data: {
               status: PayoutStatus.PAID,
               paidAt,
-              payoutChannel: payout.payoutChannel ?? 'fake-payout',
+              payoutChannel: channel,
               payoutTxnId: verdict.providerTxnId ?? payout.payoutTxnId,
               failureReason: null,
               // ⚠️ **要清空** —— 它们记的是「落 FAILED 那一刻」的判断，

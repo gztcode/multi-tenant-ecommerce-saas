@@ -362,19 +362,36 @@ export class OrderInventoryService {
 
       const stockAfter = nextStock(sku.stock, item.quantity);
 
-      // 只有库存真的要变时才走 updateMany：
+      // 只有库存真的要变时才回写：
       // DEDUCT 的库存不变，改了也是白改（还会白白推进 stockVersion，
       // 让管理端的乐观锁无谓地冲突）。
       if (stockAfter !== sku.stock) {
-        const affected = await tx.sku.updateMany({
-          where: { id: sku.id, stockVersion: sku.stockVersion },
-          data: {
-            stock: stockAfter,
-            stockVersion: { increment: 1 },
-          },
-        });
-        if (affected.count === 0) {
-          throw new ConflictException('库存已被他人修改，请重试');
+        // ⚠️ 已软删的 SKU 走裸 SQL（$executeRaw 绕过扩展的软删过滤），
+        // 否则 `tx.sku.updateMany` 会被扩展自动合并 `deletedAt: null`，
+        // 对已软删 SKU 命中 0 行 → 抛 409「库存已被他人修改」，
+        // 卡住释放/退款。释放一个已下架的 SKU 是**合理的**——
+        // 货要还回库存，租户条件照 `lockSkus` 的先例在这里手写。
+        if (sku.deletedAt !== null) {
+          const affected = await tx.$executeRaw`
+            UPDATE skus
+            SET stock = ${stockAfter}, "stockVersion" = "stockVersion" + 1
+            WHERE id = ${sku.id} AND "tenantId" = ${tenantId}
+              AND "stockVersion" = ${sku.stockVersion}
+          `;
+          if (affected === 0) {
+            throw new ConflictException('库存已被他人修改，请重试');
+          }
+        } else {
+          const affected = await tx.sku.updateMany({
+            where: { id: sku.id, stockVersion: sku.stockVersion },
+            data: {
+              stock: stockAfter,
+              stockVersion: { increment: 1 },
+            },
+          });
+          if (affected.count === 0) {
+            throw new ConflictException('库存已被他人修改，请重试');
+          }
         }
       }
 

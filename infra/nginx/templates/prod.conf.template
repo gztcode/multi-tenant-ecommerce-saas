@@ -79,6 +79,17 @@ server {
     }
 }
 
+# ---- 443：未知 Host 兜底 ----
+# 与 80 端口 return 444 同理，不给 TLS 扫描器任何回音。
+# 必须放在 443 所有 server 块最前（第一个 443 块即默认 server），
+# 否则未知 Host 会落到店铺子域名正则块被代理转发。
+# ssl_reject_handshake 在 TLS 层直接拒绝握手，无需证书即可通过 nginx -t。
+server {
+    listen 443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+
 # ---- 443：店铺子域名 ----
 # 通配符证书 *.${BASE_DOMAIN}（DNS-01 签发）；Host 反推租户子域名的
 # 逻辑与开发环境一致：网关注入并覆盖 X-Tenant-Subdomain。

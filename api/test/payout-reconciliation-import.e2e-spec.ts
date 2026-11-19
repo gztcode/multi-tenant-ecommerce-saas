@@ -124,6 +124,10 @@ describe('渠道对账的 CSV 账单导入 (e2e)', () => {
       .post('/api/v1/platform/payout-reconciliations/import')
       .set('authorization', `Bearer ${adminToken}`)
       .attach('file', Buffer.from(csv, 'utf8'), 'bill.csv')
+      // ⚠️ **渠道是必要设置项**（审计 §九：渠道不明 fail-closed 不猜）——
+      //    显式传 `fake-payout`（= 测试环境平台默认渠道），
+      //    否则会被 `importRecords` 的 `normalizeChannel` 拒为 400。
+      .field('channel', 'fake-payout')
       .field(
         'columnMapping',
         JSON.stringify({
@@ -162,6 +166,9 @@ describe('渠道对账的 CSV 账单导入 (e2e)', () => {
       .post('/api/v1/platform/payout-reconciliations/import')
       .set('authorization', `Bearer ${adminToken}`)
       .attach('file', Buffer.from(csv, 'utf8'), 'bill-no-time.csv')
+      // ⚠️ **渠道是必要设置项**（审计 §九：fail-closed 不猜）—— 显式传
+      //    `fake-payout`（= 测试环境平台默认渠道），否则 400。
+      .field('channel', 'fake-payout')
       .field(
         'columnMapping',
         JSON.stringify({
@@ -216,6 +223,9 @@ describe('渠道对账的 CSV 账单导入 (e2e)', () => {
       .post('/api/v1/platform/payout-reconciliations/import')
       .set('authorization', `Bearer ${adminToken}`)
       .attach('file', Buffer.from(csv, 'utf8'), 'bill-with-time.csv')
+      // ⚠️ **渠道是必要设置项**（审计 §九：fail-closed 不猜）—— 显式传
+      //    `fake-payout`（= 测试环境平台默认渠道），否则 400。
+      .field('channel', 'fake-payout')
       .field(
         'columnMapping',
         JSON.stringify({
@@ -366,6 +376,9 @@ describe('渠道对账的 CSV 账单导入 (e2e)', () => {
       .post('/api/v1/platform/payout-reconciliations/import')
       .set('authorization', `Bearer ${adminToken}`)
       .attach('file', Buffer.from(csv, 'utf8'), 'bill-bad-rows.csv')
+      // ⚠️ **渠道是必要设置项**（审计 §九：fail-closed 不猜）—— 显式传
+      //    `fake-payout`（= 测试环境平台默认渠道），否则 400。
+      .field('channel', 'fake-payout')
       .field(
         'columnMapping',
         JSON.stringify({
@@ -421,6 +434,9 @@ describe('渠道对账的 CSV 账单导入 (e2e)', () => {
       .post('/api/v1/platform/payout-reconciliations/import')
       .set('authorization', `Bearer ${adminToken}`)
       .attach('file', Buffer.from(csv, 'utf8'), 'bill-empty-time.csv')
+      // ⚠️ **渠道是必要设置项**（审计 §九：fail-closed 不猜）—— 显式传
+      //    `fake-payout`（= 测试环境平台默认渠道），否则 400。
+      .field('channel', 'fake-payout')
       .field(
         'columnMapping',
         JSON.stringify({

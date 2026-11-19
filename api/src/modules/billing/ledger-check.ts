@@ -81,6 +81,35 @@ export interface LedgerCheckInput {
    */
   reversalReceiptOrderIds: string[];
   /**
+   * COMMISSION 流水的实际金额（orderId → amount，整数分，**带符号**）。
+   *
+   * ⚠️ **审计 §九「订单金额口径」新增（2026-11-17）**：原判定只做存在性检查，
+   * 从不比较流水金额与订单金额 → 流水金额写错也报「✅ 流水完整」。
+   * 传入后判定升级为「存在 **且** 金额相等」；**不传（undefined）则维持纯存在性**，
+   * 与旧行为完全兼容。
+   *
+   * ⚠️ **期望值逐字来自 `backfill()`**：COMMISSION = `+commissionAmount`。
+   */
+  commissionAmountByOrderId?: Record<string, number>;
+  /**
+   * REVERSAL 流水的实际金额（orderId → amount，整数分，**带符号**）。
+   *
+   * ⚠️ **期望值**：REVERSAL = `-commissionAmount`（冲回取负）。
+   */
+  reversalAmountByOrderId?: Record<string, number>;
+  /**
+   * SALE 货款流水的实际金额（orderId → amount，整数分，**带符号**）。
+   *
+   * ⚠️ **期望值**：SALE = `+totalAmount`。
+   */
+  receiptAmountByOrderId?: Record<string, number>;
+  /**
+   * `SALE_REVERSAL` 货款冲回流水的实际金额（orderId → amount，整数分，**带符号**）。
+   *
+   * ⚠️ **期望值**：SALE_REVERSAL = `-totalAmount`（冲回取负）。
+   */
+  reversalReceiptAmountByOrderId?: Record<string, number>;
+  /**
    * 支付单（订单支付单与订阅支付单都在内）。
    *
    * ⚠️ **订单状态直接挂在支付单上**（而不是另给一张「订单 id → 状态」的表）：
@@ -226,13 +255,29 @@ export function checkLedger(input: LedgerCheckInput): LedgerCheckResult {
       continue;
     }
 
-    // ② 货款流水：零额不记
-    if (order.totalAmount !== 0 && !receiptSet.has(order.id)) {
+    // ② 货款流水：零额不记；有行则金额必须等于 `+totalAmount`（映射传入时）
+    if (
+      order.totalAmount !== 0 &&
+      !hasAmountMatching(
+        input.receiptAmountByOrderId,
+        receiptSet.has(order.id),
+        order.id,
+        order.totalAmount,
+      )
+    ) {
       receiptMissing.push(order.orderNo);
     }
 
-    // ③ 抽佣流水：零额不记
-    if (order.commissionAmount !== 0 && !commissionSet.has(order.id)) {
+    // ③ 抽佣流水：零额不记；有行则金额必须等于 `+commissionAmount`（映射传入时）
+    if (
+      order.commissionAmount !== 0 &&
+      !hasAmountMatching(
+        input.commissionAmountByOrderId,
+        commissionSet.has(order.id),
+        order.id,
+        order.commissionAmount,
+      )
+    ) {
       commissionMissing.push(order.orderNo);
     }
 
@@ -254,17 +299,33 @@ export function checkLedger(input: LedgerCheckInput): LedgerCheckResult {
       continue;
     }
 
-    // ⑥ 抽佣冲回流水：零额不记
-    if (order.commissionAmount !== 0 && !reversalSet.has(order.id)) {
+    // ⑥ 抽佣冲回流水：零额不记；有行则金额必须等于 `-commissionAmount`（映射传入时）
+    if (
+      order.commissionAmount !== 0 &&
+      !hasAmountMatching(
+        input.reversalAmountByOrderId,
+        reversalSet.has(order.id),
+        order.id,
+        -order.commissionAmount,
+      )
+    ) {
       reversalMissing.push(order.orderNo);
     }
 
-    // ⑦ 货款冲回流水：零额不记
+    // ⑦ 货款冲回流水：零额不记；有行则金额必须等于 `-totalAmount`（映射传入时）
     //    ⚠️ **谓词用 `totalAmount` 不是 `commissionAmount`** ——
     //    货款侧 `shouldBackfillReceiptReversal` 按 `totalAmount` 判零额。
     //    照抄成 `commissionAmount` → 「零佣金但有货款」的正常订单被误报成缺口
     //    → 脚本永远 exit 1 → 防线变成噪音。
-    if (order.totalAmount !== 0 && !reversalReceiptSet.has(order.id)) {
+    if (
+      order.totalAmount !== 0 &&
+      !hasAmountMatching(
+        input.reversalReceiptAmountByOrderId,
+        reversalReceiptSet.has(order.id),
+        order.id,
+        -order.totalAmount,
+      )
+    ) {
       receiptReversalMissing.push(order.orderNo);
     }
   }
@@ -365,4 +426,53 @@ function checkPayments(payments: LedgerPaymentInput[]): {
     duplicateSuccessPayments,
     needsRefundPayments,
   };
+}
+
+/**
+ * 判定「该单流水行在，且金额对」（审计 §九「订单金额口径」，2026-11-17）。
+ *
+ * ⚠️ **为什么引入这个辅助函数**：原来只做存在性检查（`Set.has`），
+ * 流水金额写错（如把 `totalAmount` 写成 `commissionAmount`、或冲回符号写反）
+ * 也报「✅ 流水完整」。现在判定升级为「存在 **且** 金额相等」。
+ *
+ * ⚠️ **期望金额必须与 `backfill()` 逐字一致**：
+ *   - SALE / COMMISSION → `+期望`（`+totalAmount` / `+commissionAmount`）
+ *   - SALE_REVERSAL / REVERSAL → `-期望`（`-totalAmount` / `-commissionAmount`）
+ *   期望值由调用方按行类型取好传入，这里只做「映射值 === 期望值」的比较。
+ *
+ * ⚠️ **不传映射（`undefined`）→ 维持纯存在性**，与旧行为完全兼容
+ *   （调用方不传就不会被金额一致性拦住）。
+ *
+ * ⚠️ **映射已传但缺这个 id → 回退纯存在性**：存在性查「有没有行」、
+ * 金额映射查「有行的金额对不对」，两者正交，缺键不报
+ * （「多余键被忽略」用例的预期行为）。
+ *
+ * ⚠️ **为什么是严格等式**：`@@unique([orderId, type])` 保证每单每类型
+ * **至多一行** → 「该有流水」=「恰好一行且金额相等」严格等价于
+ * 「存在且有正确金额」。
+ *
+ * @param amountsByOrderId 传入的金额映射（orderId → 实际金额，整数分，带符号）；
+ *   `undefined` 表示调用方不做金额校验。
+ * @param exists 该单在「有流水」集合里吗（存在性检查的旧结果）。
+ * @param orderId 订单 id。
+ * @param expectedAmount 该行类型应有的金额（整数分，带符号）。
+ */
+function hasAmountMatching(
+  amountsByOrderId: Record<string, number> | undefined,
+  exists: boolean,
+  orderId: string,
+  expectedAmount: number,
+): boolean {
+  // 不传映射 → 只问「有没有」。
+  if (amountsByOrderId === undefined) {
+    return exists;
+  }
+  // 映射已传但缺这个 id → 回退纯存在性（存在性查「有没有行」、
+  // 金额映射查「有行的金额对不对」，两者正交，缺键不报）。
+  const actual = amountsByOrderId[orderId];
+  if (actual === undefined) {
+    return exists;
+  }
+  // 有行且金额映射里有它 → 必须金额相等。
+  return exists && actual === expectedAmount;
 }

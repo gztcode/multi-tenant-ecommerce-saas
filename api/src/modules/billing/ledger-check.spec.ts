@@ -701,3 +701,151 @@ describe('checkLedger：支付单维度的判定', () => {
     expect(result.hasGap).toBe(false);
   });
 });
+
+/**
+ * 账目自检的**金额一致性**检查（审计 §九「订单金额口径」方向，2026-11-17）。
+ *
+ * ⚠️ **缺口所在**：`checkLedger` 原本只查「该有的流水行**有没有**」
+ * （用订单 id 集合做 `Set.has` 存在性检查），**从不比较 `merchant_receipt.amount`
+ * 与 `order.totalAmount`**。若某条路径把货款流水写成错误金额（例如把
+ * `totalAmount` 写成了 `commissionAmount`，或把冲回的正负号写反），
+ * 账目自检**看不出来** → 脚本报「✅ 流水完整」exit 0 → 防线形同虚设。
+ *
+ * ⚠️ **期望金额由订单字段逐字决定**（与两个 `backfill()` 完全一致）：
+ *   - SALE        = `+totalAmount`
+ *   - SALE_REVERSAL = `-totalAmount`
+ *   - COMMISSION  = `+commissionAmount`
+ *   - REVERSAL    = `-commissionAmount`
+ * 且 `@@unique([orderId, type])` 保证每单每类型**至多一行** →
+ * 「该有流水」=「恰好一行且金额相等」。
+ *
+ * ⚠️ **金额映射只在传入时生效**：不传映射（`undefined`）则维持纯存在性检查，
+ * 与旧行为完全兼容 —— 现有用例因此零改动。
+ */
+describe('checkLedger：流水金额一致性（审计 §九）', () => {
+  it('⚠️ 货款流水金额 ≠ 订单实付 → 报「缺货款流水」（金额不符也算缺口）', () => {
+    const result = checkLedger(
+      makeInput({
+        orders: [makeOrder({ totalAmount: 10000 })],
+        receiptOrderIds: ['order-1'],
+        receiptAmountByOrderId: { 'order-1': 9999 }, // 少 1 分
+      }),
+    );
+
+    expect(result.receiptMissing).toEqual(['NO-1']);
+    expect(result.hasGap).toBe(true);
+  });
+
+  it('⚠️ 货款冲回金额 ≠ -订单实付 → 报「缺货款冲回流水」', () => {
+    const result = checkLedger(
+      makeInput({
+        orders: [
+          makeOrder({
+            totalAmount: 10000,
+            status: OrderStatus.REFUNDED,
+            refundedAt: new Date('2026-01-02T00:00:00Z'),
+          }),
+        ],
+        commissionEntryOrderIds: ['order-1'],
+        reversalEntryOrderIds: ['order-1'],
+        receiptOrderIds: ['order-1'],
+        reversalReceiptOrderIds: ['order-1'],
+        // ⚠️ 冲回应为 **负数** -10000；写成 +10000（符号写反）必须被查出
+        reversalReceiptAmountByOrderId: { 'order-1': 10000 },
+      }),
+    );
+
+    expect(result.receiptReversalMissing).toEqual(['NO-1']);
+    expect(result.hasGap).toBe(true);
+  });
+
+  it('⚠️ 抽佣流水金额 ≠ 订单佣金 → 报「缺抽佣流水」', () => {
+    const result = checkLedger(
+      makeInput({
+        orders: [makeOrder({ commissionAmount: 500 })],
+        commissionEntryOrderIds: ['order-1'],
+        commissionAmountByOrderId: { 'order-1': 600 }, // 多 100 分
+      }),
+    );
+
+    expect(result.commissionMissing).toEqual(['NO-1']);
+    expect(result.hasGap).toBe(true);
+  });
+
+  it('⚠️ 抽佣冲回金额 ≠ -订单佣金 → 报「缺抽佣冲回流水」', () => {
+    const result = checkLedger(
+      makeInput({
+        orders: [
+          makeOrder({
+            commissionAmount: 500,
+            status: OrderStatus.REFUNDED,
+            refundedAt: new Date('2026-01-02T00:00:00Z'),
+          }),
+        ],
+        commissionEntryOrderIds: ['order-1'],
+        reversalEntryOrderIds: ['order-1'],
+        receiptOrderIds: ['order-1'],
+        reversalReceiptOrderIds: ['order-1'],
+        reversalAmountByOrderId: { 'order-1': 500 }, // 应为 -500
+      }),
+    );
+
+    expect(result.reversalMissing).toEqual(['NO-1']);
+    expect(result.hasGap).toBe(true);
+  });
+
+  it('⚠️ 锚点：四类流水金额全部相等 → 不报任何缺口', () => {
+    const result = checkLedger(
+      makeInput({
+        orders: [
+          makeOrder({
+            commissionAmount: 500,
+            totalAmount: 10000,
+            status: OrderStatus.REFUNDED,
+            refundedAt: new Date('2026-01-02T00:00:00Z'),
+          }),
+        ],
+        commissionEntryOrderIds: ['order-1'],
+        reversalEntryOrderIds: ['order-1'],
+        receiptOrderIds: ['order-1'],
+        reversalReceiptOrderIds: ['order-1'],
+        commissionAmountByOrderId: { 'order-1': 500 },
+        reversalAmountByOrderId: { 'order-1': -500 },
+        receiptAmountByOrderId: { 'order-1': 10000 },
+        reversalReceiptAmountByOrderId: { 'order-1': -10000 },
+      }),
+    );
+
+    expect(result.commissionMissing).toEqual([]);
+    expect(result.reversalMissing).toEqual([]);
+    expect(result.receiptMissing).toEqual([]);
+    expect(result.receiptReversalMissing).toEqual([]);
+    expect(result.hasGap).toBe(false);
+  });
+
+  it('⚠️ 金额映射的订单 id 不在已支付订单里 → 不误报（映射多余键被忽略）', () => {
+    // 映射给了一个不存在的订单 id，检查只遍历 `orders`，不会用到它 → 不报
+    const result = checkLedger(
+      makeInput({
+        orders: [makeOrder({ totalAmount: 10000 })],
+        receiptOrderIds: ['order-1'],
+        receiptAmountByOrderId: { 'order-999': 10000 },
+      }),
+    );
+
+    expect(result.receiptMissing).toEqual([]);
+    expect(result.hasGap).toBe(false);
+  });
+
+  it('⚠️ 不传金额映射 → 维持纯存在性检查（与旧行为兼容）', () => {
+    const result = checkLedger(
+      makeInput({
+        orders: [makeOrder({ totalAmount: 10000 })],
+        receiptOrderIds: ['order-1'],
+      }),
+    );
+
+    expect(result.receiptMissing).toEqual([]);
+    expect(result.hasGap).toBe(false);
+  });
+});

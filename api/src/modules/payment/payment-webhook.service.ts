@@ -640,6 +640,16 @@ export class WebhookEventService {
    * ⚠️ **金额必须与账单一致**（护栏 M10）：不一致就拒绝 ——
    * 付了 A 金额、开通了 B 金额的套餐，是最典型的资金漏洞。
    * ⚠️ **租户从账单反查**（不采信请求体里的 tenantId，阶段 3 的 R14）。
+   *
+   * ✅ **2026-11-16 审计批次 20（payment-2）重写**：
+   * - 旧实现调的是 `billingInvoices.markInvoicePaid` —— **另一个事务**、
+   *   根本不碰支付单：支付单永远停在 PENDING，且「支付单终态 + 发票付清
+   *   + 订阅期延长」不在同一事务，中途崩溃就是「钱收了、服务没开」。
+   * - 现在**先解析目标订阅支付单**（任何写入之前），支付单终态与发票付清
+   *   写进**同一个事务**（`markInvoicePaidInTx`）；成功回调还像订单路径
+   *   一样把渠道交易号绑到支付单上（`attachSubscriptionProviderTxnId`）。
+   * - **fail-closed**：成功回调但账单下没有订阅支付单 → 渠道交易无从核对，
+   *   绝不付清账单（付了 A 账单的钱去开通没有支付单记录的订阅，是凭空延长）。
    */
   private async applySubscriptionEvent(
     event: NormalizedWebhookEvent,
@@ -668,15 +678,178 @@ export class WebhookEventService {
       );
       return;
     }
+
+    // ---- 解析目标订阅支付单（任何写入之前）----
+    //
+    // ⚠️ **租户作用域**：`findFirst` 由租户扩展自动附加 tenantId 条件，
+    // 账单反查到的租户不对 → 查不到支付单 → 一并 fail-closed。
+    //
+    // ⚠️ `(invoiceId, channel)` 有部分唯一索引，同一账单同一渠道最多一笔，
+    // 直接 `findFirst` 即可。
+    const payment = await this.prisma.payment.findFirst({
+      where: {
+        invoiceId: invoice.id,
+        channel: event.channel,
+        kind: PaymentKind.SUBSCRIPTION,
+      },
+    });
+
     if (!event.success) {
-      await this.prisma.invoice.updateMany({
-        where: { id: invoice.id, status: InvoiceStatus.OPEN },
-        data: { status: InvoiceStatus.FAILED },
-      });
+      // ---- 失败回调：支付单与发票同一事务里一起转 FAILED ----
+      //
+      // ⚠️ **必须开在事务里**：支付单 PENDING → FAILED（条件更新只放行
+      // PENDING，防止把已经 SUCCESS 的终态翻转）与发票 OPEN → FAILED
+      // 同生共死。旧实现在**顶层**写发票 —— 支付单与发票状态脱节。
+      await this.prisma.$transaction(async (tx) => {
+        if (payment) {
+          await tx.payment.updateMany({
+            where: { id: payment.id, status: PaymentStatus.PENDING },
+            data: { status: PaymentStatus.FAILED },
+          });
+        }
+        await tx.invoice.updateMany({
+          where: { id: invoice.id, status: InvoiceStatus.OPEN },
+          data: { status: InvoiceStatus.FAILED },
+        });
+      }, transactionOptions());
       return;
     }
-    // ⚠️ **付清 → 延长周期**（条件更新，重复回调不会延长两次）
-    await this.billingInvoices.markInvoicePaid(invoice.id);
+
+    // ---- 成功回调：fail-closed ----
+    if (!payment) {
+      this.logger.warn(
+        `订阅回调成功但账单下没有订阅支付单，不付清账单：` +
+          `${event.referenceNo}（事件 ${event.eventId}）`,
+      );
+      return;
+    }
+
+    // ⚠️ **先绑渠道交易号，且在业务事务之外**：理由与订单路径一致——
+    // `(provider, providerTxnId)` 是幂等第二道防线，但它的 P2002 不能
+    // 发生在业务事务里（唯一约束冲突会让 PostgreSQL 事务进入 aborted 状态，
+    // 发票付清与订阅期延长会一起回滚）。放到事务外，冲突只是一个业务结果。
+    const attached = await this.attachSubscriptionProviderTxnId(payment, event);
+    if (!attached) {
+      return;
+    }
+
+    // ---- 成功事务：支付单置 SUCCESS + 发票付清 + 订阅期延长，同一事务 ----
+    await this.prisma.$transaction(async (tx) => {
+      // 支付单 PENDING/FAILED → SUCCESS（条件更新，防止与超时释放竞态）
+      const paid = await tx.payment.updateMany({
+        where: {
+          id: payment.id,
+          status: {
+            in: [PaymentStatus.PENDING, PaymentStatus.FAILED],
+          },
+        },
+        data: { status: PaymentStatus.SUCCESS },
+      });
+      if (paid.count === 0) {
+        const existing = await tx.payment.findFirst({
+          where: { id: payment.id },
+        });
+        if (!existing || existing.status !== PaymentStatus.SUCCESS) {
+          // 支付单是 REFUNDED / CLOSED / FAILED —— 不能付清账单。
+          this.logger.warn(
+            `订阅支付单状态为 ${existing?.status ?? '不存在'}，` +
+              `不付清账单：${event.referenceNo}（事件 ${event.eventId}）`,
+          );
+          return;
+        }
+        // 已是 SUCCESS（重复投递）→ 幂等继续，
+        // 发票付清的条件更新会挡住「延长两次周期」。
+      }
+      // ⚠️ **付清账单 + 延长周期，必须在支付单的事务里**（不再租独立事务）
+      await this.billingInvoices.markInvoicePaidInTx(tx, invoice.id);
+    }, transactionOptions());
+  }
+  /**
+   * 把渠道给的交易号写进订阅支付单。
+   *
+   * ⚠️ **与订单路径 `attachProviderTxnId` 的差异**：绑定 `updateMany` 的
+   * `where` **不能带 `status`** —— 订阅扣款是「先扣款、后回调」，
+   * `chargeInvoice` 可能已经支付单推进到 SUCCESS，回调仍要能覆盖交易号；
+   * 订单路径带 `status: PENDING` 是因为那里回调时支付单**必然**待支付。
+   *
+   * ⚠️ 冲突排除用 `NOT: { id: payment.id }` 而不是 `NOT: { invoiceId }`：
+   * `invoiceId` 可为空，且同一账单同一渠道只有一笔（部分唯一索引），
+   * 用 id 排除最直接，不引入 NULL 语义的判断。
+   *
+   * @returns true = 可以继续流转订阅；false = 交易号已被别的支付单占用，拒绝
+   */
+  private async attachSubscriptionProviderTxnId(
+    payment: { id: string },
+    event: NormalizedWebhookEvent,
+  ): Promise<boolean> {
+    if (!event.providerTxnId) {
+      return true;
+    }
+
+    // 1. 同一笔渠道交易是否已被**别的**支付单占用？
+    const conflicting = await this.prisma.payment.findFirst({
+      where: {
+        provider: event.provider,
+        providerTxnId: event.providerTxnId,
+        NOT: { id: payment.id },
+      },
+    });
+    if (conflicting) {
+      this.logger.error(
+        `渠道交易 ${event.providerTxnId} 已落在另一个支付单上，` +
+          `拒绝流转订阅回调：${event.referenceNo}（事件 ${event.eventId}）`,
+      );
+      return false;
+    }
+
+    // 2. 写进支付单（**覆盖建单时写的占位值**）
+    let updated: { count: number };
+    try {
+      updated = await this.prisma.payment.updateMany({
+        where: {
+          id: payment.id,
+          // ⚠️ **必须带 provider**：预检查按 (provider, providerTxnId) 判冲突，
+          //    写入不带 provider 的话，另一渠道的同号交易会把这次绑定当成成功。
+          provider: event.provider,
+        },
+        data: { providerTxnId: event.providerTxnId },
+      });
+    } catch (error) {
+      if (!isUniqueViolation(error)) {
+        throw error;
+      }
+      // ⚠️ 并发撞唯一索引：不在业务事务里，重查一次判断是否真冲突。
+      const stillConflicting = await this.prisma.payment.findFirst({
+        where: {
+          provider: event.provider,
+          providerTxnId: event.providerTxnId,
+          NOT: { id: payment.id },
+        },
+      });
+      if (stillConflicting) {
+        this.logger.error(
+          `渠道交易 ${event.providerTxnId} 已落在另一个支付单上，` +
+            `拒绝流转订阅回调：${event.referenceNo}（事件 ${event.eventId}）`,
+        );
+      } else {
+        this.logger.warn(
+          `渠道交易 ${event.providerTxnId} 绑定时撞唯一索引但查不到冲突方，` +
+            `拒绝流转订阅回调：${event.referenceNo}（事件 ${event.eventId}）`,
+        );
+      }
+      // ⚠️ 无论哪种情况都不返回 true —— 静默成功会让订阅在缺少
+      //    providerTxnId 的情况下继续流转，后续对账只能靠金额猜。
+      return false;
+    }
+
+    if (updated.count === 0) {
+      this.logger.warn(
+        `渠道交易 ${event.providerTxnId} 未写入支付单：` +
+          `订阅回调 ${event.referenceNo}（事件 ${event.eventId}）`,
+      );
+      return false;
+    }
+    return true;
   }
   /**
    * 把渠道给的交易号写进支付单。

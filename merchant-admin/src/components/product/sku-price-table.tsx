@@ -390,7 +390,10 @@ function SkuPriceTableBody({ productId, rows }: { productId: string; rows: SpecR
             {rows.map((row) => {
               const draft = drafts[row.sku.id];
               if (!draft) return null;
-              const inactive = row.sku.status === 'INACTIVE';
+              // ⚠️ 读草稿而不是初始 prop row.sku.status：toggleStatus 只更新了
+              // 草稿（drafts），点完立即渲染时 row.sku.status 还是旧值，界面
+              // 就不翻转，直到父组件刷新重传 skus。草稿才是「用户看到/已保存」的状态。
+              const inactive = draft.status === 'INACTIVE';
               const busy = busySkuId === row.sku.id;
               const message = messages[row.sku.id] ?? '';
               // 没有规格值的 SKU（老数据或单规格退化）标签是空的，

@@ -19,7 +19,7 @@ export class ImportReconciliationDto {
   @MinLength(2)
   columnMapping!: string;
 
-  /** 渠道名（选填，默认 `fake-payout`） */
+  /** 渠道名（**必填** —— 不传会被拒为 400，绝不默认猜渠道） */
   @IsOptional()
   @IsString()
   @MinLength(1)

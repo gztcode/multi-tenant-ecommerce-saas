@@ -564,7 +564,7 @@ export class RefundService {
       );
       return true;
     }
-    await this.settleRefundResult(paymentId, order, {
+    await this.settleRefundResult(paymentId, order, payment.amount, {
       ...query,
       // ⚠️ 渠道的查询结果缺 `refundTxnId` 时不要把它覆盖成空 ——
       //    受理号已经落库，保留库里那一个。
@@ -748,6 +748,7 @@ export class RefundService {
   private async settleRefundResult(
     paymentId: string,
     order: ReadableOrder,
+    paidAmount: number,
     result: {
       status: 'SUCCESS' | 'PROCESSING' | 'FAILED' | 'UNKNOWN';
       refundTxnId?: string;
@@ -759,10 +760,12 @@ export class RefundService {
     if (result.status === 'SUCCESS') {
       // ⚠️ **金额核对**：渠道说「退了这么多」必须与实付额一致。
       //    查到的金额偏大 → 多退了钱；偏小 → 少退了钱。两种都要人工查。
-      if (result.amount !== undefined && result.amount !== order.totalAmount) {
+      //    ⚠️ 基准用 `paidAmount`（实付），不是 `order.totalAmount` ——
+      //    与回调路径 `applyRefundEventInTenant` 的口径一致（审计观察项 A-②）。
+      if (result.amount !== undefined && result.amount !== paidAmount) {
         this.logger.error(
           `查询退款结果金额不符，拒绝落账：支付单 ${paymentId} ` +
-            `应退 ${order.totalAmount}，渠道报 ${result.amount}`,
+            `应退 ${paidAmount}，渠道报 ${result.amount}`,
         );
         return;
       }

@@ -115,6 +115,15 @@ export interface RefundQueryResult {
    */
   status: 'SUCCESS' | 'FAILED' | 'PROCESSING' | 'UNKNOWN';
   refundTxnId?: string;
+  /**
+   * 渠道侧声称的退款金额（分）。**只有渠道能报出来才给**；报不出来就是
+   * `undefined`，调用方据此**跳过**金额核对（宁可查不了，也不误判）。
+   *
+   * ⚠️ 审计 B-1：fake/sandbox 的 `queryRefund` 一度不返回它，导致
+   * `settleRefundResult` 的核对条件 `result.amount !== undefined` 恒为
+   * false —— 少退/多退的钱被静默落账为 `REFUNDED`。
+   */
+  amount?: number;
   definitive?: boolean;
   failureReason?: string;
 }

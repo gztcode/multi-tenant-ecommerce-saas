@@ -89,6 +89,15 @@ export class AddressService {
     } else if (dto.isDefault === false && existing.isDefault) {
       // 取消默认：把新的默认让给剩下的某一条，否则用户会一个默认都没有。
       // 剩下没有别的地址时保持「没有默认」也是合法的（下单时可指定地址）。
+      //
+      // ⚠️ **顺序要紧：先把本条取消默认，再把默认让给别人**。
+      //    反过来做的话，中间那一瞬间**本条（isDefault 仍为 true）与被提升的那条
+      //    同时为默认** → 撞 `addresses_tenant_customer_default_uniq` → P2002 → 500，
+      //    而且后面的 updateMany 根本执行不到（本条会一直是默认）。
+      await this.prisma.address.updateMany({
+        where: { id, customerId },
+        data: { isDefault: false },
+      });
       await this.promoteAnotherDefault(customerId, id);
     }
 

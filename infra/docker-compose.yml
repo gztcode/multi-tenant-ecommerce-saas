@@ -76,8 +76,8 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-ecommerce}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ecommerce-minio-secret}
-      # 浏览器直传要跨域。镜像里没有 mc 可以改服务端配置，只能走环境变量。
-      # 多个来源用英文逗号分隔。
+      # 浏览器直传要跨域。镜像自带的 /usr/bin/mc 也能改服务端配置，但那要在容器里
+      # 另跑一次命令；直接给环境变量更可靠。多个来源用英文逗号分隔。
       # ⚠️ **变量名必须是 MINIO_API_CORS_ALLOW_ORIGIN**（审计 P1-4）：
       #    写成 MINIO_CORS_ALLOW_ORIGIN 会被 MinIO **静默忽略** →
       #    回落到「反射任意 Origin + Allow-Credentials: true」→ 白名单形同虚设。
@@ -93,7 +93,8 @@ services:
       # "Rename across devices not allowed"（.minio.sys/tmp 跨设备重命名）。
       - minio-data:/data
     healthcheck:
-      # 这个镜像里没有 mc / curl / wget / nc，只有 bash 与 coreutils。
+      # 这个镜像里没有 curl / wget / nc，只有 bash 与 coreutils
+      # （/usr/bin/mc 在，但探活用它要先配 alias，不如直接连端口）。
       # 用 bash 内置的 /dev/tcp 探活：连得上 9000 端口就算就绪。
       # 注意 CMD-SHELL 默认走 /bin/sh，sh 没有 /dev/tcp，必须显式调 bash。
       test: ['CMD-SHELL', 'bash -c "exec 3<>/dev/tcp/127.0.0.1/9000"']

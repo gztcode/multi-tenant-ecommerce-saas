@@ -1,6 +1,6 @@
 import { UserRole } from '@prisma/client';
 import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
-import { ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import {
   CurrentUser,
   type CurrentUserPayload,
@@ -11,6 +11,7 @@ import { InventoryService } from './inventory.service';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
 import { ReturnStockDto } from './dto/return-stock.dto';
 import { InventoryMovementsQueryDto } from './dto/inventory-movements-query.dto';
+import { InventorySummaryQueryDto } from './dto/inventory-summary-query.dto';
 
 @ApiTags('inventory')
 @Controller('inventory')
@@ -52,8 +53,10 @@ export class InventoryController {
 
   @Get('summary')
   @ApiOperation({ summary: '库存汇总' })
-  @ApiQuery({ name: 'productId', required: true, type: String })
-  summary(@Query('productId') productId: string) {
-    return this.inventoryService.summary(productId);
+  // ⚠️ 与 `movements` 同款修法：查询参数走 DTO 才拿得到校验。
+  // 裸 `@Query('productId')` 缺参时是 `undefined`，而 Prisma 会把
+  // `where: { productId: undefined }` 整个丢掉 → 返回全租户所有 SKU 的库存。
+  summary(@Query() query: InventorySummaryQueryDto) {
+    return this.inventoryService.summary(query.productId);
   }
 }

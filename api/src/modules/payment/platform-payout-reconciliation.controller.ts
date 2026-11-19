@@ -153,8 +153,12 @@ export class PlatformPayoutReconciliationController {
     }
     const mapping = assertColumnMapping(mappingRaw);
     const parsed = parseCsvToChannelRecords(csvText, mapping);
+    // ⚠️ **不传渠道时传空串，让 `importRecords` 的 `normalizeChannel` 报 400**
+    //    （审计 §九「出款与结算口径」）—— 之前 `?? 'fake-payout'` 把「运营没选
+    //    渠道」当成「在给假渠道对账」，绕过了服务层的 fail-closed 校验。
+    //    → 渠道不明就拒绝，不让运营误以为对账生效。
     const result = await this.reconciliations.importRecords({
-      channel: dto.channel ?? 'fake-payout',
+      channel: dto.channel ?? '',
       fileName: file.originalname,
       columnMapping: JSON.stringify(mapping),
       records: parsed.records,
