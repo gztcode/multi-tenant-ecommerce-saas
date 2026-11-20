@@ -73,6 +73,18 @@ export class RedisLockService implements OnModuleDestroy {
   }
 
   /**
+   * 共享的 Redis 连接。
+   *
+   * ⚠️ **只给「同一条连接上的其他用途」用**（游客查单的防爆破计数），
+   *    不要再 new 一条：连接数、连接池参数、错误监听都只有一份，
+   *    多开连接只会让 Redis 的连接数与本进程的错误日志翻倍。
+   *    调用方要自己处理连接异常（本仓的旁路语义是「Redis 不可用就跳过」）。
+   */
+  get redis(): Redis {
+    return this.client;
+  }
+
+  /**
    * 抢锁执行。抢不到返回 `{ acquired: false }`，fn 不会被调用。
    */
   async withLock<T>(

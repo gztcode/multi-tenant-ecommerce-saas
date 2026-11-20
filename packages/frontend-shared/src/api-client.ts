@@ -86,6 +86,21 @@ export interface SharedApiClientOptions {
    * 必须由本端注入：共享包不依赖任何一端的 `@/auth`。
    */
   auth: () => Promise<{ accessToken?: string } | null>;
+  /**
+   * 取**真实客户端 IP**，作为 `x-forwarded-for` 转发给后端。
+   *
+   * 用途：后端按「来源 IP」做防爆破计数（游客查单）。
+   * 后端不在 api 前面，而是隔着网关 / BFF，Express 默认**不采信**任何代理头，
+   * 于是它看到的「来源 IP」永远是网关或 BFF 容器 —— 计数会退化成
+   * 「按订单号全局封杀」，一个坏客户端就能锁死真实客户的查单入口。
+   *
+   * ⚠️ **只有服务端注入**：浏览器端调用时返回 null（浏览器拿不到真实 IP，
+   *    硬塞一个客户端可控的值等于开了绕过口）。
+   * ⚠️ 返回的必须是**网关记录的真实对端**（入站 `x-forwarded-for` 的**最右**一项），
+   *    不是最左——最左是客户端自己就能写的值。
+   * ⚠️ 取不到就返回 null：**不发这个头**，绝不塞假 IP。
+   */
+  clientIp?: () => Promise<string | null>;
 }
 
 export interface SharedApiClient {
@@ -134,6 +149,20 @@ export function createApiClient(
     }
     if (options.forwardCookie && req.cookie) {
       headers.cookie = req.cookie;
+    }
+
+    // 服务端调用时把**真实客户端 IP**带给后端（后端按来源 IP 做防爆破计数）。
+    //
+    // ⚠️ **覆盖式**设置，不能追加：后端只信任一跳，取的是 `x-forwarded-for`
+    //    的**最右**一项；追加的话最右会变成 BFF 自己的出口 IP，
+    //    所有用户共用一个计数桶 —— 等于没修，还多了一个假 IP 的来源。
+    // ⚠️ 取不到（客户端没走网关 / 非服务端调用）就**不发这个头**：
+    //    塞假 IP 比不发更糟（假 IP 会被当成一个真实来源来计数）。
+    if (options.clientIp) {
+      const clientIp = await options.clientIp().catch(() => null);
+      if (clientIp) {
+        headers['x-forwarded-for'] = clientIp;
+      }
     }
 
     // ⚠️ **序列化放在 `try` 外面**：body 含循环引用时 `JSON.stringify` 抛

@@ -93,9 +93,17 @@ export class TenantContextInterceptor implements NestInterceptor {
     }
 
     // 匿名请求：从子域名解析租户（店铺前台场景）
+    //
+    // ⚠️ 这里用 `request.headers.host` 而**不是** `request.hostname`：
+    // api 开了 `trust proxy = 1`（见 app.module.ts 的 onModuleInit）之后，
+    // Express 的 `req.hostname` 会优先采信 `X-Forwarded-Host` —— 那是
+    // **客户端自己就能写**的头，而网关并没有设置也没有清除它。
+    // 用 request.hostname 等于把「匿名请求的租户」交给客户端决定，
+    // 会开出一个跨租户的口子。`headers.host` 由 TCP 对端（网关）提供，
+    // 客户端伪造不了；extractSubdomain 内部会剥掉端口与 IPv6 方括号。
     const subdomain = TenantResolverService.extractSubdomain(
       request.headers,
-      request.hostname || undefined,
+      request.headers.host || undefined,
     );
 
     if (!subdomain) {

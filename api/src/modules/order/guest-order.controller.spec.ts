@@ -1,145 +1,140 @@
 import { HttpException, NotFoundException } from '@nestjs/common';
+import Redis from 'ioredis';
 import type { Request } from 'express';
 
+import { RedisLockService } from '../../common/lock/redis-lock.service';
+import { GuestLookupThrottleService } from './guest-lookup-throttle.service';
 import { GuestOrderController } from './guest-order.controller';
 import type { OrderService } from './order.service';
 
 /**
- * 游客订单查询的防爆破计数（阶段 11，issue #35）。
+ * 游客订单查询的防爆破计数（P1 修复后）。
  *
- * ## 为什么这条用例必须存在
+ * ## 为什么改成断言 Redis
  *
- * 防爆破失败计数放在**进程内 Map** 里，而过期条目的清理**挂在查询路径上**：
- * `isBlocked()` 只在「同一个 key 被再次访问」时才删掉过期记录。
- * 于是攻击者只要一直用**不同的 orderNo** 打请求（每个都查不到 → 每个都记一条失败），
- * 这个 Map 就单调增长、永不回收 —— 未认证端点上的内存泄漏。
+ * 计数从「进程内 Map」迁到 Redis 之后，Map 的两条上界（时间回收 + 容量淘汰）
+ * 随之消失——过期交给 TTL、容量交给 Redis 自己，**进程内不再有任何容器**，
+ * issue #35 的内存泄漏入口结构性消失。所以这里不能再断言「Map 的 size」
+ * （Map 已经不存在了），改成直接断言 **Redis 里的 key、值与 TTL**。
  *
- * 两条缺陷要分别钉住：
- * 1. **过期条目应被回收**：窗口过后，别人的请求不该让过期条目继续占着内存；
- * 2. **容量要有明确上界**：条目数不能超过配置的上限（超限淘汰最旧的）。
+ * ⚠️ **不许用 mock 把 Redis 糊弄过去**：要证明的恰恰是
+ *    「INCR 原子 + 只在首次设 TTL + 过期后重新计数」，
+ *    mock 掉 Redis 就等于把要验证的东西删了。
+ *    跑这条用例需要可用的 Redis（`api/.env` 的 `REDIS_URL`，
+ *    默认 `redis://localhost:16380`；CI 的 api job 已带 redis service）。
  *
- * ⚠️ 第 2 条不能只写「100 次失败后 size ≤ 上限」——上限远大于 100 时
- * 这条断言恒真，证明不了「超限会淘汰」。所以这里把上限调小，
- * 用超过上限的失败次数去压它。
+ * ## 覆盖的用例
+ *
+ * 1. 同一来源对同一订单号失败 5 次后被熔断（429）；
+ * 2. **不同来源互不影响**——P1 的核心：一个坏客户端不能锁死真实客户的查单入口；
+ * 3. 查询成功后计数清零（Redis 里的 key 被删掉）；
+ * 4. 窗口过期后重新计数（TTL ≈ 10 分钟；过期后从 1 重新数）。
  */
 
-/** 控制器内部状态的最小投影（attempts 是 private，只在测试里读） */
-interface AttemptRecord {
-  count: number;
-  firstAt: number;
-}
+/** 本文件用到的订单号统一前缀，清理 Redis key 时只按它匹配，不误伤别人的 key */
+const TEST_ORDER_PREFIX = 'GL-TEST-';
 
-interface InternalState {
-  attempts: Map<string, AttemptRecord>;
-}
+describe('GuestOrderController 防爆破计数（Redis 版）', () => {
+  let redis: Redis;
+  let controller: GuestOrderController;
+  let guestLookup: jest.Mock;
 
-function internalOf(controller: GuestOrderController): InternalState {
-  return controller as unknown as InternalState;
-}
+  beforeAll(async () => {
+    redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:16380');
+    try {
+      await redis.ping();
+    } catch (error) {
+      throw new Error(
+        `本用例需要可用的 Redis（${process.env.REDIS_URL ?? 'redis://localhost:16380'}）：` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
 
-/** 一个必然查不到订单的 OrderService 替身 */
-function failingOrderService(): OrderService {
-  return {
-    guestLookup: jest.fn().mockResolvedValue(null),
-  } as unknown as OrderService;
-}
+    guestLookup = jest.fn().mockResolvedValue(null);
+    const lockService = new RedisLockService(redis);
+    controller = new GuestOrderController(
+      { guestLookup } as unknown as OrderService,
+      new GuestLookupThrottleService(lockService),
+    );
+  });
 
-function requestFrom(ip: string): Request {
-  return { ip } as unknown as Request;
-}
+  afterAll(async () => {
+    await redis.quit();
+  });
 
-/** 发一次必然失败的查询，返回抛出的异常 */
-async function failLookup(
-  controller: GuestOrderController,
-  ip: string,
-  orderNo: string,
-): Promise<unknown> {
-  try {
-    await controller.lookup({ orderNo, phone: '13800000000' }, requestFrom(ip));
-  } catch (error) {
-    return error;
+  beforeEach(() => {
+    guestLookup.mockReset().mockResolvedValue(null);
+  });
+
+  afterEach(async () => {
+    // 只清本文件自己的 key（订单号前缀唯一），不碰 Redis 里的其他计数
+    const keys = await redis.keys(
+      `guestlookup:attempts:*${TEST_ORDER_PREFIX}*`,
+    );
+    if (keys.length > 0) await redis.del(...keys);
+  });
+
+  /** 找出本文件某个订单号对应的 Redis key（订单号只含字母数字与连字符，编码后不变） */
+  async function keysOf(orderNo: string): Promise<string[]> {
+    return redis.keys(`guestlookup:attempts:*${orderNo}`);
   }
-  throw new Error('查询本应失败，但没有抛异常');
-}
 
-describe('GuestOrderController 防爆破计数（issue #35）', () => {
-  const originalMaxEntries = process.env.GUEST_LOOKUP_MAX_ATTEMPT_ENTRIES;
-
-  afterEach(() => {
-    if (originalMaxEntries === undefined) {
-      delete process.env.GUEST_LOOKUP_MAX_ATTEMPT_ENTRIES;
-    } else {
-      process.env.GUEST_LOOKUP_MAX_ATTEMPT_ENTRIES = originalMaxEntries;
+  /** 一个必然查不到订单的查询，返回抛出的异常 */
+  async function failLookup(ip: string, orderNo: string): Promise<unknown> {
+    try {
+      await controller.lookup({ orderNo, phone: '13800000000' }, {
+        ip,
+      } as unknown as Request);
+    } catch (error) {
+      return error;
     }
-  });
+    throw new Error('查询本应失败，但没有抛异常');
+  }
 
-  it('⚠️ 过期条目会被回收：窗口过后，别的 key 的请求不该让它继续占着内存', async () => {
-    const controller = new GuestOrderController(failingOrderService());
-    const internal = internalOf(controller);
-
-    const realNow = Date.now();
-    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(realNow);
-
-    // 第一个 key：失败，记一条
-    await failLookup(controller, '203.0.113.1', 'GL-AAAA');
-    expect(internal.attempts.size).toBe(1);
-
-    // 时间前进 11 分钟（超过 10 分钟窗口）
-    nowSpy.mockReturnValue(realNow + 11 * 60 * 1000);
-
-    // 另一个 key 的请求：过期条目应当被顺手回收
-    await failLookup(controller, '203.0.113.1', 'GL-BBBB');
-
-    nowSpy.mockRestore();
-
-    expect(internal.attempts.size).toBe(1);
-  });
-
-  it('⚠️ 容量有明确上界：超限后淘汰最旧的条目', async () => {
-    process.env.GUEST_LOOKUP_MAX_ATTEMPT_ENTRIES = '5';
-    const controller = new GuestOrderController(failingOrderService());
-    const internal = internalOf(controller);
-
-    for (let i = 0; i < 20; i += 1) {
-      await failLookup(controller, '203.0.113.1', `GL-${i}`);
-    }
-
-    expect(internal.attempts.size).toBe(5);
-    // 淘汰的是最旧的：留下的应该是最后 5 个
-    expect([...internal.attempts.keys()]).toEqual([
-      '203.0.113.1:GL-15',
-      '203.0.113.1:GL-16',
-      '203.0.113.1:GL-17',
-      '203.0.113.1:GL-18',
-      '203.0.113.1:GL-19',
-    ]);
-  });
-
-  it('同一 key 失败 5 次后，第 6 次被熔断（429）', async () => {
-    const controller = new GuestOrderController(failingOrderService());
-
+  it('同一来源对同一订单号失败 5 次后，第 6 次被熔断（429）', async () => {
+    const orderNo = `${TEST_ORDER_PREFIX}BLOCK`;
     for (let i = 0; i < 5; i += 1) {
-      const error = await failLookup(controller, '203.0.113.2', 'GL-CCCC');
+      const error = await failLookup('203.0.113.10', orderNo);
       expect(error).toBeInstanceOf(NotFoundException);
     }
 
-    const blocked = await failLookup(controller, '203.0.113.2', 'GL-CCCC');
+    const blocked = await failLookup('203.0.113.10', orderNo);
     expect(blocked).toBeInstanceOf(HttpException);
     expect((blocked as HttpException).getStatus()).toBe(429);
+
+    // Redis 侧：计数停在 5（熔断后不再累加）
+    const keys = await keysOf(orderNo);
+    expect(keys).toHaveLength(1);
+    expect(await redis.get(keys[0])).toBe('5');
   });
 
-  it('查询成功后计数清零', async () => {
-    const orderService = {
-      guestLookup: jest.fn().mockResolvedValue(null),
-    } as unknown as OrderService;
-    const controller = new GuestOrderController(orderService);
-    const internal = internalOf(controller);
+  it('不同来源互不影响：一个来源被熔断，另一个来源仍能正常查单', async () => {
+    const orderNo = `${TEST_ORDER_PREFIX}ISOLATION`;
 
-    await failLookup(controller, '203.0.113.3', 'GL-DDDD');
-    expect(internal.attempts.size).toBe(1);
+    for (let i = 0; i < 5; i += 1) {
+      await failLookup('203.0.113.11', orderNo);
+    }
+    const blocked = await failLookup('203.0.113.11', orderNo);
+    expect((blocked as HttpException).getStatus()).toBe(429);
 
-    (orderService.guestLookup as jest.Mock).mockResolvedValue({
-      orderNo: 'GL-DDDD',
+    // 另一个来源不受影响：第一次失败仍是 404「订单不存在或信息不匹配」
+    const other = await failLookup('203.0.113.12', orderNo);
+    expect(other).toBeInstanceOf(NotFoundException);
+    expect((other as NotFoundException).getStatus()).toBe(404);
+  });
+
+  it('查询成功后计数清零（Redis 里的 key 被删掉）', async () => {
+    const ip = '203.0.113.13';
+    const orderNo = `${TEST_ORDER_PREFIX}RESET`;
+
+    await failLookup(ip, orderNo);
+    await failLookup(ip, orderNo);
+    const keys = await keysOf(orderNo);
+    expect(keys).toHaveLength(1);
+    expect(await redis.get(keys[0])).toBe('2');
+
+    guestLookup.mockResolvedValue({
+      orderNo,
       status: 'PAID',
       totalAmount: 100,
       itemCount: 1,
@@ -147,11 +142,39 @@ describe('GuestOrderController 防爆破计数（issue #35）', () => {
       paidAt: null,
     });
 
-    await controller.lookup(
-      { orderNo: 'GL-DDDD', phone: '13800000000' },
-      requestFrom('203.0.113.3'),
-    );
+    await controller.lookup({ orderNo, phone: '13800000000' }, {
+      ip,
+    } as unknown as Request);
 
-    expect(internal.attempts.size).toBe(0);
+    expect(await redis.exists(keys[0])).toBe(0);
+  });
+
+  it('窗口过期后重新计数（TTL 是生产的 10 分钟；过期后从 1 重新数）', async () => {
+    const ip = '203.0.113.14';
+    const orderNo = `${TEST_ORDER_PREFIX}EXPIRE`;
+
+    for (let i = 0; i < 5; i += 1) {
+      await failLookup(ip, orderNo);
+    }
+    const keys = await keysOf(orderNo);
+    expect(keys).toHaveLength(1);
+    const key = keys[0];
+
+    // Redis 侧：TTL 存在，且就是生产的 10 分钟窗口
+    // ⚠️ 不为了测试缩短生产常量——过期用「直接操纵 Redis 的 TTL」来模拟
+    const ttl = await redis.pttl(key);
+    expect(ttl).toBeGreaterThan(9 * 60 * 1000);
+    expect(ttl).toBeLessThanOrEqual(10 * 60 * 1000);
+
+    // 模拟窗口走完
+    await redis.pexpire(key, 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // 过期后不再是熔断状态
+    const error = await failLookup(ip, orderNo);
+    expect(error).toBeInstanceOf(NotFoundException);
+
+    // Redis 侧：计数从 1 重新开始（新窗口的第一次失败）
+    expect(await redis.get(key)).toBe('1');
   });
 });
