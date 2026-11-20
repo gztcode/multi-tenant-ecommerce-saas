@@ -9,7 +9,7 @@ import { Observable, tap } from 'rxjs';
 import { Request, Response } from 'express';
 
 /**
- * HTTP 访问日志：方法 + 路径 + 状态码 + 耗时。
+ * HTTP 访问日志：方法 + 路径 + 状态码 + 耗时 + 客户端 IP。
  *
  * ⚠️ **不打 body**——请求/响应体里可能有密码、token、账户信息，
  * 落进日志就是泄露。要看请求内容请走调试器或专门的链路追踪。
@@ -23,6 +23,9 @@ export class LoggingInterceptor implements NestInterceptor {
     const req = context.switchToHttp().getRequest<Request>();
     const { method, url } = req;
     const requestId = req.requestId;
+    // 客户端 IP：开了 trust proxy（app.module.ts）之后 req.ip 是**代理链上的
+    // 真实对端**，不是网关 / BFF 容器的 IP——排查「谁在刷接口」时需要它。
+    const clientIp = req.ip;
     return next.handle().pipe(
       tap({
         next: () => {
@@ -35,6 +38,7 @@ export class LoggingInterceptor implements NestInterceptor {
             startedAt,
             undefined,
             requestId,
+            clientIp,
           );
         },
         error: (error: unknown) => {
@@ -43,7 +47,16 @@ export class LoggingInterceptor implements NestInterceptor {
           //    同一仓库两种口径会让日志变成信息泄露的口子。
           const status = (error as { status?: number })?.status ?? 500;
           const name = error instanceof Error ? error.name : 'UnknownError';
-          this.emit('warn', method, url, status, startedAt, name, requestId);
+          this.emit(
+            'warn',
+            method,
+            url,
+            status,
+            startedAt,
+            name,
+            requestId,
+            clientIp,
+          );
         },
       }),
     );
@@ -62,18 +75,20 @@ export class LoggingInterceptor implements NestInterceptor {
     startedAt: number,
     errorName: string | undefined,
     requestId: string | undefined,
+    clientIp: string | undefined,
   ): void {
     const fields = {
       requestId,
       method,
       url,
       status,
+      clientIp,
       durationMs: Date.now() - startedAt,
       ...(errorName !== undefined ? { errorName } : {}),
     };
-    const line = `${method} ${url} ${status} ${fields.durationMs}ms${
-      errorName !== undefined ? ` ${errorName}` : ''
-    }`;
+    const line = `${method} ${url} ${status} ${fields.durationMs}ms ${
+      clientIp ?? '-'
+    }${errorName !== undefined ? ` ${errorName}` : ''}`;
     if (level === 'log') {
       this.logger.log(line, fields);
     } else {

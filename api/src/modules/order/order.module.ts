@@ -9,6 +9,7 @@ import { OrderTimeoutWorker } from './order-timeout.worker';
 import { OrderController } from './order.controller';
 import { MerchantOrderController } from './merchant-order.controller';
 import { GuestOrderController } from './guest-order.controller';
+import { GuestLookupThrottleService } from './guest-lookup-throttle.service';
 
 /**
  * 订单模块（阶段 3）。
@@ -43,6 +44,9 @@ import { GuestOrderController } from './guest-order.controller';
     OrderService,
     OrderTimeoutService,
     OrderTimeoutWorker,
+    // 游客查单的防爆破计数（P1 修复）：计数在 Redis 里，
+    // RedisLockService 由全局的 LockModule 提供，这里不用 import。
+    GuestLookupThrottleService,
   ],
   exports: [OrderService, OrderInventoryService, OrderTimeoutService],
 })
