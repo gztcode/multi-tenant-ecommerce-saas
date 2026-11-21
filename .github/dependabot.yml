@@ -11,6 +11,9 @@ updates:
     schedule:
       interval: weekly
     commit-message:
-      # 本仓 commit message 一律简体中文（conventional commits 的 type 保留英文）
+      # prefix 保留英文 type，便于按 conventional commits 统一检索；
+      # **人工提交**仍按本仓约定用简体中文正文。
+      # ⚠️ dependabot 自动生成的 PR 说明（"Bump x from a to b"）是工具默认的英文模板，
+      #    commit-message 只能定制 prefix / scope，改不了那段正文 —— 需要中文说明时人工改写。
       prefix: "chore(deps): "
       prefix-development: "chore(deps-dev): "
