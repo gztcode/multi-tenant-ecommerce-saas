@@ -106,6 +106,10 @@ ALERT_WEBHOOK_URL=...       # 飞书/钉钉机器人地址（强烈建议配）
 #    监控瞎掉但服务照常跑。抓取端在容器网/内网时配上它：
 # METRICS_ALLOW_CIDR=10.0.0.0/8,192.168.1.0/24
 #
+# 写错的条目（如 10.0.0.0/33）会被**跳过并在 nginx 日志里点名**，
+# 不会写进配置 —— 一条非法 allow 语句会让 nginx 启动失败（整站不可用），
+# 那比「少放行一个网段」严重得多。
+#
 # Swagger UI（/api/docs）：生产**默认关闭**（NODE_ENV=production 时不挂载）。
 # 需要临时开放给同事看接口时设 true，**用完记得改回**：
 # SWAGGER_ENABLED=true
@@ -232,6 +236,8 @@ seed 产生的演示账号（若曾误跑 seed）。
   部署时由 `infra/nginx/render-metrics-allow.sh` 展开成 nginx 的 allow 语句。
   **不配 = 一个都不放行**（fail-closed）：抓不到指标，但不会误放行到公网。
   改了变量要重启 nginx 容器才生效（`docker compose ... up -d nginx`）。
+  写错的条目会被跳过并在 nginx 日志里点名（`render-metrics-allow: 跳过非法条目：…`），
+  不会让 nginx 启动失败。
   指标清单：`ecommerce_http_requests_total` / `..._duration_seconds`、
   `ecommerce_queue_jobs`、`ecommerce_payments_refunding_stuck`、
   `ecommerce_payouts_processing_stuck` + 进程指标。

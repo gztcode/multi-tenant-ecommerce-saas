@@ -164,6 +164,22 @@ test('metrics 端点：白名单按 METRICS_ALLOW_CIDR 逗号列表展开', () =
   }
 });
 
+test('白名单里的非法条目被跳过，不会让 nginx 起不来', () => {
+  // 一条非法 allow 语句会让 nginx 启动失败 → 整站不可用。
+  // 代价应该只是「少放行一个网段」，所以非法项跳过并打日志。
+  const { conf } = renderProdConf('10.0.0.0/8, 10.0.0.0/33, example.com, all');
+
+  const blocks = metricsBlocks(conf);
+  assert.equal(blocks.length, 2, 'metrics 的 location 块应当出现两处');
+  for (const body of blocks) {
+    const allows = body
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('allow '));
+    assert.deepEqual(allows, ['allow 10.0.0.0/8;']);
+    assert.ok(body.some((line) => line.trim() === 'deny all;'));
+  }
+});
+
 test('没有「注释掉的 allow/deny」这种形态', () => {
   const { conf } = renderProdConf('10.0.0.0/8');
 
