@@ -113,6 +113,10 @@ export class SpecMatrixService {
       }
     }
 
+    // ⚠️ 落库时刻用数据库时钟。**必须在开事务之前读**：
+    // 事务回调里再借一条连接去读会踩 P2024/P2028（见 order.service.ts 的同款写法）。
+    const now = await this.prisma.databaseNow();
+
     return this.prisma.$transaction(async (tx) => {
       // ---- 1. 维度：按 name 匹配 ----
       const existingSpecs = await tx.productSpec.findMany({
@@ -201,7 +205,7 @@ export class SpecMatrixService {
             : { where: { specId } };
         await tx.productSpecValue.updateMany({
           ...staleValueWhere,
-          data: { deletedAt: new Date() },
+          data: { deletedAt: now },
         });
 
         resolvedDims.push({
@@ -220,7 +224,7 @@ export class SpecMatrixService {
           : { where: { productId } };
       await tx.productSpec.updateMany({
         ...staleSpecWhere,
-        data: { deletedAt: new Date() },
+        data: { deletedAt: now },
       });
 
       // 被软删维度下的取值要一并软删。
@@ -232,7 +236,7 @@ export class SpecMatrixService {
       // 这个值还占着位置而拒绝写入。软删除没有外键级联，这一处得手动做。
       await tx.productSpecValue.updateMany({
         where: { spec: { productId, deletedAt: { not: null } } },
-        data: { deletedAt: new Date() },
+        data: { deletedAt: now },
       });
 
       // ---- 3. 笛卡尔积 ----

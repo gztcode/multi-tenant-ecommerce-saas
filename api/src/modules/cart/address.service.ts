@@ -140,10 +140,12 @@ export class AddressService {
     }
 
     const wasDefault = existing.isDefault;
+    // ⚠️ 落库时刻用数据库时钟（`databaseNow()`），不用应用进程的 `new Date()`
+    const now = await this.prisma.databaseNow();
     // 软删：Address 是软删模型，扩展会禁止物理删除
     await this.prisma.address.updateMany({
       where: { id, customerId },
-      data: { deletedAt: new Date(), isDefault: false },
+      data: { deletedAt: now, isDefault: false },
     });
 
     if (wasDefault) {

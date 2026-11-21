@@ -238,9 +238,10 @@ export class ProductsService {
 
     const nextStatus = dto.status ?? product.status;
     // 首次转为 PUBLISHED 时写入 publishedAt；再次上架保留原时间
+    // ⚠️ 落库时刻用数据库时钟（`databaseNow()`），不用应用进程的 `new Date()`
     const publishedAt =
       nextStatus === 'PUBLISHED' && product.status !== 'PUBLISHED'
-        ? new Date()
+        ? await this.prisma.databaseNow()
         : product.publishedAt;
 
     const affected = await this.prisma.product.updateMany({
@@ -279,10 +280,13 @@ export class ProductsService {
     if (!product) {
       throw new NotFoundException('商品不存在');
     }
+    // ⚠️ 落库时刻用数据库时钟。**必须在开事务之前读**：
+    // 事务回调里再借一条连接去读会踩 P2024/P2028（见 order.service.ts 的同款写法）。
+    const now = await this.prisma.databaseNow();
     await this.prisma.$transaction(async (tx) => {
       await tx.product.updateMany({
         where: { id },
-        data: { deletedAt: new Date() },
+        data: { deletedAt: now },
       });
       // ⚠️ **级联软删 SKU**（审计 P2-9b）：SKU 额度是按「活跃 SKU 数」算的，
       // 商品软删后它的 SKU 若还活着，就一直占着额度 —— 商品删了额度还在，
@@ -290,7 +294,7 @@ export class ProductsService {
       // 历史订单不受影响：`OrderItem` 只存 `skuId` 标量，没有指向 SKU 的关系。
       await tx.sku.updateMany({
         where: { productId: id },
-        data: { deletedAt: new Date() },
+        data: { deletedAt: now },
       });
     });
   }
@@ -394,6 +398,10 @@ export class ProductsService {
       await this.assertCategoryUsable(dto.categoryId);
     }
 
+    // ⚠️ 落库时刻用数据库时钟。**必须在开事务之前读**：
+    // 事务回调里再借一条连接去读会踩 P2024/P2028（见 order.service.ts 的同款写法）。
+    const now = await this.prisma.databaseNow();
+
     return this.prisma.$transaction(async (tx) => {
       // ids 里可能混着别的租户的 id——扩展合并的 where.tenantId 会把它们滤掉，
       // 所以下面拿到的 products 只含本租户的商品，updated 也只数这些。
@@ -421,7 +429,7 @@ export class ProductsService {
           if (status === 'PUBLISHED') {
             await tx.product.updateMany({
               where: { id: { in: productIds }, status: { not: 'PUBLISHED' } },
-              data: { publishedAt: new Date() },
+              data: { publishedAt: now },
             });
           }
           await tx.product.updateMany({
@@ -436,12 +444,12 @@ export class ProductsService {
         case 'DELETE': {
           await tx.product.updateMany({
             where: { id: { in: productIds } },
-            data: { deletedAt: new Date() },
+            data: { deletedAt: now },
           });
           // 级联软删 SKU，理由同 remove()（审计 P2-9b）
           await tx.sku.updateMany({
             where: { productId: { in: productIds } },
-            data: { deletedAt: new Date() },
+            data: { deletedAt: now },
           });
           break;
         }

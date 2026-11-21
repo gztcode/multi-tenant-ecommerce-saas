@@ -116,9 +116,11 @@ export class PromotionService {
    */
   async remove(id: string): Promise<void> {
     const tenantId = this.currentTenantId();
+    // ⚠️ 落库时刻用数据库时钟（`databaseNow()`），不用应用进程的 `new Date()`
+    const now = await this.prisma.databaseNow();
     const affected = await this.prisma.promotion.updateMany({
       where: { id, tenantId },
-      data: { deletedAt: new Date() },
+      data: { deletedAt: now },
     });
     if (affected.count === 0) {
       throw new NotFoundException('活动不存在');

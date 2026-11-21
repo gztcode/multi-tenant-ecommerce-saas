@@ -267,9 +267,11 @@ export class CategoriesService {
       throw new BadRequestException('该品类下还有商品，请先移动或删除商品');
     }
 
+    // ⚠️ 落库时刻用数据库时钟（`databaseNow()`），不用应用进程的 `new Date()`
+    const now = await this.prisma.databaseNow();
     await this.prisma.category.updateMany({
       where: { id },
-      data: { deletedAt: new Date() },
+      data: { deletedAt: now },
     });
   }
 }
