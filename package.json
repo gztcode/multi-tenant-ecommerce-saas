@@ -26,5 +26,8 @@
     "multer": "2.5.0",
     "postcss": "8.5.31",
     "tinypool": "2.2.0"
+  },
+  "devDependencies": {
+    "audit-ci": "^7.1.0"
   }
 }

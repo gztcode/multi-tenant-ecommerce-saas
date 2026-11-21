@@ -1,0 +1,59 @@
+// ============================================================================
+// audit-ci 配置（JSONC，允许注释）
+//
+// 用途：CI「依赖漏洞扫描」job 使用
+//   位置：.github/workflows/ci.yml → jobs.security
+//   用法：npx audit-ci --config .github/audit-ci.jsonc --registry=https://registry.npmjs.org
+//
+// 【卡门策略】只对 high / critical 让 CI 失败；moderate 及以下只报告、不失败。
+//   "high": true 的语义是「high 及以上都失败」= high + critical 卡门，
+//   moderate / low 不卡门（但仍会出现在报告里）。
+//
+// 【白名单纪律】每一条都必须写明：
+//   1) 为什么放过（不可达 / 误报 / 暂时修不了）；
+//   2) 打算怎么回来修。
+//   匹配语法用「GHSA 编号|依赖路径」，不要只写包名：
+//   只放过这一条路径上的这个公告；同包的其他路径、升级后引入的新公告仍然卡门。
+//   （audit-ci 默认 show-not-found，白名单条目失效时会在日志里点名提醒，
+//     不会变成一条永远生效的「整包豁免」。）
+// ============================================================================
+{
+  "$schema": "https://github.com/IBM/audit-ci/raw/main/docs/schema.json",
+  "high": true,
+  "allowlist": [
+    // -----------------------------------------------------------------------
+    // GHSA-7589-6fvf-x4pw / CVE-2026-121707 —— effect ReDoS（CWE-1333）
+    //   受影响包：effect 3.21.0（受影响范围 <= 3.22.0，官方修复版 3.22.1）
+    //   依赖链：api 的 devDependencies 里 prisma@6.19.3 → @prisma/config@6.19.3 → effect@3.21.0
+    //
+    //   为什么放过（运行时不可达）：
+    //     prisma 是**构建 / 迁移期**用的 CLI，只在 api 的 devDependencies 里；
+    //     生产镜像的运行阶段用 `npm ci --omit=dev --workspace api` 安装，
+    //     不包含 prisma / @prisma/config / effect；
+    //     运行时代码用的是 @prisma/client，它不依赖 @prisma/config，不在这条链上。
+    //     即：漏洞代码不会进入对外提供服务的产物。
+    //
+    //   为什么现在不修：
+    //     npm audit 给出的修复版本是 prisma@7.10.1（6 → 7 是 semver-major，
+    //     涉及 Prisma CLI 行为变化），不该混进「只加扫描」这个 PR。
+    //
+    //   怎么回来修：另开 PR 把 prisma 升到 7.10.1+，然后删除本条白名单。
+    // -----------------------------------------------------------------------
+    "GHSA-7589-6fvf-x4pw|prisma>@prisma/config>effect",
+    // -----------------------------------------------------------------------
+    // GHSA-ggr8-5vv4-36mx / CVE-2026-40345 —— deepmerge-ts 栈耗尽（CWE-674）
+    //   受影响包：deepmerge-ts 7.1.5（受影响范围 < 8.0.0，官方修复版 8.0.0）
+    //   依赖链：api 的 devDependencies 里 prisma@6.19.3 → @prisma/config@6.19.3 → deepmerge-ts@7.1.5
+    //
+    //   为什么放过（运行时不可达）：同上一条，整条链只在构建 / 迁移期，不进生产镜像。
+    //
+    //   为什么现在不修：
+    //     @prisma/config@6.19.3 对 deepmerge-ts 是**精确锁** 7.1.5，
+    //     强行用根 overrides 提到 8.0.0 属于 major 跨越，可能破坏 prisma CLI；
+    //     npm audit 给出的官方路径同样是 prisma@7.10.1。
+    //
+    //   怎么回来修：同上一条，升级 prisma 到 7.10.1+ 后删除本条白名单。
+    // -----------------------------------------------------------------------
+    "GHSA-ggr8-5vv4-36mx|prisma>@prisma/config>deepmerge-ts"
+  ]
+}

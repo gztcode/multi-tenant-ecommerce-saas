@@ -1,0 +1,16 @@
+# Dependabot：只开 npm 生态的每周更新。
+#
+# 本仓是 npm workspaces 单仓（根一份 package-lock.json，六个工作区共用），
+# 根目录一个 directory 就能覆盖全部工作区的依赖，不需要逐个工作区列一遍。
+#
+# 只开 npm：GitHub Actions 等其他生态本轮不在范围内（见 PR 正文「没做的事」）。
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      # 本仓 commit message 一律简体中文（conventional commits 的 type 保留英文）
+      prefix: "chore(deps): "
+      prefix-development: "chore(deps-dev): "
