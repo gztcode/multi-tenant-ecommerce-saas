@@ -98,6 +98,19 @@ LOG_LEVEL=info
 ALERT_WEBHOOK_URL=...       # 飞书/钉钉机器人地址（强烈建议配）
 ```
 
+以下两项**不属于**启动守卫校验项（守卫不校验、留空也能起），但影响生产暴露面：
+
+```bash
+# Prometheus 抓取端点（/api/v1/metrics）的可信网段，逗号分隔的 CIDR。
+# ⚠️ **不配 = 一个都不放行**（fail-closed）→ 抓取全部 403，
+#    监控瞎掉但服务照常跑。抓取端在容器网/内网时配上它：
+# METRICS_ALLOW_CIDR=10.0.0.0/8,192.168.1.0/24
+#
+# Swagger UI（/api/docs）：生产**默认关闭**（NODE_ENV=production 时不挂载）。
+# 需要临时开放给同事看接口时设 true，**用完记得改回**：
+# SWAGGER_ENABLED=true
+```
+
 > `PAYOUT_ACCOUNT_ENCRYPTION_KEY` 一旦投入生产**不能轮换**——
 > 轮换后已打款的出款单快照永久解不开（守卫与 README 都有警告）。
 
@@ -124,10 +137,19 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
 ```bash
 curl -f https://api.example.com/api/v1/health          # {"status":"ok",...}
-curl -f https://api.example.com/api/v1/metrics | head  # Prometheus 指标
+curl -f https://api.example.com/api/v1/metrics | head  # Prometheus 指标（默认 403，见下）
 curl -sI https://example.com | grep -i strict          # HSTS 头存在
 curl -sI http://example.com | head -1                  # 301 → https
 ```
+
+> ⚠️ **`/api/v1/metrics` 生产默认对公网 403**：nginx 模板里该路径是
+> `deny all`，只有 `METRICS_ALLOW_CIDR` 列出的网段能抓（见 §3、§9）。
+> 所以上面那条 curl 从公网跑**预期是 403**（`curl -f` 会因此报失败）；
+> 要验证抓取通不通，得从白名单网段内的机器跑，或临时把该机的公网 IP
+> 加进 `METRICS_ALLOW_CIDR` 后 `docker compose ... up -d nginx` 重载。
+>
+> 同样地，`/api/docs`（Swagger UI）生产默认**不可达**（404），
+> 需要看文档时在 `infra/.env` 里设 `SWAGGER_ENABLED=true` 并重启 api。
 
 ## 5. 数据库加固
 
@@ -203,8 +225,13 @@ seed 产生的演示账号（若曾误跑 seed）。
 
 ## 9. 可观测性接入
 
-- **抓取**：Prometheus 抓 `https://api.example.com/api/v1/metrics`
-  （建议在 nginx 上给该路径加网段白名单，模板里有注释好的示例块）。
+- **抓取**：Prometheus 抓 `https://api.example.com/api/v1/metrics`。
+  该路径在生产 nginx 模板里**默认 `deny all`**（对公网 403），只有
+  `METRICS_ALLOW_CIDR` 列出的可信网段能访问 —— 变量在 `infra/.env` 里配，
+  逗号分隔多个 CIDR（如 `10.0.0.0/8,192.168.1.0/24`），
+  部署时由 `infra/nginx/render-metrics-allow.sh` 展开成 nginx 的 allow 语句。
+  **不配 = 一个都不放行**（fail-closed）：抓不到指标，但不会误放行到公网。
+  改了变量要重启 nginx 容器才生效（`docker compose ... up -d nginx`）。
   指标清单：`ecommerce_http_requests_total` / `..._duration_seconds`、
   `ecommerce_queue_jobs`、`ecommerce_payments_refunding_stuck`、
   `ecommerce_payouts_processing_stuck` + 进程指标。
