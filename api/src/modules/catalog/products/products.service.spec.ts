@@ -132,6 +132,8 @@ describe('ProductsService.batch · ADJUST_PRICE', () => {
       $transaction: jest.fn(async (cb: (t: unknown) => Promise<unknown>) =>
         cb(tx),
       ),
+      // 落库时刻用数据库时钟（`databaseNow()`），单测里给个固定值即可
+      databaseNow: jest.fn().mockResolvedValue(new Date('2026-01-04')),
     };
     const minPrice = { recalculate: jest.fn().mockResolvedValue(undefined) };
     return { prisma, tx, skuUpdateMany, minPrice };

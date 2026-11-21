@@ -169,6 +169,8 @@ function fakePrisma(rows: Row[]) {
     user: {
       findFirst: jest.fn(() => Promise.resolve(null)),
     },
+    // 软删落库时刻用数据库时钟（`databaseNow()`），单测里给个固定值即可
+    databaseNow: jest.fn(() => Promise.resolve(new Date('2026-01-04'))),
   };
 
   return { prisma, rows };

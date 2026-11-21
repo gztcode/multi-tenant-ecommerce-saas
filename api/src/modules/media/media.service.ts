@@ -269,9 +269,11 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
     if (!media) {
       throw new NotFoundException('媒体不存在');
     }
+    // ⚠️ 落库时刻用数据库时钟（`databaseNow()`），不用应用进程的 `new Date()`
+    const now = await this.prisma.databaseNow();
     await this.prisma.media.updateMany({
       where: { id },
-      data: { deletedAt: new Date() },
+      data: { deletedAt: now },
     });
   }
 
