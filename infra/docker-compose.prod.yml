@@ -26,8 +26,23 @@ services:
       - ./nginx/templates:/etc/nginx/templates:ro
       - ./certs:/etc/nginx/certs:ro
       - ./certbot-www:/var/www/certbot:ro
+      # 把 METRICS_ALLOW_CIDR 展开成 allow 语句（见脚本内注释）。
+      # 文件名 25- → 在 20-envsubst-on-templates.sh 之后执行。
+      # ⚠️ 必须是**可执行**文件（git 里是 100755），否则官方 entrypoint
+      #    会打印 "Ignoring ... not executable" 直接跳过 —— 结果是 metrics
+      #    全部被 deny（安全，但抓不到）。
+      - ./nginx/render-metrics-allow.sh:/docker-entrypoint.d/25-metrics-allow.sh:ro
     environment:
       BASE_DOMAIN: ${BASE_DOMAIN:?请在 infra/.env 里设置 BASE_DOMAIN（如 example.com）}
+      # Prometheus 抓取端点（/api/v1/metrics）的可信网段，逗号分隔的 CIDR。
+      # 不配 = 一个都不放行（fail-closed）→ 监控抓不到指标，从内网补配。
+      METRICS_ALLOW_CIDR: ${METRICS_ALLOW_CIDR:-}
+
+  # 生产默认**不挂** Swagger UI（/api/docs）：文档会把全部接口与鉴权方式
+  # 摊给公网扫描器。需要临时开放时在 infra/.env 里设 SWAGGER_ENABLED=true。
+  api:
+    environment:
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-}
 
   # 生产上不需要把数据服务暴露到宿主机（哪怕回环）：
   # postgres:

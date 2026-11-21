@@ -13,6 +13,10 @@
 #   （店铺在 `<tenant>.${BASE_DOMAIN}`，证书需覆盖 `*.${BASE_DOMAIN}`——
 #    Let's Encrypt 用 DNS-01 challenge 签泛域名证书，见 DEPLOY.md §证书）
 # - 证书路径固定挂载到 /etc/nginx/certs/{fullchain.pem,privkey.pem}
+# - METRICS_ALLOW_CIDR：Prometheus 抓取端点（/api/v1/metrics）的可信网段，
+#   逗号分隔的 CIDR（如 10.0.0.0/8,192.168.0.0/16）。**不配 = 一个都不放行**
+#   （fail-closed，metrics 抓不到 → 监控瞎，只能从内网补配）。
+#   由 25-metrics-allow.sh 展开成 allow 语句（envsubst 不认逗号列表）。
 #
 # ## 与 platform.test.conf（本机开发）的差异
 #
@@ -129,6 +133,20 @@ server {
         limit_req_status 503;
     }
 
+    # 店铺子域名上的 metrics 也要收口：上面的 location /api/v1/ 会把请求
+    # 转发到 api，不单独限制的话换个 Host（<店铺>.example.com）就能绕过
+    # 中心域名上的白名单。规则与 API 中心域名块一致。
+    location /api/v1/metrics {
+        #@METRICS_ALLOW_CIDR@
+        deny all;
+        proxy_pass http://api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Tenant-Subdomain $tenant;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
     location /_next/static/ {
         proxy_pass http://storefront_backend;
         proxy_http_version 1.1;
@@ -158,13 +176,25 @@ server {
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy strict-origin-when-cross-origin always;
 
-    # Prometheus 抓取端点：只允许内网/监控网段（按部署环境改网段）。
-    # api 容器端口仍绑回环，抓取经本域名 + 网段白名单。
-    # location /api/v1/metrics {
-    #     allow 10.0.0.0/8;
-    #     deny all;
-    #     proxy_pass http://api_backend;
-    # }
+    # Prometheus 抓取端点：生产**默认对公网不可达**。
+    #
+    # 白名单网段由 METRICS_ALLOW_CIDR 决定（逗号分隔的 CIDR，如 10.0.0.0/8）。
+    # 它不是模板变量：envsubst 只认 ${VAR}，而一条 allow 指令只吃**一个**
+    # 地址/CIDR，逗号列表没法直接写进模板 —— 所以由 25-metrics-allow.sh 在
+    # envsubst 渲染之后，把下面的占位符行替换成若干条 allow 语句。
+    #
+    # ⚠️ 变量为空 / 展开脚本没跑 → 占位符保持注释 → 该 location 只剩 deny all，
+    #    抓取全部拒绝（fail-closed），nginx 仍能正常启动。
+    location /api/v1/metrics {
+        #@METRICS_ALLOW_CIDR@
+        deny all;
+        proxy_pass http://api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Tenant-Subdomain "";
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
 
     location /api/v1/auth/ {
         limit_req zone=api_auth burst=20 nodelay;

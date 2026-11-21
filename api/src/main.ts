@@ -5,13 +5,13 @@ import './load-env';
 
 import { NestFactory } from '@nestjs/core';
 import { Logger, ValidationPipe } from '@nestjs/common';
-import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { TenantContextInterceptor } from './modules/tenancy/tenant-context.interceptor';
 import { assertSecureConfig } from './common/config/assert-secure-config';
 import { assertPayoutEncryptionKey } from './common/config/assert-payout-encryption-key';
+import { setupSwagger } from './common/config/swagger-config';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { LoggingInterceptor } from './common/http/logging.interceptor';
 import { SECURITY_HEADERS_OPTIONS } from './common/http/security-headers';
@@ -67,14 +67,10 @@ async function bootstrap() {
 
   // Swagger 路径不带全局前缀 api/v1 —— 文档本身不属于版本化的业务接口，
   // 放在 /api/docs 让它既好记又不会和业务路由混淆。
-  const swaggerConfig = new DocumentBuilder()
-    .setTitle('多租户电商 SaaS API')
-    .setDescription('多租户电商 SaaS API · 阶段 2：商品中心')
-    .setVersion('1.0')
-    .addBearerAuth()
-    .build();
-  const document = SwaggerModule.createDocument(app, swaggerConfig);
-  SwaggerModule.setup('api/docs', app, document);
+  //
+  // ⚠️ 生产环境**默认不挂**（SWAGGER_ENABLED=true 才开）：Swagger UI 会把
+  //    全部接口与鉴权方式摊给公网扫描器。开关逻辑见 swagger-config.ts。
+  setupSwagger(app);
 
   const port = Number(process.env.PORT ?? 3000);
 
