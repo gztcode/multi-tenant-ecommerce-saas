@@ -1,5 +1,14 @@
 import { defineConfig } from '@playwright/test';
 
+import {
+  API_BASE_URL,
+  API_PORT,
+  DATABASE_URL,
+  MERCHANT_ADMIN_URL,
+  STOREFRONT_PORT,
+  STOREFRONT_URL,
+} from './support/env';
+
 /**
  * 浏览器级端到端测试配置（阶段 11c）。
  *
@@ -16,15 +25,16 @@ import { defineConfig } from '@playwright/test';
  *   开着 FAKE_PAYMENT（假网关支付页只在非生产存在）。
  * - **storefront**（端口 3001，dev 脚本固定端口）：API_BASE_URL 指向 3100；
  *   localhost 的 Host 不带子域名 → tenant.ts 兜底到 demo，正好是 seed 的店铺。
+ * - **merchant-admin**（端口 3002，dev 脚本固定端口）：同样是中心域名，
+ *   商家后台登录**不带** `x-tenant-subdomain`，租户由 token 决定。
+ *
+ * 端口与库地址单源在 `support/env.ts`：spec 里要用绝对地址访问 3002，
+ * 两处各写一份迟早会漂。
  *
  * ⚠️ 密钥与 CI 的 e2e job 保持同源（ci-*-前缀），历史密文才解得开。
  */
-const API_PORT = 3100;
-const STOREFRONT_PORT = 3001;
-
 const apiEnv = {
-  DATABASE_URL:
-    'postgresql://ecommerce:ecommerce@localhost:15432/ecommerce_browser?schema=public',
+  DATABASE_URL,
   REDIS_URL: process.env.REDIS_URL ?? 'redis://localhost:16380',
   BULLMQ_PREFIX: 'bull-browser',
   JWT_SECRET: 'ci-jwt-secret-with-enough-entropy-0123456789',
@@ -45,7 +55,7 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
   use: {
-    baseURL: `http://localhost:${STOREFRONT_PORT}`,
+    baseURL: STOREFRONT_URL,
     trace: 'retain-on-failure',
   },
   webServer: [
@@ -63,12 +73,25 @@ export default defineConfig({
       cwd: '..',
       url: `http://localhost:${STOREFRONT_PORT}/`,
       reuseExistingServer: !process.env.CI,
-      timeout: 120_000,
+      timeout: 180_000,
       env: {
-        API_BASE_URL: `http://localhost:${API_PORT}/api/v1`,
+        API_BASE_URL,
         AUTH_SECRET: 'browser-e2e-auth-secret-0123456789',
         AUTH_TRUST_HOST: 'true',
         NEXT_PUBLIC_TENANT_SUBDOMAIN: 'demo',
+      },
+    },
+    {
+      command: 'npm run dev --workspace merchant-admin',
+      cwd: '..',
+      url: `${MERCHANT_ADMIN_URL}/login`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+      env: {
+        API_BASE_URL,
+        AUTH_SECRET: 'browser-e2e-auth-secret-0123456789',
+        AUTH_URL: MERCHANT_ADMIN_URL,
+        AUTH_TRUST_HOST: 'true',
       },
     },
   ],
