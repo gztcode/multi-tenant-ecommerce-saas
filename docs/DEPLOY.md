@@ -23,18 +23,30 @@
 
 | 记录 | 类型 | 值 | 用途 |
 |------|------|------|------|
-| `example.com` 与 `*.example.com` | A | 服务器 IP | 店铺前台（`<tenant>.example.com`） |
+| `*.example.com` | A | 服务器 IP | 店铺前台（`<tenant>.example.com`） |
+| `example.com` | A | 服务器 IP | **不承载业务**：nginx 显式拒绝（http/https 都是 444 断连），仅用于完成 TLS 握手 |
 | `api.example.com` | A | 服务器 IP | API（支付渠道回调指向这里） |
 | `merchant.example.com` | A | 服务器 IP | 商家后台 |
 | `admin.example.com` | A | 服务器 IP | 平台超管后台 |
 
+> 裸根域名 `example.com` **不是入口**：店铺在 `<tenant>.example.com`，三个后台
+> 各有中心域名。nginx 模板里它有自己的 `server` 块，明确 `return 444`（不跳转、
+> 不代理），与「未知 Host 一律断连」同一口径。之所以仍保留 A 记录与证书覆盖，
+> 是为了让 `https://example.com` 能**完成握手后再明确断连**，而不是解析失败或
+> 先报证书错误（见 §2）。
+
 > 如果嫌 5 条记录麻烦：`*.example.com` 一条泛解析可以同时覆盖
-> 店铺子域名与三个中心域名（nginx 的 server_name 已按域区分）。
+> 店铺子域名与三个中心域名（nginx 的 server_name 已按域区分）。裸根域名那条
+> 可以不加，但那样 `example.com` 会直接 DNS 解析失败，而不是走到 nginx 的显式拒绝。
 
 ## 2. 证书（泛域名，DNS-01）
 
 `infra/nginx/templates/prod.conf.template` 使用一张覆盖
-`example.com` + `*.example.com` 的证书，签发方式必须用 **DNS-01**：
+`example.com` + `*.example.com` 的证书，签发方式必须用 **DNS-01**。
+
+> 为什么要带裸 `example.com`：它不承载业务，但 nginx 的根域块要**完成 TLS
+> 握手后再 444 断连**（见模板注释）。证书不覆盖它，访问 `https://example.com`
+> 会先看到证书错误，而不是明确的拒绝。
 
 ```bash
 # 以 certbot + DNSPod 插件为例（阿里云用 certbot-dns-aliyun，Cloudflare 用内置 dns-cloudflare）
@@ -157,8 +169,10 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```bash
 curl -f https://api.example.com/api/v1/health          # {"status":"ok",...}
 curl -f https://api.example.com/api/v1/metrics | head  # Prometheus 指标（默认 403，见下）
-curl -sI https://example.com | grep -i strict          # HSTS 头存在
-curl -sI http://example.com | head -1                  # 301 → https
+curl -sI https://api.example.com/api/v1/health | grep -i strict  # HSTS 头存在
+# 裸根域名不承载业务：http/https 都是「握手后断连」（444），拿不到状态行
+curl -s -o /dev/null -w 'https %{http_code}\n' https://example.com  # https 000（连接被断开）
+curl -s -o /dev/null -w 'http  %{http_code}\n' http://example.com   # http  000（同上，不 301）
 ```
 
 > ⚠️ **`/api/v1/metrics` 生产默认对公网 403**：nginx 模板里该路径是
