@@ -9,8 +9,9 @@
 //   2. 语法：把渲染产物喂给 nginx -t（用本机已有的 nginx:1.27-alpine 镜像，
 //      不引入新依赖；没有 docker 时跳过语法检查并打印说明）。
 //
-// ⚠️ 本文件是**人工/CI 手动跑**的检查（infra 下没有测试基建），
-//    它不参与 npm test / jest / vitest。
+// ⚠️ 本文件由 CI 的 `nginx` job 跑（`.github/workflows/ci.yml`），命令就是上面那行，
+//    失败会让 CI 变红。CI 的 ubuntu runner 有 docker，所以第 2 项语法检查在 CI 上是
+//    **真跑**（只有本地没 docker 时才跳过）。它不参与 npm test / jest / vitest。
 
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -39,7 +40,7 @@ function renderTemplate(template, env) {
   );
 }
 
-/** 渲染模板 + 跑展开脚本，返回最终产物。 */
+/** 渲染模板 + 跑展开脚本，返回最终产物；stderr 用于断言「跳过并打日志」。 */
 function renderProdConf(metricsAllowCidr) {
   const dir = mkdtempSync(join(tmpdir(), 'prod-conf-'));
   const confPath = join(dir, 'prod.conf');
@@ -47,10 +48,21 @@ function renderProdConf(metricsAllowCidr) {
     BASE_DOMAIN: 'example.com',
   });
   writeFileSync(confPath, rendered);
-  execFileSync('sh', [EXPAND_SCRIPT, confPath], {
+  // ⚠️ 必须用 spawnSync 分开取流：execFileSync 只返回 stdout，
+  //    「跳过非法条目」的日志写在 stderr 上。
+  const result = spawnSync('sh', [EXPAND_SCRIPT, confPath], {
     env: { ...process.env, METRICS_ALLOW_CIDR: metricsAllowCidr ?? '' },
+    encoding: 'utf8',
   });
-  return { confPath, dir, conf: readFileSync(confPath, 'utf8') };
+  if (result.status !== 0) {
+    throw new Error(`展开脚本失败：${result.stderr || result.stdout}`);
+  }
+  return {
+    confPath,
+    dir,
+    conf: readFileSync(confPath, 'utf8'),
+    stderr: result.stderr,
+  };
 }
 
 /** 取出所有 `location /api/v1/metrics { ... }` 块的正文行。 */
@@ -167,7 +179,10 @@ test('metrics 端点：白名单按 METRICS_ALLOW_CIDR 逗号列表展开', () =
 test('白名单里的非法条目被跳过，不会让 nginx 起不来', () => {
   // 一条非法 allow 语句会让 nginx 启动失败 → 整站不可用。
   // 代价应该只是「少放行一个网段」，所以非法项跳过并打日志。
-  const { conf } = renderProdConf('10.0.0.0/8, 10.0.0.0/33, example.com, all');
+  // ⚠️ `deadbeef` / `::` 是 IPv6 形状校验放过去的历史漏洞，nginx 都不认它们。
+  const { conf, stderr } = renderProdConf(
+    '10.0.0.0/8, 10.0.0.0/33, example.com, all, deadbeef, ::, 1.2.3.4',
+  );
 
   const blocks = metricsBlocks(conf);
   assert.equal(blocks.length, 2, 'metrics 的 location 块应当出现两处');
@@ -175,8 +190,34 @@ test('白名单里的非法条目被跳过，不会让 nginx 起不来', () => {
     const allows = body
       .map((line) => line.trim())
       .filter((line) => line.startsWith('allow '));
-    assert.deepEqual(allows, ['allow 10.0.0.0/8;']);
+    assert.deepEqual(allows, ['allow 10.0.0.0/8;', 'allow 1.2.3.4;']);
     assert.ok(body.some((line) => line.trim() === 'deny all;'));
+  }
+
+  // 「跳过并打日志」是运维排查的入口：每个被丢弃的条目都要在 stderr 里点名。
+  for (const bad of ['10.0.0.0/33', 'example.com', 'all', 'deadbeef', '::']) {
+    assert.match(stderr, new RegExp(`跳过非法条目：${bad.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  }
+});
+
+test('IPv6 条目一律跳过（当前策略只放行 IPv4）', () => {
+  // 保守策略：IPv6 只做形状校验挡不住 `deadbeef` / `::`，而它们会让 nginx 启动失败。
+  // 所以只收 IPv4 —— 合法的 IPv6 网段（2001:db8::/32、fe80::1、::1）也一并跳过。
+  const { conf, stderr } = renderProdConf(
+    '2001:db8::/32, fe80::1, ::1, 10.0.0.0/8',
+  );
+
+  const blocks = metricsBlocks(conf);
+  assert.equal(blocks.length, 2, 'metrics 的 location 块应当出现两处');
+  for (const body of blocks) {
+    const allows = body
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('allow '));
+    assert.deepEqual(allows, ['allow 10.0.0.0/8;'], 'IPv6 条目不应写进配置');
+    assert.ok(body.some((line) => line.trim() === 'deny all;'));
+  }
+  for (const v6 of ['2001:db8::/32', 'fe80::1', '::1']) {
+    assert.match(stderr, new RegExp(`跳过非法条目：${v6.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
   }
 });
 
@@ -203,7 +244,8 @@ test('渲染产物不残留未定义的 ${VAR} 字面量', () => {
 });
 
 test('nginx -t：默认拒绝与白名单两种配置都过语法检查', () => {
-  for (const cidr of ['', '10.0.0.0/8']) {
+  // 最后一档混入死条目（deadbeef / ::）：它们被跳过，所以真 nginx 也必须过。
+  for (const cidr of ['', '10.0.0.0/8', '10.0.0.0/8, deadbeef, ::']) {
     const { confPath, dir } = renderProdConf(cidr);
     const out = nginxSyntaxCheck(confPath, dir);
     if (out === null) continue;

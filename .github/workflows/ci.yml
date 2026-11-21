@@ -123,6 +123,20 @@ jobs:
       - run: npx tsc --noEmit
         working-directory: packages/frontend-shared
 
+  nginx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # 生产 nginx 模板 + metrics 白名单脚本的渲染测试（node:test，无 npm 依赖）。
+      # ⚠️ 不许加 `|| true` / `continue-on-error`：这个 job 存在的意义就是让
+      #    模板或白名单脚本改坏时 CI 变红。ubuntu runner 自带 docker，
+      #    用例里的 `nginx -t` 会真跑（本地没 docker 时才跳过）。
+      - run: node --test infra/nginx/prod-conf.render.test.mjs
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 20

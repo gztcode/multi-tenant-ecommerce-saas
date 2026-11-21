@@ -22,6 +22,11 @@
 # 一条非法 allow 语句会让 nginx **启动失败**，代价是整站不可用 ——
 # 那比「少放行一个网段」严重得多。
 #
+# ⚠️ **只放行 IPv4**：IPv6 条目一律跳过并打日志（包括 2001:db8::/32 这类合法网段）。
+#    只做形状校验的 IPv6 判断放过了 `deadbeef`、`::` 这类 nginx 不认的写法，
+#    实测会让 nginx 起不来。要放行 IPv6 必须写真正的地址解析，
+#    在那之前宁可少放行一个网段。
+#
 # 用法：render-metrics-allow.sh [配置文件路径]
 #   默认 /etc/nginx/conf.d/prod.conf（模板 prod.conf.template 的渲染产物）。
 
@@ -42,26 +47,26 @@ printf '%s' "${METRICS_ALLOW_CIDR:-}" \
     | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
     | grep -v '^$' \
     | awk '
-        # 返回 1 = 像个能用的地址（IPv4 严格校验；IPv6 只做形状校验）
-        function ok(s,   n, p, i, a, cnt) {
+        # 返回 1 = 能被 nginx 接受的 IPv4 地址或 CIDR。
+        #
+        # ⚠️ IPv6 一律拒绝（不是漏了）：只做形状校验时 `deadbeef`、`::`
+        #    也能通过，而 nginx 会把它们判成非法地址 → 启动失败 = 整站不可用。
+        #    要放行 IPv6 得写真正的地址解析，在没做到之前宁可少放行一个网段。
+        function ok(s,   n, p, i, a) {
             p = 0
             n = index(s, "/")
             if (n > 0) {
                 p = substr(s, n + 1)
                 s = substr(s, 1, n - 1)
                 if (p !~ /^[0-9]+$/) return 0
+                if (p + 0 > 32) return 0
             }
-            if (s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
-                cnt = split(s, a, ".")
-                for (i = 1; i <= 4; i++) {
-                    if (a[i] + 0 > 255) return 0
-                }
-                return (p == 0) || (p + 0 <= 32)
+            if (s !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) return 0
+            split(s, a, ".")
+            for (i = 1; i <= 4; i++) {
+                if (a[i] + 0 > 255) return 0
             }
-            if (s ~ /^[0-9a-fA-F:]+$/) {
-                return (p == 0) || (p + 0 <= 128)
-            }
-            return 0
+            return 1
         }
         ok($0) { print "        allow " $0 ";"; next }
         { print "render-metrics-allow: 跳过非法条目：" $0 > "/dev/stderr" }

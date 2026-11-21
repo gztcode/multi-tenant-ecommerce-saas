@@ -101,10 +101,13 @@ ALERT_WEBHOOK_URL=...       # 飞书/钉钉机器人地址（强烈建议配）
 以下两项**不属于**启动守卫校验项（守卫不校验、留空也能起），但影响生产暴露面：
 
 ```bash
-# Prometheus 抓取端点（/api/v1/metrics）的可信网段，逗号分隔的 CIDR。
+# Prometheus 抓取端点（/api/v1/metrics）的可信网段，逗号分隔的 IPv4 地址/CIDR。
 # ⚠️ **不配 = 一个都不放行**（fail-closed）→ 抓取全部 403，
 #    监控瞎掉但服务照常跑。抓取端在容器网/内网时配上它：
 # METRICS_ALLOW_CIDR=10.0.0.0/8,192.168.1.0/24
+#
+# ⚠️ **只接受 IPv4**：IPv6 条目（如 2001:db8::/32）一律跳过并打日志 ——
+#    IPv6 的形状校验挡不住 `deadbeef`、`::` 这类 nginx 不认的写法。
 #
 # 写错的条目（如 10.0.0.0/33）会被**跳过并在 nginx 日志里点名**，
 # 不会写进配置 —— 一条非法 allow 语句会让 nginx 启动失败（整站不可用），
@@ -232,12 +235,13 @@ seed 产生的演示账号（若曾误跑 seed）。
 - **抓取**：Prometheus 抓 `https://api.example.com/api/v1/metrics`。
   该路径在生产 nginx 模板里**默认 `deny all`**（对公网 403），只有
   `METRICS_ALLOW_CIDR` 列出的可信网段能访问 —— 变量在 `infra/.env` 里配，
-  逗号分隔多个 CIDR（如 `10.0.0.0/8,192.168.1.0/24`），
+  逗号分隔多个 **IPv4** 地址/CIDR（如 `10.0.0.0/8,192.168.1.0/24`），
   部署时由 `infra/nginx/render-metrics-allow.sh` 展开成 nginx 的 allow 语句。
   **不配 = 一个都不放行**（fail-closed）：抓不到指标，但不会误放行到公网。
   改了变量要重启 nginx 容器才生效（`docker compose ... up -d nginx`）。
   写错的条目会被跳过并在 nginx 日志里点名（`render-metrics-allow: 跳过非法条目：…`），
-  不会让 nginx 启动失败。
+  不会让 nginx 启动失败。**IPv6 条目（含合法网段）同样被跳过** ——
+  当前只放行 IPv4，见脚本头部注释。
   指标清单：`ecommerce_http_requests_total` / `..._duration_seconds`、
   `ecommerce_queue_jobs`、`ecommerce_payments_refunding_stuck`、
   `ecommerce_payouts_processing_stuck` + 进程指标。
