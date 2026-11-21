@@ -11,7 +11,9 @@
 #
 # - BASE_DOMAIN：店铺子域名的基准域，如 `example.com`
 #   （店铺在 `<tenant>.${BASE_DOMAIN}`，证书需覆盖 `*.${BASE_DOMAIN}`——
-#    Let's Encrypt 用 DNS-01 challenge 签泛域名证书，见 DEPLOY.md §证书）
+#    Let's Encrypt 用 DNS-01 challenge 签泛域名证书，见 DEPLOY.md §证书。
+#    ⚠️ SAN 里还要带**裸的** `${BASE_DOMAIN}`：裸根域名有自己的 443 块，
+#    它要完成 TLS 握手后再显式断连，证书不覆盖根域名就会先报证书错误。）
 # - 证书路径固定挂载到 /etc/nginx/certs/{fullchain.pem,privkey.pem}
 # - METRICS_ALLOW_CIDR：Prometheus 抓取端点（/api/v1/metrics）的可信网段，
 #   逗号分隔的 CIDR（如 10.0.0.0/8,192.168.0.0/16）。**不配 = 一个都不放行**
@@ -105,10 +107,31 @@ server {
     return 444;
 }
 
-# 已知域名的 80：证书签发/续期走 webroot，其余 301 到 https
+# ---- 80：裸根域名（不承载业务，明确拒绝） ----
+# 根域名不是任何入口：店铺在 <tenant>.example.com，三个后台各有中心域名。
+# **这里刻意不 301 到 https**：443 上的根域名同样是「握手完成后 444 断连」
+# （见下方 443 根域块），301 过去只会让浏览器得到「跳转 → 连接被重置」，
+# 比直接断更糟。两侧动作一致 = 自洽。
+# 保留 ACME 路由：中心域名若改用 http-01 逐个签，根域名的 challenge 仍需可达
+# （泛域名证书走 DNS-01，不经过这里）。
 server {
     listen 80;
-    server_name ${BASE_DOMAIN} *.${BASE_DOMAIN} api.${BASE_DOMAIN} merchant.${BASE_DOMAIN} admin.${BASE_DOMAIN};
+    server_name ${BASE_DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 444;
+    }
+}
+
+# 已知域名的 80：证书签发/续期走 webroot，其余 301 到 https
+# ⚠️ server_name **不含裸根域名** —— 它由上面的块显式拒绝，不参与跳转。
+server {
+    listen 80;
+    server_name *.${BASE_DOMAIN} api.${BASE_DOMAIN} merchant.${BASE_DOMAIN} admin.${BASE_DOMAIN};
 
     # ACME http-01 challenge（certbot webroot 指向该卷）
     location /.well-known/acme-challenge/ {
@@ -122,13 +145,34 @@ server {
 
 # ---- 443：未知 Host 兜底 ----
 # 与 80 端口 return 444 同理，不给 TLS 扫描器任何回音。
-# 必须放在 443 所有 server 块最前（第一个 443 块即默认 server），
-# 否则未知 Host 会落到店铺子域名正则块被代理转发。
+# ⚠️ `default_server` 是 listen 的**显式参数**，与 server 块书写顺序无关：
+#    只有 SNI/HTTP Host 匹配不到任何 server_name 的请求才落到这里。
+#    裸根域名不靠这个兜底 —— 它有自己的显式块（见下一节）。
 # ssl_reject_handshake 在 TLS 层直接拒绝握手，无需证书即可通过 nginx -t。
 server {
     listen 443 ssl default_server;
     server_name _;
     ssl_reject_handshake on;
+}
+
+# ---- 443：裸根域名（不承载业务，明确拒绝） ----
+# 根域名匹配不到店铺子域名正则块（正则要求 `<tenant>.` 前缀）。如果不显式写块，
+# 它只能落到 default_server，「落到哪里」取决于 server 块的书写顺序 ——
+# 顺序一变行为就静默改变，这正是审计 P3-3 要消除的隐式依赖。
+#
+# 处置：完成 TLS 握手 → return 444 直接断开、不回任何响应。与「未知 Host 一律
+# 断连」同一口径：不给扫描器回音，也不代理到任何后端（没有 location，就没有
+# 被转发到 storefront/api 的可能）。
+# ⚠️ 证书必须覆盖裸根域名（见 docs/DEPLOY.md §2）：这里要握手后才断，
+#    证书不覆盖的话用户先看到证书错误，而不是「明确的拒绝」。
+server {
+    listen 443 ssl;
+    server_name ${BASE_DOMAIN};
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    return 444;
 }
 
 # ---- 443：店铺子域名 ----
