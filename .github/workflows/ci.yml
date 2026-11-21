@@ -205,6 +205,28 @@ jobs:
       - run: npm run test:e2e
         working-directory: api
 
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm install -g npm@11
+      # ⚠️ workspaces：漏洞扫描只需要根 devDependencies 里的 audit-ci（44 个包），
+      #    不必装全部工作区依赖。
+      #    --ignore-scripts：扫描不依赖任何 postinstall。
+      - run: npm ci --workspaces=false --ignore-scripts
+      # ⚠️ 必须显式指定 registry：audit-ci 走 npm audit 的批量漏洞接口，
+      #    国内镜像（mirrors.cloud.tencent.com / npmmirror）没有这个接口，
+      #    会报 "Invocation of npm audit failed" 直接红。
+      # ⚠️ 卡门策略与白名单都在 .github/audit-ci.jsonc（进版本库，可评审）：
+      #    只对 high / critical 卡门，moderate 及以下只报告、不失败。
+      - run: npx audit-ci --config .github/audit-ci.jsonc --registry=https://registry.npmjs.org
+
   browser:
     runs-on: ubuntu-latest
     timeout-minutes: 20
