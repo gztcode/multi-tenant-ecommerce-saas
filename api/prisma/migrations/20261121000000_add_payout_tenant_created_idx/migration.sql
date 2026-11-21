@@ -1,0 +1,24 @@
+-- Payout 补 tenantId 前导索引（阶段 11，P2-4 审计）。
+--
+-- 背景：租户侧出款单列表按「创建时刻倒序」翻页
+-- （`payout-query.service.ts` 的 `listForTenant`：`where` 只带 tenantId，
+--  `orderBy: { createdAt: 'desc' }`）。原先 payouts 上没有任何以 tenantId
+-- 打头的索引，这条查询只能 Seq Scan 全表再 top-N 排序。
+--
+-- 索引设计：
+--   - `tenantId` 在前 —— 租户前缀可用，跨租户不互相干扰；
+--   - `createdAt` 在后 —— 排序也能走索引，不需要额外的 Sort 节点。
+--
+-- ⚠️ 方向取**升序**（`"createdAt" ASC`）而不是 DESC：
+--    PostgreSQL 的 btree 索引支持**反向扫描**（`Index Scan Backward`），
+--    `ORDER BY "createdAt" DESC` 走升序索引时代价与正向扫描完全一致
+--    （EXPLAIN 实测见 PR 正文）；而升序索引同时还能服务
+--    `ORDER BY "createdAt" ASC` 的查询，将来不用再补第二条索引。
+--
+-- ⚠️ 生产上线注意（详见 PR 正文）：
+--    普通 `CREATE INDEX` 会拿 SHARE 锁，**阻塞 payouts 的 INSERT/UPDATE**。
+--    payouts 表大的话请在低峰期执行，或先手工（事务外）跑
+--    `CREATE INDEX CONCURRENTLY "payouts_tenantId_createdAt_idx" ...`，
+--    本迁移的 `IF NOT EXISTS` 会自动跳过已存在的索引，不会报「已存在」。
+CREATE INDEX IF NOT EXISTS "payouts_tenantId_createdAt_idx"
+  ON "payouts"("tenantId", "createdAt");

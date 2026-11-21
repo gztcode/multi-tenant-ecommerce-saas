@@ -1393,6 +1393,10 @@ model Payout {
   @@index([statementId])
   /// ⚠️ 阶段 5h-2：执行侧按「状态 + 创建时刻」捞单
   @@index([status, createdAt])
+  /// ⚠️ 阶段 11（P2-4 审计）：租户侧出款单列表按「创建时刻倒序」翻页，
+  ///    原先没有可用索引 —— 只能 Seq Scan 全表再 top-N 排序。
+  ///    tenantId 打头让租户前缀可用，createdAt 次之让排序也走索引。
+  @@index([tenantId, createdAt])
   @@map("payouts")
 }
 
