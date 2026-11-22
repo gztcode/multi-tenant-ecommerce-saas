@@ -169,6 +169,14 @@ function hasDirective(lines, pattern) {
   return lines.some((line) => pattern.test(line.trim()));
 }
 
+/** 某个监听端口上的所有 server 块（`listen 80;` / `listen 443 ssl ...`）。 */
+function serversOnPort(conf, port) {
+  // `listen 80;` 后面直接是分号，没有参数，所以不能只认「端口 + 空格」。
+  return serverBlocks(conf).filter((block) =>
+    hasDirective(block.lines, new RegExp(`^listen ${port}(;|\\s)`)),
+  );
+}
+
 /** server_name 匹配器：店铺块是正则，三个后台是精确域名。 */
 const STOREFRONT_SERVER = (name) => name.startsWith('~^');
 const ADMIN_SERVER = (name) => name === 'merchant.example.com' || name === 'admin.example.com';
@@ -347,6 +355,113 @@ test('渲染产物不残留未定义的 ${VAR} 字面量', () => {
     .split('\n')
     .find((line) => !line.trim().startsWith('#') && line.includes('${'));
   assert.equal(leftover, undefined, '产物里出现了 envsubst 没替换掉的 ${...}');
+});
+
+// ---- 裸根域名（P3-3） ----
+//
+// 审计 P3-3：裸根域名 `example.com` 匹配不到店铺正则块（正则要求 `<tenant>.`
+// 前缀），只能落到 443 的 default_server；「落到哪里」取决于 server 块书写顺序，
+// 任何人调整顺序都会静默改变根域名的行为。这里用断言钉住**显式**处置：
+// 根域名自己一个块、明确拒绝、不代理后端、http/https 自洽、文档逐行对得上。
+
+test('裸根域名有显式 443 块：return 444，不代理到任何后端，也不落到店铺正则块', () => {
+  const { conf } = renderProdConf('');
+
+  // 1) 443 上必须有一个 server_name 恰好是 example.com 的块。
+  //    精确名优先于正则，所以根域名请求会命中它，而不是店铺子域名块。
+  const root443 = serversOnPort(conf, 443).filter((block) => block.serverName === 'example.com');
+  assert.equal(root443.length, 1, '443 上必须恰好有一个裸根域名 server 块');
+  const [root] = root443;
+
+  // 2) 它直接断开（444），既不是跳转也不是代理；没有 location 就没有被转发的可能。
+  assert.ok(hasDirective(root.lines, /^return 444;$/), '裸根域名必须显式 return 444');
+  assert.ok(!hasDirective(root.lines, /^return 301 /), '裸根域名不能被 301 到任何地方');
+  assert.ok(!hasDirective(root.lines, /^proxy_pass /), '裸根域名不允许 proxy_pass');
+  assert.equal(
+    locationBlocks(root.lines).length,
+    0,
+    '裸根域名块不应有 location（有 location 就有被代理到后端的可能）',
+  );
+
+  // 3) 店铺块的正则确实匹配不到裸根域名（这是「不产生 $tenant 为空请求」的根因）。
+  const storefront = findServer(conf, STOREFRONT_SERVER);
+  assert.ok(storefront, '找不到店铺子域名 server 块');
+  const storefrontRegex = new RegExp(storefront.serverName.replace(/^~/, ''));
+  assert.doesNotMatch(
+    'example.com',
+    storefrontRegex,
+    `店铺子域名正则不应匹配裸根域名：${storefront.serverName}`,
+  );
+});
+
+test('443 的 default_server 与裸根域名块是两个独立块，且 default_server 是显式参数', () => {
+  const { conf } = renderProdConf('');
+  const all443 = serversOnPort(conf, 443);
+
+  // default_server 由 listen 参数显式指定，不靠「谁写在最前」。
+  const defaults = all443.filter((block) =>
+    hasDirective(block.lines, /^listen 443 ssl default_server;$/),
+  );
+  assert.equal(defaults.length, 1, '443 上必须恰有一个显式 default_server');
+  assert.equal(defaults[0].serverName, '_', 'default_server 应保留 server_name _ 兜底未知 Host');
+  assert.ok(
+    hasDirective(defaults[0].lines, /^ssl_reject_handshake on;$/),
+    'default_server 应对未知 Host 拒绝握手',
+  );
+
+  // 根域名块必须靠显式 server_name 命中，不能兼任 default_server（那就退回「兜底」了）。
+  const root = all443.filter((block) => block.serverName === 'example.com');
+  assert.equal(root.length, 1, '443 上必须恰好有一个裸根域名 server 块');
+  assert.ok(
+    !hasDirective(root[0].lines, /default_server/),
+    '裸根域名不能兼任 default_server：它必须被显式命名，而不是靠兜底',
+  );
+});
+
+test('裸根域名 http 与 https 自洽：两侧都明确拒绝，不出现 301 → 断连的死循环', () => {
+  const { conf } = renderProdConf('');
+
+  // http 侧：裸根域名自己一个块，直接拒绝，不 301。
+  const root80 = serversOnPort(conf, 80).filter((block) => block.serverName === 'example.com');
+  assert.equal(root80.length, 1, '80 上必须恰好有一个裸根域名 server 块');
+  assert.ok(hasDirective(root80[0].lines, /^return 444;$/), 'http 裸根域名必须显式拒绝（444）');
+  assert.ok(!hasDirective(root80[0].lines, /^return 301 /), 'http 裸根域名不能被 301 到 https');
+
+  // 80 → https 的 301 块不能把裸根域名写进 server_name（否则就是 301 到一个必然断连的地址）。
+  const redirect = serversOnPort(conf, 80).find((block) =>
+    hasDirective(block.lines, /^return 301 https:\/\/\$host\$request_uri;$/),
+  );
+  assert.ok(redirect, '找不到 80 → https 的 301 块');
+  const redirectNames = redirect.serverName.split(/\s+/);
+  assert.ok(!redirectNames.includes('example.com'), '80 → https 的 301 块不能包含裸根域名');
+  for (const label of ['api', 'merchant', 'admin']) {
+    assert.ok(
+      redirectNames.includes(`${label}.example.com`),
+      `80 → https 的 301 块应保留 ${label}.example.com`,
+    );
+  }
+  assert.ok(redirectNames.includes('*.example.com'), '80 → https 的 301 块应保留泛域名');
+
+  // https 侧与 http 侧动作一致（都是 444 断连），不存在「跳到 https 再断」的落差。
+  const root443 = serversOnPort(conf, 443).filter((block) => block.serverName === 'example.com');
+  assert.equal(root443.length, 1, '443 上必须恰好有一个裸根域名 server 块');
+  assert.ok(hasDirective(root443[0].lines, /^return 444;$/), 'https 裸根域名必须显式拒绝（444）');
+});
+
+test('docs/DEPLOY.md §1 DNS 表与实际行为一致：裸根域名写明不承载业务', () => {
+  const deploy = readFileSync(join(HERE, '..', '..', 'docs', 'DEPLOY.md'), 'utf8');
+  const rows = deploy.split('\n').filter((line) => line.trim().startsWith('|'));
+
+  // 裸根域名必须是独立一行，且用途写明「不承载业务 / 拒绝 / 444」，不能写成店铺前台。
+  const rootRow = rows.find((line) => /^\|\s*`example\.com`\s*\|/.test(line));
+  assert.ok(rootRow, 'DEPLOY.md §1 DNS 表缺少裸根域名 example.com 的独立行');
+  assert.match(rootRow, /不承载业务|拒绝|444/, `裸根域名行未写明真实行为：${rootRow}`);
+  assert.doesNotMatch(rootRow, /店铺前台/, `裸根域名行不能写成店铺前台：${rootRow}`);
+
+  // 店铺前台仍由泛域名承担，这条不能一起改坏。
+  const wildcardRow = rows.find((line) => /^\|\s*`\*\.example\.com`\s*\|/.test(line));
+  assert.ok(wildcardRow, 'DEPLOY.md §1 DNS 表缺少 *.example.com 的独立行');
+  assert.match(wildcardRow, /店铺前台/, '泛域名行仍应写明店铺前台');
 });
 
 // ---- 限流（P2-3 / P3-2） ----
