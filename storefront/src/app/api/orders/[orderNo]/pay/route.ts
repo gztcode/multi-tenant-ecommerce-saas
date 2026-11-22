@@ -11,7 +11,7 @@ interface CreatedPayment {
   provider: string;
   status: string;
   providerTxnId: string | null;
-  /** 支付页面 URL（**相对路径**，以 /api/v1 开头） */
+  /** 支付页面 URL：相对路径（以 /api/v1 开头）或渠道给的绝对地址 */
   payUrl: string;
   rawResponse: unknown;
 }
@@ -19,14 +19,20 @@ interface CreatedPayment {
 /**
  * 发起支付的中转。
  *
- * ⚠️ **后端返回的 payUrl 是相对路径**（`/api/v1/pay/fake/:paymentId`），
- * 那是**后端服务**自己的路由前缀，浏览器拿到后要访问的是 api 服务，
- * 不是 storefront。所以这里在服务端把它拼成绝对 URL 再返回给前端——
- * 否则浏览器会去 storefront 自己的 `/api/v1/pay/fake/...`，
- * 那里根本没有这个路由（404）。
+ * ⚠️ **后端返回的 payUrl 可能是相对路径**（`/api/v1/pay/fake/:paymentId`），
+ * 那是**后端服务**自己的路由前缀。浏览器拿到后要访问的是**当前站点域名**
+ * 下的同一个路径——网关会把店铺子域名下的 `/api/v1/` 转发给 api 服务。
+ * 所以这里把它规整成**根相对路径**（带前导 `/`）交给浏览器，
+ * 由浏览器按当前 origin 解析。
  *
- * 真实支付渠道的形态一样：微信给的是 `code_url`、支付宝给的是支付 URL，
- * 都是渠道的地址，前端只负责跳过去。
+ * ⚠️ **不能用服务端 `API_BASE_URL` 拼绝对地址**：compose 里那是容器内地址
+ * （`http://api:3000/api/v1`），浏览器根本打不开。
+ * ⚠️ **也不能返回不带前导 `/` 的相对路径**：浏览器会按**当前页面 URL**
+ * 解析，从 `/orders/xxx` 跳到 `/orders/api/v1/...`，一样到不了支付页。
+ *
+ * 真实支付渠道的形态不同：微信给的是 `code_url`、支付宝给的是支付 URL，
+ * 以及 `alipays://` / `weixin://` 这类唤起 scheme，都是**带 scheme 的绝对地址**，
+ * 原样透传。
  */
 export async function POST(
   _request: Request,
@@ -51,7 +57,7 @@ export async function POST(
       amount: payment.amount,
       channel: payment.channel,
       status: payment.status,
-      payUrl: absolutePayUrl(payment.payUrl),
+      payUrl: browserPayUrl(payment.payUrl),
     });
   } catch (cause) {
     return toErrorResponse(cause);
@@ -59,23 +65,32 @@ export async function POST(
 }
 
 /**
- * 把后端给的相对 payUrl 拼成绝对地址。
+ * 带 scheme 的绝对 URL（`https://…`、`alipays://…`、`weixin://…`）。
  *
- * 后端的 payUrl 以 `/api/v1` 开头，而 API_BASE_URL 本身就以 `/api/v1` 结尾，
- * 所以要**去掉重复的那一段**再拼。直接 `${API_BASE_URL}${payUrl}` 会得到
- * `http://localhost:3000/api/v1/api/v1/pay/fake/xxx`——404。
+ * ⚠️ **不能只认 http/https**：支付宝/微信的唤起 scheme 不是 http(s)，
+ * 按相对路径处理会拼成 `/alipays://…` 这种打不开的废串。
+ * ⚠️ 协议相对地址 `//host` **不匹配**这条（它没有 scheme，以 `/` 开头），
+ * 会落到下面的同源规整分支——这是刻意的。
  */
-function absolutePayUrl(payUrl: string): string {
-  const base = (
-    process.env.API_BASE_URL ?? 'http://localhost:3000/api/v1'
-  ).replace(/\/+$/, '');
+const ABSOLUTE_URL = /^[a-z][a-z0-9+.-]*:/i;
 
-  // 已经是绝对地址（真实渠道给的可能是完整 URL）就直接用
-  if (/^https?:\/\//i.test(payUrl)) {
+/**
+ * 危险 scheme：浏览器会把它们当成可执行/内联内容，绝不能交给导航。
+ * 命中时不透传，按相对路径收敛成本站的普通路径。
+ */
+const DANGEROUS_SCHEME = /^(?:javascript|data|vbscript):/i;
+
+/**
+ * 把后端给的 payUrl 交给浏览器按**当前 origin** 解析。
+ *
+ * - 带 scheme 的绝对地址（真实渠道给的完整 URL 或唤起 scheme）原样返回，
+ *   危险 scheme（`javascript:` / `data:` / `vbscript:`）除外。
+ * - 其余补成**根相对**（以 `/` 开头）。顺带把 `//host` 这种
+ *   **协议相对地址**收敛成同源路径——否则前导 `//` 会让浏览器跳到别的域名。
+ */
+function browserPayUrl(payUrl: string): string {
+  if (ABSOLUTE_URL.test(payUrl) && !DANGEROUS_SCHEME.test(payUrl)) {
     return payUrl;
   }
-
-  const prefix = '/api/v1';
-  const path = payUrl.startsWith(prefix) ? payUrl.slice(prefix.length) : payUrl;
-  return `${base}${path.startsWith('/') ? path : `/${path}`}`;
+  return `/${payUrl.replace(/^\/+/, '')}`;
 }

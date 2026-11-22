@@ -55,7 +55,13 @@ test('登录 → 加购 → 下单 → 假网关支付 → 订单 PAID', async (
   await page.getByRole('button', { name: /提交订单|下单|支付/ }).click();
 
   // ---- 假网关支付 ----
-  // 下单后进入支付环节：点击「去支付」跳到假网关页（API 端口）
+  // 「去支付」跳的是**根相对** payUrl（`/api/v1/pay/fake/:paymentId`），
+  // 浏览器按当前 origin 解析：
+  // - 生产：nginx 的 `location /api/v1/` 抢先转发给 api；
+  // - dev / 本 e2e：前面没有网关，storefront 自己当网关替身
+  //   （`next.config.ts` 里只在非生产生成的那条假网关 rewrite）。
+  // ⚠️ `waitForURL` 只匹配 URL 路径，**404 页面也会假通过**；
+  //    真正的防线是下面的 `dd` 断言（只有假网关页面才有订单号）。
   await page.getByRole('button', { name: /去支付|立即支付/ }).click();
   await page.waitForURL(/\/api\/v1\/pay\/fake\//, { timeout: 20_000 });
   // 先读订单号：假网关的 confirm 是「空 200」，点击后页面变空文档
