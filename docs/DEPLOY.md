@@ -23,18 +23,41 @@
 
 | 记录 | 类型 | 值 | 用途 |
 |------|------|------|------|
-| `example.com` 与 `*.example.com` | A | 服务器 IP | 店铺前台（`<tenant>.example.com`） |
+| `*.example.com` | A | 服务器 IP | 店铺前台（`<tenant>.example.com`） |
+| `example.com` | A | 服务器 IP | **不承载业务**：nginx 显式拒绝（http/https 都是 444 断连），仅用于完成 TLS 握手 |
 | `api.example.com` | A | 服务器 IP | API（支付渠道回调指向这里） |
 | `merchant.example.com` | A | 服务器 IP | 商家后台 |
 | `admin.example.com` | A | 服务器 IP | 平台超管后台 |
 
+> 裸根域名 `example.com` **不是入口**：店铺在 `<tenant>.example.com`，三个后台
+> 各有中心域名。nginx 模板里它有自己的 `server` 块，明确 `return 444`（不跳转、
+> 不代理），与「未知 Host 一律断连」同一口径。之所以仍保留 A 记录与证书覆盖，
+> 是为了让 `https://example.com` 能**完成握手后再明确断连**，而不是解析失败或
+> 先报证书错误（见 §2）。
+
 > 如果嫌 5 条记录麻烦：`*.example.com` 一条泛解析可以同时覆盖
-> 店铺子域名与三个中心域名（nginx 的 server_name 已按域区分）。
+> 店铺子域名与三个中心域名（nginx 的 server_name 已按域区分）。裸根域名那条
+> 可以不加，但那样 `example.com` 会直接 DNS 解析失败，而不是走到 nginx 的显式拒绝。
+
+> **IPv6**：上表只有 A 记录 —— 能解析到服务器的**只有 IPv4**。网关本身是
+> **双栈监听**（每个 server 块同时 `listen` IPv4 与 `[::]`，80 / 443 的兜底
+> `default_server` 两个地址族各一份），所以要让 IPv6 客户端也访问，只需给同
+> 一批名字补上同值的 **AAAA 记录**（泛解析同理：`*.example.com` 一条 AAAA
+> 覆盖店铺与三个中心域名）。
+>
+> 补了 AAAA 之后，IPv6 上的行为与 IPv4 **逐条一致**：未知 Host 与裸根域名
+> 444 断连，合法店铺 Host 正常转发，`[::]:443` 同样是完成 TLS 握手后再拒绝。
+> 不补 AAAA 也不算故障：IPv6-only 客户端会解析不到地址（DNS 层就没有 AAAA），
+> 而不是连到一个只认 IPv4 的网关。
 
 ## 2. 证书（泛域名，DNS-01）
 
 `infra/nginx/templates/prod.conf.template` 使用一张覆盖
-`example.com` + `*.example.com` 的证书，签发方式必须用 **DNS-01**：
+`example.com` + `*.example.com` 的证书，签发方式必须用 **DNS-01**。
+
+> 为什么要带裸 `example.com`：它不承载业务，但 nginx 的根域块要**完成 TLS
+> 握手后再 444 断连**（见模板注释）。证书不覆盖它，访问 `https://example.com`
+> 会先看到证书错误，而不是明确的拒绝。
 
 ```bash
 # 以 certbot + DNSPod 插件为例（阿里云用 certbot-dns-aliyun，Cloudflare 用内置 dns-cloudflare）
@@ -98,6 +121,38 @@ LOG_LEVEL=info
 ALERT_WEBHOOK_URL=...       # 飞书/钉钉机器人地址（强烈建议配）
 ```
 
+以下两项**不属于**启动守卫校验项（守卫不校验、留空也能起），但影响生产暴露面：
+
+```bash
+# Prometheus 抓取端点（/api/v1/metrics）的可信网段，逗号分隔的 IPv4 地址/CIDR。
+# ⚠️ **不配 = 一个都不放行**（fail-closed）→ 抓取全部 403，
+#    监控瞎掉但服务照常跑。抓取端在容器网/内网时配上它：
+# METRICS_ALLOW_CIDR=10.0.0.0/8,192.168.1.0/24
+#
+# ⚠️ **只接受 IPv4**：IPv6 条目（如 2001:db8::/32）一律跳过并打日志 ——
+#    IPv6 的形状校验挡不住 `deadbeef`、`::` 这类 nginx 不认的写法。
+#
+# 写错的条目（如 10.0.0.0/33）会被**跳过并在 nginx 日志里点名**，
+# 不会写进配置 —— 一条非法 allow 语句会让 nginx 启动失败（整站不可用），
+# 那比「少放行一个网段」严重得多。
+#
+# Swagger UI（/api/docs）：生产**默认关闭**（NODE_ENV=production 时不挂载）。
+# 需要临时开放给同事看接口时设 true，**用完记得改回**：
+# SWAGGER_ENABLED=true
+```
+
+网关限流阈值（同样是**不配也能起**、只影响限流强度；变量名、单位、
+默认值与校准方法见 §9）：
+
+```bash
+RATE_LIMIT_FRONT_RATE=20    # 每秒请求数，三个前端入口共用
+RATE_LIMIT_FRONT_BURST=100  # 突发队列长度
+RATE_LIMIT_API_RATE=20
+RATE_LIMIT_API_BURST=40
+RATE_LIMIT_AUTH_RATE=10     # api 的 /api/v1/auth/，从紧
+RATE_LIMIT_AUTH_BURST=20
+```
+
 > `PAYOUT_ACCOUNT_ENCRYPTION_KEY` 一旦投入生产**不能轮换**——
 > 轮换后已打款的出款单快照永久解不开（守卫与 README 都有警告）。
 
@@ -124,10 +179,30 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
 ```bash
 curl -f https://api.example.com/api/v1/health          # {"status":"ok",...}
-curl -f https://api.example.com/api/v1/metrics | head  # Prometheus 指标
-curl -sI https://example.com | grep -i strict          # HSTS 头存在
-curl -sI http://example.com | head -1                  # 301 → https
+curl -f https://api.example.com/api/v1/metrics | head  # Prometheus 指标（默认 403，见下）
+curl -sI https://api.example.com/api/v1/health | grep -i strict  # HSTS 头存在
+# 裸根域名不承载业务：http/https 都是「握手后断连」（444），拿不到状态行
+curl -s -o /dev/null -w 'https %{http_code}\n' https://example.com  # https 000（连接被断开）
+curl -s -o /dev/null -w 'http  %{http_code}\n' http://example.com   # http  000（同上，不 301）
+
+# IPv6 双栈（在服务器本机执行；[::1] 指本机回环，绕过 DNS 与 AAAA）
+curl -s -o /dev/null -w 'v6 http  %{http_code}\n' -g -6 -H 'Host: example.com' 'http://[::1]/'                 # 000
+curl -s -o /dev/null -w 'v6 https %{http_code}\n' -g -6 -k --resolve example.com:443:[::1] https://example.com/ # 000
+curl -s -o /dev/null -w 'v6 api   %{http_code}\n' -g -6 -k --resolve api.example.com:443:[::1] https://api.example.com/api/v1/health  # 200
 ```
+
+> IPv6 那三条必须带 `-g -6` 和 `--resolve`（或 `-H 'Host: ...'`）：容器的
+> `/etc/hosts` 只有 IPv4 映射，直接用域名测会走 DNS 并可能拿到 `::1`，
+> 让你分不清测的是哪个地址族。`--resolve` 同时注入 SNI，https 才能选中正确的块。
+
+> ⚠️ **`/api/v1/metrics` 生产默认对公网 403**：nginx 模板里该路径是
+> `deny all`，只有 `METRICS_ALLOW_CIDR` 列出的网段能抓（见 §3、§9）。
+> 所以上面那条 curl 从公网跑**预期是 403**（`curl -f` 会因此报失败）；
+> 要验证抓取通不通，得从白名单网段内的机器跑，或临时把该机的公网 IP
+> 加进 `METRICS_ALLOW_CIDR` 后 `docker compose ... up -d nginx` 重载。
+>
+> 同样地，`/api/docs`（Swagger UI）生产默认**不可达**（404），
+> 需要看文档时在 `infra/.env` 里设 `SWAGGER_ENABLED=true` 并重启 api。
 
 ## 5. 数据库加固
 
@@ -203,11 +278,99 @@ seed 产生的演示账号（若曾误跑 seed）。
 
 ## 9. 可观测性接入
 
-- **抓取**：Prometheus 抓 `https://api.example.com/api/v1/metrics`
-  （建议在 nginx 上给该路径加网段白名单，模板里有注释好的示例块）。
+- **抓取**：Prometheus 抓 `https://api.example.com/api/v1/metrics`。
+  该路径在生产 nginx 模板里**默认 `deny all`**（对公网 403），只有
+  `METRICS_ALLOW_CIDR` 列出的可信网段能访问 —— 变量在 `infra/.env` 里配，
+  逗号分隔多个 **IPv4** 地址/CIDR（如 `10.0.0.0/8,192.168.1.0/24`），
+  部署时由 `infra/nginx/render-metrics-allow.sh` 展开成 nginx 的 allow 语句。
+  **不配 = 一个都不放行**（fail-closed）：抓不到指标，但不会误放行到公网。
+  改了变量要重启 nginx 容器才生效（`docker compose ... up -d nginx`）。
+  写错的条目会被跳过并在 nginx 日志里点名（`render-metrics-allow: 跳过非法条目：…`），
+  不会让 nginx 启动失败。**IPv6 条目（含合法网段）同样被跳过** ——
+  当前只放行 IPv4，见脚本头部注释。
   指标清单：`ecommerce_http_requests_total` / `..._duration_seconds`、
   `ecommerce_queue_jobs`、`ecommerce_payments_refunding_stuck`、
   `ecommerce_payouts_processing_stuck` + 进程指标。
+- **网关限流（P2-3 / P3-2）**：限流在 **Nginx 层**按客户端 IP
+  （`$binary_remote_addr`，即与本机建 TCP 连接的对端地址）计，不放进程内
+  ——多副本下进程内计数器各算各的，等于没有限流。
+  - 被限流的 location（这才是真实流量那一跳：浏览器 → 同源 BFF →
+    Next.js 服务端 → api 容器，BFF 调 api 不过 Nginx）：
+    | 入口 | location | zone |
+    |------|----------|------|
+    | 店铺前台（`<tenant>.example.com`）页面 / RSC / BFF 中转 | `location /` | `front_general` |
+    | 商家后台 `merchant.example.com` | `location /` | `front_general` |
+    | 平台超管 `admin.example.com` | `location /` | `front_general` |
+    | 店铺子域名直连 api（绕过 BFF 的脚本） | `location /api/v1/` | `api_general` |
+    | api 中心域名其余路径 | `location /` | `api_general` |
+    | api 中心域名认证端点 | `location /api/v1/auth/` | `api_auth` |
+  - **豁免**：`/api/v1/webhooks/`（支付/订阅渠道回调）在两个入口都单独
+    路由且**不限流**。渠道把非 2xx 当投递失败会重投并告警，而回调高峰
+    （大促集中支付）正是限流最容易误伤的时段；它们的安全边界在 api 侧
+    （验签 + `(provider, eventId)` 唯一索引幂等），不靠 IP 限流。
+  - **拒绝码是 429 + `Retry-After: 1`**（不是 503）：503 会被客户端当成
+    「服务故障」而重试，反而放大压力；429 的语义是「你太快了」。
+  - 阈值**可配**，六个变量（单位分别是**每秒请求数**与**突发队列长度**）：
+
+    | 变量 | 默认值 | 含义 |
+    |------|--------|------|
+    | `RATE_LIMIT_FRONT_RATE` / `_BURST` | 20 r/s / 100 | 三个前端入口共用一份预算 |
+    | `RATE_LIMIT_API_RATE` / `_BURST` | 20 r/s / 40 | 直连 api 的 `/api/v1` |
+    | `RATE_LIMIT_AUTH_RATE` / `_BURST` | 10 r/s / 20 | `/api/v1/auth/`（从紧） |
+
+    ⚠️ **默认值是保守占位，上线前必须按真实访问日志校准**（下面给方法）。
+    不配 = 用默认值；配错（非数字、超过 6 位、rate 为 0）= 回落默认值并在
+    nginx 日志里点名（`docker compose ... logs nginx | grep render-rate-limit`），
+    绝不会渲染出坏配置让 nginx 起不来。
+    改了变量要 **重建** nginx 容器（`docker compose ... up -d nginx`，
+    仅 `reload` 不会重跑 entrypoint 脚本）。
+    zone 是**三档共享**的：同一 IP 在店铺和商家后台之间共用 `front_general` 预算，
+    换个子域名/入口不会换来一份新配额。
+  - **怎么按访问日志校准**（保守做法：单 IP 每分钟峰值 ÷ 60 × 2~3 倍余量）：
+
+    ```bash
+    cd infra
+    # 1) 单 IP 的每分钟请求数峰值（combined 格式的第 1 列是 IP，第 4 列是 [时间）
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+      logs --no-log-prefix --since 24h nginx \
+      | awk '{ ts=$4; sub(/^\[/, "", ts); split(ts, a, ":"); k=$1" "a[1]" "a[2]":"a[3]; c[k]++ }
+             END { for (k in c) print c[k], k }' \
+      | sort -rn | head -20
+
+    # 2) 全站每分钟请求数峰值（判断阈值整体是否合理）
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+      logs --no-log-prefix --since 24h nginx \
+      | awk '{ ts=$4; sub(/^\[/, "", ts); split(ts, a, ":"); k=a[1]" "a[2]":"a[3]; c[k]++ }
+             END { for (k in c) print c[k], k }' \
+      | sort -rn | head -5
+
+    # 3) 被限流的请求（有输出就要复核是否误伤，按 IP 与 zone 归类）
+    #    error.log 的形态：... limiting requests, excess: 5.000 by zone
+    #    "front_general", client: 203.0.113.7, server: ...
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+      logs --no-log-prefix --since 24h nginx \
+      | grep 'limiting requests' \
+      | sed -E 's/.*by zone "([^"]+)".*client: ([0-9a-f.:]+).*/\1 \2/' \
+      | sort | uniq -c | sort -rn | head -20
+    ```
+
+    **算例**：第 1 条命令的头部是 `240 203.0.113.7 21/Nov/2026 10:31`，
+    即该 IP 一分钟 240 次 ≈ 4 r/s → 取 2~3 倍余量 → **`RATE_LIMIT_FRONT_RATE=12`**。
+    取**所有 IP 的最大值**，不是平均值：限流是 per-IP 的，平均值会把
+    单个真实用户（开多个标签页、RSC 预取）挡在门外。
+    `BURST` 建议取 `RATE × 5` 左右，容忍页面首屏并发（一个页面可能同时发
+    十几个 RSC/静态资源请求）。若日志里 `limiting` 大量出现而 QPS 并不高，
+    说明阈值过低，或（更常见）**前面挂了 CDN/LB 但没配 real_ip** —— 那种
+    情况下所有请求都算在 CDN 节点 IP 上，一把限流会把全站打死。
+  - ⚠️ **上 CDN/LB 前必须先配 real_ip**：模板当前**没有** `set_real_ip_from` /
+    `real_ip_header`，`$binary_remote_addr` 取的是直连对端。前面加了代理后，
+    对端恒为代理 IP → 限流退化成「全站共享一份配额」。届时在
+    `prod.conf.template` 的 http 级加 `set_real_ip_from <代理网段>` +
+    `real_ip_header X-Forwarded-For`（由**代理**覆写该头才可信），
+    而不是把限流键改成客户端可伪造的头。
+  - ⚠️ **CGNAT / 办公网出口**：大量真实用户可能共享同一个公网 IP，`FRONT`
+    档不要压得太紧（默认 20 r/s 就是为此留的余量），否则一个公司的用户
+    会互相抢配额。
 - **告警规则建议**：`payouts_processing_stuck > 0` 与
   `payments_refunding_stuck > 0` 直接是资金事件（这两个 gauge 正常恒为 0）；
   `queue_jobs{state="failed"}` 持续增长说明 webhook 消费在失败。
@@ -238,5 +401,10 @@ seed 产生的演示账号（若曾误跑 seed）。
 - [ ] 迁移已跑（`--profile tools run --rm migrate` 无待应用项）
 - [ ] 平台超管账号已手工创建，seed 演示账号不存在
 - [ ] 告警 webhook 已配置且收到过测试告警
+- [ ] 限流阈值已按真实访问日志校准（§9：单 IP 每分钟峰值 ÷ 60 × 2~3 倍），
+      不是默认占位值；`docker compose ... logs nginx | grep render-rate-limit`
+      确认六个变量都按预期生效、没有「回落到默认值」的点名
+- [ ] 若前面有 CDN/LB：`set_real_ip_from` / `real_ip_header` 已配（§9），
+      否则限流会把全站算在一个 IP 上
 - [ ] 备份 cron 已配且备份产物在**另一台机器**上验证过可恢复
 - [ ] `./restore.sh` 的恢复流程演练过一次（光备份不演练 = 没有备份）

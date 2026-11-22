@@ -26,12 +26,14 @@ export function OrderDetail({ initial }: { initial: Order }) {
   /**
    * 发起支付，然后跳到支付页面。
    *
-   * 支付页面在**后端服务**上（假网关是 `GET /api/v1/pay/fake/:paymentId`），
-   * 中转路由已经把它拼成了绝对 URL——真实渠道也是同样的形态
-   * （微信给 code_url、支付宝给支付 URL，前端只负责跳过去）。
+   * 支付页面在**后端服务**上（假网关是 `GET /api/v1/pay/fake/:paymentId`）。
+   * 中转路由返回的是**根相对路径**（`/api/v1/...`）——浏览器按当前 origin
+   * 解析后，网关会把店铺域名下的 `/api/v1/` 转发给 api 服务。
+   * 真实渠道也走同一条路（微信 `code_url`、支付宝支付 URL 原样透传）。
    *
    * ⚠️ 用 `window.location.assign` 而不是 `<a href>` / `router.push`：
-   * 支付页面是**站外**的地址（另一个服务），Router 的客户端导航管不了它。
+   * 这个路径由**网关**转发给 api 服务，不是 storefront 的页面，
+   * Next Router 的客户端导航会落到自己的 404。
    */
   async function pay() {
     setBusy(true);
