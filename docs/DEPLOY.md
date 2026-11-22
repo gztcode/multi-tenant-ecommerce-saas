@@ -39,6 +39,17 @@
 > 店铺子域名与三个中心域名（nginx 的 server_name 已按域区分）。裸根域名那条
 > 可以不加，但那样 `example.com` 会直接 DNS 解析失败，而不是走到 nginx 的显式拒绝。
 
+> **IPv6**：上表只有 A 记录 —— 能解析到服务器的**只有 IPv4**。网关本身是
+> **双栈监听**（每个 server 块同时 `listen` IPv4 与 `[::]`，80 / 443 的兜底
+> `default_server` 两个地址族各一份），所以要让 IPv6 客户端也访问，只需给同
+> 一批名字补上同值的 **AAAA 记录**（泛解析同理：`*.example.com` 一条 AAAA
+> 覆盖店铺与三个中心域名）。
+>
+> 补了 AAAA 之后，IPv6 上的行为与 IPv4 **逐条一致**：未知 Host 与裸根域名
+> 444 断连，合法店铺 Host 正常转发，`[::]:443` 同样是完成 TLS 握手后再拒绝。
+> 不补 AAAA 也不算故障：IPv6-only 客户端会解析不到地址（DNS 层就没有 AAAA），
+> 而不是连到一个只认 IPv4 的网关。
+
 ## 2. 证书（泛域名，DNS-01）
 
 `infra/nginx/templates/prod.conf.template` 使用一张覆盖
@@ -173,7 +184,16 @@ curl -sI https://api.example.com/api/v1/health | grep -i strict  # HSTS 头存�
 # 裸根域名不承载业务：http/https 都是「握手后断连」（444），拿不到状态行
 curl -s -o /dev/null -w 'https %{http_code}\n' https://example.com  # https 000（连接被断开）
 curl -s -o /dev/null -w 'http  %{http_code}\n' http://example.com   # http  000（同上，不 301）
+
+# IPv6 双栈（在服务器本机执行；[::1] 指本机回环，绕过 DNS 与 AAAA）
+curl -s -o /dev/null -w 'v6 http  %{http_code}\n' -g -6 -H 'Host: example.com' 'http://[::1]/'                 # 000
+curl -s -o /dev/null -w 'v6 https %{http_code}\n' -g -6 -k --resolve example.com:443:[::1] https://example.com/ # 000
+curl -s -o /dev/null -w 'v6 api   %{http_code}\n' -g -6 -k --resolve api.example.com:443:[::1] https://api.example.com/api/v1/health  # 200
 ```
+
+> IPv6 那三条必须带 `-g -6` 和 `--resolve`（或 `-H 'Host: ...'`）：容器的
+> `/etc/hosts` 只有 IPv4 映射，直接用域名测会走 DNS 并可能拿到 `::1`，
+> 让你分不清测的是哪个地址族。`--resolve` 同时注入 SNI，https 才能选中正确的块。
 
 > ⚠️ **`/api/v1/metrics` 生产默认对公网 403**：nginx 模板里该路径是
 > `deny all`，只有 `METRICS_ALLOW_CIDR` 列出的网段能抓（见 §3、§9）。

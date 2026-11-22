@@ -3,14 +3,20 @@
 // 跑法（仓库根）：
 //   node --test infra/nginx/prod-conf.render.test.mjs
 //
-// 检查三件事：
+// 检查四件事：
 //   1. 结构：metrics 端点默认 deny all、白名单按 METRICS_ALLOW_CIDR 展开、
 //      没有「注释掉的 allow」这种形态；
 //   2. 限流（P2-3 / P3-2）：限流落在真实流量入口（三个前端的 location /）、
 //      阈值可配且非法值回落默认、拒绝码统一 429 + Retry-After、
 //      支付回调不被限流；
-//   3. 语法/行为：渲染产物喂给 nginx -t；再真起一个 nginx:1.27-alpine 容器，
-//      用低阈值打满请求，证明真实返回的是 429 **而不是 503**
+//   3. 双栈：每个 server 块的 IPv4 监听都有参数逐字一致的 `[::]` 监听，
+//      80 / 443 的 default_server 在 IPv4 与 IPv6 上都是我们；镜像自带的
+//      default.conf 被覆盖成不含 server 块的占位文件（否则 Host: localhost /
+//      IP 直访会拿到镜像欢迎页 200，且 `[::]:80` 兜底隐式依赖 default_server）；
+//   4. 语法/行为：渲染产物喂给 nginx -t；再真起一个 nginx:1.27-alpine 容器，
+//      用低阈值打满请求，证明真实返回的是 429 **而不是 503**；另起一个按生产
+//      挂载（含 default.conf 覆盖）的容器，证明 IPv6 的 http/https/合法 Host
+//      与 IPv4 行为一致、未知 Host 不再返回欢迎页。
 //      （用本机已有的镜像，不引入新依赖；没有 docker 时跳过并打印说明）。
 //
 // ⚠️ 本文件由 CI 的 `nginx` job 跑（`.github/workflows/ci.yml`），命令就是上面那行，
@@ -167,6 +173,11 @@ function findLocation(serverLines, head) {
 /** 某个块里是否有某条指令（按行首匹配，忽略缩进）。 */
 function hasDirective(lines, pattern) {
   return lines.some((line) => pattern.test(line.trim()));
+}
+
+/** 某个 server 块里所有 listen 指令（去掉缩进与行尾分号外的空白）。 */
+function listenDirectives(serverLines) {
+  return serverLines.map((line) => line.trim()).filter((line) => /^listen\s/.test(line));
 }
 
 /** 某个监听端口上的所有 server 块（`listen 80;` / `listen 443 ssl ...`）。 */
@@ -462,6 +473,132 @@ test('docs/DEPLOY.md §1 DNS 表与实际行为一致：裸根域名写明不承
   const wildcardRow = rows.find((line) => /^\|\s*`\*\.example\.com`\s*\|/.test(line));
   assert.ok(wildcardRow, 'DEPLOY.md §1 DNS 表缺少 *.example.com 的独立行');
   assert.match(wildcardRow, /店铺前台/, '泛域名行仍应写明店铺前台');
+});
+
+// ---- 双栈（IPv4 + IPv6） ----
+//
+// 官方 nginx 镜像的 entrypoint 会把模板渲染成 /etc/nginx/conf.d/prod.conf，
+// **不会**覆盖镜像自带的 /etc/nginx/conf.d/default.conf，而且
+// 10-listen-on-ipv6-by-default.sh 还会给后者加上 `listen [::]:80;`。
+// 历史配置里 prod.conf 全是 IPv4-only，于是 `:::80` 上唯一的 server 是镜像那块
+// （root /usr/share/nginx/html）→ 走 IPv6 的任意 Host 返回欢迎页 200；
+// 而 `[::]:443` 根本不存在 → IPv6 的 HTTPS 连不上。
+//
+// 这里钉住三件事：每个块都双栈且参数逐字一致、`[::]` 上的兜底是我们的块、
+// 镜像那块不再参与（由 docker-compose.prod.yml 挂载的占位文件覆盖）。
+
+test('双栈：每个 server 块的 IPv4 监听都有参数逐字一致的 [::] 监听', () => {
+  const { conf } = renderProdConf('');
+  const blocks = serverBlocks(conf);
+
+  // 9 个块：80 三个（兜底 / 裸根 / 跳转）+ 443 六个（兜底 / 裸根 / 店铺 / api / 商家 / 平台）。
+  // ⚠️ 先钉住块数：块数为 0 时下面的循环一次都不跑，用例会「假绿」。
+  assert.equal(blocks.length, 9, `server 块数应为 9，实际 ${blocks.length}`);
+
+  let pairs = 0;
+  for (const block of blocks) {
+    const listens = listenDirectives(block.lines);
+    const v4 = listens.filter((line) => /^listen (80|443)(;|\s)/.test(line));
+    const v6 = listens.filter((line) => /^listen \[::\]:(80|443)(;|\s)/.test(line));
+
+    // 每个块至少有一条 IPv4 监听（本模板不用 IPv6-only 块）。
+    assert.ok(v4.length >= 1, `${block.serverName}：找不到 IPv4 监听`);
+    assert.equal(
+      v6.length,
+      v4.length,
+      `${block.serverName}：IPv4 监听 ${v4.length} 条，[::] 监听 ${v6.length} 条，应一一对应`,
+    );
+
+    for (const line of v4) {
+      // 逐字对应：`listen 443 ssl default_server;` → `listen [::]:443 ssl default_server;`
+      const expected = line.replace(/^listen /, 'listen [::]:');
+      assert.ok(
+        listens.includes(expected),
+        `${block.serverName}：缺少与「${line}」参数一致的「${expected}」`,
+      );
+      pairs += 1;
+    }
+  }
+  // 3 + 6 = 9 条 IPv4 监听，也就应当有 9 条 [::] 监听。
+  assert.equal(pairs, 9, `IPv4 监听应有 9 条，实际 ${pairs} 条`);
+});
+
+test('[::] 上的兜底是我们的块：80 / 443 各恰有一个 default_server，且与 IPv4 同块', () => {
+  const { conf } = renderProdConf('');
+  const blocks = serverBlocks(conf);
+
+  for (const [port, v4, v6] of [
+    [80, 'listen 80 default_server;', 'listen [::]:80 default_server;'],
+    [443, 'listen 443 ssl default_server;', 'listen [::]:443 ssl default_server;'],
+  ]) {
+    const v4Blocks = blocks.filter((block) => listenDirectives(block.lines).includes(v4));
+    const v6Blocks = blocks.filter((block) => listenDirectives(block.lines).includes(v6));
+
+    // 同一个地址上只能有一个 default_server —— 多一个 nginx 直接启动失败。
+    assert.equal(v4Blocks.length, 1, `${port}：IPv4 default_server 应恰好一个`);
+    assert.equal(v6Blocks.length, 1, `${port}：IPv6 default_server 应恰好一个`);
+    // 两个地址族的兜底必须是同一个 server 块，否则 IPv6 会落到另一套规则上。
+    assert.equal(
+      v4Blocks[0],
+      v6Blocks[0],
+      `${port}：IPv4 与 IPv6 的 default_server 必须是同一个 server 块`,
+    );
+    assert.equal(v6Blocks[0].serverName, '_', `${port}：兜底块的 server_name 应保持 _`);
+  }
+
+  // 443 的 [::] 兜底也要拒绝握手；80 的 [::] 兜底要 444 断连。
+  const defaultV6 = blocks.filter((block) =>
+    listenDirectives(block.lines).includes('listen [::]:443 ssl default_server;'),
+  )[0];
+  assert.ok(
+    hasDirective(defaultV6.lines, /^ssl_reject_handshake on;$/),
+    '443 的 [::] default_server 应对未知 Host 拒绝握手',
+  );
+  const default80V6 = blocks.filter((block) =>
+    listenDirectives(block.lines).includes('listen [::]:80 default_server;'),
+  )[0];
+  assert.ok(
+    hasDirective(default80V6.lines, /^return 444;$/),
+    '80 的 [::] default_server 应 444 断连（不是返回欢迎页）',
+  );
+});
+
+test('IPv4 监听不回退：80 仍 3 块、443 仍 6 块，且每块都先有 IPv4 监听', () => {
+  const { conf } = renderProdConf('');
+
+  // serversOnPort 只认 `listen 80...` / `listen 443...`（不认 `listen [::]:...`），
+  // 所以这组断言就是「IPv4 侧一点没动」的证据。
+  assert.equal(serversOnPort(conf, 80).length, 3, '80 上应有 3 个 IPv4 server 块');
+  assert.equal(serversOnPort(conf, 443).length, 6, '443 上应有 6 个 IPv4 server 块');
+
+  // 裸根域名 / 店铺 / 三个后台的 IPv4 监听必须原样保留（防止「换成 IPv6-only」）。
+  for (const expected of [
+    'listen 80;',
+    'listen 443 ssl;',
+    'listen 80 default_server;',
+    'listen 443 ssl default_server;',
+  ]) {
+    const blocks = serverBlocks(conf).filter((block) =>
+      listenDirectives(block.lines).includes(expected),
+    );
+    assert.ok(blocks.length >= 1, `IPv4 监听「${expected}」不应被删掉`);
+  }
+});
+
+test('镜像自带的 default.conf 被覆盖成不含 server 块的占位文件，且 compose 真的挂了它', () => {
+  // 只加 [::] 监听也能双栈一致（实测：未知 Host 两族都 444），但镜像那块仍是
+  // `[::]:80` 上的第二个 server —— `Host: localhost` / IP 直访会拿到欢迎页 200，
+  // 且 `[::]:80` 的兜底隐式依赖 prod.conf 的 default_server 那行。所以要覆盖掉。
+  const override = readFileSync(join(HERE, 'conf.d', 'default.conf'), 'utf8');
+  assert.doesNotMatch(override, /^\s*listen\s/m, '覆盖文件不能含任何 listen 指令');
+  assert.doesNotMatch(override, /^\s*server\s*\{/m, '覆盖文件不能含任何 server 块');
+
+  const compose = readFileSync(join(HERE, '..', 'docker-compose.prod.yml'), 'utf8');
+  assert.match(
+    compose,
+    /\.\/nginx\/conf\.d\/default\.conf:\/etc\/nginx\/conf\.d\/default\.conf:ro/,
+    'docker-compose.prod.yml 必须把覆盖文件挂到 /etc/nginx/conf.d/default.conf',
+  );
 });
 
 // ---- 限流（P2-3 / P3-2） ----
@@ -915,4 +1052,239 @@ function runLiveRateLimitCheck() {
 test('真实 nginx 容器：超阈值返回 429（带 Retry-After）而不是 503', () => {
   // 用例做成可跳过：没 docker 的本地机器打印说明后直接返回。
   if (runLiveRateLimitCheck() === null) return;
+});
+
+// ---- 真实容器行为：IPv6 与 IPv4 一致，未知 Host 不返回欢迎页 ----
+//
+// 前面的结构断言只能证明「配置里有 [::] 那行字」。真正要否掉的是
+// 「IPv6 上端口根本没监听」「IPv6 落到镜像欢迎页」「覆盖文件没生效」。
+// 这里按生产 compose 的挂载方式起容器（模板 + conf.d/default.conf 覆盖 + 证书 +
+// 两个展开脚本），再从容器内分别用 -4 / -6 打请求。
+//
+// ⚠️ 排查坑：容器 /etc/hosts 只有 IPv4 映射（Docker 默认不给 /etc/hosts 写 IPv6），
+//    `curl http://example.com/` 会走 DNS 并可能拿到 `::1`，测出来的是 IPv6 而
+//    你自己以为是 IPv4。所以这里一律用 `--resolve` / `Host:` 头显式指定地址族。
+function runLiveIpv6Check() {
+  try {
+    execFileSync('docker', ['version'], { stdio: 'ignore' });
+  } catch {
+    console.log('  ↷ 跳过真实容器 IPv6 验证：本机没有可用的 docker');
+    return null;
+  }
+
+  // 本用例声称「照生产 compose 的挂载方式起容器」——先钉住这个前提，
+  // 否则 compose 漏挂覆盖文件时，这里照样能起容器并全绿（假绿）。
+  assert.match(
+    readFileSync(join(HERE, '..', 'docker-compose.prod.yml'), 'utf8'),
+    /\.\/nginx\/conf\.d\/default\.conf:\/etc\/nginx\/conf\.d\/default\.conf:ro/,
+    'docker-compose.prod.yml 没有挂载 default.conf 覆盖文件，容器用例无法代表生产',
+  );
+
+  const dir = mkdtempSync(join(tmpdir(), 'nginx-ipv6-'));
+  const templateDir = join(dir, 'templates');
+  const certDir = join(dir, 'certs');
+  mkdirSync(templateDir);
+  mkdirSync(certDir);
+  copyFileSync(TEMPLATE_PATH, join(templateDir, 'prod.conf.template'));
+  // 与 docker-compose.prod.yml 一致：用仓库里的占位文件覆盖镜像自带的 default.conf。
+  const overridePath = join(HERE, 'conf.d', 'default.conf');
+  execFileSync('openssl', [
+    'req',
+    '-x509',
+    '-newkey',
+    'rsa:2048',
+    '-nodes',
+    '-keyout',
+    join(certDir, 'privkey.pem'),
+    '-out',
+    join(certDir, 'fullchain.pem'),
+    '-days',
+    '1',
+    '-subj',
+    '/CN=example.com',
+    '-addext',
+    'subjectAltName=DNS:example.com,DNS:*.example.com',
+  ]);
+
+  const name = `nginx-ipv6-test-${process.pid}`;
+  const started = spawnSync(
+    'docker',
+    [
+      'run',
+      '-d',
+      '--name',
+      name,
+      '--add-host',
+      'api:127.0.0.1',
+      '--add-host',
+      'storefront:127.0.0.1',
+      '--add-host',
+      'merchant-admin:127.0.0.1',
+      '--add-host',
+      'platform-admin:127.0.0.1',
+      '-v',
+      `${templateDir}:/etc/nginx/templates:ro`,
+      '-v',
+      `${overridePath}:/etc/nginx/conf.d/default.conf:ro`,
+      '-v',
+      `${certDir}:/etc/nginx/certs:ro`,
+      '-v',
+      `${EXPAND_SCRIPT}:/docker-entrypoint.d/25-metrics-allow.sh:ro`,
+      '-v',
+      `${RATE_SCRIPT}:/docker-entrypoint.d/26-rate-limit.sh:ro`,
+      '-e',
+      'BASE_DOMAIN=example.com',
+      '-e',
+      'METRICS_ALLOW_CIDR=',
+      'nginx:1.27-alpine',
+    ],
+    { encoding: 'utf8' },
+  );
+  if (started.status !== 0) {
+    throw new Error(`创建 nginx 容器失败：${started.stderr || started.stdout}`);
+  }
+  // docker run -d 只要创建成功就返回 0：配置有错（例如两块都声明
+  // `[::]:80 default_server` → duplicate listen options）时容器会**秒退**。
+  // 必须显式等它运行起来，否则后面 exec 只会报误导性的 "is not running"。
+  let up = false;
+  for (let i = 0; i < 50; i += 1) {
+    const running = spawnSync('docker', ['inspect', '-f', '{{.State.Running}}', name], {
+      encoding: 'utf8',
+    });
+    if (running.stdout.trim() === 'true') {
+      up = true;
+      break;
+    }
+    spawnSync('sleep', ['0.1']);
+  }
+  if (!up) {
+    const logs = spawnSync('docker', ['logs', name], { encoding: 'utf8' });
+    spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
+    throw new Error(`nginx 容器没起来（配置错误？）：\n${logs.stdout}${logs.stderr}`);
+  }
+  // 容器 running 不等于 nginx 已建好监听（entrypoint 还要渲染模板 + 跑两个脚本）。
+  spawnSync('sleep', ['1']);
+
+  /** 在容器内用 curl 打一次，返回真实 http_code 与 curl 退出码。 */
+  const probe = (args) => {
+    const result = spawnSync('docker', ['exec', name, 'curl', ...args], { encoding: 'utf8' });
+    return { code: `${result.stdout}`.trim(), exit: result.status };
+  };
+  const CURL = ['-s', '-o', '/dev/null', '-w', '%{http_code}'];
+
+  try {
+    // 1) 容器内实际生效的 default.conf 必须是我们的占位文件（镜像那块不再监听任何端口）。
+    const defaultConf = spawnSync('docker', ['exec', name, 'cat', '/etc/nginx/conf.d/default.conf'], {
+      encoding: 'utf8',
+    });
+    assert.equal(defaultConf.status, 0, `读容器内 default.conf 失败：${defaultConf.stderr}`);
+    assert.doesNotMatch(
+      defaultConf.stdout,
+      /^\s*listen\s/m,
+      '容器内 default.conf 仍有 listen（镜像欢迎页块还在，Host: localhost / IP 直访会 200）',
+    );
+
+    // 2) 两个地址族都真的在监听 80 / 443（0x0050 / 0x01BB，状态 0A = LISTEN）。
+    const tcp6 = spawnSync('docker', ['exec', name, 'cat', '/proc/net/tcp6'], { encoding: 'utf8' });
+    assert.equal(tcp6.status, 0, `读 /proc/net/tcp6 失败：${tcp6.stderr}`);
+    for (const [port, hex] of [
+      [80, '0050'],
+      [443, '01BB'],
+    ]) {
+      assert.match(
+        tcp6.stdout,
+        new RegExp(`:${hex}\\s+\\S+\\s+0A`),
+        `没有监听在 [::]:${port}（IPv6 上该端口不可达）`,
+      );
+    }
+
+    // 3) 四条主行为 + IPv4 对照。
+    //    - 未知 Host / 裸根域名：444 断连 → curl 退出码 52（握手/请求后空回复）、http_code 000。
+    //    - 合法店铺 Host：转发到未启动的 storefront → 502。
+    const ipv6RootHttp = probe(['-g', '-6', ...CURL, '-H', 'Host: example.com', 'http://[::1]/']);
+    const ipv6RootHttps = probe([
+      '-g', '-6', '-k', ...CURL,
+      '--resolve', 'example.com:443:[::1]', 'https://example.com/',
+    ]);
+    const ipv6Store = probe([
+      '-g', '-6', '-k', ...CURL,
+      '--resolve', 'demo.example.com:443:[::1]', 'https://demo.example.com/',
+    ]);
+    const ipv4RootHttp = probe(['-4', ...CURL, '-H', 'Host: example.com', 'http://127.0.0.1/']);
+    const ipv4RootHttps = probe([
+      '-4', '-k', ...CURL,
+      '--resolve', 'example.com:443:127.0.0.1', 'https://example.com/',
+    ]);
+    const ipv4Store = probe([
+      '-4', '-k', ...CURL,
+      '--resolve', 'demo.example.com:443:127.0.0.1', 'https://demo.example.com/',
+    ]);
+    // Host: localhost 是覆盖文件的直接收益：不覆盖时镜像那块 server_name localhost
+    // 会精确命中它，两个地址族都返回欢迎页 200（实测确认，不是猜测）。
+    const ipv6Localhost = probe(['-g', '-6', ...CURL, '-H', 'Host: localhost', 'http://[::1]/']);
+    const ipv4Localhost = probe(['-4', ...CURL, '-H', 'Host: localhost', 'http://127.0.0.1/']);
+
+    // IPv6 裸根 http：绝不能是镜像欢迎页（200），必须是 444（空回复）。
+    assert.notEqual(
+      ipv6RootHttp.code,
+      '200',
+      `IPv6 裸根 http 返回了 ${ipv6RootHttp.code}（多半落到镜像欢迎页）`,
+    );
+    assert.equal(ipv6RootHttp.exit, 52, `IPv6 裸根 http 未 444 断连（curl exit=${ipv6RootHttp.exit}）`);
+    // IPv6 裸根 https：能连上 [::]:443 并完成握手后 444。
+    // curl 在 TLS 上的「空回复」是 exit 56（不是 http 的 52）；可区分的坏结果：
+    // 7 = 连接被拒（[::]:443 根本没监听）、35 = TLS 握手失败（走了 ssl_reject_handshake）。
+    assert.equal(ipv6RootHttps.exit, 56, `IPv6 裸根 https 未 444 断连（curl exit=${ipv6RootHttps.exit}）`);
+    // IPv6 合法店铺 Host：被转发到 storefront（502 = 上游未起，说明路由正确）。
+    assert.equal(ipv6Store.code, '502', `IPv6 店铺子域未转发到 storefront：${JSON.stringify(ipv6Store)}`);
+    assert.equal(ipv6Store.exit, 0, `IPv6 店铺子域请求异常：${JSON.stringify(ipv6Store)}`);
+
+    // Host: localhost / IP 直访：覆盖生效后也必须 444，不能是欢迎页 200。
+    assert.notEqual(
+      ipv6Localhost.code,
+      '200',
+      'IPv6 上 Host: localhost 拿到了镜像欢迎页（覆盖文件没生效）',
+    );
+    assert.equal(ipv6Localhost.exit, 52, `IPv6 Host: localhost 未 444 断连（exit=${ipv6Localhost.exit}）`);
+    assert.notEqual(
+      ipv4Localhost.code,
+      '200',
+      'IPv4 上 Host: localhost 拿到了镜像欢迎页（覆盖文件没生效）',
+    );
+    assert.equal(ipv4Localhost.exit, 52, `IPv4 Host: localhost 未 444 断连（exit=${ipv4Localhost.exit}）`);
+
+    // IPv4 回退检查：同样的请求在 IPv4 上必须得到同样的结果。
+    assert.equal(ipv4RootHttp.exit, 52, `IPv4 裸根 http 行为变了（exit=${ipv4RootHttp.exit}）`);
+    assert.equal(ipv4RootHttps.exit, 56, `IPv4 裸根 https 行为变了（exit=${ipv4RootHttps.exit}）`);
+    assert.equal(ipv4Store.code, '502', `IPv4 店铺子域行为变了：${JSON.stringify(ipv4Store)}`);
+
+    // 两个地址族逐条对齐 —— 这才是「IPv6 行为与 IPv4 一致」的可证伪断言。
+    assert.deepEqual(
+      [ipv6RootHttp.code, ipv6RootHttp.exit],
+      [ipv4RootHttp.code, ipv4RootHttp.exit],
+      '裸根 http 在 IPv4 / IPv6 上行为不一致',
+    );
+    assert.deepEqual(
+      [ipv6RootHttps.code, ipv6RootHttps.exit],
+      [ipv4RootHttps.code, ipv4RootHttps.exit],
+      '裸根 https 在 IPv4 / IPv6 上行为不一致',
+    );
+    assert.deepEqual(
+      [ipv6Store.code, ipv6Store.exit],
+      [ipv4Store.code, ipv4Store.exit],
+      '店铺子域 https 在 IPv4 / IPv6 上行为不一致',
+    );
+    assert.deepEqual(
+      [ipv6Localhost.code, ipv6Localhost.exit],
+      [ipv4Localhost.code, ipv4Localhost.exit],
+      'Host: localhost 在 IPv4 / IPv6 上行为不一致',
+    );
+  } finally {
+    spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
+  }
+  return true;
+}
+
+test('真实 nginx 容器：IPv6 与 IPv4 行为一致（未知 Host 不再返回欢迎页）', () => {
+  if (runLiveIpv6Check() === null) return;
 });

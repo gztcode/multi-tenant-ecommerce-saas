@@ -15,6 +15,22 @@
 #    ⚠️ SAN 里还要带**裸的** `${BASE_DOMAIN}`：裸根域名有自己的 443 块，
 #    它要完成 TLS 握手后再显式断连，证书不覆盖根域名就会先报证书错误。）
 # - 证书路径固定挂载到 /etc/nginx/certs/{fullchain.pem,privkey.pem}
+#
+# ## 双栈（IPv4 + IPv6）
+#
+# 每个 server 块都同时监听 IPv4 与 `[::]`，**参数必须逐字一致**
+# （例如 `listen 443 ssl default_server;` 对应 `listen [::]:443 ssl default_server;`）：
+# 否则同一个端口在两个地址族上的行为会分叉。
+# 两个兜底块（80 / 443 的 `server_name _`）在 `[::]` 上同样是 `default_server`，
+# 未知 Host 在 IPv6 上走同一套「一律断连」口径。
+# ⚠️ 官方镜像自带的 /etc/nginx/conf.d/default.conf 会被 entrypoint 加上
+#    `listen [::]:80;`（不带 default_server，所以**不会**与我们冲突、容器照常起）。
+#    但它是 `[::]:80` 上的第二个 server：`Host: localhost` 或直接用 IP 访问会命中它，
+#    返回镜像欢迎页 200 —— 与本配置文件「未知 Host 一律断连」的口径不符。
+#    另外，`[::]:80` 的兜底会隐式依赖本文件里 default_server 那行永不出错。
+#    所以 docker-compose.prod.yml 把它覆盖成 infra/nginx/conf.d/default.conf
+#    （一个不含任何 server 块的占位文件），兜底完全由本文件显式承担。
+#    改这里时别漏掉那一处。
 # - METRICS_ALLOW_CIDR：Prometheus 抓取端点（/api/v1/metrics）的可信网段，
 #   逗号分隔的 CIDR（如 10.0.0.0/8,192.168.0.0/16）。**不配 = 一个都不放行**
 #   （fail-closed，metrics 抓不到 → 监控瞎，只能从内网补配）。
@@ -101,8 +117,11 @@ ssl_prefer_server_ciphers off;
 # ---- 80 端口：ACME 续期 + 全站跳转 ----
 
 # 未知 Host 一律断连（不给扫描器任何回音）
+# IPv6 上同样由本块兜底（`default_server` 按地址族各自生效，IPv6 不会落到
+# 镜像自带的欢迎页块）。
 server {
     listen 80 default_server;
+    listen [::]:80 default_server;
     server_name _;
     return 444;
 }
@@ -116,6 +135,7 @@ server {
 # （泛域名证书走 DNS-01，不经过这里）。
 server {
     listen 80;
+    listen [::]:80;
     server_name ${BASE_DOMAIN};
 
     location /.well-known/acme-challenge/ {
@@ -131,6 +151,7 @@ server {
 # ⚠️ server_name **不含裸根域名** —— 它由上面的块显式拒绝，不参与跳转。
 server {
     listen 80;
+    listen [::]:80;
     server_name *.${BASE_DOMAIN} api.${BASE_DOMAIN} merchant.${BASE_DOMAIN} admin.${BASE_DOMAIN};
 
     # ACME http-01 challenge（certbot webroot 指向该卷）
@@ -151,6 +172,7 @@ server {
 # ssl_reject_handshake 在 TLS 层直接拒绝握手，无需证书即可通过 nginx -t。
 server {
     listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
     server_name _;
     ssl_reject_handshake on;
 }
@@ -167,6 +189,7 @@ server {
 #    证书不覆盖的话用户先看到证书错误，而不是「明确的拒绝」。
 server {
     listen 443 ssl;
+    listen [::]:443 ssl;
     server_name ${BASE_DOMAIN};
 
     ssl_certificate     /etc/nginx/certs/fullchain.pem;
@@ -180,6 +203,7 @@ server {
 # 逻辑与开发环境一致：网关注入并覆盖 X-Tenant-Subdomain。
 server {
     listen 443 ssl;
+    listen [::]:443 ssl;
     http2 on;
     server_name ~^(?<tenant>[a-z0-9-]+)\.${BASE_DOMAIN}$;
 
@@ -278,6 +302,7 @@ server {
 # ---- 443：API 中心域名 ----
 server {
     listen 443 ssl;
+    listen [::]:443 ssl;
     http2 on;
     server_name api.${BASE_DOMAIN};
 
@@ -356,6 +381,7 @@ server {
 # ---- 443：商家后台 ----
 server {
     listen 443 ssl;
+    listen [::]:443 ssl;
     http2 on;
     server_name merchant.${BASE_DOMAIN};
 
@@ -390,6 +416,7 @@ server {
 # ---- 443：平台超管后台 ----
 server {
     listen 443 ssl;
+    listen [::]:443 ssl;
     http2 on;
     server_name admin.${BASE_DOMAIN};
 
