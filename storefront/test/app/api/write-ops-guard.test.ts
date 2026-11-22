@@ -578,6 +578,45 @@ describe('orders/[orderNo]/pay：发起支付', () => {
 
     expect(payload.payUrl).toBe('https://pay.example.com/wx/code_url');
   });
+
+  it('唤起 scheme（alipays://）不是相对路径 → 原样透传', async () => {
+    // 支付宝/微信的唤起 scheme 不是 http(s)：按相对路径处理会拼成
+    // `/alipays://…`，浏览器打不开。
+    const payUrl = 'alipays://platformapi/startapp?appId=20000067&url=x';
+    apiFetchMock.mockResolvedValue({ ...payment, payUrl } as never);
+
+    const response = await payOrder(
+      postRequest('http://localhost/api/orders/ORDER-1/pay', {}),
+      routeParams({ orderNo: 'ORDER-1' }),
+    );
+    const payload = (await response.json()) as { payUrl: string };
+
+    expect(payload.payUrl).toBe(payUrl);
+    expect(payload.payUrl.startsWith('/')).toBe(false);
+  });
+
+  it('危险 scheme（javascript: / data:）不当成可跳转地址 → 收敛成本站路径', async () => {
+    for (const payUrl of [
+      'javascript:alert(document.cookie)',
+      'data:text/html,<script>alert(1)</script>',
+    ]) {
+      apiFetchMock.mockResolvedValue({ ...payment, payUrl } as never);
+
+      const response = await payOrder(
+        postRequest('http://localhost/api/orders/ORDER-1/pay', {}),
+        routeParams({ orderNo: 'ORDER-1' }),
+      );
+      const payload = (await response.json()) as { payUrl: string };
+
+      // 关键：不带 scheme 地被当成同源路径，而不是原样交给浏览器导航
+      expect(payload.payUrl.startsWith('/')).toBe(true);
+      expect(payload.payUrl.startsWith(`/${payUrl}`)).toBe(true);
+      expect(
+        new URL(payload.payUrl, 'https://demo.platform.test/orders/ORDER-1')
+          .origin,
+      ).toBe('https://demo.platform.test');
+    }
+  });
 });
 
 describe('orders/guest-lookup：游客查订单（唯一免 accessToken 的写型中转）', () => {

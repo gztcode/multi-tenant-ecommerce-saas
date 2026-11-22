@@ -31,7 +31,8 @@ interface CreatedPayment {
  * 解析，从 `/orders/xxx` 跳到 `/orders/api/v1/...`，一样到不了支付页。
  *
  * 真实支付渠道的形态不同：微信给的是 `code_url`、支付宝给的是支付 URL，
- * 都是渠道的绝对地址，原样透传。
+ * 以及 `alipays://` / `weixin://` 这类唤起 scheme，都是**带 scheme 的绝对地址**，
+ * 原样透传。
  */
 export async function POST(
   _request: Request,
@@ -64,14 +65,31 @@ export async function POST(
 }
 
 /**
+ * 带 scheme 的绝对 URL（`https://…`、`alipays://…`、`weixin://…`）。
+ *
+ * ⚠️ **不能只认 http/https**：支付宝/微信的唤起 scheme 不是 http(s)，
+ * 按相对路径处理会拼成 `/alipays://…` 这种打不开的废串。
+ * ⚠️ 协议相对地址 `//host` **不匹配**这条（它没有 scheme，以 `/` 开头），
+ * 会落到下面的同源规整分支——这是刻意的。
+ */
+const ABSOLUTE_URL = /^[a-z][a-z0-9+.-]*:/i;
+
+/**
+ * 危险 scheme：浏览器会把它们当成可执行/内联内容，绝不能交给导航。
+ * 命中时不透传，按相对路径收敛成本站的普通路径。
+ */
+const DANGEROUS_SCHEME = /^(?:javascript|data|vbscript):/i;
+
+/**
  * 把后端给的 payUrl 交给浏览器按**当前 origin** 解析。
  *
- * - 绝对地址（真实渠道给的完整 URL）原样返回。
- * - 相对路径补成**根相对**（以 `/` 开头）。顺带把 `//host` 这种
+ * - 带 scheme 的绝对地址（真实渠道给的完整 URL 或唤起 scheme）原样返回，
+ *   危险 scheme（`javascript:` / `data:` / `vbscript:`）除外。
+ * - 其余补成**根相对**（以 `/` 开头）。顺带把 `//host` 这种
  *   **协议相对地址**收敛成同源路径——否则前导 `//` 会让浏览器跳到别的域名。
  */
 function browserPayUrl(payUrl: string): string {
-  if (/^https?:\/\//i.test(payUrl)) {
+  if (ABSOLUTE_URL.test(payUrl) && !DANGEROUS_SCHEME.test(payUrl)) {
     return payUrl;
   }
   return `/${payUrl.replace(/^\/+/, '')}`;
