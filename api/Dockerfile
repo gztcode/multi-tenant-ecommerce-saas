@@ -19,7 +19,10 @@ WORKDIR /app
 # workspaces 布局下 `npm ci --workspace api` 需要根清单 + api 的清单。
 COPY package.json package-lock.json ./
 COPY api/package.json api/package.json
-RUN npm ci --workspace api
+# ⚠️ workspaces 的单根 lockfile 仍会在版本冲突时把包嵌进 api/node_modules。
+#    这里保证这个目录一定存在：builder 阶段要整目录复制它（见下），
+#    万一某天 lockfile 全部提升、npm 不再创建它，COPY 会因为源路径不存在而构建失败。
+RUN npm ci --workspace api && mkdir -p /app/api/node_modules
 
 # ---------- 构建阶段 ----------
 FROM node:22-alpine AS builder
@@ -30,6 +33,12 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
 COPY api/package.json api/package.json
 COPY api/ api/
+# ⚠️ 必须补这一行：deps 阶段 `npm ci --workspace api` 的产物可能**同时**落在
+#    /app/node_modules 和 /app/api/node_modules（版本冲突的包会被嵌在后者）。
+#    只复制根目录会让 `nest build` 的 @nestjs/swagger CLI 插件解析失败
+#    （Error "@nestjs/swagger" plugin is not installed）。放在源码 COPY 之后，
+#    避免上下文里残留的 node_modules 覆盖 deps 阶段的产物。
+COPY --from=deps /app/api/node_modules ./api/node_modules
 WORKDIR /app/api
 # prisma generate 必须显式跑：@prisma/client 的产物落在 node_modules/.prisma 里，
 # 光靠 npm install 不会生成，运行时 new PrismaClient() 会直接抛错。
