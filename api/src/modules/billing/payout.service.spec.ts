@@ -1203,6 +1203,26 @@ describe('审批：必须重算金额（护栏 P5）', () => {
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('⚠️ 重复审批稳定返回「不能重复审批」（幂等检查排在结算单校验之前）', async () => {
+    // ⚠️ **回归**：审批通过后会**自动入队**，worker 抢到单就把该期结算单
+    //    联动成 `PAID`。结算单校验若排在幂等检查之前，同一个「重复审批」
+    //    会按结算单当前状态返回「结算单尚未确认」—— 文案不确定。
+    const prisma = fakePrisma({
+      receipts: [receipt({ id: 'r-1' })],
+      statement: statement({ status: SettlementStatus.PAID }),
+      payout: payout({ status: PayoutStatus.APPROVED }),
+    });
+
+    const service = makeService(prisma);
+
+    await expect(asPlatform(() => service.approve('payout-a'))).rejects.toThrow(
+      new ConflictException('出款单已被审批或状态已变，不能重复审批'),
+    );
+    // ⚠️ **根本没走到结算单校验，也没重算金额**
+    expect(prisma.settlementStatement.findFirst).not.toHaveBeenCalled();
+    expect(prisma.merchantReceipt.findMany).not.toHaveBeenCalled();
+  });
+
   it('出款单不存在 → 404', async () => {
     const prisma = fakePrisma({
       receipts: [],

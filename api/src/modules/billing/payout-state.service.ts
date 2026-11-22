@@ -393,6 +393,15 @@ export class PayoutStateService {
       const period = { from: payout.periodStart, to: payout.periodEnd };
       const periodLabel = formatPeriodLabel(payout.periodStart);
 
+      // ⚠️ **幂等检查必须排在结算单校验之前**：
+      //    审批通过后会**自动入队**，worker 抢到单就把该期结算单联动成 `PAID`。
+      //    若先校验结算单，同一个「重复审批」会按结算单当前状态返回不同文案
+      //    （有时是「结算单尚未确认」）—— 排查时看不出真正原因。
+      //    这里只是**前置判据**，并发下的真正赢家仍由下面事务里的条件更新决定。
+      if (payout.status !== PayoutStatus.REQUESTED) {
+        throw new ConflictException('出款单已被审批或状态已变，不能重复审批');
+      }
+
       // ⚠️⚠️ **按 kind 分支重算** —— 补差单**绝不能**调 `computeAmounts`：
       //    那会把整期佣金再扣一遍（护栏 X13）。
       const isSupplement = payout.kind === PayoutKind.SUPPLEMENT;
