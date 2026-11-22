@@ -9,7 +9,7 @@
  * - cart [DELETE]：**游客可用**（无 token 也打到后端）
  * - orders/[orderNo]/cancel [POST]：登录必填，body {}
  * - orders/[orderNo]/confirm [POST]：登录必填，body {}
- * - orders/[orderNo]/pay [POST]：登录必填，body {}，payUrl 拼绝对 URL
+ * - orders/[orderNo]/pay [POST]：登录必填，body {}，payUrl 规整成**根相对路径**
  * - orders/guest-lookup [POST]：**唯一不要 accessToken 的写型中转**，body 白名单（orderNo/phone）
  *
  * 断言纪律（与既有 order-whitelist / cart-whitelist 一致）：
@@ -482,8 +482,9 @@ describe('orders/[orderNo]/pay：发起支付', () => {
   };
 
   beforeEach(() => {
-    // absolutePayUrl 读 process.env.API_BASE_URL；测试里固定默认值保证可断言。
-    process.env.API_BASE_URL = 'http://localhost:3000/api/v1';
+    // 模拟生产 compose 里的**容器内地址**：旧实现把它拼进 payUrl，
+    // 浏览器根本打不开。固定成这个值，钉住「它绝不能出现在返回值里」。
+    process.env.API_BASE_URL = 'http://api:3000/api/v1';
   });
 
   afterEach(() => {
@@ -520,20 +521,50 @@ describe('orders/[orderNo]/pay：发起支付', () => {
     });
   });
 
-  it('后端相对 payUrl 拼成绝对 URL 再返回', async () => {
+  it('后端相对 payUrl → 返回根相对路径，浏览器按当前 origin 解析（同源）', async () => {
     apiFetchMock.mockResolvedValue(payment as never);
 
     const response = await payOrder(
       postRequest('http://localhost/api/orders/ORDER-1/pay', {}),
       routeParams({ orderNo: 'ORDER-1' }),
     );
-    const payload = (await response.json()) as Record<string, unknown>;
+    const payload = (await response.json()) as { payUrl: string };
 
-    // 不能把后端的 /api/v1 前缀拼两遍：base 以 /api/v1 结尾，payUrl 以 /api/v1 开头。
-    expect(payload.payUrl).toBe('http://localhost:3000/api/v1/pay/fake/pay-1');
+    // 1. 绝不能是服务端内网地址（compose 里 API_BASE_URL 是 http://api:3000/api/v1）
+    expect(payload.payUrl).not.toMatch(/^https?:\/\//);
+    expect(payload.payUrl).not.toContain('api:3000');
+    // 2. 必须是**根相对**（带前导 /），否则浏览器会按当前页面 URL 解析
+    expect(payload.payUrl.startsWith('/')).toBe(true);
+    expect(payload.payUrl).toBe('/api/v1/pay/fake/pay-1');
+    // 3. 浏览器解析结果：同源，且命中假支付页
+    const resolved = new URL(
+      payload.payUrl,
+      'https://demo.platform.test/orders/ORDER-1',
+    );
+    expect(resolved.origin).toBe('https://demo.platform.test');
+    expect(resolved.pathname).toBe('/api/v1/pay/fake/pay-1');
   });
 
-  it('payUrl 已是绝对地址 → 原样透传', async () => {
+  it('协议相对地址 //host 收敛成同源路径（不能跳到别的域名）', async () => {
+    apiFetchMock.mockResolvedValue({
+      ...payment,
+      payUrl: '//evil.example.com/pay',
+    } as never);
+
+    const response = await payOrder(
+      postRequest('http://localhost/api/orders/ORDER-1/pay', {}),
+      routeParams({ orderNo: 'ORDER-1' }),
+    );
+    const payload = (await response.json()) as { payUrl: string };
+
+    expect(payload.payUrl).toBe('/evil.example.com/pay');
+    expect(
+      new URL(payload.payUrl, 'https://demo.platform.test/orders/ORDER-1')
+        .origin,
+    ).toBe('https://demo.platform.test');
+  });
+
+  it('payUrl 已是绝对地址 → 原样透传（真实渠道不受影响）', async () => {
     apiFetchMock.mockResolvedValue({
       ...payment,
       payUrl: 'https://pay.example.com/wx/code_url',
@@ -546,6 +577,45 @@ describe('orders/[orderNo]/pay：发起支付', () => {
     const payload = (await response.json()) as Record<string, unknown>;
 
     expect(payload.payUrl).toBe('https://pay.example.com/wx/code_url');
+  });
+
+  it('唤起 scheme（alipays://）不是相对路径 → 原样透传', async () => {
+    // 支付宝/微信的唤起 scheme 不是 http(s)：按相对路径处理会拼成
+    // `/alipays://…`，浏览器打不开。
+    const payUrl = 'alipays://platformapi/startapp?appId=20000067&url=x';
+    apiFetchMock.mockResolvedValue({ ...payment, payUrl } as never);
+
+    const response = await payOrder(
+      postRequest('http://localhost/api/orders/ORDER-1/pay', {}),
+      routeParams({ orderNo: 'ORDER-1' }),
+    );
+    const payload = (await response.json()) as { payUrl: string };
+
+    expect(payload.payUrl).toBe(payUrl);
+    expect(payload.payUrl.startsWith('/')).toBe(false);
+  });
+
+  it('危险 scheme（javascript: / data:）不当成可跳转地址 → 收敛成本站路径', async () => {
+    for (const payUrl of [
+      'javascript:alert(document.cookie)',
+      'data:text/html,<script>alert(1)</script>',
+    ]) {
+      apiFetchMock.mockResolvedValue({ ...payment, payUrl } as never);
+
+      const response = await payOrder(
+        postRequest('http://localhost/api/orders/ORDER-1/pay', {}),
+        routeParams({ orderNo: 'ORDER-1' }),
+      );
+      const payload = (await response.json()) as { payUrl: string };
+
+      // 关键：不带 scheme 地被当成同源路径，而不是原样交给浏览器导航
+      expect(payload.payUrl.startsWith('/')).toBe(true);
+      expect(payload.payUrl.startsWith(`/${payUrl}`)).toBe(true);
+      expect(
+        new URL(payload.payUrl, 'https://demo.platform.test/orders/ORDER-1')
+          .origin,
+      ).toBe('https://demo.platform.test');
+    }
   });
 });
 
