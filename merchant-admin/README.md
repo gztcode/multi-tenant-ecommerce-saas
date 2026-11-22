@@ -74,11 +74,11 @@ curl -X POST http://localhost:3000/api/v1/auth/register/merchant \
 ## 单元测试
 
 ```bash
-npm test          # 428 条 / 29 个文件
+npm test          # 562 条 / 41 个文件
 npm run test:watch   # watch 模式
 ```
 
-框架是 **Vitest**（不是 Jest——Next.js 15 + React 19 生态里 Vitest 是主流，
+框架是 **Vitest**（不是 Jest——Next.js 16 + React 19 生态里 Vitest 是主流，
 原生 ESM/TS，`vi.mock` 好用）。配置见 `vitest.config.ts`。
 
 ### 测什么

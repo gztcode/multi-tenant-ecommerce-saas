@@ -1,6 +1,6 @@
 # AGENTS.md
 
-多租户电商 SaaS 单仓：NestJS API + 三个 Next.js 15 应用 + Docker/Nginx。
+多租户电商 SaaS 单仓：NestJS API + 三个 Next.js 16 应用 + Docker/Nginx。
 三个前端从阶段 7c 起共用 `packages/frontend-shared`（`@ecom/frontend-shared`），
 阶段 11b 起**是 npm workspaces**（仓库根一份 package.json + lockfile）。
 本文件只记录「看文件名和框架文档看不出来、但一踩就错」的事。
