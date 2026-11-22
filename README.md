@@ -158,9 +158,9 @@
 | 目录 | 说明 | 端口 | 技术栈 |
 |------|------|------|--------|
 | `api/` | 后端 API | 3000 | NestJS 11 + Prisma 6 + PostgreSQL 16 |
-| `storefront/` | 消费者店铺前台 | 3001 | Next.js 15 + NextAuth v5 + shadcn/ui |
-| `merchant-admin/` | 商家后台 | 3002 | Next.js 15 + NextAuth v5 + shadcn/ui |
-| `platform-admin/` | 平台超管后台 | 3003 | Next.js 15 + NextAuth v5 + shadcn/ui |
+| `storefront/` | 消费者店铺前台 | 3001 | Next.js 16 + NextAuth v5 + shadcn/ui |
+| `merchant-admin/` | 商家后台 | 3002 | Next.js 16 + NextAuth v5 + shadcn/ui |
+| `platform-admin/` | 平台超管后台 | 3003 | Next.js 16 + NextAuth v5 + shadcn/ui |
 | `infra/` | 容器编排与网关路由 | 80 | Docker Compose + Nginx |
 | `packages/frontend-shared/` | 三端共享包（`@ecom/frontend-shared`，npm workspace） | —— | TypeScript + zod |
 
