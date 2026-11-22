@@ -52,7 +52,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # ⚠️ 必须 ≥24.9：NestJS 12 全家是 ESM-only，Jest 走 require(esm) 需要
+          #    vm.SourceTextModule.prototype.hasAsyncGraph（Node 22 没有这个 API）。
+          node-version: 24
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm install -g npm@11
@@ -181,7 +183,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # ⚠️ 必须 ≥24.9：同 api job，Jest 加载 NestJS 12 的 ESM 包依赖 require(esm)。
+          node-version: 24
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm install -g npm@11

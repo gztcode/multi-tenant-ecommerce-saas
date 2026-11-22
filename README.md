@@ -222,7 +222,9 @@ cd platform-admin && cp .env.example .env && npm run dev   # :3003
 > `npm run build --workspace storefront`，或直接进各目录执行原脚本
 > （二进制会沿目录树向上解析到根 node_modules/.bin）。
 
-> Node/npm 基线：Node 22 + npm 11（见仓库根 `.nvmrc`；本机 Node 26 也可用）。
+> Node/npm 基线：Node 24 + npm 11（见仓库根 `.nvmrc`）。运行与构建也支持 Node 22，
+> 但 api 的测试需 **Node ≥ 24.9**：NestJS 12 全家是 ESM-only，Jest 走 `require(esm)`
+> 依赖 `vm.SourceTextModule.prototype.hasAsyncGraph`（Node 22 没有这个 API）。
 > CI 与 Docker 镜像统一 npm 11；`package.json` 的 `engines` 只做提示，不作为安装闸。
 
 ### 本机端口
