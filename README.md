@@ -316,9 +316,9 @@ npm test --workspace @ecom/browser-e2e   # 登录→加购→下单→假网关�
 **三个前端都有单元测试**（Vitest）：
 
 ```bash
-cd merchant-admin  && npm test   # 428 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费白名单 + 令牌刷新 + jwt 回调的决策逻辑 + 出款/收款账户组件测试
-cd storefront     && npm test   # 228 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）+ jwt 回调的决策逻辑
-cd platform-admin && npm test   # 475 条：计费与对账中转路由的白名单 + 页面级测试 + 套餐表单 / 平台默认渠道设置的组件测试
+cd merchant-admin  && npm test   # 562 条：中转路由的护栏（认证 / 白名单 / 畸形请求体 / 批量上限 / 订单白名单）+ 计费白名单 + 令牌刷新 + jwt 回调的决策逻辑 + 出款/收款账户组件测试
+cd storefront     && npm test   # 297 条：中转路由与纯函数的白名单 + **前端组件测试**（jsdom + Testing Library：加购按钮 / 地址簿 / 主题轮询）+ jwt 回调的决策逻辑
+cd platform-admin && npm test   # 534 条：计费与对账中转路由的白名单 + 页面级测试 + 套餐表单 / 平台默认渠道设置的组件测试
 ```
 
 > ✅ **三个前端都有组件测试基建**（`vitest.config.ts` + `test/setup.ts`）：
