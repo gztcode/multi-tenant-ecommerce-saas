@@ -21,7 +21,7 @@
     "dev:install": "npm install"
   },
   "overrides": {
-    "@vitest/mocker": "4.1.12",
+    "@vitest/mocker": "5.1.1",
     "body-parser": "2.4.0",
     "multer": "2.5.0",
     "postcss": "8.5.31",
