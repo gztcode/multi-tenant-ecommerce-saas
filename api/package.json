@@ -27,7 +27,7 @@
     "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "prisma db seed",
     "db:fix-legacy-checksum": "prisma db execute --schema prisma/schema.prisma --file prisma/fix-legacy-migration-checksum.sql",
-    "test:cov:e2e": "NODE_OPTIONS=\"--experimental-vm-modules --max-old-space-size=4096\" jest --config ./test/jest-e2e.json --runInBand --coverage --collectCoverageFrom='src/**/*.ts' --collectCoverageFrom='!src/**/*.module.ts' --collectCoverageFrom='!src/main.ts'",
+    "test:cov:e2e": "NODE_OPTIONS=\"--experimental-vm-modules --max-old-space-size=4096\" jest --config ./test/jest-e2e.json --runInBand --coverage --collectCoverageFrom='src/**/*.ts' --collectCoverageFrom='!src/**/*.module.ts' --collectCoverageFrom='!src/main.ts' --collectCoverageFrom='!src/**/*.spec.ts' --collectCoverageFrom='!src/load-env.ts' --collectCoverageFrom='!src/common/config/load-env.ts' --collectCoverageFrom='!src/common/config/assert-payout-encryption-key.ts' --collectCoverageFrom='!src/common/config/swagger-config.ts' --collectCoverageFrom='!src/common/config/seed-guard.ts' --collectCoverageFrom='!src/common/config/env-import-order-scanner.ts' --collectCoverageFrom='!src/common/db/tx-boundary-scanner.ts' --collectCoverageFrom='!src/common/db/tx-boundary-exemptions.ts' --collectCoverageFrom='!src/common/guards/controller-roles-scanner.ts' --collectCoverageFrom='!src/common/guards/controller-roles-exemptions.ts' --collectCoverageFrom='!src/modules/billing/ledger-check.ts'",
     "db:test:deploy": "node test/deploy-test-db.mjs",
     "backfill:ledger": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/backfill-commission-entries.ts",
     "backfill:commissions": "npm run backfill:ledger",

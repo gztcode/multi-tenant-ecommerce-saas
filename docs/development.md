@@ -112,17 +112,32 @@ npm test --workspace @ecom/browser-e2e   # 登录→加购→下单→假网关�
 ```
 
 > 🔒 **e2e 覆盖率是独立的一道棘轮**（`api/test/jest-e2e.json` 的 `coverageThreshold`，
-> 2026-11-27 加）：statements 35 / branches 46 / functions 29 / lines 34。
+> 2026-11-27 加，同日改口径）：statements 79 / branches 60 / functions 85 / lines 79。
 > 它只作用于 e2e 配置，和 `api/package.json` 里单测那组（59/52/53/59）互不影响。
 >
-> - **算式**：两遍实测 `37.12 / 48.57 / 31.37 / 36.58` 与 `37.12 / 48.56 / 31.37 / 36.58`，
->   取较低那遍向下取整再减 2 个点（37-2=35、48-2=46、31-2=29、36-2=34）。
+> - **口径（分母只算产品文件）**：`test:cov:e2e` 的 `collectCoverageFrom` 先排除
+>   `src/**/*.module.ts` / `src/main.ts` / `src/**/*.spec.ts`，再排除 11 个
+>   **e2e 永远不会加载的脚本与启动引导文件**：`src/load-env.ts`、
+>   `src/common/config/load-env.ts`、`assert-payout-encryption-key.ts`、
+>   `swagger-config.ts`、`seed-guard.ts`、`env-import-order-scanner.ts`、
+>   `src/common/db/tx-boundary-{scanner,exemptions}.ts`、
+>   `src/common/guards/controller-roles-{scanner,exemptions}.ts`、
+>   `src/modules/billing/ledger-check.ts`。排除前分母 225 个文件（其中 11 个恒 0%），
+>   排除后 **214 个产品文件、无 0% 文件**。其中 8 个只被 `scripts/*.ts`
+>   调用（两个 load-env、三个 `*-scanner`、两个 `*-exemptions` 数据表、
+>   `ledger-check`），`seed-guard` 只被 `prisma/seed.ts`（子进程）调用，`swagger-config` 与
+>   `assert-payout-encryption-key` 只被已排除的 `main.ts` 调用（e2e 用
+>   `Test.createTestingModule(AppModule)` 启动，不走 `main.ts`）。
+> - **算式**：两遍实测 `81.24 / 62.29 / 87.16 / 81.11`（两遍完全一致），
+>   向下取整再减 2 个点（81-2=79、62-2=60、87-2=85、81-2=79）。
 >   只许**上调**，下调阈值等同于允许覆盖率倒退。
-> - **为什么比单测低**：`collectCoverageFrom='src/**/*.ts'` 的统计口径里包含了
->   79 个 `*.spec.ts` 单测文件（8830 行，e2e 永远不加载，覆盖率恒为 0）。
->   只看 225 个非 spec 的产品文件，e2e 的 lines 是 76.81%、functions 83.18% ——
->   控制器 / DTO / 中间件这些「单测覆盖不到」的部分正是 e2e 在兜。
->   所以**不要**为了数字好看去改排除清单，要动就单独立项。
+> - **为什么必须排除 spec**：旧口径的 `src/**/*.ts` 把 79 个 `*.spec.ts`
+>   （约 8830 行）也算了进去，而 e2e 永远不会加载单测文件 —— 它们恒为 0%，
+>   把真实覆盖率压到 lines 36.58%，34% 的门槛证明不了产品代码有没有被测到。
+>   排除后同一批 e2e 的 lines 是 81.11%。
+> - **反向证明**（2026-11-27 实测）：临时挪走 `payment` / `catalog` / `settlement` /
+>   `ledger-reconciliation` 四个套件 → `75.95 / 57.28 / 80.32 / 75.76`，四项全部
+>   低于阈值、退出码 1；临时把阈值改成 99 → 全绿套件下仍四项不达标、退出码 1。
 > - **不要和单测共用 `coverage/`**：e2e 用自己的 `coverage-e2e/`（配置里写死），
 >   两边的报告互相覆盖会得出错误结论；该目录已进 `.gitignore`。
 > - 49 个套件在同一个进程里累积 Istanbul 覆盖率，默认堆（本机实测约 2GB）会
