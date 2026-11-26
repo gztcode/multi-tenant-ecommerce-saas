@@ -13,5 +13,7 @@
     "jsx": "preserve",
     "types": ["node"]
   },
-  "include": ["src"]
+  // ⚠️ test 也要进类型检查：CI 的 shared job 只跑 `tsc --noEmit` + `npm test`，
+  //    漏掉 test 的话，测试文件里的类型错误要等到运行时才发现。
+  "include": ["src", "test", "vitest.config.ts"]
 }
