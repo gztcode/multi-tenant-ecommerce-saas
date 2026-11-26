@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# 此文件与 gztcode/multi-tenant-ecommerce-saas 共用同一份副本；改接口或输出格式前
+# 需与 saas 同步，两仓 CI 都会校验 sha256（scripts/check-docs-links.py.sha256）。
 """检查仓库 Markdown 文档里的相对链接是否可达。
 
 用法：

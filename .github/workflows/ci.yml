@@ -130,9 +130,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      # 纯标准库脚本，ubuntu runner 自带 python3，不装依赖。
-      # ⚠️ 不许加 `|| true` / `continue-on-error`：死链必须让 PR 变红。
-      # `scripts/check-docs-links.py` 与 gztcode/picknote 共用同一份文件，修改需两仓同步。
+      # 与 gztcode/picknote 共用同一份 `scripts/check-docs-links.py`：
+      # 两仓 CI 都用 `scripts/check-docs-links.py.sha256` 钉住脚本内容，
+      # **改脚本必须同步改 .sha256**，否则这里会因 checksum 不匹配直接红。
+      # 固定 python 3.12，与 picknote 用同一个解释器，链接统计口径才可比。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 校验共享脚本 sha256：脚本被单边改动（未同步 .sha256）时先红在这里。
+      # ⚠️ 不许加 `|| true` / `continue-on-error`：校验和死链都必须让 PR 变红。
+      - run: shasum -a 256 -c scripts/check-docs-links.py.sha256
       - run: python3 scripts/check-docs-links.py --all
 
   nginx:
