@@ -7,5 +7,14 @@
     "^.+\\.(t|j)s$": "ts-jest"
   },
   "globalSetup": "<rootDir>/test/setup-e2e.ts",
-  "setupFilesAfterEnv": ["<rootDir>/test/setup.ts"]
+  "setupFilesAfterEnv": ["<rootDir>/test/setup.ts"],
+  "coverageDirectory": "coverage-e2e",
+  "coverageThreshold": {
+    "global": {
+      "statements": 35,
+      "branches": 46,
+      "functions": 29,
+      "lines": 34
+    }
+  }
 }
