@@ -26,7 +26,7 @@
 #
 # ## 默认值从哪来
 #
-# 全部是**保守占位**，上线前必须按真实访问日志校准（docs/DEPLOY.md §9）：
+# 全部是**保守占位**，上线前必须按真实访问日志校准（docs/deployment.md §9）：
 #   - front：三个前端的 location /（浏览器真实流量入口）
 #   - api  ：直连 api 的 /api/v1（脚本、第三方集成）
 #   - auth ：api 的 /api/v1/auth/（认证端点从紧）

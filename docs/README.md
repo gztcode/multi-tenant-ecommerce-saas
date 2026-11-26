@@ -10,7 +10,7 @@
 | [架构设计](architecture.md) | 系统组成、请求链路、多租户隔离、订单状态机与库存流水、模块依赖与渠道抽象 | 新人、改核心逻辑前 |
 | [开发指南](development.md) | 本地环境搭建、本机端口、示例账号、测试命令、npm workspaces、假网关、渠道配置、代码规范与推送 | 日常开发 |
 | [数据库](database.md) | 数据模型约定、迁移流程、测试库、`pg_trgm`、备份与恢复 | 改 schema、上线前 |
-| [部署指南](DEPLOY.md) | compose 全栈容器、生产部署（TLS、密钥、升级、回滚）、Nginx 与运维脚本 | 部署与运维 |
+| [部署指南](deployment.md) | compose 全栈容器、生产部署（TLS、密钥、升级、回滚）、Nginx 与运维脚本 | 部署与运维 |
 | [需求与规划](requirements/README.md) | 需求模板、当前待办、历史阶段的设计/计划/验收归档 | 了解来龙去脉 |
 
 ## 各子项目 README

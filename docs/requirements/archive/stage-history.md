@@ -26,7 +26,7 @@
   （`infra/docker-compose.prod.yml`）；网关 `limit_req` 限流；
   `statement_timeout=8s`（防单租户慢查询拖垮共享库）；compose 新增
   `migrate` 工具服务（builder 镜像带 prisma CLI，`--profile tools`）。
-  完整部署流程见 **[`../../DEPLOY.md`](../../DEPLOY.md)**。
+  完整部署流程见 **[`../../deployment.md`](../../deployment.md)**。
 - **代码收口**：`payment.service.ts`（2636 行）拆为四个服务
   （lookup / order / refund / webhook）+ 202 行 facade；
   `payout.service.ts`（2052 行）拆为 `PayoutQueryService` + `PayoutStateService`

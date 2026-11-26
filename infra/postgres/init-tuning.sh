@@ -16,7 +16,7 @@
 # - e2e 的测试库 ecommerce_test 是之后由测试基建创建的，**不带超时**——
 #   测试里的慢查询（锁竞争重试等）不应被生产阈值打断；
 # - docker-entrypoint-initdb.d 只在**数据卷首次创建**时执行。
-#   已存在的数据库用 DEPLOY.md §数据库加固里的 ALTER DATABASE 手动补。
+#   已存在的数据库用 deployment.md §数据库加固里的 ALTER DATABASE 手动补。
 #
 # STATEMENT_TIMEOUT_MS 置 0 可禁用（不设置超时）。
 

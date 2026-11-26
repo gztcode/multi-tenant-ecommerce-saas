@@ -20,9 +20,9 @@
 | 生产 TLS 模板（泛域名 + ACME + HSTS，envsubst 渲染） | `infra/nginx/templates/prod.conf.template` | 官方 nginx 镜像 `nginx -t` 语法通过（stub upstream + 自签证书） |
 | compose 生产 override（80/443 对外，数据服务端口可摘除） | `infra/docker-compose.prod.yml` | `docker compose config` 通过；缺 `BASE_DOMAIN` 时按设计快速失败 |
 | 网关限流 `limit_req`（general 20r/s / auth 10r/s） | `platform.test.conf` + 模板 | nginx 语法通过；阈值注释说明 BFF 聚合 IP 的下限依据 |
-| `statement_timeout=8s`（防单租户慢查询拖垮共享库） | `infra/postgres/init-tuning.sh` | 仅数据卷首次创建时生效；已有库按 DEPLOY.md 手动 ALTER |
+| `statement_timeout=8s`（防单租户慢查询拖垮共享库） | `infra/postgres/init-tuning.sh` | 仅数据卷首次创建时生效；已有库按 deployment.md 手动 ALTER |
 | `migrate` 工具服务（builder 镜像带 prisma CLI） | `docker-compose.yml` `--profile tools` | compose config 含该服务 |
-| 生产部署文档（DNS/证书/密钥/迁移/回滚/核对清单） | `docs/DEPLOY.md` | 11 节，密钥校验/占位符拒绝与启动守卫口径一致 |
+| 生产部署文档（DNS/证书/密钥/迁移/回滚/核对清单） | `docs/deployment.md` | 11 节，密钥校验/占位符拒绝与启动守卫口径一致 |
 
 ## 三、代码收口
 

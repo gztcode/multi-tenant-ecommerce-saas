@@ -114,7 +114,7 @@ cd infra && docker compose up -d --build
 - 手工验收假支付/假出款网关时，api 必须用 `NODE_ENV=development` 跑。compose 默认 `NODE_ENV=production`；
   在 production 下打开 `FAKE_PAYMENT_ENABLED` / `FAKE_PAYOUT_ENABLED` 会被 `assertSecureConfig`
   **拒绝启动**。⚠️ 但**开关关着也起不来**：compose 自带 production 姿态 + 占位密钥/默认 DB 密码，
-  阶段 9 的凭据校验同样拒绝 → 用假网关联调只能走本机 `npm run start:dev`（见 `docs/DEPLOY.md` 附录 A「本机全栈容器」）。
+  阶段 9 的凭据校验同样拒绝 → 用假网关联调只能走本机 `npm run start:dev`（见 `docs/deployment.md` 附录 A「本机全栈容器」）。
 - 假出款网关的渠道流水只存在**进程内存**，重启容器即丢；不要用它造跨重启的验收数据。
 - `infra/docker-compose.yml` 里的 `JWT_SECRET` / `AUTH_SECRET` 是明文固定值，仅供本机开发。
 

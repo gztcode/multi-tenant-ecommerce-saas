@@ -51,7 +51,7 @@ services:
       # 限流阈值：{FRONT,API,AUTH}_{RATE,BURST}，单位分别是每秒请求数与突发
       # 队列长度。**不配 = 脚本内置的保守默认值**；配错（非数字、过大）→
       # 回落默认值并在 nginx 日志里点名，绝不会渲染出坏配置。
-      # 默认值必须按真实访问日志校准，见 docs/DEPLOY.md §9。
+      # 默认值必须按真实访问日志校准，见 docs/deployment.md §9。
       # 改完要 `docker compose ... up -d nginx` 重建容器才生效。
       RATE_LIMIT_FRONT_RATE: ${RATE_LIMIT_FRONT_RATE:-}
       RATE_LIMIT_FRONT_BURST: ${RATE_LIMIT_FRONT_BURST:-}

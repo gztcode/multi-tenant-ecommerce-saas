@@ -125,6 +125,16 @@ jobs:
       - run: npx tsc --noEmit
         working-directory: packages/frontend-shared
 
+  docs-links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # 纯标准库脚本，ubuntu runner 自带 python3，不装依赖。
+      # ⚠️ 不许加 `|| true` / `continue-on-error`：死链必须让 PR 变红。
+      # `scripts/check-docs-links.py` 与 gztcode/picknote 共用同一份文件，修改需两仓同步。
+      - run: python3 scripts/check-docs-links.py --all
+
   nginx:
     runs-on: ubuntu-latest
     timeout-minutes: 10

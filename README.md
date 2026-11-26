@@ -58,7 +58,7 @@ cd platform-admin && ([ -f .env ] || cp .env.example .env) && npm run dev   # :3
 | [架构设计](docs/architecture.md) | 系统组成、请求链路、多租户隔离、订单状态机与库存流水、模块依赖与渠道抽象 |
 | [开发指南](docs/development.md) | 本地环境、npm workspaces、本机端口、示例账号、渠道与假网关、测试、代码规范、推送 |
 | [数据库](docs/database.md) | 数据模型约定、迁移流程、测试库、`pg_trgm`、备份与恢复 |
-| [部署指南](docs/DEPLOY.md) | 本机全栈容器、生产部署（TLS、密钥、升级、回滚）、Nginx 与运维脚本 |
+| [部署指南](docs/deployment.md) | 本机全栈容器、生产部署（TLS、密钥、升级、回滚）、Nginx 与运维脚本 |
 | [需求与规划](docs/requirements/README.md) | 需求模板、当前待办与技术债、阶段 1~11 的设计/计划/验收归档 |
 | [AGENTS.md](AGENTS.md) | 面向 AI 助手与新人：目录布局、命令、不可违反的约定、踩坑记录（**动手前必读**） |
 
@@ -69,6 +69,5 @@ cd platform-admin && ([ -f .env ] || cp .env.example .env) && npm run dev   # :3
 
 ## 当前状态
 
-阶段 11「可观测性与生产部署加固」已完成并验收通过
-（[验收记录](docs/requirements/archive/plans/2026-11-07-plan-11-observability-deploy-acceptance.md)）。
-下一阶段待办见 [backlog](docs/requirements/backlog.md)。
+当前进行到**阶段 11（可观测性与生产部署加固，已完成）**，各阶段状态与技术债见
+[需求与规划](docs/requirements/README.md)。

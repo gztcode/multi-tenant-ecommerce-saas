@@ -51,5 +51,5 @@
 
 - [开发指南](development.md) —— 本地环境、测试、代码规范
 - [数据库](database.md) —— 数据模型约定、迁移、备份恢复
-- [部署指南](DEPLOY.md) —— compose 全栈与生产部署
+- [部署指南](deployment.md) —— compose 全栈与生产部署
 - [需求与规划](requirements/README.md) —— 各阶段设计、计划与验收记录
