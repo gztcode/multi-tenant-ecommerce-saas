@@ -34,6 +34,16 @@ npm run lint          # 静态检查
 - e2e **必须串行**（`--runInBand`）：共享同一个测试库与 Redis 队列，并行会互相干扰。
 - e2e 与单元测试都跑在**测试库** `ecommerce_test`（`DATABASE_URL_TEST`）上，
   与开发库物理隔离；`npm test` / `npm run test:e2e` 会先自动应用迁移。
+- **覆盖率门禁**：`api/package.json` 的 `jest.coverageThreshold` 设了全局下限
+  （statements / branches / functions / lines 四项），只在 `npm run test:cov` 时生效，
+  CI 的 api job 跑的就是它。这是**只许升不许降的棘轮**：调阈值必须在评审里说明原因
+  （补了哪块测试所以上调，或为什么不得不下调），不能为了让红变绿直接压低。
+  `package.json` 是严格 JSON 写不了注释，这条约定就记在这里。
+- `test` / `test:cov` 都**不带** `--passWithNoTests`：测试目录被改名、用例被删光时
+  必须红，而不是静默通过。
+- `src/main.ts` 是 NestJS 启动引导文件（`NestFactory.create` + 监听端口），
+  无法在不真起进程的前提下单测，已从覆盖率统计里排除；`src/load-env.ts` 是
+  `process.loadEnvFile` 的副作用模块，同样进不了单测，仍计入覆盖率（记为 0%）。
 
 ## 账目运维脚本
 

@@ -71,7 +71,9 @@ jobs:
         working-directory: api
       - run: npm run lint
         working-directory: api
-      - run: npm test
+      # ⚠️ 必须是 test:cov 而不是 test：覆盖率门禁（jest.coverageThreshold）只在
+      #    带 --coverage 时生效，用 npm test 跑等于门禁不存在。
+      - run: npm run test:cov
         working-directory: api
 
   frontend:
