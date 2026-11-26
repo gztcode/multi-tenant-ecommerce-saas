@@ -9,14 +9,21 @@
   "exports": {
     "./*": "./src/*"
   },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
   "dependencies": {
     "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
     "@types/react": "^19",
+    "@types/react-dom": "^19",
     "next": "16.4.6",
     "react": "19.1.0",
-    "typescript": "^5.9.3"
+    "react-dom": "19.1.0",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.1"
   }
 }

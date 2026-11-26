@@ -157,10 +157,22 @@ async function requestRefresh(
     return { ok: false, reason: 'network' };
   }
 
-  const data = (await response.json()) as {
-    accessToken?: string;
-    refreshToken?: string;
-  };
+  // ⚠️ **200 也可能是坏响应**：反向代理的维护页、门户劫持都会给出 200 + HTML。
+  //    解析失败属于「响应不完整」，按网络类失败处理——保留旧令牌，下次再试。
+  //    不能让它抛出去：`jwt` 回调每次读会话都会炸，用户看到的是 500 页面，
+  //    而不是「这次没刷成，稍后再试」。
+  let data: { accessToken?: string; refreshToken?: string } | null;
+  try {
+    data = (await response.json()) as {
+      accessToken?: string;
+      refreshToken?: string;
+    } | null;
+  } catch {
+    return { ok: false, reason: 'network' };
+  }
+  if (!data || typeof data !== 'object') {
+    return { ok: false, reason: 'network' };
+  }
   if (!data.accessToken || !data.refreshToken) {
     // 响应不完整：当作「没刷新成」，但**不**判定凭证失效。
     return { ok: false, reason: 'network' };

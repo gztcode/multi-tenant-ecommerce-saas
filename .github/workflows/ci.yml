@@ -126,6 +126,11 @@ jobs:
       - run: npm ci --workspace @ecom/frontend-shared
       - run: npx tsc --noEmit
         working-directory: packages/frontend-shared
+      # 共享包里是钱（money / format-price）、令牌（token-expiry / token-refresh）、
+      # 鉴权（assert-auth-secret / jwt-callback）这些「改错了没人会红」的逻辑。
+      # 只跑 tsc 等于只挡住类型错误，行为错照样合并。
+      - run: npm test
+        working-directory: packages/frontend-shared
 
   docs-links:
     runs-on: ubuntu-latest
