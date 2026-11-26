@@ -1062,6 +1062,30 @@ describe('支付事件应用（消费端复核，审计 P0-6）', () => {
     expect(orderService.transitionInTx).toHaveBeenCalled();
   });
 
+  it('⚠️ 支付成功 → 订单转 PAID 的同一处流转写入 payChannel（取自支付单渠道）', async () => {
+    const { service, orderService } = setupApply();
+
+    // ⚠️ 刻意用一个与假渠道不同的 channel：实现里写死 'fake' 的话会在这里露馅
+    await service.applyEvent(
+      paymentEvent({ provider: 'sandbox', channel: 'sandbox' }),
+      TENANT_ID,
+    );
+
+    expect(orderService.transitionInTx).toHaveBeenCalledTimes(1);
+    const [, , from, to, extra] = orderService.transitionInTx.mock.calls[0] as [
+      unknown,
+      string,
+      OrderStatus,
+      OrderStatus,
+      Record<string, unknown>,
+    ];
+    expect(from).toBe(OrderStatus.PENDING_PAYMENT);
+    expect(to).toBe(OrderStatus.PAID);
+    // ⚠️ 必须是**同一次**状态流转带上的字段：另起一次 UPDATE 会留下
+    //    「订单已 PAID 但渠道还是空」的中间态，也会多一次写。
+    expect(extra).toEqual(expect.objectContaining({ payChannel: 'sandbox' }));
+  });
+
   describe('loadRegisteredEvent（复核事件行）', () => {
     it('没有这张事件行 → null（这个任务不生效）', async () => {
       const { prisma, service } = setupApply();
