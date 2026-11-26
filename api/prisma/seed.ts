@@ -1,7 +1,23 @@
 import { Prisma, PrismaClient, UserRole } from '@prisma/client';
 import * as argon2 from 'argon2';
+import {
+  assertSeedAllowed,
+  resolveSeedPassword,
+  SeedGuardError,
+  type SeedPasswordSource,
+} from '../src/common/config/seed-guard';
 
 const prisma = new PrismaClient();
+
+/**
+ * 日志里只写口令来源，**不打印口令本身**。
+ *
+ * ⚠️ 旧实现会把明文口令打到 stdout（CI 日志、运维终端、journald 都留得下），
+ *    而种子账号的口令长期不变 —— 等于把凭据写进日志。
+ */
+function describeSeedPasswordSource(source: SeedPasswordSource): string {
+  return source === 'env' ? '环境变量' : '内置默认值（仅限非生产环境）';
+}
 
 /**
  * 阶段 2a 的示例店铺子域名。
@@ -22,7 +38,12 @@ async function seedPlatformAdmin(): Promise<void> {
   const email = (
     process.env.SEED_PLATFORM_ADMIN_EMAIL ?? 'admin@platform.test'
   ).toLowerCase();
-  const password = process.env.SEED_PLATFORM_ADMIN_PASSWORD ?? 'Admin12345!';
+  // ⚠️ 生产环境未显式提供口令时这里直接抛错（见 seed-guard.ts）——
+  //    内置默认口令在版本库里，等于公开。
+  const { password, source: passwordSource } = resolveSeedPassword(
+    process.env,
+    'platform-admin',
+  );
 
   const existing = await prisma.user.findFirst({
     // 查重也大小写不敏感：与 lower(email) 唯一索引的语义对齐，
@@ -61,7 +82,9 @@ async function seedPlatformAdmin(): Promise<void> {
     throw error;
   }
 
-  console.log(`已创建平台超管：${email} / ${password}`);
+  console.log(
+    `已创建平台超管：${email}（口令来源：${describeSeedPasswordSource(passwordSource)}）`,
+  );
 }
 
 /**
@@ -81,8 +104,9 @@ async function seedDemoStore(): Promise<void> {
   const merchantEmail = (
     process.env.SEED_DEMO_MERCHANT_EMAIL ?? 'owner@demo.platform.test'
   ).toLowerCase();
-  const merchantPassword =
-    process.env.SEED_DEMO_MERCHANT_PASSWORD ?? 'Demo12345!';
+  // 与平台超管同一套护栏：生产环境未显式提供即抛错。
+  const { password: merchantPassword, source: merchantPasswordSource } =
+    resolveSeedPassword(process.env, 'demo-merchant');
 
   const existingTenant = await prisma.tenant.findUnique({
     where: { subdomain: DEMO_SUBDOMAIN },
@@ -382,7 +406,7 @@ async function seedDemoStore(): Promise<void> {
 
   console.log(
     `已创建示例店铺：${DEMO_SUBDOMAIN}.platform.test，` +
-      `店主 ${merchantEmail} / ${merchantPassword}`,
+      `店主 ${merchantEmail}（口令来源：${describeSeedPasswordSource(merchantPasswordSource)}）`,
   );
   console.log(
     '  3 层品类树（服饰 / T恤 / 纯棉T恤、鞋靴、清仓专区[已软删]、手机数码）',
@@ -475,7 +499,10 @@ async function seedDemoCustomer(): Promise<void> {
   const email = (
     process.env.SEED_DEMO_CUSTOMER_EMAIL ?? 'customer@demo.platform.test'
   ).toLowerCase();
-  const password = process.env.SEED_DEMO_CUSTOMER_PASSWORD ?? 'Demo12345!';
+  const { password, source: passwordSource } = resolveSeedPassword(
+    process.env,
+    'demo-customer',
+  );
 
   const existing = await prisma.user.findFirst({
     // ⚠️ 必须大小写不敏感：数据库的唯一索引是
@@ -524,10 +551,15 @@ async function seedDemoCustomer(): Promise<void> {
     throw error;
   }
 
-  console.log(`已创建示例消费者：${email} / ${password}`);
+  console.log(
+    `已创建示例消费者：${email}（口令来源：${describeSeedPasswordSource(passwordSource)}）`,
+  );
 }
 
 async function main() {
+  // ⚠️ **第一步就是生产护栏**：生产环境默认拒绝执行，需显式 ALLOW_PROD_SEED=true。
+  assertSeedAllowed(process.env);
+
   await seedPlatformAdmin();
   // ⚠️ 试用套餐要在订阅之前建好——订阅要挂到套餐上。
   // 放在 seedDemoStore 之前，这样即使 demo 店铺已存在（store 那段会跳过），
@@ -539,9 +571,15 @@ async function main() {
 }
 
 main()
-  .catch((error) => {
-    console.error(error);
-    process.exit(1);
+  .catch((error: unknown) => {
+    // 护栏类错误只打印一行说明；其它异常保留完整堆栈，便于定位。
+    if (error instanceof SeedGuardError) {
+      console.error(`[seed] ${error.message}`);
+    } else {
+      console.error(error);
+    }
+    // 用 exitCode 而不是 process.exit：让 finally 里的 $disconnect 跑完。
+    process.exitCode = 1;
   })
   .finally(async () => {
     await prisma.$disconnect();
