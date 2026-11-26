@@ -1,7 +1,12 @@
 # 需求模板
 
-复制本文件，命名为 `YYYY-MM-DD-<主题>.md`，放在 `docs/requirements/`（未排期）或
-`docs/requirements/archive/`（已完成/已过期）下。删除本行说明后再填写。
+复制本文件，命名为 `YYYY-MM-DD-<主题>.md`，放在 `docs/requirements/`（讨论中/已排期/进行中）；
+完成后移到 `docs/requirements/archive/requirements/`（按需创建）。删除本行说明后再填写。
+
+> **归档说明**：`archive/requirements/` 目前**尚无实例**；首个把需求归档进去的人，
+> 必须同时在 [`archive/README.md`](archive/README.md) 的索引里补一行（路径 + 一句话内容），
+> 否则该文件等于不存在。设计与计划/验收不随需求移动，仍分别归档到
+> `archive/specs/` 与 `archive/plans/`。
 
 ---
 

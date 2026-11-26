@@ -3,8 +3,8 @@
 本目录集中存放项目的需求、设计、实施计划与验收记录。以前这些内容散落在根
 `README.md` 和各阶段文档里，从本次整理起统一收口到这里。
 
-> 截至 2026-11-26 梳理：下面第三节的状态表是**状态口径的唯一来源**，
-> 根 README 只保留一行当前阶段。
+> 截至 2026-11-27 梳理：下面第三节的状态表是**状态口径的唯一来源**，
+> 根 README 只保留一行当前阶段。全仓只有这一处梳理时间戳。
 
 ## 一、需求来源
 
@@ -23,13 +23,16 @@
 
 | 文档类型 | 命名 | 放哪里 |
 |---------|------|--------|
-| 需求 | `YYYY-MM-DD-<主题>.md` | 本目录（未完成/进行中） |
+| 需求 | `YYYY-MM-DD-<主题>.md` | 本目录（讨论中/已排期/进行中） |
+| 已完成的需求 | 同上 | `archive/requirements/`（按需创建，目前尚无实例） |
 | 设计 | `YYYY-MM-DD-plan-<阶段号>-<主题>-design.md` | `archive/specs/`（完成后归档） |
 | 计划 | `YYYY-MM-DD-plan-<阶段号>-<主题>.md` | `archive/plans/` |
 | 验收 | `YYYY-MM-DD-plan-<阶段号>-acceptance.md` | `archive/plans/` |
 
 已完成或已过期的一律移入 [`archive/`](archive/)，**不删除**；归档内容不再维护，
 只作为决策依据。当前还在讨论、尚未实现的需求留在本目录，不要提前归档。
+需求完成后移到 `archive/requirements/`（该目录按需创建，目前尚无实例；
+首个使用者须同时补 [`archive/README.md`](archive/README.md) 的索引）。
 
 ## 三、当前状态
 
@@ -37,17 +40,21 @@
 |------|------|------|
 | 1 ~ 10 | 地基与身份 → 商品中心 → 交易链路 → 前端打磨 → 营销与资金链路（5a~5m）→ 渠道适配层 → 工程加固 → 资金与并发 → 技术债清理 → 事务边界收口 | ✅ 已完成并验收通过 |
 | 11 | 可观测性与生产部署加固（pino 日志、Prometheus 指标、告警 webhook、生产 TLS 与 compose override、RedisLockService） | ✅ 已完成并验收通过（[验收记录](archive/plans/2026-11-07-plan-11-observability-deploy-acceptance.md)） |
-| 下一阶段 | 见 [`backlog.md`](backlog.md) 的两份技术债清单（阶段 4 验收优先项、阶段 7 之后剩余项） | ⏳ 未排期 |
+| 11b | npm workspaces 化（根唯一 lockfile，5 个子包共用 `@ecom/frontend-shared`） | ✅ 已完成（PR #30，merge `6b1eddf`，[CI run](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593)）；有实现、无设计/计划/验收归档 |
+| 11c | 浏览器级 e2e（Playwright golden path） | ✅ 已完成（PR #31，merge `88583bb`，[CI run](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42452795536)）；有实现、无设计/计划/验收归档 |
+| 11d | 退货入库流程 | ✅ 已完成（PR #32，merge `9e287b3`，[CI run](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42488083335)）；有实现、无设计/计划/验收归档 |
+| 下一阶段 | **阶段 11 之后的剩余技术债**：2 项待办、6 项已放弃（留档）、7 项等业主裁决 —— 见 [`backlog.md`](backlog.md) 第二节 | ⏳ 未排期 |
 
-阶段 11 交付内容的详细叙述见[阶段进度记录](archive/stage-history.md)。
+阶段 11 与 11b/11c/11d 交付内容的详细叙述见[阶段进度记录](archive/stage-history.md)；
+11b/11c/11d 没有各自的归档文档，实现证据见 [`archive/README.md`](archive/README.md) 的阶段索引。
 
 ## 四、索引
 
 | 文档 | 内容 |
 |------|------|
-| [`backlog.md`](backlog.md) | 待办与技术债：原 README「后续计划」「剩余技术债」章节原文 |
+| [`backlog.md`](backlog.md) | 待办与技术债：按当前代码与 PR 校准过的条目（状态 / 完成证据 / 估算 / 阻塞原因） |
 | [`TEMPLATE.md`](TEMPLATE.md) | 需求模板：背景、目标、验收标准、涉及模块、风险取舍、关联文档 |
-| [`archive/README.md`](archive/README.md) | 阶段 1 ~ 11 的设计 / 计划 / 验收索引（历史，已过期但保留） |
+| [`archive/README.md`](archive/README.md) | 阶段 1 ~ 11 与 11b/11c/11d 的设计 / 计划 / 验收索引（历史，已过期但保留；11b~11d 只有实现证据） |
 | [`archive/stage-history.md`](archive/stage-history.md) | 原 README 顶部的阶段进度叙述 |
 
 ## 五、写文档的几条实用约定
