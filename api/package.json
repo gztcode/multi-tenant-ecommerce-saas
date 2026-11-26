@@ -17,9 +17,9 @@
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\"",
-    "test": "node test/deploy-test-db.mjs && NODE_OPTIONS=--experimental-vm-modules jest --passWithNoTests",
+    "test": "node test/deploy-test-db.mjs && NODE_OPTIONS=--experimental-vm-modules jest",
     "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
-    "test:cov": "node test/deploy-test-db.mjs && NODE_OPTIONS=--experimental-vm-modules jest --coverage --passWithNoTests",
+    "test:cov": "node test/deploy-test-db.mjs && NODE_OPTIONS=--experimental-vm-modules jest --coverage",
     "test:debug": "node --experimental-vm-modules --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "NODE_OPTIONS=--experimental-vm-modules jest --config ./test/jest-e2e.json --runInBand",
     "prisma:generate": "prisma generate",
@@ -118,9 +118,18 @@
     "collectCoverageFrom": [
       "**/*.(t|j)s",
       "!main.ts",
+      "!src/main.ts",
       "!**/*.module.ts"
     ],
     "coverageDirectory": "coverage",
+    "coverageThreshold": {
+      "global": {
+        "statements": 59,
+        "branches": 52,
+        "functions": 53,
+        "lines": 59
+      }
+    },
     "testEnvironment": "node",
     "maxWorkers": "50%"
   }
