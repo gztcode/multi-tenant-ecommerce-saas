@@ -459,19 +459,19 @@ test('裸根域名 http 与 https 自洽：两侧都明确拒绝，不出现 301
   assert.ok(hasDirective(root443[0].lines, /^return 444;$/), 'https 裸根域名必须显式拒绝（444）');
 });
 
-test('docs/DEPLOY.md §1 DNS 表与实际行为一致：裸根域名写明不承载业务', () => {
-  const deploy = readFileSync(join(HERE, '..', '..', 'docs', 'DEPLOY.md'), 'utf8');
+test('docs/deployment.md §1 DNS 表与实际行为一致：裸根域名写明不承载业务', () => {
+  const deploy = readFileSync(join(HERE, '..', '..', 'docs', 'deployment.md'), 'utf8');
   const rows = deploy.split('\n').filter((line) => line.trim().startsWith('|'));
 
   // 裸根域名必须是独立一行，且用途写明「不承载业务 / 拒绝 / 444」，不能写成店铺前台。
   const rootRow = rows.find((line) => /^\|\s*`example\.com`\s*\|/.test(line));
-  assert.ok(rootRow, 'DEPLOY.md §1 DNS 表缺少裸根域名 example.com 的独立行');
+  assert.ok(rootRow, 'deployment.md §1 DNS 表缺少裸根域名 example.com 的独立行');
   assert.match(rootRow, /不承载业务|拒绝|444/, `裸根域名行未写明真实行为：${rootRow}`);
   assert.doesNotMatch(rootRow, /店铺前台/, `裸根域名行不能写成店铺前台：${rootRow}`);
 
   // 店铺前台仍由泛域名承担，这条不能一起改坏。
   const wildcardRow = rows.find((line) => /^\|\s*`\*\.example\.com`\s*\|/.test(line));
-  assert.ok(wildcardRow, 'DEPLOY.md §1 DNS 表缺少 *.example.com 的独立行');
+  assert.ok(wildcardRow, 'deployment.md §1 DNS 表缺少 *.example.com 的独立行');
   assert.match(wildcardRow, /店铺前台/, '泛域名行仍应写明店铺前台');
 });
 

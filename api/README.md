@@ -91,6 +91,6 @@ npm run db:fix-legacy-checksum   # 迁移 checksum 修正（仅报 modified 时�
 | `test/` | e2e 测试（`*.e2e-spec.ts`）与测试库迁移脚本 |
 
 数据库连接：`postgresql://ecommerce:ecommerce@localhost:15432/ecommerce`
-（宿主机端口 15432，容器内 5432；本机端口分配见仓库根 README。）
+（宿主机端口 15432，容器内 5432；本机端口分配见 `docs/development.md`。）
 
-根目录 `README.md` 与 `docs/superpowers/plans/` 有完整说明。
+根目录 `README.md` 是入口，`docs/` 下有开发、数据库、部署与需求归档的完整说明。

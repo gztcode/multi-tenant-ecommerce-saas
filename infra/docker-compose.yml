@@ -24,7 +24,7 @@ services:
       # 提前到建库阶段解决——详见该 SQL 文件里的注释。
       - ./postgres/init-extensions.sql:/docker-entrypoint-initdb.d/init-extensions.sql:ro
       # 阶段 11：statement_timeout 等运行时调优（只在数据卷首次创建时执行；
-      # 已有库见 docs/DEPLOY.md 的手动 ALTER 步骤）
+      # 已有库见 docs/deployment.md 的手动 ALTER 步骤）
       - ./postgres/init-tuning.sh:/docker-entrypoint-initdb.d/init-tuning.sh:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-ecommerce} -d ${POSTGRES_DB:-ecommerce}']
@@ -316,7 +316,7 @@ services:
   #
   # 迁移策略：**迁移先行、应用后滚**。先跑本服务把库迁到位，
   # 再重启 api（应用代码要兼容旧库结构才能安全滚动——本项目的迁移
-  # 都是加列/加索引类，兼容性成立；做破坏性迁移时要走 DEPLOY.md 的双阶段流程）。
+  # 都是加列/加索引类，兼容性成立；做破坏性迁移时要走 deployment.md 的双阶段流程）。
   migrate:
     build:
       context: ../api

@@ -7,11 +7,11 @@
 # $tenant / $host 这类 nginx 运行时变量不受影响。
 # 由 docker-compose.prod.yml 挂载本目录并注入 BASE_DOMAIN。
 #
-# ## 需要的环境变量（见 infra/.env.example 与 docs/DEPLOY.md）
+# ## 需要的环境变量（见 infra/.env.example 与 docs/deployment.md）
 #
 # - BASE_DOMAIN：店铺子域名的基准域，如 `example.com`
 #   （店铺在 `<tenant>.${BASE_DOMAIN}`，证书需覆盖 `*.${BASE_DOMAIN}`——
-#    Let's Encrypt 用 DNS-01 challenge 签泛域名证书，见 DEPLOY.md §证书。
+#    Let's Encrypt 用 DNS-01 challenge 签泛域名证书，见 deployment.md §证书。
 #    ⚠️ SAN 里还要带**裸的** `${BASE_DOMAIN}`：裸根域名有自己的 443 块，
 #    它要完成 TLS 握手后再显式断连，证书不覆盖根域名就会先报证书错误。）
 # - 证书路径固定挂载到 /etc/nginx/certs/{fullchain.pem,privkey.pem}
@@ -40,7 +40,7 @@
 #   由 26-rate-limit.sh 在 envsubst 之后展开 `#@RATE_LIMIT_*@` 占位行，
 #   因为 envsubst 不支持默认值、也不会校验值（非法值会直接让 nginx 起不来）。
 #   不配 = 脚本内置的保守默认值；配错 = 回落默认值并在日志里点名。
-#   默认值必须按真实访问日志校准，见 docs/DEPLOY.md §9。
+#   默认值必须按真实访问日志校准，见 docs/deployment.md §9。
 #
 # ## 与 platform.test.conf（本机开发）的差异
 #
@@ -99,7 +99,7 @@ proxy_read_timeout 60s;
 # limit_req_zone 语句（envsubst 只认 ${VAR}、不支持默认值，也不校验值）。
 # 脚本没跑 / 环境变量非法 → 占位行保持注释 → 限流不生效但 nginx 照常启动
 # （可用性优先于限流；渲染期就断言过它必须被展开，见 prod-conf.render.test.mjs）。
-# 内置默认值是**保守占位**，上线前必须按真实访问日志校准（DEPLOY.md §9）。
+# 内置默认值是**保守占位**，上线前必须按真实访问日志校准（deployment.md §9）。
 #@RATE_LIMIT_ZONES@
 
 # 限流拒绝统一 429（P3-2）。503 会被客户端当成「服务故障」而重试，
@@ -185,7 +185,7 @@ server {
 # 处置：完成 TLS 握手 → return 444 直接断开、不回任何响应。与「未知 Host 一律
 # 断连」同一口径：不给扫描器回音，也不代理到任何后端（没有 location，就没有
 # 被转发到 storefront/api 的可能）。
-# ⚠️ 证书必须覆盖裸根域名（见 docs/DEPLOY.md §2）：这里要握手后才断，
+# ⚠️ 证书必须覆盖裸根域名（见 docs/deployment.md §2）：这里要握手后才断，
 #    证书不覆盖的话用户先看到证书错误，而不是「明确的拒绝」。
 server {
     listen 443 ssl;
