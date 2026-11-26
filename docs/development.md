@@ -143,7 +143,8 @@ e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物
 
 > CI（`.github/workflows/ci.yml`）分六个 job：`api`（tsc + lint + 单测）、
 > `frontend` matrix（storefront / merchant-admin / platform-admin 各自 tsc + 单测 +
-> lint + build）、`shared`（tsc）与 `e2e`（串行跑 `test:e2e`，排除依赖 MinIO 的
+> lint + build）、`shared`（tsc + 单测，`npm test --workspace @ecom/frontend-shared`）与
+> `e2e`（串行跑 `test:e2e`，排除依赖 MinIO 的
 > media 套件）。
 
 ### 单测冷启动偶发变红：并行 worker 数超出机器承受能力（事项 #31，2026-11-27）
