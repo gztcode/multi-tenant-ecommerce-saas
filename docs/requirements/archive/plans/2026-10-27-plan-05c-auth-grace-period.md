@@ -2632,7 +2632,7 @@ diff merchant-admin/src/lib/token-refresh.ts storefront/src/lib/token-refresh.ts
 > （本机手工起的 api 同样要停）。否则容器的 BullMQ worker 会抢走测试投进同一个
 > 队列的任务（容器连开发库、测试连测试库），表现为 `payment.e2e-spec.ts` 的
 > **假失败**。详见
-> [验收记录 §一](docs/superpowers/plans/2026-10-24-plan-03-acceptance.md)。
+> [验收记录 §一](./2026-10-24-plan-03-acceptance.md)。
 ```
 
 **替换成**：

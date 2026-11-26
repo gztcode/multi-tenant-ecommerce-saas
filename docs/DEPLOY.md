@@ -5,7 +5,8 @@
 迁移策略、备份与升级流程。
 
 > **范围声明**：这是单机部署（一台服务器 + compose）。多副本、HA、
-> secret manager、CDN 属于规模化改造，见 README「剩余技术债」。
+> secret manager、CDN 属于规模化改造，见
+> [待办与技术债](requirements/backlog.md)。
 
 ---
 
@@ -154,7 +155,7 @@ RATE_LIMIT_AUTH_BURST=20
 ```
 
 > `PAYOUT_ACCOUNT_ENCRYPTION_KEY` 一旦投入生产**不能轮换**——
-> 轮换后已打款的出款单快照永久解不开（守卫与 README 都有警告）。
+> 轮换后已打款的出款单快照永久解不开（守卫与[开发指南](development.md)都有警告）。
 
 ## 4. 首次部署
 
@@ -408,3 +409,34 @@ seed 产生的演示账号（若曾误跑 seed）。
       否则限流会把全站算在一个 IP 上
 - [ ] 备份 cron 已配且备份产物在**另一台机器**上验证过可恢复
 - [ ] `./restore.sh` 的恢复流程演练过一次（光备份不演练 = 没有备份）
+
+---
+
+## 附录 A：本机全栈容器（不使用生产 override）
+
+下面这段来自原根 `README.md`，是本机把四个应用一起用 compose 跑起来的方式，
+与上面的生产部署互不影响。
+
+```bash
+cd infra && docker compose up -d
+```
+
+八个服务一起起来：`postgres` / `minio` / `redis` / `api` / `storefront` / `merchant-admin` / `platform-admin` / `nginx`。
+
+- 后端健康检查：<http://localhost:3000/api/v1/health>（api 端口仅绑定本机回环；经 Nginx 访问时用 `Host: api.platform.test`）
+- 接口文档：<http://localhost:3000/api/docs>
+- 店铺前台：<http://localhost/> （用 `Host` 头指定店铺，如 `Host: demo.platform.test`）
+
+子域名本地调试：把 `127.0.0.1 *.platform.test` 写进 `/etc/hosts`。
+
+> **注意**：compose 默认是 **production 姿态**（`api/Dockerfile` 自带 `ENV NODE_ENV=production`，compose 也显式设 `NODE_ENV: production`），
+> 所以上面这条命令**原样跑不起来**。启动校验会拒绝 compose 内置的默认凭据：默认/空的 PostgreSQL、Redis、MinIO 密码，
+> 以及示例/默认的 `JWT_SECRET` / `AUTH_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY` 都会让进程启动即失败。
+> 要真跑通，必须通过环境变量提供真实的 `POSTGRES_PASSWORD` / `REDIS_PASSWORD` / `MINIO_ROOT_PASSWORD` 凭据，
+> 以及真实的 `JWT_SECRET` / `AUTH_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY`（其中 `JWT_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY` 至少 32 字符，可用 `openssl rand -base64 48` 生成）。
+>
+> 本机联调请走[开发指南](development.md)的「本地开发」路径（`cd api && npm run start:dev`，读 `api/.env`，`NODE_ENV` 不是 production，不触发这些拒绝）。
+> 也**不要**把 compose 的 `NODE_ENV` 改成 development 绕过：那会让非生产默认的假支付（`fake`）/ 假出款（`fake-payout`）渠道生效，
+> 属于安全姿态变更。
+>
+> compose 里的 `JWT_SECRET` / `AUTH_SECRET` 是明文固定值，**仅供本机开发**；真实部署必须换成外部注入的随机密钥。

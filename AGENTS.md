@@ -35,14 +35,16 @@
 
 ## 先读什么
 
-- `docs/superpowers/specs/*-design.md` + `docs/superpowers/plans/*.md` 才是真实设计与计划；
-  最近一次已完成的是 **阶段 9「历史技术债清理」**（2026-11-04，
-  设计见 `docs/superpowers/specs/2026-11-04-plan-09-tech-debt-cleanup-design.md`，
-  验收见 `docs/superpowers/plans/2026-11-04-plan-09-acceptance.md`）。
-  新阶段按「design → plan（勾选式 Task）→ 代码 → acceptance 记录」推进。
+- `docs/requirements/archive/specs/*-design.md` + `docs/requirements/archive/plans/*.md`
+  是各阶段真实的设计、计划与验收记录（索引见 `docs/requirements/archive/README.md`）；
+  最近一次已完成的是 **阶段 11「可观测性与生产部署加固」**（2026-11-07，
+  验收见 `docs/requirements/archive/plans/2026-11-07-plan-11-observability-deploy-acceptance.md`）。
+  新需求按 [`docs/requirements/TEMPLATE.md`](docs/requirements/TEMPLATE.md) 立文档，
+  再按「design → plan（勾选式 Task）→ 代码 → acceptance 记录」推进。
 - **每个 plan 开头的 §0「全局约定 / 动手前必须知道」优先于直觉**，里面有失败注入、定向 lint、迁移手写等纪律。
-- `README.md` 已随阶段 9 收尾更新（进度、测试条数、共享包说明、技术债）；但**数字会随提交漂移**，
-  以 `git log`、最新 plan/acceptance、`package.json`、`vitest.config.ts` 为准。
+- `README.md` 现在只留简介 / 技术栈 / 目录结构 / 快速开始 / 文档索引；主题细节在 `docs/`
+  （开发与测试见 `docs/development.md`，数据模型与迁移见 `docs/database.md`）。
+  **数字会随提交漂移**，以 `git log`、最新 plan/acceptance、`package.json`、`vitest.config.ts` 为准。
 
 ## 命令
 
@@ -112,7 +114,7 @@ cd infra && docker compose up -d --build
 - 手工验收假支付/假出款网关时，api 必须用 `NODE_ENV=development` 跑。compose 默认 `NODE_ENV=production`；
   在 production 下打开 `FAKE_PAYMENT_ENABLED` / `FAKE_PAYOUT_ENABLED` 会被 `assertSecureConfig`
   **拒绝启动**。⚠️ 但**开关关着也起不来**：compose 自带 production 姿态 + 占位密钥/默认 DB 密码，
-  阶段 9 的凭据校验同样拒绝 → 用假网关联调只能走本机 `npm run start:dev`（见 README「全栈容器」）。
+  阶段 9 的凭据校验同样拒绝 → 用假网关联调只能走本机 `npm run start:dev`（见 `docs/DEPLOY.md` 附录 A「本机全栈容器」）。
 - 假出款网关的渠道流水只存在**进程内存**，重启容器即丢；不要用它造跨重启的验收数据。
 - `infra/docker-compose.yml` 里的 `JWT_SECRET` / `AUTH_SECRET` 是明文固定值，仅供本机开发。
 
