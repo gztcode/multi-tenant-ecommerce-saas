@@ -7,10 +7,12 @@
 
 | 层 | 技术 |
 |----|------|
-| 后端 | NestJS 11 + Prisma 6 + PostgreSQL 16（全局前缀 `/api/v1`，Swagger 在 `/api/docs`） |
+| 后端 | NestJS 12 + Prisma 6 + PostgreSQL 16（全局前缀 `/api/v1`，Swagger 在 `/api/docs`） |
 | 前端 | Next.js 16 + NextAuth v5 + shadcn/ui，三端共用 `@ecom/frontend-shared` |
 | 基础设施 | Docker Compose + Nginx（按 Host 路由并注入 `X-Tenant-Subdomain`） |
-| 测试 | 后端 Jest 30（单测 + e2e）、前端 Vitest 3、浏览器 e2e Playwright |
+| 测试 | 后端 Jest 30（单测 + e2e）、前端 Vitest 5、浏览器 e2e Playwright |
+
+> 上表版本以各目录 `package.json` 为准（会随依赖升级漂移）。
 
 ## 目录结构
 

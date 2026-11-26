@@ -1,6 +1,6 @@
 # api — 多租户电商 SaaS 后端
 
-NestJS 11 + Prisma 6 + PostgreSQL 16。
+NestJS 12 + Prisma 6 + PostgreSQL 16（版本以 `api/package.json` 为准）。
 
 ## 本地运行
 
@@ -24,8 +24,8 @@ npm run start:dev
 ## 测试
 
 ```bash
-npm test              # 单元测试（950 条 / 58 个套件，3 条跳过）
-npm run test:e2e      # 端到端测试（663 条 / 40 个套件，串行）
+npm test              # 单元测试（规模以 npx jest --listTests | wc -l 为准）
+npm run test:e2e      # 端到端测试（串行；套件数以 npx jest --config test/jest-e2e.json --listTests 为准）
 npm run test:cov      # 单元测试覆盖率
 npm run test:cov:e2e  # e2e 覆盖率
 npm run lint          # 静态检查

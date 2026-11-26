@@ -9,7 +9,7 @@
 
 | 目录 | 说明 | 端口 |
 |------|------|------|
-| `api/` | NestJS 11 + Prisma 6 + PostgreSQL 16；全局前缀 `/api/v1`，Swagger 在 `/api/docs` | 3000 |
+| `api/` | NestJS 12 + Prisma 6 + PostgreSQL 16；全局前缀 `/api/v1`，Swagger 在 `/api/docs` | 3000 |
 | `storefront/` | 消费者店铺前台（按子域名区分店铺） | 3001 |
 | `merchant-admin/` | 商家后台（中心域名，无店铺子域名） | 3002 |
 | `platform-admin/` | 平台超管后台 | 3003 |
@@ -92,7 +92,7 @@ cd infra && docker compose up -d --build
 | 前端类型检查 | `cd <app> && npx tsc --noEmit` |
 | 前端构建 / lint | `cd <app> && npm run build` / `npm run lint` |
 
-- 后端用 **Jest 30**（单测 `api/src/**/*.spec.ts`，e2e `api/test/**/*.e2e-spec.ts`）；前端用 **Vitest 3**。不要混用 runner。
+- 后端用 **Jest 30**（单测 `api/src/**/*.spec.ts`，e2e `api/test/**/*.e2e-spec.ts`）；前端用 **Vitest 5**。不要混用 runner（版本以各 `package.json` 为准）。
 - e2e 在进程内 `Test.createTestingModule(AppModule)` 启动，**不需要另起 api 服务**，但需要测试库、Redis 和 MinIO
   可用（媒体 e2e 会真实 PUT 到 `localhost:19000`）。
 - e2e **必须串行**（`test:e2e` / `test:cov:e2e` 均已带 `--runInBand`）：所有文件共享同一个测试库和 Redis 队列，
