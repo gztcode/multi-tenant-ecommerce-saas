@@ -10,6 +10,7 @@ import {
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { withTimeout } from '../../../common/util/with-timeout';
+import { MINIO_DEFAULT_BUCKET, resolveMinioConfig } from './minio-config';
 
 /** 读 URL 的有效期：1 小时 */
 const READ_URL_TTL_SECONDS = 60 * 60;
@@ -48,29 +49,29 @@ export class MinioService implements OnModuleInit {
   private readonly logger = new Logger(MinioService.name);
   private publicClient!: S3Client;
   private internalClient!: S3Client;
-  private bucket!: string;
-
-  constructor() {
-    this.bucket = process.env.MINIO_BUCKET ?? 'ecommerce-media';
-  }
+  private bucket: string = MINIO_DEFAULT_BUCKET;
 
   async onModuleInit(): Promise<void> {
-    const region = process.env.MINIO_REGION ?? 'us-east-1';
+    // ⚠️ **生产环境缺配置在这里直接抛**（应用起不来），而不是回落 localhost：
+    //    旧实现会「能启动、但所有上传都指向一台不存在的主机」，故障被推迟到
+    //    用户第一次上传才以 500 暴露。解析规则与默认值见 `minio-config.ts`。
+    const config = resolveMinioConfig(process.env);
+    this.bucket = config.bucket;
     const credentials = {
-      accessKeyId: process.env.MINIO_ACCESS_KEY ?? 'ecommerce',
-      secretAccessKey: process.env.MINIO_SECRET_KEY ?? 'ecommerce-minio-secret',
+      accessKeyId: config.accessKey,
+      secretAccessKey: config.secretKey,
     };
 
     this.publicClient = new S3Client({
-      endpoint: process.env.MINIO_ENDPOINT ?? 'http://localhost:19000',
-      region,
+      endpoint: config.endpoint,
+      region: config.region,
       credentials,
       forcePathStyle: true,
     });
 
     this.internalClient = new S3Client({
-      endpoint: process.env.MINIO_INTERNAL_ENDPOINT ?? 'http://localhost:19000',
-      region,
+      endpoint: config.internalEndpoint,
+      region: config.region,
       credentials,
       forcePathStyle: true,
     });
