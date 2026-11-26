@@ -84,11 +84,19 @@ export function ReconciliationItemsTable({
   source,
   items,
   actionableCount,
+  emptyText = '没有差异。',
 }: {
   reconciliationId: string;
   source: ReconciliationSource;
   items: ReconciliationItem[];
   actionableCount: number;
+  /**
+   * 空列表文案。
+   *
+   * ⚠️ **筛选后为空不能说「没有差异」** —— 任务本身有差异、只是当前条件下
+   *    一条都没有，两种情况的处置动作完全不同。
+   */
+  emptyText?: string;
 }) {
   const router = useRouter();
   const busyRef = useRef(false);
@@ -240,7 +248,7 @@ export function ReconciliationItemsTable({
   return (
     <div className="space-y-2">
       {items.length === 0 ? (
-        <p className="text-sm text-muted-foreground">没有差异。</p>
+        <p className="text-sm text-muted-foreground">{emptyText}</p>
       ) : (
         <Table>
           <TableHeader>

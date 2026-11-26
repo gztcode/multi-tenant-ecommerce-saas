@@ -116,6 +116,19 @@ export function reconciliationTimeoutBudget(
  */
 export const RECONCILIATION_MAX_ITEMS = 200;
 
+/**
+ * 详情接口的差异列表筛选条件（全部可选，全空 = 不筛）。
+ *
+ * ⚠️ **只作用于「差异列表与其总数」** —— 任务本体、`diffCount`
+ *    （任务级差异总数）、`actionableCount`（批量确认的分母）都不受影响，
+ *    否则「共 N 条」会随视角漂移、按钮分母也会跟着筛选变。
+ */
+export interface ReconciliationDetailFilter {
+  severity?: ReconciliationSeverity;
+  resolution?: ReconciliationResolution;
+  type?: ReconciliationDiffType;
+}
+
 /** 判定 D 类用的「扩大窗口」余量（小时） */
 export const RECONCILIATION_EXPANDED_MARGIN_HOURS = 15;
 
@@ -1051,8 +1064,27 @@ export class PayoutReconciliationService {
     });
   }
 
-  /** 对账任务详情 + 差异列表 */
-  async detail(id: string): Promise<unknown> {
+  /**
+   * 对账任务详情 + 差异列表。
+   *
+   * `filter` 只筛**差异列表与 `itemsTotal`**（任务本体、`diffCount`、
+   * `actionableCount` 不受影响）；三个字段全空时与不传逐字一致
+   * （同样的排序、同样的 200 条上限）。
+   * ⚠️ **它只是只读视角** —— 批量确认的固定条件（PENDING + A 类 + payoutId）
+   * 不随筛选变，见 `batchConfirmByFilter`。
+   */
+  async detail(
+    id: string,
+    filter: ReconciliationDetailFilter = {},
+  ): Promise<unknown> {
+    // 只把「真的有值」的条件放进 where：全空时 where 与改造前**完全相等**
+    // （单测断言的是精确对象，多一个 `severity: undefined` 就红）。
+    const itemWhere = {
+      reconciliationId: id,
+      ...(filter.severity ? { severity: filter.severity } : {}),
+      ...(filter.resolution ? { resolution: filter.resolution } : {}),
+      ...(filter.type ? { type: filter.type } : {}),
+    };
     return tenantContext.run(platformScope(), async () => {
       // ⚠️ **第一个查询只取任务本体** —— 差异项要单独查（见下）。
       //    带 `include: { items: true }` 会把**这个任务的全部差异项**捞进内存，
@@ -1077,14 +1109,16 @@ export class PayoutReconciliationService {
       //    → 用 `id` 兜底做二级键，顺序才真的确定。
       //    （同一先例见 `common/payment/payout-verification.service.ts` 的 `orderBy`）
       const items = await this.prisma.payoutReconciliationItem.findMany({
-        where: { reconciliationId: id },
+        where: itemWhere,
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         take: RECONCILIATION_MAX_ITEMS,
       });
       // ⚠️ **总数要单独查** —— 截断后 `items.length` 已经不是真实条数，
       //    而前端要靠 `itemsTotal` 知道「还有多少条没显示」。
+      //    ⚠️ **必须与列表用同一组条件** —— 筛选后 `itemsTotal` 是「该条件下共几条」，
+      //    与列表口径不一致的话 `itemsTruncated` 会误报（说截断了其实没有，或反之）。
       const itemsTotal = await this.prisma.payoutReconciliationItem.count({
-        where: { reconciliationId: id },
+        where: itemWhere,
       });
       // ⚠️ **`actionableCount` 是「确认全部」按钮的分母** —— 口径与批量确认的
       //    FILTER 固定条件**逐字一致**（PENDING + A 类 + 有 payoutId），

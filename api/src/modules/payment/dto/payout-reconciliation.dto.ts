@@ -1,6 +1,7 @@
 import { Type } from 'class-transformer';
 import {
   IsDateString,
+  IsEnum,
   IsIn,
   IsInt,
   IsOptional,
@@ -10,6 +11,11 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
+import {
+  ReconciliationDiffType,
+  ReconciliationResolution,
+  ReconciliationSeverity,
+} from '@prisma/client';
 
 /** 手动触发对账的入参 */
 export class TriggerReconciliationDto {
@@ -45,6 +51,30 @@ export class ListReconciliationsDto {
   @Min(1)
   @Max(100)
   pageSize?: number;
+}
+
+/** 对账任务详情的查询参数（差异列表筛选） */
+export class DetailReconciliationDto {
+  /**
+   * 严重级：只返回该级别的差异项。
+   *
+   * ⚠️ **`@IsEnum` 直接用 schema 里的枚举** —— 枚举值只有一处事实来源
+   *    （`prisma/schema.prisma`），以后加一个级别不用回来改这里。
+   *    写成 `@IsString` 的话非法值会漏到 Prisma，撞 PG 的 enum 冒成 500。
+   */
+  @IsOptional()
+  @IsEnum(ReconciliationSeverity)
+  severity?: ReconciliationSeverity;
+
+  /** 处置状态：PENDING / RESOLVED / IGNORED */
+  @IsOptional()
+  @IsEnum(ReconciliationResolution)
+  resolution?: ReconciliationResolution;
+
+  /** 差异类型（A–F 六类） */
+  @IsOptional()
+  @IsEnum(ReconciliationDiffType)
+  type?: ReconciliationDiffType;
 }
 
 /** 处置一条差异 */
