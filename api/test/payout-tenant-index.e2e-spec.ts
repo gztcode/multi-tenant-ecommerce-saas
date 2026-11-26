@@ -6,8 +6,18 @@
  *  `orderBy: { createdAt: 'desc' }`）。原先 payouts 上没有任何以 tenantId
  * 打头的索引 —— 这条查询只能 Seq Scan 全表再 top-N 排序。
  *
- * 本用例用 `EXPLAIN (ANALYZE)` 把「走索引」这个事实钉住：
- * 索引一旦被误删（迁移回滚 / 手工 DROP），用例会立刻红。
+ * 本用例用 `EXPLAIN (ANALYZE)` 把「这条查询路径能用上租户索引」钉住：
+ * 索引一旦被误删（迁移回滚 / 手工 DROP），或用错列序（createdAt 打头），
+ * 用例会立刻红。
+ *
+ * ⚠️ 断言的是「索引可用于该查询」，**不是**「计划器这次恰好选了索引」。
+ *    后者取决于统计信息与 visibility map：5 千行的表上 count(*) 的 Seq Scan
+ *    代价只有 ~200，而 Index Only Scan 依赖「所有页都标了 all-visible」——
+ *    只要 VACUUM 没能标全（其它会话持有旧快照时就会这样），计划器就改走
+ *    Seq Scan。2026-11-26 main 上的 e2e 就是这样偶发变红（PR #59 后首次
+ *    push run 失败、rerun 才绿）。所以这里在事务内关掉 Seq/Bitmap Scan，
+ *    让计划器只能在索引路径里选，结果确定；索引缺失时它仍会落回 Seq Scan
+ *    （`enable_seqscan = off` 只是加罚分，不是禁止），守卫能力不变。
  */
 import { Prisma, PrismaClient } from '@prisma/client';
 
@@ -67,11 +77,11 @@ describe('payouts 租户前缀索引（阶段 11 / P2-4）', () => {
       CROSS JOIN LATERAL generate_series(1, c.n) AS g
     `);
 
-    // ⚠️ 必须 VACUUM (ANALYZE)：
-    //    1. ANALYZE —— PG 选计划靠的是统计信息，插完不更新的话
-    //       统计信息还停留在「表是空的」那一份，计划选择会飘；
-    //    2. VACUUM —— count(*) 走 Index Only Scan 的前提是 visibility map
-    //       干净（否则每行都要回表，代价算下来比全表扫还高，PG 就改走 Seq Scan）。
+    // ANALYZE 给计划器一份与数据一致的统计信息（行数/选择率），
+    // 否则统计还停留在「表是空的」那一份，连索引路径都不一定被评估。
+    // VACUUM 顺手把页标成 all-visible，让强制索引后的 count 走 Index Only
+    // Scan（Heap Fetches: 0）—— 但**用例不依赖这一点**：断言只看「走了索引」，
+    // 见文件头与 explainWithIndexForced 的说明。
     await prisma.$executeRaw(Prisma.sql`VACUUM (ANALYZE) "payouts"`);
   });
 
@@ -84,20 +94,48 @@ describe('payouts 租户前缀索引（阶段 11 / P2-4）', () => {
     await prisma.$disconnect();
   });
 
-  /** 跑一条 EXPLAIN (ANALYZE)，返回拼好的计划文本 */
-  async function explain(sql: Prisma.Sql): Promise<string> {
-    const rows = await prisma.$queryRaw<Array<Record<string, string>>>(sql);
-    return rows.map((row) => row[PLAN_COLUMN]).join('\n');
+  /**
+   * 跑一条 EXPLAIN (ANALYZE)，并在**同一个事务**里先关掉 Seq Scan / Bitmap Scan。
+   *
+   * ⚠️ 必须同一个事务：Prisma 的每个 `$executeRaw` 都另借连接，会话级 SET
+   *    换条连接就失效；`$transaction` 独占连接，`SET LOCAL` 只在本事务生效，
+   *    不会把设置泄漏给连接池里的其它查询。
+   *
+   * ⚠️ 关掉 Seq/Bitmap Scan 的**理由**见文件头：被测行为是「索引可用于该
+   *    查询路径」，不是「计划器这次偏爱索引」。关掉后只剩索引路径，计划
+   *    形状确定（否则 count(*) 会随 visibility map 在 Index Only Scan 与
+   *    Seq Scan 之间摇摆）。索引不存在时计划器仍会选 Seq Scan（带罚分），
+   *    索引名 / Index Cond 断言照样会红。
+   */
+  async function explainWithIndexForced(sql: Prisma.Sql): Promise<string> {
+    return prisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe('SET LOCAL enable_seqscan = off');
+      // Bitmap Scan 也关掉：它同样「用了索引」，但计划节点形状会随代价浮动，
+      // 让 regex 在 Index Scan / Bitmap Index Scan 之间摇摆。
+      await tx.$executeRawUnsafe('SET LOCAL enable_bitmapscan = off');
+      const rows = await tx.$queryRaw<Array<Record<string, string>>>(sql);
+      return rows.map((row) => row[PLAN_COLUMN]).join('\n');
+    });
   }
 
+  /** 租户侧列表查询（`PayoutQueryService.listForTenant` 的 SQL 形状） */
+  const listSql = Prisma.sql`
+    EXPLAIN (ANALYZE)
+    SELECT * FROM "payouts"
+    WHERE "tenantId" = ${PROBE_TENANT}::text
+    ORDER BY "createdAt" DESC
+    LIMIT 20
+  `;
+
+  /** 列表分页的总数查询（同一个 service 里的 `count`） */
+  const countSql = Prisma.sql`
+    EXPLAIN (ANALYZE)
+    SELECT count(*) FROM "payouts"
+    WHERE "tenantId" = ${PROBE_TENANT}::text
+  `;
+
   it('租户侧出款单列表（按创建时刻倒序）走索引，不做全表扫', async () => {
-    const plan = await explain(Prisma.sql`
-      EXPLAIN (ANALYZE)
-      SELECT * FROM "payouts"
-      WHERE "tenantId" = ${PROBE_TENANT}::text
-      ORDER BY "createdAt" DESC
-      LIMIT 20
-    `);
+    const plan = await explainWithIndexForced(listSql);
 
     expect(plan).toContain(INDEX_NAME);
     expect(plan).toMatch(INDEX_SCAN);
@@ -108,26 +146,18 @@ describe('payouts 租户前缀索引（阶段 11 / P2-4）', () => {
   });
 
   it('索引的租户前缀被用作 index condition（证明 tenantId 打头）', async () => {
-    const plan = await explain(Prisma.sql`
-      EXPLAIN (ANALYZE)
-      SELECT * FROM "payouts"
-      WHERE "tenantId" = ${PROBE_TENANT}::text
-      ORDER BY "createdAt" DESC
-      LIMIT 20
-    `);
+    const plan = await explainWithIndexForced(listSql);
 
     expect(plan).toMatch(/Index Cond: \("tenantId" =/);
   });
 
   it('出款单总数统计（count）同样走索引', async () => {
-    const plan = await explain(Prisma.sql`
-      EXPLAIN (ANALYZE)
-      SELECT count(*) FROM "payouts"
-      WHERE "tenantId" = ${PROBE_TENANT}::text
-    `);
+    const plan = await explainWithIndexForced(countSql);
 
     expect(plan).toContain(INDEX_NAME);
     expect(plan).toMatch(INDEX_SCAN);
     expect(plan).not.toContain('Seq Scan');
+    // count 也必须是「按租户前缀找」，而不是把整个索引扫一遍再过滤
+    expect(plan).toMatch(/Index Cond: \("tenantId" =/);
   });
 });
