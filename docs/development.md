@@ -105,11 +105,29 @@ PAYOUT_PLATFORM_DEFAULT_CHANNEL=fake-payout
 cd api
 npm test              # 单元测试（隔离机制 / 状态机转移表 / 抽佣纯函数 / 渠道契约等；规模以 npx jest --listTests | wc -l 为准）
 npm run test:e2e      # 端到端（串行；套件数以 npx jest --config test/jest-e2e.json --listTests 为准）
-npm run test:cov:e2e  # 项目真实覆盖率
+npm run test:cov:e2e  # 项目真实覆盖率（带 e2e 专属门禁，见下）
 
 # 浏览器级 e2e（Playwright，真实 Chromium 走 storefront 全链路）
 npm test --workspace @ecom/browser-e2e   # 登录→加购→下单→假网关支付→PAID
 ```
+
+> 🔒 **e2e 覆盖率是独立的一道棘轮**（`api/test/jest-e2e.json` 的 `coverageThreshold`，
+> 2026-11-27 加）：statements 35 / branches 46 / functions 29 / lines 34。
+> 它只作用于 e2e 配置，和 `api/package.json` 里单测那组（59/52/53/59）互不影响。
+>
+> - **算式**：两遍实测 `37.12 / 48.57 / 31.37 / 36.58` 与 `37.12 / 48.56 / 31.37 / 36.58`，
+>   取较低那遍向下取整再减 2 个点（37-2=35、48-2=46、31-2=29、36-2=34）。
+>   只许**上调**，下调阈值等同于允许覆盖率倒退。
+> - **为什么比单测低**：`collectCoverageFrom='src/**/*.ts'` 的统计口径里包含了
+>   79 个 `*.spec.ts` 单测文件（8830 行，e2e 永远不加载，覆盖率恒为 0）。
+>   只看 225 个非 spec 的产品文件，e2e 的 lines 是 76.81%、functions 83.18% ——
+>   控制器 / DTO / 中间件这些「单测覆盖不到」的部分正是 e2e 在兜。
+>   所以**不要**为了数字好看去改排除清单，要动就单独立项。
+> - **不要和单测共用 `coverage/`**：e2e 用自己的 `coverage-e2e/`（配置里写死），
+>   两边的报告互相覆盖会得出错误结论；该目录已进 `.gitignore`。
+> - 49 个套件在同一个进程里累积 Istanbul 覆盖率，默认堆（本机实测约 2GB）会
+>   OOM 崩掉（`FATAL ERROR: Ineffective mark-compacts near heap limit`），
+>   `test:cov:e2e` 因此带 `--max-old-space-size=4096`。
 
 > ✅ **跑 e2e 不需要停 api 容器**（阶段 5c 实测更正）。队列前缀隔离
 > （`BULLMQ_PREFIX=bull-e2e`）与每轮清库早已实现，**容器 api 全程在跑**的情况下
@@ -141,11 +159,11 @@ cd platform-admin && npm test   # 计费与对账中转路由的白名单 + 页�
 
 e2e 与单元测试都跑在**测试库** `ecommerce_test` 上，与开发库物理隔离。
 
-> CI（`.github/workflows/ci.yml`）分六个 job：`api`（tsc + lint + 单测）、
+> CI（`.github/workflows/ci.yml`）分六个 job：`api`（tsc + lint + 单测覆盖率门禁）、
 > `frontend` matrix（storefront / merchant-admin / platform-admin 各自 tsc + 单测 +
 > lint + build）、`shared`（tsc + 单测，`npm test --workspace @ecom/frontend-shared`）与
-> `e2e`（串行跑 `test:e2e`，排除依赖 MinIO 的
-> media 套件）。
+> `e2e`（串行跑 `test:cov:e2e`，带 e2e 自己的覆盖率门禁；MinIO 用真容器起，
+> media 套件也在里面跑）。
 
 ### 单测冷启动偶发变红：并行 worker 数超出机器承受能力（事项 #31，2026-11-27）
 

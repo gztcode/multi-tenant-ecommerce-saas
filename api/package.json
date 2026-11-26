@@ -27,7 +27,7 @@
     "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "prisma db seed",
     "db:fix-legacy-checksum": "prisma db execute --schema prisma/schema.prisma --file prisma/fix-legacy-migration-checksum.sql",
-    "test:cov:e2e": "NODE_OPTIONS=--experimental-vm-modules jest --config ./test/jest-e2e.json --runInBand --coverage --collectCoverageFrom='src/**/*.ts' --collectCoverageFrom='!src/**/*.module.ts' --collectCoverageFrom='!src/main.ts'",
+    "test:cov:e2e": "NODE_OPTIONS=\"--experimental-vm-modules --max-old-space-size=4096\" jest --config ./test/jest-e2e.json --runInBand --coverage --collectCoverageFrom='src/**/*.ts' --collectCoverageFrom='!src/**/*.module.ts' --collectCoverageFrom='!src/main.ts'",
     "db:test:deploy": "node test/deploy-test-db.mjs",
     "backfill:ledger": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/backfill-commission-entries.ts",
     "backfill:commissions": "npm run backfill:ledger",

@@ -35,6 +35,9 @@ yarn-error.log*
 
 # 测试覆盖率
 coverage/
+# e2e 覆盖率单独一个目录（见 api/test/jest-e2e.json 的 coverageDirectory），
+# 避免和单测的 coverage/ 互相覆盖
+coverage-e2e/
 
 infra/backups/
 infra/backup.log
