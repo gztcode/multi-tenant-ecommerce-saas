@@ -127,7 +127,6 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:-ecommerceRedis163}@redis:6379
       NODE_ENV: production
       PORT: '3000'
-      API_PREFIX: api/v1
       # 本地开发用的固定值。必须固定：每次 up 都换密钥的话，
       # 之前签发的 token 会全部失效，调试时登录状态莫名其妙丢失。
       # 同时受两项约束：长度 ≥ 32 字符；不能等于 .env.example 里的占位符

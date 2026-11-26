@@ -51,11 +51,6 @@ export function isDevOnlyChannel(kind: ChannelKind, channel: string): boolean {
   return DEV_ONLY_CHANNELS[kind].includes(normalizeChannel(channel));
 }
 
-/** 某用途下所有 devOnly 渠道（启动校验报错时列名单用） */
-export function devOnlyChannels(kind: ChannelKind): readonly string[] {
-  return DEV_ONLY_CHANNELS[kind];
-}
-
 /** 当前是否是生产环境 */
 export function isProduction(): boolean {
   return process.env.NODE_ENV === 'production';

@@ -31,11 +31,6 @@ export function sandboxChannelUrl(): string | null {
   return raw.length > 0 ? raw.replace(/\/+$/, '') : null;
 }
 
-/** 出款是否声明为异步（`SANDBOX_PAYOUT_ASYNC=true`） */
-export function isSandboxPayoutAsync(): boolean {
-  return process.env.SANDBOX_PAYOUT_ASYNC === 'true';
-}
-
 /** 沙箱渠道是否应被注册：非生产 + 配了地址 */
 export function isSandboxPayoutRegistrable(): boolean {
   return process.env.NODE_ENV !== 'production' && sandboxChannelUrl() !== null;
