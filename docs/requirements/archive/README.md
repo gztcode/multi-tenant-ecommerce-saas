@@ -1,7 +1,7 @@
-# 归档：历史阶段的设计、计划与验收
+# 归档：历史阶段的设计、计划、验收与需求
 
-这里保存阶段 1 ~ 11 的原始文档，**内容原样保留、不再维护**，只作为来龙去脉与决策依据的
-存档。文中出现的路径若已随文档重组变化，以仓库当前结构为准。
+这里保存阶段 1 ~ 11 以及 11b/11c/11d 的原始文档，**内容原样保留、不再维护**，只作为来龙去脉与
+决策依据的存档。文中出现的路径若已随文档重组变化，以仓库当前结构为准。
 
 ## 目录
 
@@ -9,6 +9,7 @@
 |--------|------|
 | [`specs/`](specs/) | 阶段设计文档（`*-design.md`），写「为什么这样做」与方案对比 |
 | [`plans/`](plans/) | 实施计划（勾选式 Task）、验收记录（`*acceptance*`）、阶段性技术债清单 |
+| `requirements/` | 已完成的需求文档，按需创建（当前为空，尚无实例；创建后在此处补链接） |
 
 ## 命名约定
 
@@ -18,7 +19,11 @@
   （个别阶段的验收与计划同名，如 `2026-10-25-plan-04-frontend-polish-acceptance.md`）
 
 阶段 02 拆成 2a/2b、阶段 5 拆成 5a ~ 5m、阶段 7 拆成 7a/7b/7c、阶段 8 拆成 8a/8b/8c，
+阶段 11 之后还有三个已交付但未立档的子阶段 11b/11c/11d（见下表），
 编号与提交历史里的 `阶段 N` 说法一一对应。
+
+> 历史计划里的勾选框（`- [ ]`）从未回填，`[x]` 数量为 0。**不要拿它判断完成度**，
+> 完成情况以各阶段验收记录、提交历史与 [`../../README.md`](../../README.md) 的状态表为准。
 
 ## 阶段索引
 
@@ -51,6 +56,9 @@
 | 9 | 历史技术债清理（安全/运维/资金/前端文档） | [设计](specs/2026-11-04-plan-09-tech-debt-cleanup-design.md) · [计划](plans/2026-11-04-plan-09-tech-debt-cleanup.md) · [验收](plans/2026-11-04-plan-09-acceptance.md) |
 | 10 | 事务边界与连接池收口 | [设计](specs/2026-11-04-plan-10-tx-boundary-design.md) · [计划](plans/2026-11-04-plan-10-tx-boundary.md) · [验收](plans/2026-11-04-plan-10-acceptance.md) |
 | 11 | 可观测性与生产部署加固 | — · 计划见验收记录内的 Step 列表 · [验收](plans/2026-11-07-plan-11-observability-deploy-acceptance.md) |
+| 11b | npm workspaces 化 | **有实现、无设计/计划/验收归档**。证据：[根 `package.json`](../../../package.json) 的 `workspaces`（api / storefront / merchant-admin / platform-admin / packages/frontend-shared）与 [`packages/frontend-shared/package.json`](../../../packages/frontend-shared/package.json)（`private: true`）；PR #30，merge `6b1eddf` |
+| 11c | 浏览器级 e2e（Playwright golden path） | **有实现、无设计/计划/验收归档**。证据：[`e2e-browser/playwright.config.ts`](../../../e2e-browser/playwright.config.ts) 与 `e2e-browser/specs/`；PR #31，merge `88583bb` |
+| 11d | 退货入库流程 | **有实现、无设计/计划/验收归档**。证据：`POST /api/v1/inventory/returns`（[`inventory.controller.ts`](../../../api/src/modules/inventory/inventory.controller.ts)）与 [`return-inventory.e2e-spec.ts`](../../../api/test/return-inventory.e2e-spec.ts)；PR #32，merge `9e287b3` |
 
 ## 其他归档文档
 
@@ -60,4 +68,4 @@
 | [`plans/2026-11-05-audit-findings.md`](plans/2026-11-05-audit-findings.md) | 阶段 11 之前的全仓审计发现（按严重度分级） |
 | [`stage-history.md`](stage-history.md) | 原 README 的阶段进度叙述（阶段 11 倒推到阶段 1） |
 
-当前待办见 [`../backlog.md`](../backlog.md)。
+当前待办见 [`../backlog.md`](../backlog.md)；条目级状态、完成证据与「等业主裁决」清单都在那里。
