@@ -47,6 +47,8 @@ interface OrderBody {
   status: string;
   totalAmount: number;
   itemCount: number;
+  /** 支付渠道（前端订单详情展示用；支付成功时由支付单的 channel 写入） */
+  payChannel: string | null;
   /** 退款时间（阶段 5b 加的字段）。报表的「退款冲回」按它归期 */
   refundedAt: Date | null;
   items: Array<{ skuId: string; quantity: number; unitPrice: number }>;
@@ -1103,6 +1105,11 @@ describe('支付与 webhook (e2e)', () => {
     });
     expect(becamePaid).toBe(true);
 
+    // ⚠️ 订单的 payChannel 必须与支付单的渠道一致 ——
+    //    两端前端的订单详情都在读它，写不进去就永远展示「—」。
+    const paidOrderRow = await readOrder(merchant.tenantId, order.orderNo);
+    expect(paidOrderRow.payChannel).toBe(FAKE_CHANNEL);
+
     // ⚠️ DEDUCT 流水：quantity = -qty 但 **stock 不变**
     // （预占时已经扣过了，这里只是把「预占」转成「已售」）
     const movements = await readMovements(merchant.tenantId, skuId);
@@ -1341,6 +1348,11 @@ describe('支付与 webhook (e2e)', () => {
       return rows.status === 'PAID';
     });
     expect(becamePaid).toBe(true);
+
+    // ⚠️ 假网关这条路（不走 HTTP webhook，直接调同一段流转逻辑）
+    //    也必须把渠道写进订单 —— 两条入口共用 applyEventInTx，这里钉住它
+    const confirmedOrder = await readOrder(merchant.tenantId, order.orderNo);
+    expect(confirmedOrder.payChannel).toBe(FAKE_CHANNEL);
 
     const movements = await readMovements(merchant.tenantId, skuId);
     const deducts = movements.filter((m) => m.type === 'DEDUCT');

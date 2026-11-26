@@ -388,6 +388,12 @@ export class WebhookEventService {
     //
     // ⚠️ **tx 上的 `now()` 是「事务开始时刻」**，与事务外取有 ≤30s 偏差。
     //    `paidAt` 是财务口径字段，这个偏差在容差内，但**必须在此写明**。
+    //
+    // ⚠️ **`payChannel` 与状态流转写在同一条 UPDATE 里**：前端订单详情要展示
+    //    「用哪个渠道付的」，而它只能取自支付单的 `channel`（渠道名，不是 provider）。
+    //    分成两条写会留下「订单已 PAID、渠道还是空」的中间态，也多一次写；
+    //    而 `event.channel` 正是上面 `payment.updateMany` 的匹配条件
+    //    —— 两者必然相等，等于 `Payment.channel`。
     const nowRows = await tx.$queryRaw<Array<{ now: Date }>>`
       SELECT now() as now
     `;
@@ -397,7 +403,7 @@ export class WebhookEventService {
       order.id,
       OrderStatus.PENDING_PAYMENT,
       OrderStatus.PAID,
-      { paidAt },
+      { paidAt, payChannel: event.channel },
     );
     if (!won) {
       // ⚠️ **按「这笔钱是不是刚收的」分流**（2026-11-05 审计 P0-3 / P1-3）：
