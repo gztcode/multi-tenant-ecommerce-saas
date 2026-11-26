@@ -67,24 +67,10 @@
 
 > 原先的 #1「守卫拒绝的 401/403 没有访问日志」已收口（访问日志下沉到
 > `AccessLogMiddleware`），移入[三、已完成](#三已完成保留索引)。
+> 「对账差异详情支持筛选」也已收口（只读筛选，未动批量确认的人工闸），
+> 同样移入[三、已完成](#三已完成保留索引)。
 
-#### 1. 对账差异详情支持筛选
-
-- **状态**：待办
-- **完成证据**：—
-- **估算**：1–2 天
-- **阻塞原因**：无外部依赖。只给**读接口**加可选筛选参数，**不改**批量确认的 FILTER 人工闸。
-- **现状**：对账详情最多返回前 200 条差异
-  （`RECONCILIATION_MAX_ITEMS = 200`，`api/src/modules/payment/payout-reconciliation.service.ts:117`），
-  页面提示「其余差异请在列表页按批次逐个查看」，但列表页只有任务级分页，**没有差异项批次视图**。
-  超过 200 条的 B/C/D 类差异对运营不可见。
-- **为什么不再按原方案做**：旧版 backlog 写「扩展 `FILTER` 模式的固定条件」，但 FILTER 的固定条件是
-  `PENDING + A 类 + payoutId`（`payout-reconciliation.service.ts:1218-1223`），
-  扩展它会放宽「批量确认只处理 A 类」的人工闸。原方案已移入
-  [2.2 已放弃](#22-已放弃保留理由)，改做只读筛选。
-- **验收方向**：`GET /platform/payout-reconciliations/:id` 增加可选 `severity` / `resolution` / `type`
-  查询参数，只作用于差异列表与总数；无参数时行为与现在逐字一致；
-  批量确认的 FILTER 条件与现有测试保持不变。
+当前没有待办工程项。
 
 ### 2.2 已放弃（保留理由）
 
@@ -93,7 +79,7 @@
 | 三端源码 import 路径大面积替换到共享包 | 已放弃 | 三端仍是 `export *` 薄壳（如 `storefront/src/lib/api-client.ts:3`） | 1–2 天 | 薄壳让调用点零改动；纯重构、无功能收益，将来真要清理再单独做 |
 | 共享包独立发布 / 版本化 | 已放弃 | `packages/frontend-shared/package.json` 仍是 `"private": true`，无外部消费者 | 1–2 天 | 没有外部消费者，发布与版本化收益为零 |
 | 通用平台设置中心抽象 | 已放弃 | `platform_settings` 目前只有 `payout.platformDefaultChannel` 一个 key（`api/src/common/platform-settings/platform-setting.service.ts:43`） | 3–5 天 | 只有一个 key，过早抽象；等出现第二个 key 再评估 |
-| CSV 批量确认按严重级 / 状态扩展 `FILTER` | 已放弃 | 原 FILTER 固定条件见 `payout-reconciliation.service.ts:1218-1223` | 1–2 天 | 会放宽「批量只处理 A 类」的人工闸，动钱路径风险大于收益；改为 [2.1 待办 #1](#1-对账差异详情支持筛选) 的只读筛选 |
+| CSV 批量确认按严重级 / 状态扩展 `FILTER` | 已放弃 | 原 FILTER 固定条件见 `payout-reconciliation.service.ts:1218-1223` | 1–2 天 | 会放宽「批量只处理 A 类」的人工闸，动钱路径风险大于收益；改为只读筛选（已做完，见[三、已完成](#三已完成保留索引) 的「对账差异详情支持筛选」行） |
 | `Order.itemCount` 补快照回写 | 已放弃 | `api/src/modules/order/order.service.ts:1048` 注释明确「下单时写入的件数总和」 | 无需做 | 当前没有改单路径；只有将来支持改单才需要回写 |
 | 购物车金额改为实时精确值 | 已放弃 | `storefront/src/components/cart/cart-list.tsx:294` 已提示「金额为估算值，实际以提交订单时为准」 | 无需做 | 设计取舍：真实金额由后端在下单时按当时 SKU 价格计算 |
 
@@ -127,6 +113,7 @@
 | 给商家后台做主题实时预览 | PR #12（merge `b5b6d68`）；`merchant-admin/src/components/theme/theme-form.tsx:39,166`；测试 `merchant-admin/test/components/theme/theme-form.test.tsx`；无 CI run | 完全做完。**纠正**：实现早于阶段 11，阶段 11 收尾只是复核，不是阶段 11 新增 |
 | 给 e2e 的队列做隔离 + 每轮清库 | PR #5（merge `fd5e4f8`）；`api/test/setup-e2e.ts:34,49,91`；无 CI run | 完全做完（`bull-e2e` 前缀 + `truncateAllTables`） |
 | 守卫拒绝的 401/403 没有访问日志 | PR #63；`api/src/common/http/access-log.middleware.ts` + `access-log.middleware.spec.ts`；`api/src/app.module.ts` 注册 `RequestIdMiddleware → AccessLogMiddleware → MetricsMiddleware` | 完全做完：访问日志从拦截器下沉到中间件层，`res 'finish'` 按最终状态码记录，401/403/404/500 都落一条；删除 `LoggingInterceptor`，同一次请求不会双写；仍不打 body / 密码 / token / cookie |
+| 对账差异详情支持筛选 | 本 PR；`api/src/modules/payment/payout-reconciliation.service.ts` 的 `detail(id, filter)` + `dto/payout-reconciliation.dto.ts` 的 `DetailReconciliationDto`；`platform-admin/src/app/(dashboard)/reconciliations/[id]/page.tsx` 的筛选表单；单测 `payout-reconciliation.service.spec.ts` 的 `describe('筛选')`、e2e `payout-reconciliation-service.e2e-spec.ts` 的两条「详情筛选」用例 | 完全做完：`GET /platform/payout-reconciliations/:id` 支持可选 `severity` / `resolution` / `type`，只作用于差异列表与 `itemsTotal`；无参数时与改造前逐字一致（200 条上限与排序不变）；批量确认的 FILTER 固定条件（`PENDING + A 类 + payoutId`）与相关测试一行未改；`actionableCount` 不受筛选影响。**超过 200 条的差异现在靠筛选收窄范围看全**，文案不再承诺「去列表页按批次查看」 |
 | 告警系统落地（webhook） | PR #30（merge `6b1eddf`），CI [run 42450549593](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593) | 完全做完：`ALERT_WEBHOOK_URL` + `api/src/common/channel/webhook-alert-sink.ts`（去重与限频） |
 | 跨副本分布式锁 | PR #30（merge `6b1eddf`），CI [run 42450549593](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593) | 完全做完：`api/src/common/lock/redis-lock.service.ts` + spec；套在 media 清理、出款救援、渠道对账上 |
 | pino 结构化日志 / 生产 TLS / 慢查询阈值 | PR #30（merge `6b1eddf`），CI [run 42450549593](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593) | **主体做完**：`api/src/common/logging/pino-logger.service.ts`；`infra/nginx/templates/prod.conf.template:174-196`；`infra/postgres/init-tuning.sh:34`。**secret manager 未做**，见 [2.3 等业主裁决 #6](#23-等业主裁决) |
