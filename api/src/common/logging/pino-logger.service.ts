@@ -12,7 +12,7 @@ import type { Logger as PinoInstance } from 'pino';
  * `new Logger()` 实例的 log/warn/error 委托给这里——业务代码零改动，
  * 输出却从纯文本变成带时间戳/级别/上下文的 JSON。
  *
- * ## 安全口径（沿用 LoggingInterceptor / AllExceptionsFilter 的约定）
+ * ## 安全口径（沿用 AccessLogMiddleware / AllExceptionsFilter 的约定）
  *
  * - **不打请求/响应 body**——密码、token、账户信息落日志就是泄露；
  * - 自定义字段（各服务往 `logger.error(msg, fields)` 里塞的第二个参数）

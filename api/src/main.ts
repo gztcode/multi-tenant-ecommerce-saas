@@ -13,7 +13,6 @@ import { assertSecureConfig } from './common/config/assert-secure-config';
 import { assertPayoutEncryptionKey } from './common/config/assert-payout-encryption-key';
 import { setupSwagger } from './common/config/swagger-config';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
-import { LoggingInterceptor } from './common/http/logging.interceptor';
 import { SECURITY_HEADERS_OPTIONS } from './common/http/security-headers';
 import { PinoLoggerService } from './common/logging/pino-logger.service';
 import { PayoutEncryptionSelfCheck } from './modules/billing/payout-encryption-self-check.service';
@@ -50,17 +49,10 @@ async function bootstrap() {
       transform: true,
     }),
   );
-  // ⚠️ **顺序很重要**：全局拦截器里**先注册的在外层**。
-  //    LoggingInterceptor 放**第一位**（最外层）才能记录到租户解析失败
-  //    抛的 404（那是在 TenantContextInterceptor 里抛的）——放里面就看不见。
-  //
-  // ⚠️ **已知缺口**：守卫的 401/403 不落**日志**——Nest 的守卫在拦截器链
-  //    **之外**执行，任何全局拦截器都盖不到。（HTTP **指标**没有这个缺口：
-  //    MetricsMiddleware 在中间件层注册，见 app.module.ts。）
-  app.useGlobalInterceptors(
-    app.get(LoggingInterceptor),
-    app.get(TenantContextInterceptor),
-  );
+  // HTTP 访问日志已下沉到中间件层（`AccessLogMiddleware`，见 app.module.ts）：
+  // 中间件在守卫之前注册、在 res 'finish' 时取最终状态码，因此守卫拒绝的
+  // 401/403 也有访问日志——这是拦截器方案盖不到的。这里只保留租户上下文。
+  app.useGlobalInterceptors(app.get(TenantContextInterceptor));
   // 必须在 createDocument 之前注册：过滤器不会改变路由表，但先挂上过滤器
   // 才能保证后面 Swagger UI 自身的请求也走统一错误格式。
   app.useGlobalFilters(new AllExceptionsFilter());

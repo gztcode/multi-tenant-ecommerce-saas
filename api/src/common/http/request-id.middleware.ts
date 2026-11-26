@@ -15,7 +15,7 @@ declare module 'express-serve-static-core' {
  * - 优先透传上游的 `x-request-id`（Nginx / 网关 / 前一跳生成），
  *   没有才生成 UUID——跨服务排查时能用同一个 ID 串起来；
  * - 回写响应头 `x-request-id`，调用方报障时把 ID 发来就能定位到具体请求；
- * - LoggingInterceptor 的访问日志与异常日志都会带上它。
+ * - AccessLogMiddleware 的访问日志与异常日志都会带上它。
  *
  * ⚠️ 这个值**只是排查关联键，不是认证凭证**——客户端可以自带任意
  * `x-request-id`，不能拿它做任何权限判断。
