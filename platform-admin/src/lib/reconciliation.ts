@@ -46,6 +46,30 @@ export type ReconciliationDiffType =
   | 'LOCAL_PAID_CHANNEL_ABSENT'
   | 'STATUS_MISMATCH';
 
+/**
+ * 筛选下拉与 BFF 白名单共用的取值表。
+ *
+ * ⚠️ **顺序就是下拉里的顺序**：严重级从重到轻，差异类型按设计 §四·4.3 的 A–F。
+ * ⚠️ **不要另抄一份枚举** —— 详情页的 `<select>`、页面的参数校验、
+ *    `app/api/billing/reconciliations/[id]/route.ts` 的白名单都读这里；
+ *    抄两份的话「页面能选、中转却 400」这种漂移只能靠人眼发现。
+ */
+export const RECONCILIATION_SEVERITY_VALUES: readonly ReconciliationSeverity[] =
+  ['CRITICAL', 'WARNING', 'INFO'];
+
+export const RECONCILIATION_RESOLUTION_VALUES: readonly ReconciliationResolution[] =
+  ['PENDING', 'RESOLVED', 'IGNORED'];
+
+export const RECONCILIATION_DIFF_TYPE_VALUES: readonly ReconciliationDiffType[] =
+  [
+    'CHANNEL_PENDING_LOCAL',
+    'CHANNEL_SUCCESS_LOCAL_FAILED',
+    'AMOUNT_MISMATCH',
+    'CHANNEL_ONLY',
+    'LOCAL_PAID_CHANNEL_ABSENT',
+    'STATUS_MISMATCH',
+  ];
+
 export const RECONCILIATION_SOURCE_LABEL: Record<ReconciliationSource, string> =
   {
     API: '渠道接口',
@@ -177,6 +201,8 @@ export interface Reconciliation {
    * 差异项的**真实总数**（截断前的条数）。
    *
    * ⚠️ **只有详情接口有**（列表接口不查差异项）。
+   * ⚠️ **带筛选参数时它是「该筛选条件下的总数」** —— 与 `items` 同一组条件；
+   *    任务级的真实差异总数看 `diffCount`，两者不要混用。
    */
   itemsTotal?: number;
   /**

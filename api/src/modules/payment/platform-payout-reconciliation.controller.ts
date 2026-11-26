@@ -22,6 +22,7 @@ import { PayoutExecutionService } from '../billing/payout-execution.service';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import {
   ConfirmPaidDto,
+  DetailReconciliationDto,
   ListReconciliationsDto,
   ResolveReconciliationItemDto,
   TriggerReconciliationDto,
@@ -91,9 +92,24 @@ export class PlatformPayoutReconciliationController {
   }
 
   @Get(':id')
-  @ApiOperation({ summary: '对账任务详情 + 差异列表' })
-  async detail(@Param('id', new ParseUUIDPipe()) id: string) {
-    return this.reconciliations.detail(id);
+  @ApiOperation({
+    summary: '对账任务详情 + 差异列表',
+    description:
+      '可选筛选参数（只作用于差异列表与 `itemsTotal`，任务级统计不受影响）：' +
+      '`severity`（INFO / WARNING / CRITICAL）、`resolution`（PENDING / RESOLVED / IGNORED）、' +
+      '`type`（A–F 六类差异）。非法枚举值 → 400。' +
+      '⚠️ 差异列表仍然最多返回 200 条（`RECONCILIATION_MAX_ITEMS`），' +
+      '被截断时 `itemsTruncated = true`、`itemsTotal` 是该条件下的真实条数。',
+  })
+  async detail(
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Query() query: DetailReconciliationDto,
+  ) {
+    return this.reconciliations.detail(id, {
+      severity: query.severity,
+      resolution: query.resolution,
+      type: query.type,
+    });
   }
 
   @Post()

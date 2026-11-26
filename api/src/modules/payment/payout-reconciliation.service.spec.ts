@@ -241,7 +241,14 @@ function fakePrisma(
         Promise<FakeItem[]>,
         [
           {
-            where?: { reconciliationId?: string; id?: { gt?: string } };
+            where?: {
+              reconciliationId?: string;
+              id?: { gt?: string };
+              /** 详情筛选（阶段：对账差异详情支持筛选） */
+              severity?: ReconciliationSeverity;
+              resolution?: ReconciliationResolution;
+              type?: ReconciliationDiffType;
+            };
             orderBy?:
               | { createdAt?: 'asc' | 'desc' }
               | Array<{ createdAt?: 'asc' | 'desc' } | { id?: 'asc' | 'desc' }>;
@@ -259,6 +266,19 @@ function fakePrisma(
           // ⚠️ **FILTER 模式的游标** —— 真实 Prisma 写的是 `id: { gt: cursor }`
           const gt = args.where?.id?.gt;
           if (gt !== undefined && !(i.id > gt)) {
+            return false;
+          }
+          // 详情筛选：三个条件都要真的过滤，否则「筛选没生效」的用例照样过
+          if (args.where?.severity && i.severity !== args.where.severity) {
+            return false;
+          }
+          if (
+            args.where?.resolution &&
+            i.resolution !== args.where.resolution
+          ) {
+            return false;
+          }
+          if (args.where?.type && i.type !== args.where.type) {
             return false;
           }
           return true;
@@ -281,6 +301,7 @@ function fakePrisma(
           {
             where?: {
               reconciliationId?: string;
+              severity?: ReconciliationSeverity;
               resolution?: ReconciliationResolution;
               type?: ReconciliationDiffType;
               payoutId?: { not?: null };
@@ -294,6 +315,7 @@ function fakePrisma(
             (i) =>
               (!rows.reconciliationId ||
                 i.reconciliationId === rows.reconciliationId) &&
+              (!rows.severity || i.severity === rows.severity) &&
               (!rows.resolution || i.resolution === rows.resolution) &&
               (!rows.type || i.type === rows.type) &&
               (rows.payoutId === undefined || i.payoutId !== null),
@@ -889,6 +911,223 @@ describe('PayoutReconciliationService', () => {
       await expect(service.detail('rec-404')).rejects.toBeInstanceOf(
         NotFoundException,
       );
+    });
+
+    /**
+     * 差异列表筛选（`severity` / `resolution` / `type`）。
+     *
+     * ⚠️ **只读视角** —— 筛选只改「差异列表与 `itemsTotal`」，
+     *    任务本体、`diffCount`、`actionableCount` 一律不动：
+     *    后者的口径必须与批量确认的固定 FILTER（PENDING + A 类 + payoutId）
+     *    逐字一致，跟着筛选变的话按钮分母就飘了。
+     */
+    describe('筛选', () => {
+      /**
+       * 造一组可筛选的差异：3 条 CRITICAL 待处置 + 2 条 WARNING 待处置
+       * + 1 条 INFO 已处置 + 1 条 CRITICAL 已忽略。
+       *
+       * ⚠️ **每组 id 前缀必须不同** —— `makeItems` 每次都从 `item-0000` 开始，
+       *    直接拼会有重复 id，「按 id 截断」的语义就乱了。
+       */
+      function group(
+        prefix: string,
+        count: number,
+        overrides: Partial<FakeItem>,
+      ): FakeItem[] {
+        return makeItems(count, overrides).map((item, i) => ({
+          ...item,
+          id: `${prefix}-${String(i).padStart(4, '0')}`,
+        }));
+      }
+
+      function makeFilterableItems(): FakeItem[] {
+        return [
+          ...group('crit-pending', 3, {
+            severity: ReconciliationSeverity.CRITICAL,
+            resolution: ReconciliationResolution.PENDING,
+            type: ReconciliationDiffType.AMOUNT_MISMATCH,
+          }),
+          ...group('warn-pending', 2, {
+            severity: ReconciliationSeverity.WARNING,
+            resolution: ReconciliationResolution.PENDING,
+            type: ReconciliationDiffType.CHANNEL_SUCCESS_LOCAL_FAILED,
+          }),
+          ...group('info-resolved', 1, {
+            severity: ReconciliationSeverity.INFO,
+            resolution: ReconciliationResolution.RESOLVED,
+            type: ReconciliationDiffType.CHANNEL_ONLY,
+          }),
+          ...group('crit-ignored', 1, {
+            severity: ReconciliationSeverity.CRITICAL,
+            resolution: ReconciliationResolution.IGNORED,
+            type: ReconciliationDiffType.STATUS_MISMATCH,
+          }),
+        ];
+      }
+
+      type DetailBody = {
+        items: Array<{
+          id: string;
+          severity: string;
+          resolution: string;
+          type: string;
+        }>;
+        itemsTotal: number;
+        itemsTruncated: boolean;
+        actionableCount: number;
+      };
+
+      it('severity=CRITICAL：只返回 CRITICAL，总数与列表口径一致', async () => {
+        const prisma = fakePrisma({ items: makeFilterableItems() });
+        const service = makeService(prisma, emptyProvider());
+
+        const detail = (await service.detail('rec-1', {
+          severity: ReconciliationSeverity.CRITICAL,
+        })) as DetailBody;
+
+        // 3 条待处置 + 1 条已忽略 —— 严重级筛选**不看处置状态**
+        expect(detail.items).toHaveLength(4);
+        expect(
+          detail.items.every(
+            (i) => i.severity === ReconciliationSeverity.CRITICAL,
+          ),
+        ).toBe(true);
+        expect(detail.itemsTotal).toBe(4);
+        expect(detail.itemsTruncated).toBe(false);
+        // ⚠️ **条件要真的进查询** —— 只在内存里过滤就等于全表捞回来再筛
+        expect(prisma.payoutReconciliationItem.findMany).toHaveBeenCalledWith({
+          where: {
+            reconciliationId: 'rec-1',
+            severity: ReconciliationSeverity.CRITICAL,
+          },
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          take: RECONCILIATION_MAX_ITEMS,
+        });
+        expect(prisma.payoutReconciliationItem.count).toHaveBeenCalledWith({
+          where: {
+            reconciliationId: 'rec-1',
+            severity: ReconciliationSeverity.CRITICAL,
+          },
+        });
+      });
+
+      it('resolution=RESOLVED：只返回已处置的', async () => {
+        const prisma = fakePrisma({ items: makeFilterableItems() });
+        const service = makeService(prisma, emptyProvider());
+
+        const detail = (await service.detail('rec-1', {
+          resolution: ReconciliationResolution.RESOLVED,
+        })) as DetailBody;
+
+        expect(detail.items).toHaveLength(1);
+        expect(detail.items[0].type).toBe(ReconciliationDiffType.CHANNEL_ONLY);
+        expect(detail.itemsTotal).toBe(1);
+      });
+
+      it('type=CHANNEL_SUCCESS_LOCAL_FAILED：只返回该类差异', async () => {
+        const prisma = fakePrisma({ items: makeFilterableItems() });
+        const service = makeService(prisma, emptyProvider());
+
+        const detail = (await service.detail('rec-1', {
+          type: ReconciliationDiffType.CHANNEL_SUCCESS_LOCAL_FAILED,
+        })) as DetailBody;
+
+        expect(detail.items).toHaveLength(2);
+        expect(
+          detail.items.every(
+            (i) =>
+              i.type === ReconciliationDiffType.CHANNEL_SUCCESS_LOCAL_FAILED,
+          ),
+        ).toBe(true);
+        expect(detail.itemsTotal).toBe(2);
+      });
+
+      it('多个条件同时生效（AND）', async () => {
+        const prisma = fakePrisma({ items: makeFilterableItems() });
+        const service = makeService(prisma, emptyProvider());
+
+        const detail = (await service.detail('rec-1', {
+          severity: ReconciliationSeverity.CRITICAL,
+          resolution: ReconciliationResolution.PENDING,
+        })) as DetailBody;
+
+        expect(detail.items).toHaveLength(3);
+        expect(detail.itemsTotal).toBe(3);
+      });
+
+      it('筛选后仍超上限：截断标记与总数都按筛选口径算', async () => {
+        const prisma = fakePrisma({
+          items: [
+            ...group('crit', 201, {
+              severity: ReconciliationSeverity.CRITICAL,
+            }),
+            ...group('info', 5, { severity: ReconciliationSeverity.INFO }),
+          ],
+        });
+        const service = makeService(prisma, emptyProvider());
+
+        const detail = (await service.detail('rec-1', {
+          severity: ReconciliationSeverity.CRITICAL,
+        })) as DetailBody;
+
+        expect(detail.items).toHaveLength(RECONCILIATION_MAX_ITEMS);
+        // ⚠️ **不是 206** —— 筛选后的总数才是分母，否则前端会说「共 206 条」
+        //    却永远只能翻到 200 条 CRITICAL
+        expect(detail.itemsTotal).toBe(201);
+        expect(detail.itemsTruncated).toBe(true);
+      });
+
+      it('筛选不改变可批量确认条数（口径与批量确认 FILTER 一致）', async () => {
+        const prisma = fakePrisma({
+          reconciliation: {
+            id: 'rec-1',
+            source: ReconciliationSource.FILE,
+          },
+          items: [
+            ...group('crit-a', 2, {
+              severity: ReconciliationSeverity.CRITICAL,
+              type: ReconciliationDiffType.CHANNEL_PENDING_LOCAL,
+              resolution: ReconciliationResolution.PENDING,
+              payoutId: 'p-1',
+            }),
+            ...group('info-a', 3, {
+              severity: ReconciliationSeverity.INFO,
+              type: ReconciliationDiffType.CHANNEL_PENDING_LOCAL,
+              resolution: ReconciliationResolution.PENDING,
+              payoutId: 'p-2',
+            }),
+          ],
+        });
+        const service = makeService(prisma, emptyProvider());
+
+        const detail = (await service.detail('rec-1', {
+          severity: ReconciliationSeverity.INFO,
+        })) as DetailBody;
+
+        expect(detail.items).toHaveLength(3);
+        // ⚠️ **仍然是 5** —— 按钮分母 = 批量确认真正会处理的行数，
+        //    不能因为当前只看 INFO 就变成 3
+        expect(detail.actionableCount).toBe(5);
+      });
+
+      it('空对象筛选与不传参数逐字一致', async () => {
+        const prisma = fakePrisma({ items: makeFilterableItems() });
+        const service = makeService(prisma, emptyProvider());
+
+        const detail = (await service.detail('rec-1', {})) as DetailBody;
+
+        expect(detail.items).toHaveLength(7);
+        expect(detail.itemsTotal).toBe(7);
+        // ⚠️ **精确对象断言** —— 多一个 `severity: undefined` 就不算「逐字一致」
+        expect(prisma.payoutReconciliationItem.findMany).toHaveBeenCalledWith({
+          where: { reconciliationId: 'rec-1' },
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          take: RECONCILIATION_MAX_ITEMS,
+        });
+        expect(prisma.payoutReconciliationItem.count).toHaveBeenCalledWith({
+          where: { reconciliationId: 'rec-1' },
+        });
+      });
     });
   });
 

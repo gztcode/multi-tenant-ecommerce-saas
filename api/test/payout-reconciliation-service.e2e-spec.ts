@@ -136,10 +136,11 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
     count: number,
     severity: ReconciliationSeverity,
     resolution: ReconciliationResolution,
+    type: ReconciliationDiffType = ReconciliationDiffType.STATUS_MISMATCH,
   ) {
     return Array.from({ length: count }, () => ({
       reconciliationId,
-      type: ReconciliationDiffType.STATUS_MISMATCH,
+      type,
       severity,
       resolution,
     }));
@@ -335,6 +336,245 @@ describe('渠道对账服务与差异分类 (e2e)', () => {
       pendingWarning: 3,
       pendingInfo: 1,
     });
+  });
+
+  /**
+   * 详情接口的差异筛选（只读）：`severity` / `resolution` / `type`。
+   *
+   * ⚠️ **筛选只作用于差异列表与 `itemsTotal`** —— 任务本体的 `diffCount`、
+   *    以及批量确认用的 `actionableCount` 必须纹丝不动。
+   *    `actionableCount` 被筛选影响的话，运营筛到 INFO 后
+   *    「批量确认」按钮上的数字就会变，点下去却是另一批单 —— 动钱。
+   *    所以这里专门用**筛掉可处置项**的条件（`severity=INFO`）断言它仍是 2。
+   *
+   * ⚠️ **非法枚举必须 400** —— DTO 用 schema 的枚举做 `@IsEnum`，
+   *    漏了这层校验就会把 `BOGUS` 直接送进 PG 的 enum 参数，
+   *    冒出来的是 500 而不是 400。
+   */
+  it('详情筛选：severity / resolution / type 只作用于差异列表与总数', async () => {
+    const token = await loginPlatformAdmin();
+    const auth = `Bearer ${token}`;
+
+    // 两条可处置（A 类）差异要有真实 `payoutId`（外键），所以先造两张单
+    const merchant = await createMerchant(app, prisma);
+    const aPayout = await seedPayout(prisma, {
+      tenantId: merchant.tenantId,
+      status: PayoutStatus.PROCESSING,
+    });
+    const bPayout = await seedPayout(prisma, {
+      tenantId: merchant.tenantId,
+      status: PayoutStatus.PROCESSING,
+    });
+
+    const reconciliation = await asPlatform(() =>
+      prisma.payoutReconciliation.create({
+        data: {
+          channel: 'fake-payout',
+          // ⚠️ 用 FILE 来源：`actionableCount` 只对 FILE 来源计数
+          source: ReconciliationSource.FILE,
+          fileName: 'filter-bill.csv',
+          windowFrom: new Date(Date.now() - 24 * 60 * 60 * 1000),
+          windowTo: new Date(),
+          status: ReconciliationStatus.COMPLETED,
+          triggeredBy: 'admin-1',
+        },
+      }),
+    );
+    // 共 9 条：3 严重待处置（C 类）+ 2 警告待处置（B 类）+ 1 提示已处置（D 类）
+    //        + 1 严重已忽略（F 类）+ 2 严重待处置且可批量确认（A 类）
+    await asPlatform(() =>
+      prisma.payoutReconciliationItem.createMany({
+        data: [
+          ...makeDiffItems(
+            reconciliation.id,
+            3,
+            ReconciliationSeverity.CRITICAL,
+            ReconciliationResolution.PENDING,
+            ReconciliationDiffType.AMOUNT_MISMATCH,
+          ),
+          ...makeDiffItems(
+            reconciliation.id,
+            2,
+            ReconciliationSeverity.WARNING,
+            ReconciliationResolution.PENDING,
+            ReconciliationDiffType.CHANNEL_SUCCESS_LOCAL_FAILED,
+          ),
+          ...makeDiffItems(
+            reconciliation.id,
+            1,
+            ReconciliationSeverity.INFO,
+            ReconciliationResolution.RESOLVED,
+            ReconciliationDiffType.CHANNEL_ONLY,
+          ),
+          ...makeDiffItems(
+            reconciliation.id,
+            1,
+            ReconciliationSeverity.CRITICAL,
+            ReconciliationResolution.IGNORED,
+            ReconciliationDiffType.STATUS_MISMATCH,
+          ),
+          ...makeDiffItems(
+            reconciliation.id,
+            2,
+            ReconciliationSeverity.CRITICAL,
+            ReconciliationResolution.PENDING,
+            ReconciliationDiffType.CHANNEL_PENDING_LOCAL,
+          ).map((item, index) => ({
+            ...item,
+            payoutId: index === 0 ? aPayout.id : bPayout.id,
+          })),
+        ],
+      }),
+    );
+
+    const detail = (query = '') =>
+      http(app)
+        .get(
+          `/api/v1/platform/payout-reconciliations/${reconciliation.id}${query}`,
+        )
+        .set('Authorization', auth);
+
+    type DetailBody = {
+      items: Array<{
+        severity: ReconciliationSeverity;
+        resolution: ReconciliationResolution;
+        type: ReconciliationDiffType;
+      }>;
+      itemsTotal: number;
+      itemsTruncated: boolean;
+      actionableCount: number;
+    };
+
+    // ---- 无参数：与改造前一致，全部 9 条 ----
+    const all = await detail().expect(200);
+    const allBody = all.body as DetailBody;
+    expect(allBody.items).toHaveLength(9);
+    expect(allBody.itemsTotal).toBe(9);
+    expect(allBody.itemsTruncated).toBe(false);
+    expect(allBody.actionableCount).toBe(2);
+
+    // ---- severity：只剩严重级，总数跟着变，可处置数不变 ----
+    const critical = await detail('?severity=CRITICAL').expect(200);
+    const criticalBody = critical.body as DetailBody;
+    expect(criticalBody.items).toHaveLength(6);
+    expect(criticalBody.itemsTotal).toBe(6);
+    expect(
+      criticalBody.items.every(
+        (item) => item.severity === ReconciliationSeverity.CRITICAL,
+      ),
+    ).toBe(true);
+    expect(criticalBody.actionableCount).toBe(2);
+
+    // ⚠️ **筛掉可处置项后 `actionableCount` 仍是 2** —— 批量确认的数字
+    //    不受筛选影响；这条一红就说明筛选误伤了钱路径
+    const info = await detail('?severity=INFO').expect(200);
+    const infoBody = info.body as DetailBody;
+    expect(infoBody.items).toHaveLength(1);
+    expect(infoBody.items[0].type).toBe(ReconciliationDiffType.CHANNEL_ONLY);
+    expect(infoBody.actionableCount).toBe(2);
+
+    // ---- resolution ----
+    const resolved = await detail('?resolution=RESOLVED').expect(200);
+    const resolvedBody = resolved.body as DetailBody;
+    expect(resolvedBody.items).toHaveLength(1);
+    expect(resolvedBody.itemsTotal).toBe(1);
+    expect(resolvedBody.items[0].resolution).toBe(
+      ReconciliationResolution.RESOLVED,
+    );
+
+    // ---- type ----
+    const onlyChannel = await detail('?type=CHANNEL_ONLY').expect(200);
+    const onlyChannelBody = onlyChannel.body as DetailBody;
+    expect(onlyChannelBody.items).toHaveLength(1);
+    expect(onlyChannelBody.items[0].type).toBe(
+      ReconciliationDiffType.CHANNEL_ONLY,
+    );
+
+    // ---- 多条件是 AND ----
+    const both = await detail('?severity=CRITICAL&resolution=PENDING').expect(
+      200,
+    );
+    const bothBody = both.body as DetailBody;
+    expect(bothBody.items).toHaveLength(5);
+    expect(bothBody.itemsTotal).toBe(5);
+
+    // ---- 非法枚举 / 白名单外参数：400，不是 500 ----
+    await detail('?severity=BOGUS').expect(400);
+    await detail('?resolution=DONE').expect(400);
+    await detail('?type=SOMETHING_ELSE').expect(400);
+    await detail('?pageSize=9999').expect(400);
+  });
+
+  /**
+   * 命中 200 条上限时，返回体必须让前端知道「还有更多」。
+   *
+   * ⚠️ **这是本任务的核心痛点** —— 差异可能上万条，详情只回前 200 条；
+   *    没有 `itemsTruncated` / `itemsTotal` 的话，
+   *    运营会以为「就这 200 条差异」，而被截掉的那批根本没入口看。
+   *    筛选是那个入口：把范围缩小到 200 条以内就能看全。
+   */
+  it('详情筛选：超过 200 条时如实返回截断标记与筛选后总数', async () => {
+    const token = await loginPlatformAdmin();
+    const auth = `Bearer ${token}`;
+
+    const reconciliation = await asPlatform(() =>
+      prisma.payoutReconciliation.create({
+        data: {
+          channel: 'fake-payout',
+          source: ReconciliationSource.API,
+          windowFrom: new Date(Date.now() - 24 * 60 * 60 * 1000),
+          windowTo: new Date(),
+          status: ReconciliationStatus.COMPLETED,
+          triggeredBy: 'admin-1',
+        },
+      }),
+    );
+    await asPlatform(() =>
+      prisma.payoutReconciliationItem.createMany({
+        data: [
+          // 205 条提示级 + 3 条严重级：不筛选必然被截断，筛严重级则一屏看全
+          ...makeDiffItems(
+            reconciliation.id,
+            205,
+            ReconciliationSeverity.INFO,
+            ReconciliationResolution.PENDING,
+          ),
+          ...makeDiffItems(
+            reconciliation.id,
+            3,
+            ReconciliationSeverity.CRITICAL,
+            ReconciliationResolution.PENDING,
+          ),
+        ],
+      }),
+    );
+
+    const detail = (query = '') =>
+      http(app)
+        .get(
+          `/api/v1/platform/payout-reconciliations/${reconciliation.id}${query}`,
+        )
+        .set('Authorization', auth);
+
+    type DetailBody = {
+      items: unknown[];
+      itemsTotal: number;
+      itemsTruncated: boolean;
+    };
+
+    const all = await detail().expect(200);
+    const allBody = all.body as DetailBody;
+    expect(allBody.items).toHaveLength(200);
+    expect(allBody.itemsTotal).toBe(208);
+    expect(allBody.itemsTruncated).toBe(true);
+
+    const critical = await detail('?severity=CRITICAL').expect(200);
+    const criticalBody = critical.body as DetailBody;
+    expect(criticalBody.items).toHaveLength(3);
+    // ⚠️ **`itemsTotal` 是「当前筛选下的总数」，不是任务级总数** ——
+    //    否则筛完仍显示 208 条、`itemsTruncated` 仍为 true，运营以为没筛掉东西
+    expect(criticalBody.itemsTotal).toBe(3);
+    expect(criticalBody.itemsTruncated).toBe(false);
   });
 
   /** 其余四个端点也要真的打一遍 —— 路径改过，别再被遮蔽了 */
