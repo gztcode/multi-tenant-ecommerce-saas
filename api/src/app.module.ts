@@ -2,7 +2,7 @@ import { Module, OnModuleInit } from '@nestjs/common';
 import { MiddlewareConsumer, NestModule } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 import type { Express } from 'express';
-import { LoggingInterceptor } from './common/http/logging.interceptor';
+import { AccessLogMiddleware } from './common/http/access-log.middleware';
 import { RequestIdMiddleware } from './common/http/request-id.middleware';
 import { LockModule } from './common/lock/lock.module';
 import { PinoLoggerService } from './common/logging/pino-logger.service';
@@ -54,12 +54,12 @@ import { PlatformSettingsApiModule } from './modules/platform-settings/platform-
     // 平台默认渠道设置接口（阶段 6a Task 4）
     PlatformSettingsApiModule,
   ],
-  // HTTP 访问日志拦截器 + 全局结构化日志服务。
+  // 全局结构化日志服务。
   //
-  // ⚠️ **必须注册成 provider**，main.ts 才能用 app.get() 拿它们——
+  // ⚠️ **必须注册成 provider**，main.ts 才能用 app.get() 拿它——
   //    未注册的类 app.get() 会抛 UnknownElementException，而单测/e2e
   //    都不加载 main.ts，这个坑在 CI 里跑不出来（API 会在启动阶段死掉）。
-  providers: [LoggingInterceptor, PinoLoggerService],
+  providers: [PinoLoggerService],
 })
 export class AppModule implements NestModule, OnModuleInit {
   constructor(private readonly httpAdapterHost: HttpAdapterHost) {}
@@ -103,11 +103,16 @@ export class AppModule implements NestModule, OnModuleInit {
     expressApp.set('trust proxy', 1);
   }
 
-  // 请求 ID 中间件（阶段 11）：在一切路由之前给每个请求挂 requestId，
-  // LoggingInterceptor / AllExceptionsFilter 的日志都带它。
-  // HTTP 指标中间件（阶段 11）：在守卫之前注册 res 'finish' 监听，
-  // 守卫拒绝的 401/403 也能进指标（拦截器版本做不到，见 metrics.module 注释）。
+  // 顺序即执行顺序，三条都必须排在守卫之前：
+  // 1. RequestIdMiddleware（阶段 11）：给每个请求挂 requestId，
+  //    访问日志 / 指标 / AllExceptionsFilter 的日志都带它；
+  // 2. AccessLogMiddleware：res 'finish' 时按**最终状态码**写一条访问日志，
+  //    守卫拒绝的 401/403 也盖得到（拦截器版本做不到）；
+  // 3. MetricsMiddleware：同样在 'finish' 时记录指标。
+  // ⚠️ AccessLogMiddleware 依赖 RequestIdMiddleware 先跑，不能调换前两位。
   configure(consumer: MiddlewareConsumer): void {
-    consumer.apply(RequestIdMiddleware, MetricsMiddleware).forRoutes('*');
+    consumer
+      .apply(RequestIdMiddleware, AccessLogMiddleware, MetricsMiddleware)
+      .forRoutes('*');
   }
 }

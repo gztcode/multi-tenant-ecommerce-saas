@@ -76,7 +76,7 @@ npm run db:fix-legacy-checksum   # 迁移 checksum 修正（仅报 modified 时�
 | 路径 | 说明 |
 | --- | --- |
 | `src/common/tenant/` | 租户隔离的核心：Prisma query extension、租户上下文、三张白名单表。`require-tenant.ts` 的 `requireTenantId()` 是 service 层「上下文里没有 tenantId → 403 无法确定店铺」的唯一入口（阶段 7b） |
-| `src/common/http/` | 横切 HTTP 关注点：`LoggingInterceptor`（访问日志，不打 body 与原始错误信息；守卫的 401/403 盖不到——守卫在拦截器链之外）、`pagination.ts`（分页参数 clamp） |
+| `src/common/http/` | 横切 HTTP 关注点：`AccessLogMiddleware`（访问日志，中间件层、`res 'finish'` 取最终状态码，守卫的 401/403 也盖得到；不打 body 与原始错误信息）、`RequestIdMiddleware`（`x-request-id`）、`pagination.ts`（分页参数 clamp） |
 | `src/common/filters/` | 全局异常过滤器 `AllExceptionsFilter`（错误响应脱敏） |
 | `src/common/payment/` | 出款渠道与核实契约的下沉区。**`common/` 下唯一持有 `@Module` 的目录**——因为 `billing` 不能 import `payment`（成环） |
 | `src/common/channel/` | 渠道描述符、配置解析与告警钩子（阶段 6 新增） |
