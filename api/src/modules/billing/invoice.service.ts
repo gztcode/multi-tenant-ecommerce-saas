@@ -1,6 +1,7 @@
 import {
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import {
@@ -37,6 +38,8 @@ export interface InvoiceView extends Invoice {
  */
 @Injectable()
 export class InvoiceService {
+  private readonly logger = new Logger(InvoiceService.name);
+
   constructor(private readonly prisma: TenantPrismaService) {}
 
   /**
@@ -305,6 +308,12 @@ export class InvoiceService {
    * 账单付清 → 订阅期延长一个周期（**在一个已开启的事务里**）。
    *
    * ⚠️ 供 `markInvoicePaid` 调用，也供将来「与别的写同生共死」的场景复用。
+   *
+   * ⚠️ **只有这张账单把周期往后推时，才更新订阅周期**：
+   * `invoice.periodEnd > subscription.currentPeriodEnd` 成立才延长；
+   * 不成立（旧周期账单 / 重复账单 / 区间已被新周期覆盖）→ 账单照常标
+   * `PAID`，但订阅的 `planId` / 周期 / `pendingPlanId` / `status` /
+   * `trialEndsAt` **一行都不改**，只记一条 `warn`。
    */
   async markInvoicePaidInTx(
     tx: PrismaTransaction,
@@ -353,6 +362,28 @@ export class InvoiceService {
     if (!subscription) {
       return false;
     }
+    // ⚠️ **只有这张账单把周期往后推时，才更新订阅周期**（业主裁定 2026-11-27）。
+    //
+    // 换套餐即刻重开新周期、剩余天数作废 —— 此后一张**属于旧周期**的未付账单
+    // （手动支付、后台补偿、上一轮扣款重试）再被付清时，如果无条件把周期
+    // 写回 `invoice.periodStart ~ invoice.periodEnd`，就会把刚开的新周期整个抢走：
+    // 旧区间可能整段在过去，下一轮 `expireIfNeeded` 立刻把订阅打成 `EXPIRED`
+    // —— 商家刚付的钱换来的新周期凭空消失。钱照收，周期不能回滚。
+    //
+    // 正常续费的账单由 `renewOne()` 从 `currentPeriodEnd` 起算，
+    // `invoice.periodEnd > subscription.currentPeriodEnd` 恒成立，行为不变。
+    const extendsPeriod =
+      invoice.periodEnd.getTime() > subscription.currentPeriodEnd.getTime();
+    if (!extendsPeriod) {
+      this.logger.warn(
+        `账单 ${invoice.number} 已收，但不延长周期：` +
+          `账单区间 ${invoice.periodStart.toISOString()} ~ ${invoice.periodEnd.toISOString()}，` +
+          `订阅当前区间 ${subscription.currentPeriodStart.toISOString()} ~ ${subscription.currentPeriodEnd.toISOString()}` +
+          `（区间已被新周期覆盖）`,
+      );
+      return true;
+    }
+
     // ⚠️ **延长周期 + 让待生效的套餐在这里生效**
     const nextPlanId = subscription.pendingPlanId ?? subscription.planId;
 
