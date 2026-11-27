@@ -5,6 +5,7 @@ import {
   Headers,
   HttpCode,
   Post,
+  Req,
   UseGuards,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
@@ -20,6 +21,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 // 装饰器签名里引用的类型：isolatedModules 下必须用 import type，
 // 否则 TS 无法判断它是运行时值还是仅类型，编译报错 TS1272。
 import type { CurrentUserPayload } from '../../common/decorators/current-user.decorator';
+import type { Request } from 'express';
 
 @ApiTags('auth')
 @Controller('auth')
@@ -30,11 +32,14 @@ export class AuthController {
     private readonly tenantResolver: TenantResolverService,
   ) {}
 
+  // 注册与登录都带 `ip` 做限流（安全审计 M2）。IP 取自 `req.ip`：
+  // app.module.ts 设了 `trust proxy = 1`，走 BFF 时拿到的是 XFF 最右项 ——
+  // BFF 转发时写入的真实客户端 IP，不是 BFF 容器地址。
   @Post('register/merchant')
   @Skip()
   @ApiOperation({ summary: '商家注册并开店' })
-  registerMerchant(@Body() dto: RegisterMerchantDto) {
-    return this.authService.registerMerchant(dto);
+  registerMerchant(@Body() dto: RegisterMerchantDto, @Req() request: Request) {
+    return this.authService.registerMerchant(dto, request.ip);
   }
 
   // 注意：register/customer 不能加 @Skip()。
@@ -43,8 +48,8 @@ export class AuthController {
   // 缺少子域名时由拦截器返回 404（无法确定店铺），这是正确的行为。
   @Post('register/customer')
   @ApiOperation({ summary: '消费者注册（需带店铺子域名）' })
-  registerCustomer(@Body() dto: RegisterCustomerDto) {
-    return this.authService.registerCustomer(dto);
+  registerCustomer(@Body() dto: RegisterCustomerDto, @Req() request: Request) {
+    return this.authService.registerCustomer(dto, request.ip);
   }
 
   // 登录要加 @Skip()：登录发生在中心域名（api.platform.test / merchant.platform.test），
@@ -61,9 +66,10 @@ export class AuthController {
   async login(
     @Body() dto: LoginDto,
     @Headers() headers: Record<string, string | string[] | undefined>,
+    @Req() request: Request,
   ) {
     const tenantId = await this.resolveLoginTenantId(headers);
-    return this.authService.login(dto, tenantId);
+    return this.authService.login(dto, tenantId, request.ip);
   }
 
   /**
