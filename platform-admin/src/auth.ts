@@ -9,6 +9,7 @@ import {
   type JwtToken,
   type SessionLike,
 } from '@/lib/jwt-callback';
+import { requestLogin } from '@/lib/login';
 
 import { assertAuthSecret } from '@ecom/frontend-shared/assert-auth-secret';
 import {
@@ -63,16 +64,19 @@ export const { handlers, auth, signIn, signOut } = NextAuth(
           email: { label: '邮箱', type: 'email' },
           password: { label: '密码', type: 'password' },
         },
-        async authorize(credentials) {
-          const response = await fetch(`${API_BASE_URL}/auth/login`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
+        async authorize(credentials, request) {
+          // ⚠️ 登录请求由 `@/lib/login` 构造：它会把入站 XFF 的最右一项
+          //    作为 `x-forwarded-for` 转发给后端。不转发的话，所有平台员工
+          //    登录都来自同一个 BFF 容器，api 的按 IP 限流会退化成一个全局
+          //    共享的桶（30 次/15 分钟），攻击者试错即可锁死全平台登录。
+          const response = await requestLogin(
+            {
               email: credentials?.email,
               password: credentials?.password,
               scope: 'PLATFORM',
-            }),
-          });
+            },
+            request,
+          );
 
           if (!response.ok) {
             // 登录失败不返回具体原因，交给登录页统一显示「邮箱或密码不正确」。

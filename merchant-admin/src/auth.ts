@@ -9,6 +9,7 @@ import {
   type JwtToken,
   type SessionLike,
 } from '@/lib/jwt-callback';
+import { requestLogin } from '@/lib/login';
 
 import { assertAuthSecret } from '@ecom/frontend-shared/assert-auth-secret';
 import {
@@ -72,18 +73,22 @@ export const { handlers, auth, signIn, signOut } = NextAuth(
           email: { label: '邮箱', type: 'email' },
           password: { label: '密码', type: 'password' },
         },
-        async authorize(credentials) {
+        async authorize(credentials, request) {
           // 与 storefront 不同：商家后台不带 x-tenant-subdomain。
           // 中心域名上没有「当前店铺」的概念，租户身份完全由后端按登录账号绑定。
-          const response = await fetch(`${API_BASE_URL}/auth/login`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
+          //
+          // ⚠️ 登录请求由 `@/lib/login` 构造：它会把入站 XFF 的最右一项
+          //    作为 `x-forwarded-for` 转发给后端。不转发的话，所有商家登录
+          //    都来自同一个 BFF 容器，api 的按 IP 限流会退化成一个全局共享
+          //    的桶（30 次/15 分钟），攻击者试错即可锁死全平台登录。
+          const response = await requestLogin(
+            {
               email: credentials?.email,
               password: credentials?.password,
               scope: 'MERCHANT',
-            }),
-          });
+            },
+            request,
+          );
 
           if (!response.ok) {
             // 登录失败不返回具体原因（邮箱不存在 vs 密码错误），
