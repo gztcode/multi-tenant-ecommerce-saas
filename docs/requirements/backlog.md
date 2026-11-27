@@ -91,7 +91,7 @@
 
 | # | 裁决问题 | 裁决（2026-11-27） | 现状 / 代码位置 | 说明 |
 |---|---------|------------------|----------------|------|
-| 1 | 换套餐的周期长度：按新套餐 `periodDays`，还是按剩余周期折算？ | **按新套餐 `periodDays` 重新起算**；**不折算剩余天数、不退款、不补差价** | `api/src/modules/payment/renewal.service.ts:129` 已如此（`periodEnd = periodStart + plan.periodDays`）；换套餐本身在下个周期生效（`api/src/modules/billing/subscription.service.ts:142-160` 的 `changePlan` 只写 `pendingPlanId`） | **现状即符合裁决口径，无需代码改动**，不存在「PR 在途」；当前周期不退款是既有设计 |
+| 1 | 换套餐的周期长度：按新套餐 `periodDays`，还是按剩余周期折算？ | **按新套餐 `periodDays` 重新起算**；**不折算剩余天数、不退款、不补差价**；并**即刻重开一个完整新周期，剩余天数作废** | 换套餐已改为**立即生效**：`api/src/modules/billing/subscription.service.ts` 的 `changePlan()` 在同一个事务里切 `planId`、把 `currentPeriodStart` 重置为数据库当前时刻、`currentPeriodEnd = 现在 + 新套餐.periodDays`，并清空 `pendingPlanId`；续费扫描（`renewal.service.ts`）仍按 `pendingPlanId ?? planId` 兜底历史数据 | 升级 / 降级同一规则（避免两套语义）；已开出、未支付的账单保持原样可支付；换套餐本身不生成任何调整账单 |
 | 2 | 对账人工闸边界：A 类之外是否允许批量确认？ | **维持现状，只允许 A 类** | `api/src/modules/payment/payout-reconciliation-resolver.service.ts` 顶部注释、`AGENTS.md` 的「CSV 来源的 A 类差异不自动改成 `PAID`」 | 动钱路径放宽风险大于收益；与 [2.2](#22-已放弃保留理由)「CSV 批量确认按严重级 / 状态扩展 `FILTER`」的放弃理由一致 |
 | 3 | CSV 来源 A 类的人工闸是否维持「机器不替人改钱」的现状？ | **维持现状** | CSV 来源的 A 类差异落 `PENDING` 人工项，批量确认按 `IDS` / `FILTER` 逐条复核 | 决策即完成，无代码改动 |
 | 4 | 是否做多店：`maxStores` 补实现还是从 backlog 删除？ | **不做，从 backlog 删除** | `api/src/modules/billing/quota.service.ts:141` 只读取不约束；`platform-admin/src/app/(dashboard)/plans/plan-form.tsx:380` 标注「当前架构每租户固定 1 家，此字段暂不生效」 | 真做多店要先做架构改造（`subdomain` 从 `Tenant` 迁到 `Store`、商品 / 订单按店归属），近期无收益；`maxStores` 字段保留但不再作为待办 |
