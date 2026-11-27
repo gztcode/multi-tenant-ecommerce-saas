@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -6,6 +7,7 @@ import {
 import { SubscriptionStatus, type Subscription } from '@prisma/client';
 import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { rethrowIfUniqueViolation } from '../../common/errors/unique-constraint';
+import { transactionOptions } from '../../common/db/transaction-options';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
 import { PlanService } from './plan.service';
 import { hasService } from './subscription-state';
@@ -136,10 +138,16 @@ export class SubscriptionService {
   }
 
   /**
-   * 换套餐（**下个周期生效**）。
+   * 换套餐：**立即生效**，并重开一个完整的新周期（剩余天数作废）。
    *
-   * ⚠️ **不做差价计算**：当前周期不退款不补差价，
-   * `pendingPlanId` 在下一个周期开始时生效。
+   * ⚠️ **业主口径（2026-11-27）**：「升级即刻重开一个完整新周期，剩余天数作废。」
+   *    升级与降级同一规则：`planId` 立刻切到新套餐，
+   *    `currentPeriodStart` 重置为「现在」，
+   *    `currentPeriodEnd = 现在 + 新套餐.periodDays`。
+   * ⚠️ **不折算、不退款、不补差价**：剩余天数直接作废，也不生成任何调整账单；
+   *    已开出、尚未支付的当前周期账单保持原样可支付。
+   * ⚠️ **不改 `status`**：已过期（EXPIRED）的订阅不会因为换套餐而「复活」，
+   *    与换套餐之前的行为一致。
    */
   async changePlan(planId: string): Promise<Subscription> {
     const tenantId = this.currentTenantId();
@@ -147,18 +155,38 @@ export class SubscriptionService {
     if (!plan) {
       throw new NotFoundException('套餐不存在或已下架');
     }
+    // ⚠️ **非法周期必须拦在这里**：`periodDays <= 0` 会算出
+    //    `periodEnd <= periodStart` 的「新周期」（商家付了钱、周期原地不动）。
+    //    接口层有 `@Min(1)`，但库是共享的（直连改库 / 历史脏数据 / 种子脚本），
+    //    这条会「推进周期」的路径必须自己兜底 —— 与续费扫描同一口径。
+    if (plan.periodDays <= 0) {
+      throw new BadRequestException('套餐周期不合法，无法切换');
+    }
     const existing = await this.prisma.subscription.findFirst({
       where: { tenantId },
     });
     if (!existing) {
       throw new NotFoundException('还没有订阅');
     }
-    // ⚠️ **用 `updateMany` 而不是 `update`**：租户作用域模型上
-    // `update` 的 where 只接受唯一字段，扩展会直接拒绝。
-    await this.prisma.subscription.updateMany({
-      where: { tenantId },
-      data: { pendingPlanId: plan.id },
-    });
+
+    const dayMs = 24 * 3600 * 1000;
+    // ⚠️ **时间用数据库的时钟**（护栏 M15）；事务内必须显式传 `tx` 给
+    //    `databaseNow()`，否则会再借一条连接（阶段 10 的 P2024）。
+    await this.prisma.$transaction(async (tx) => {
+      const now = await this.databaseNow(tx);
+      // ⚠️ **用 `updateMany` 而不是 `update`**：租户作用域模型上
+      // `update` 的 where 只接受唯一字段，扩展会直接拒绝。
+      await tx.subscription.updateMany({
+        where: { tenantId },
+        data: {
+          planId: plan.id,
+          pendingPlanId: null,
+          currentPeriodStart: now,
+          currentPeriodEnd: new Date(now.getTime() + plan.periodDays * dayMs),
+        },
+      });
+    }, transactionOptions());
+
     const updated = await this.prisma.subscription.findFirst({
       where: { tenantId },
     });
