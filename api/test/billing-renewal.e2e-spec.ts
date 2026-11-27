@@ -1090,22 +1090,91 @@ describe('账单、续费与订阅付款 (e2e)', () => {
   });
 
   // ============================================================
-  // 换套餐后：续费账单按「待生效的套餐」出账
+  // 换套餐：立刻切到新套餐并重开一个完整周期（剩余天数作废）
+  //
+  // 业主口径（2026-11-27）：「升级即刻重开一个完整新周期，剩余天数作废。」
+  // 升级与降级同一规则 —— 换套餐**不再**写「待生效」，不折算、不退款、
+  // 不补差价，也不生成任何调整账单。
   // ============================================================
 
-  it('有 pendingPlanId 时：续费账单按待生效套餐的价格出账', async () => {
+  it('换套餐立即生效：订阅切到新套餐、周期从此刻起重算、pendingPlanId 清空', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const currentPlanId = await createPlan({ price: 9900, periodDays: 30 });
+    const newPlanId = await createPlan({ price: 29900, periodDays: 365 });
+
+    const original = await subscribe(merchant.token, currentPlanId);
+    const originalStart = new Date(original.currentPeriodStart).getTime();
+    const originalEnd = new Date(original.currentPeriodEnd).getTime();
+
+    // ⚠️ **换套餐**：从这一版起立即生效，不再等待旧周期走完
+    const response = await http(app)
+      .patch('/api/v1/billing/subscription')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ planId: newPlanId })
+      .expect(200);
+
+    const body = response.body as SubscriptionBody;
+    expect(body.planId).toBe(newPlanId);
+
+    const after = await readSubscription(merchant.tenantId);
+    expect(after).not.toBeNull();
+    // ⚠️ 套餐直接切过去，「待生效」字段清空
+    expect(after!.planId).toBe(newPlanId);
+    expect(after!.pendingPlanId).toBeNull();
+
+    // ⚠️ 新周期从「此刻」起算，长度是**新套餐整个周期**（365 天），
+    //    不是旧套餐剩余的天数，也不从旧周期结束日接续
+    const start = after!.currentPeriodStart.getTime();
+    const end = after!.currentPeriodEnd.getTime();
+    expect(start).toBeGreaterThan(originalStart);
+    expect(end - start).toBe(365 * DAY_MS);
+    expect(end).not.toBe(originalEnd);
+
+    // ⚠️ 换套餐本身不出账：不折算、不退款、不补差价
+    expect(await readInvoices(merchant.tenantId)).toHaveLength(0);
+  });
+
+  it('换套餐（降级）同一规则：立即切到短周期套餐，剩余天数作废', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const currentPlanId = await createPlan({ price: 29900, periodDays: 365 });
+    const cheaperPlanId = await createPlan({ price: 9900, periodDays: 30 });
+
+    const original = await subscribe(merchant.token, currentPlanId);
+    const originalEnd = new Date(original.currentPeriodEnd).getTime();
+
+    await http(app)
+      .patch('/api/v1/billing/subscription')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ planId: cheaperPlanId })
+      .expect(200);
+
+    const after = await readSubscription(merchant.tenantId);
+    expect(after).not.toBeNull();
+    expect(after!.planId).toBe(cheaperPlanId);
+    expect(after!.pendingPlanId).toBeNull();
+    // 剩余 364 天多直接作废：新周期只有 30 天，结束日大幅前移
+    expect(after!.currentPeriodEnd.getTime()).toBeLessThan(originalEnd);
+    expect(
+      after!.currentPeriodEnd.getTime() - after!.currentPeriodStart.getTime(),
+    ).toBe(30 * DAY_MS);
+    expect(await readInvoices(merchant.tenantId)).toHaveLength(0);
+  });
+
+  it('历史数据：库里残留 pendingPlanId 时，续费账单仍按待生效套餐的价格出账', async () => {
+    // ⚠️ 换套餐已改为立即生效、`changePlan()` 不再写 `pendingPlanId`；
+    //    但旧口径下写进库的待生效套餐可能还在，续费扫描按
+    //    `pendingPlanId ?? planId` 兜底读取，这条路径要保住。
     const merchant = await createMerchant(app, prisma);
     const currentPlanId = await createPlan({ price: 9900, periodDays: 30 });
     const pendingPlanId = await createPlan({ price: 29900, periodDays: 30 });
 
     await subscribe(merchant.token, currentPlanId);
-
-    // ⚠️ **换套餐**（下个周期生效）—— `pendingPlanId` 就是待生效的套餐
-    await http(app)
-      .patch('/api/v1/billing/subscription')
-      .set('authorization', `Bearer ${merchant.token}`)
-      .send({ planId: pendingPlanId })
-      .expect(200);
+    await asTenant(merchant.tenantId, () =>
+      prisma.subscription.updateMany({
+        where: { tenantId: merchant.tenantId },
+        data: { pendingPlanId },
+      }),
+    );
 
     // 把当前周期结束日挪到「3 天内」（扫描的窗口是周期开始前 3 天）
     const periodStart = new Date(Date.now() + DAY_MS);
@@ -1118,13 +1187,6 @@ describe('账单、续费与订阅付款 (e2e)', () => {
 
     await renewal.scan();
 
-    // ⚠️ **关键断言**：账单金额是**待生效套餐**的价格（29900），不是
-    // 当前套餐的 9900。
-    //
-    // 改之前：账单按 `subscription.planId`（当前套餐）出账 → 9900，
-    // 但这个周期开始后订阅会切到待生效的套餐（`markInvoicePaid` 里
-    // `planId = pendingPlanId`）—— **商家付 ¥99 用上了 ¥299 的套餐**，
-    // 平台少收了 ¥200。
     const all = await readInvoices(merchant.tenantId);
     expect(all).toHaveLength(1);
     expect(all[0].amount).toBe(29900);
@@ -1153,27 +1215,16 @@ describe('账单、续费与订阅付款 (e2e)', () => {
     expect(all[0].amount).toBe(9900);
   });
 
-  // ============================================================
-  // 换套餐后：周期按**新套餐**的 periodDays 重新起算整个周期
-  //
-  // 业主口径（2026-11-27）：升级/换套餐时按新套餐的 `periodDays`
-  // 重新起算，**不折算剩余天数、不退款、不补差价**。
-  // 这组用例把口径钉死在「账单的两个边界」与「付清后的订阅状态」上 ——
-  // 只断言金额（上面那条）挡不住「周期仍按旧套餐算」的回归。
-  // ============================================================
-
-  it('换套餐后：续费账单按新套餐 periodDays 起算整个新周期', async () => {
+  it('换套餐后下一次续费：账单按新套餐的价格与 periodDays 出账', async () => {
     const merchant = await createMerchant(app, prisma);
     const currentPlanId = await createPlan({ price: 9900, periodDays: 30 });
-    const pendingPlanId = await createPlan({ price: 29900, periodDays: 365 });
+    const newPlanId = await createPlan({ price: 29900, periodDays: 365 });
 
     await subscribe(merchant.token, currentPlanId);
-
-    // ⚠️ **换套餐**（下个周期生效）：此刻 `pendingPlanId = 365 天的套餐`
     await http(app)
       .patch('/api/v1/billing/subscription')
       .set('authorization', `Bearer ${merchant.token}`)
-      .send({ planId: pendingPlanId })
+      .send({ planId: newPlanId })
       .expect(200);
 
     // 当前周期结束日固定成一个已知时刻（扫描窗口是结束前 3 天）
@@ -1195,20 +1246,20 @@ describe('账单、续费与订阅付款 (e2e)', () => {
     expect(all[0].periodEnd.getTime()).toBe(
       currentPeriodEnd.getTime() + 365 * DAY_MS,
     );
-    // 金额用新套餐的价格（护栏 M9 的延伸：价格与周期必须来自同一个套餐）
+    // 金额用新套餐的价格（价格与周期必须来自同一个套餐）
     expect(all[0].amount).toBe(29900);
   });
 
-  it('换套餐的账单付清后：订阅切到新套餐、pendingPlanId 清空、周期与账单一致', async () => {
+  it('换套餐后的账单付清：订阅周期与账单逐毫秒一致', async () => {
     const merchant = await createMerchant(app, prisma);
     const currentPlanId = await createPlan({ price: 9900, periodDays: 30 });
-    const pendingPlanId = await createPlan({ price: 29900, periodDays: 365 });
+    const newPlanId = await createPlan({ price: 29900, periodDays: 365 });
 
     await subscribe(merchant.token, currentPlanId);
     await http(app)
       .patch('/api/v1/billing/subscription')
       .set('authorization', `Bearer ${merchant.token}`)
-      .send({ planId: pendingPlanId })
+      .send({ planId: newPlanId })
       .expect(200);
 
     const currentPeriodEnd = new Date(Date.now() + DAY_MS);
@@ -1233,8 +1284,8 @@ describe('账单、续费与订阅付款 (e2e)', () => {
     const after = await readSubscription(merchant.tenantId);
     expect(after).not.toBeNull();
     expect(after!.status).toBe('ACTIVE');
-    // ⚠️ **套餐在这里切换**：新套餐生效、待生效字段清空
-    expect(after!.planId).toBe(pendingPlanId);
+    // 套餐在换套餐那一刻就切了，付清账单只是推进周期
+    expect(after!.planId).toBe(newPlanId);
     expect(after!.pendingPlanId).toBeNull();
     // ⚠️ **订阅周期与账单逐毫秒一致**（不再按旧套餐的 30 天算）
     expect(after!.currentPeriodStart.getTime()).toBe(
@@ -1251,13 +1302,15 @@ describe('账单、续费与订阅付款 (e2e)', () => {
   //
   // ⚠️ 接口层（`CreatePlanDto` / `UpdatePlanDto`）有 `@Min(1)`，
   //    正常路径建不出这种套餐；但库是共享的（直连改库、历史脏数据、
-  //    种子脚本），续费这条**出账 + 扣钱**的路径必须自己兜底：
+  //    种子脚本）。两条会「推进周期」的路径都必须自己兜底：
+  //    - `changePlan()`（立即切套餐 + 重开周期）
+  //    - 续费扫描（对历史 `pendingPlanId` 兜底）
   //    一个 0 天的周期会让商家付了钱、周期原地不动，下一轮扫描
   //    再把订阅判成 EXPIRED（钱收了、服务没开）。
   // ============================================================
 
   it.each([0, -30])(
-    '边界：待生效套餐 periodDays=%i 时不出账、不动订阅周期',
+    '边界：换套餐到 periodDays=%i 的套餐被拒绝，订阅原样不动',
     async (invalidPeriodDays) => {
       const merchant = await createMerchant(app, prisma);
       const currentPlanId = await createPlan({ price: 9900, periodDays: 30 });
@@ -1274,12 +1327,54 @@ describe('账单、续费与订阅付款 (e2e)', () => {
         },
       });
 
-      await subscribe(merchant.token, currentPlanId);
+      const before = await subscribe(merchant.token, currentPlanId);
+
+      // ⚠️ **必须拒绝**，不能算出 periodEnd <= periodStart 的周期
       await http(app)
         .patch('/api/v1/billing/subscription')
         .set('authorization', `Bearer ${merchant.token}`)
         .send({ planId: invalidPlan.id })
-        .expect(200);
+        .expect(400);
+
+      // ⚠️ **订阅原样不动**：套餐、周期都没被改
+      const after = await readSubscription(merchant.tenantId);
+      expect(after).not.toBeNull();
+      expect(after!.planId).toBe(currentPlanId);
+      expect(after!.pendingPlanId).toBeNull();
+      expect(after!.currentPeriodStart.getTime()).toBe(
+        new Date(before.currentPeriodStart).getTime(),
+      );
+      expect(after!.currentPeriodEnd.getTime()).toBe(
+        new Date(before.currentPeriodEnd).getTime(),
+      );
+      // 不产生任何账单
+      expect(await readInvoices(merchant.tenantId)).toHaveLength(0);
+    },
+  );
+
+  it.each([0, -30])(
+    '边界：历史 pendingPlanId 的套餐 periodDays=%i 时续费不出账、不动订阅周期',
+    async (invalidPeriodDays) => {
+      const merchant = await createMerchant(app, prisma);
+      const currentPlanId = await createPlan({ price: 9900, periodDays: 30 });
+
+      const invalidPlan = await prisma.plan.create({
+        data: {
+          code: `P-${unique()}`,
+          name: '非法周期套餐',
+          price: 29900,
+          periodDays: invalidPeriodDays,
+          commissionBps: 500,
+        },
+      });
+
+      await subscribe(merchant.token, currentPlanId);
+      await asTenant(merchant.tenantId, () =>
+        prisma.subscription.updateMany({
+          where: { tenantId: merchant.tenantId },
+          data: { pendingPlanId: invalidPlan.id },
+        }),
+      );
 
       const currentPeriodEnd = new Date(Date.now() + DAY_MS);
       await asTenant(merchant.tenantId, () =>
@@ -1292,8 +1387,7 @@ describe('账单、续费与订阅付款 (e2e)', () => {
       await renewal.scan();
 
       // ⚠️ **不得出账**：没有任何账单
-      const all = await readInvoices(merchant.tenantId);
-      expect(all).toHaveLength(0);
+      expect(await readInvoices(merchant.tenantId)).toHaveLength(0);
 
       // ⚠️ **订阅周期不动**：不能出现 periodEnd <= periodStart 的「新周期」
       const after = await readSubscription(merchant.tenantId);

@@ -43,6 +43,7 @@ interface PlanBody {
 
 interface SubscriptionBody {
   id: string;
+  currentPeriodStart: string;
   currentPeriodEnd: string;
   planId?: string;
   pendingPlanId?: string | null;
@@ -421,15 +422,16 @@ describe('商家侧的账单与支付方式列表 (e2e)', () => {
   });
 
   // ============================================================
-  // 换套餐（下个周期生效）
+  // 换套餐（立即生效，剩余天数作废）
   // ============================================================
 
-  it('PATCH /billing/subscription：已有订阅时换套餐写 pendingPlanId，当前套餐不变', async () => {
+  it('PATCH /billing/subscription：换套餐立即生效，重开完整新周期并清空 pendingPlanId', async () => {
     const merchant = await createMerchant(app, prisma);
-    const planId = await createPlan();
-    const newPlanId = await createPlan();
+    const planId = await createPlan({ periodDays: 30 });
+    const newPlanId = await createPlan({ periodDays: 7 });
 
-    await subscribe(merchant.token, planId);
+    const original = await subscribe(merchant.token, planId);
+    const originalEnd = new Date(original.currentPeriodEnd).getTime();
 
     const response = await http(app)
       .patch('/api/v1/billing/subscription')
@@ -438,9 +440,16 @@ describe('商家侧的账单与支付方式列表 (e2e)', () => {
       .expect(200);
 
     const body = response.body as SubscriptionBody;
-    // ⚠️ **下个周期才生效**：当前套餐**不变**，只写 pendingPlanId。
-    expect(body.planId).toBe(planId);
-    expect(body.pendingPlanId).toBe(newPlanId);
+    // ⚠️ **立即生效**：套餐直接切到新套餐，不再写「待生效」。
+    expect(body.planId).toBe(newPlanId);
+    expect(body.pendingPlanId).toBeNull();
+
+    // ⚠️ **重开一个完整新周期**：从「现在」起算，长度是新套餐的 periodDays。
+    const start = new Date(body.currentPeriodStart).getTime();
+    const end = new Date(body.currentPeriodEnd).getTime();
+    expect(end - start).toBe(7 * DAY_MS);
+    // 剩余天数作废：不再沿用旧周期的结束日（30 天 → 7 天，明显前移）
+    expect(end).toBeLessThan(originalEnd);
 
     // ⚠️ **再查一次**：确认真的落库了，不只是响应体上写着。
     const current = await http(app)
@@ -449,8 +458,10 @@ describe('商家侧的账单与支付方式列表 (e2e)', () => {
       .expect(200);
 
     const currentBody = current.body as SubscriptionBody;
-    expect(currentBody.planId).toBe(planId);
-    expect(currentBody.pendingPlanId).toBe(newPlanId);
+    expect(currentBody.planId).toBe(newPlanId);
+    expect(currentBody.pendingPlanId).toBeNull();
+    expect(new Date(currentBody.currentPeriodStart).getTime()).toBe(start);
+    expect(new Date(currentBody.currentPeriodEnd).getTime()).toBe(end);
   });
 
   it('⚠️ POST /billing/subscription 仍然幂等（护栏 M4）：不换套餐', async () => {
