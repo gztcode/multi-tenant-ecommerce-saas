@@ -2,12 +2,14 @@ import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { ValidationPipe } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
+import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { AppModule } from '../src/app.module';
 import { TenantContextInterceptor } from '../src/modules/tenancy/tenant-context.interceptor';
 import { TenantPrismaService } from '../src/common/tenant/tenant-prisma.service';
 import { tenantContext } from '../src/common/tenant/tenant-context';
 import { MediaService } from '../src/modules/media/media.service';
 import { MinioService } from '../src/modules/media/storage/minio.service';
+import { resolveMinioConfig } from '../src/modules/media/storage/minio-config';
 import { http } from './helpers';
 import { createMerchant } from './merchant-fixture';
 
@@ -72,6 +74,42 @@ function jpegBytes(size: number, fill = 0): Buffer<ArrayBuffer> {
   const bytes = Buffer.alloc(size, fill);
   bytes.set([0xff, 0xd8, 0xff, 0xe0], 0);
   return bytes;
+}
+
+/**
+ * 用后端凭据直接往 bucket 写对象，绕过 presigned URL。
+ *
+ * ⚠️ 只用于构造「对象已进存储」的场景（如历史遗留的超限对象）：
+ *    审计 L1 之后，经签名 URL 的 PUT 已被 content-length 约束，
+ *    客户端再也造不出「申报 1KB、实传 6MB」的对象。
+ */
+async function putObjectDirect(
+  key: string,
+  body: Buffer,
+  contentType: string,
+): Promise<void> {
+  const config = resolveMinioConfig();
+  const client = new S3Client({
+    endpoint: config.internalEndpoint,
+    region: config.region,
+    credentials: {
+      accessKeyId: config.accessKey,
+      secretAccessKey: config.secretKey,
+    },
+    forcePathStyle: true,
+  });
+  try {
+    await client.send(
+      new PutObjectCommand({
+        Bucket: config.bucket,
+        Key: key,
+        ContentType: contentType,
+        Body: body,
+      }),
+    );
+  } finally {
+    client.destroy();
+  }
 }
 
 /**
@@ -311,20 +349,80 @@ describe('媒体上传 (e2e)', () => {
     });
   });
 
-  it('confirm 采纳对象的真实字节数，而不是客户端申报的 size', async () => {
+  it('签名里带长度约束：超过申报大小的上传在存储层被拒绝', async () => {
     const merchant = await createMerchant(app, prisma);
 
-    // 故意申报 999 字节，实际传 2048 字节。
-    // 若实现只是把客户端的申报值原样写回，这个断言就会红——
-    // 「只信客户端说传完了」正是 confirm 要挡掉的失效模式。
+    const created = await issueUploadUrl(merchant.token, {
+      filename: 'small.jpg',
+      mime: 'image/jpeg',
+      size: 1024,
+    });
+
+    // ⛔ 审计 L1：签发时只校验客户端自报的 size 是不够的——presigned PUT
+    //    的签名里若不包含 content-length，凭证就等价于「多大都能传」，
+    //    超限文件会先落盘、再由 confirm 事后删除（存储与带宽已经被消耗）。
+    //    这里先断言签名的 SignedHeaders 里确实有 content-length。
+    const signedHeaders = new URL(created.uploadUrl).searchParams.get(
+      'X-Amz-SignedHeaders',
+    );
+    expect(signedHeaders).toContain('content-length');
+
+    // 申报 1KB、真发 2KB：content-length 与签名不符，MinIO 直接 403
+    const oversize = await fetch(created.uploadUrl, {
+      method: 'PUT',
+      headers: { 'content-type': 'image/jpeg' },
+      body: jpegBytes(2048, 3),
+    });
+    expect(oversize.ok).toBe(false);
+    expect(oversize.status).toBe(403);
+
+    // 超限请求没有留下对象：confirm 仍按「尚未上传」拒绝，
+    // 而不是走到「读真实大小、超限再删」那条事后补救路径。
+    const notUploaded = await http(app)
+      .post(`/api/v1/media/${created.media.id}/confirm`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(400);
+    expect((notUploaded.body as { message: string }).message).toContain(
+      '尚未上传',
+    );
+
+    // 同一张凭证按申报的 1KB 上传则成功——约束是「必须一致」，不是「一律拒绝」
+    const exact = await fetch(created.uploadUrl, {
+      method: 'PUT',
+      headers: { 'content-type': 'image/jpeg' },
+      body: jpegBytes(1024, 3),
+    });
+    expect(exact.ok).toBe(true);
+
+    const confirmed = await http(app)
+      .post(`/api/v1/media/${created.media.id}/confirm`)
+      .set('authorization', `Bearer ${merchant.token}`)
+      .expect(201);
+    expect(mediaBody(confirmed).status).toBe('READY');
+    expect(mediaBody(confirmed).size).toBe(1024);
+  });
+
+  it('confirm 采纳对象的真实字节数，而不是库里的申报值', async () => {
+    const merchant = await createMerchant(app, prisma);
+
+    // 签名已经把「申报值 = 实际值」钉在存储层了，这里改库里那一列，
+    // 模拟「申报值与真实对象不一致」的残留数据。若 confirm 只是把申报值
+    // 原样写回，size 就会是 1 —— 「只信客户端说传完了」正是要挡掉的失效模式。
     const created = await issueUploadUrl(merchant.token, {
       filename: 'lie.jpg',
       mime: 'image/jpeg',
-      size: 999,
+      size: 1024,
     });
-    expect(created.media.size).toBe(999);
+    expect(created.media.size).toBe(1024);
 
-    const bytes = jpegBytes(2048, 1);
+    await asTenant(merchant.tenantId, () =>
+      prisma.media.updateMany({
+        where: { id: created.media.id },
+        data: { size: 1 },
+      }),
+    );
+
+    const bytes = jpegBytes(1024, 1);
     const put = await fetch(created.uploadUrl, {
       method: 'PUT',
       headers: { 'content-type': 'image/jpeg' },
@@ -337,7 +435,7 @@ describe('媒体上传 (e2e)', () => {
       .set('authorization', `Bearer ${merchant.token}`)
       .expect(201);
 
-    expect(mediaBody(confirmed).size).toBe(2048);
+    expect(mediaBody(confirmed).size).toBe(1024);
   });
 
   it('媒体受租户隔离：B 看不见也改不动 A 的媒体', async () => {
@@ -684,13 +782,14 @@ describe('媒体上传 (e2e)', () => {
       .set('authorization', `Bearer ${merchant.token}`)
       .expect(400);
   });
-  // 阶段 2b 失败注入发现：confirm 时的媒体大小复核**没有 e2e 覆盖**。
-  // 而它才是这条路径上唯一真正的防线——presigned PUT 的签名里没有长度约束，
-  // 商家可以为 1KB 的申请签发凭证，再直传一个远超上限的文件。
-  it('confirm 时复核大小：直传超大文件后确认被拒', async () => {
+  // 审计 L1 修复后，presigned URL 的签名已经约束了 content-length，
+  // 经签名 URL 造不出「申报 1KB、实传 6MB」的对象（见上面的存储层拒绝用例）。
+  // 但 confirm 的第二道大小闸仍必须成立：历史遗留对象、或签名机制本身失效时，
+  // 超限文件不能入库。这里用后端凭据直接把超限对象写进 bucket 来构造该场景。
+  it('confirm 时复核大小：bucket 里已有的超大对象确认被拒', async () => {
     const merchant = await createMerchant(app, prisma);
 
-    // 按上限（5MB）申报，实际会传得更多
+    // 按 1KB 签发，但用后端凭据把 6MB 的对象直接写进 bucket（绕过签名）
     //
     // ⚠️ **用 `uploadBody()` 收敛类型**：supertest 的 `response.body` 是 `any`，
     // 直接访问 `.uploadUrl` / `.media.id` 会触发
@@ -703,14 +802,8 @@ describe('媒体上传 (e2e)', () => {
         .expect(201),
     );
 
-    // 直传一个超过 MEDIA_MAX_SIZE 的对象
     const tooBig = jpegBytes(6 * 1024 * 1024, 7);
-    const put = await fetch(signed.uploadUrl, {
-      method: 'PUT',
-      headers: { 'content-type': 'image/jpeg' },
-      body: tooBig,
-    });
-    expect(put.ok).toBe(true);
+    await putObjectDirect(signed.media.key, tooBig, 'image/jpeg');
 
     // 确认时必须被拦下——不能因为「签发时申报的是 1KB」就放行
     const response = await http(app)
@@ -721,5 +814,14 @@ describe('媒体上传 (e2e)', () => {
     expect(String((response.body as { message?: string }).message)).toContain(
       '上限',
     );
+
+    // 超限对象不能继续占着 bucket，记录也标成孤儿（不硬删）
+    expect(await minio.statObject(signed.media.key)).toBeNull();
+    await asTenant(merchant.tenantId, async () => {
+      const stored = await prisma.media.findFirst({
+        where: { id: signed.media.id },
+      });
+      expect(stored?.status).toBe('ORPHANED');
+    });
   });
 });

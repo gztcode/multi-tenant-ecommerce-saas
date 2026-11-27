@@ -159,7 +159,10 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
       } as never,
     });
 
-    const uploadUrl = await this.minio.createUploadUrl(key, dto.mime);
+    // ⛔ 把申报字节数交给签名（审计 L1）：presigned PUT 只有签名里包含
+    //    content-length，存储层才会拒绝「申报 1KB、实传 5GB」的请求。
+    //    这里的 dto.size 不是「提示」，而是这张凭证允许写入的唯一字节数。
+    const uploadUrl = await this.minio.createUploadUrl(key, dto.mime, dto.size);
     // 浏览器真正用 readUrl：bucket 是私有的，media.url 那个固定地址直接
     // GET 会 403。Chainguard 版 MinIO 不支持 PutBucketPolicy（实测
     // NotImplemented），配不了匿名读，所以走限时签名 URL。
@@ -188,9 +191,10 @@ export class MediaService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('文件尚未上传或已被删除');
     }
 
-    // ⛔ 复核大小上限。presigned PUT 的签名里**没有**长度约束——商家可以为
-    // 1KB 的申请签发凭证，然后直传一个 500MB 的文件。只在签发时校验大小，
-    // 等于把限制交给客户端自觉。
+    // 复核大小上限。签发时已经把申报字节数写进签名（存储层会拒绝不一致的
+    // PUT，见 MinioService.createUploadUrl），这里是第二道闸：防的是签名机制
+    // 本身失效（SDK 升级把 content-length 从 SignedHeaders 里丢掉）以及
+    // 历史遗留对象——真超限就删掉，别让它继续占着 bucket。
     const maxSize = Number(process.env.MEDIA_MAX_SIZE ?? 5242880);
     if (actualSize > maxSize) {
       // 顺手把对象删掉，别让它继续占着 bucket
