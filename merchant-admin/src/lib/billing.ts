@@ -114,6 +114,12 @@ export interface Invoice {
   paidAt: string | null;
   /** ISO 8601 */
   voidedAt: string | null;
+  /** 作废人 userId（后端只存 id；展示用下面的 voidedByName） */
+  voidedBy?: string | null;
+  /** 作废人显示名（后端查询时解析；账号查不到时回落到 id） */
+  voidedByName?: string | null;
+  /** 作废原因（可选） */
+  voidReason?: string | null;
   /** ISO 8601 */
   createdAt: string;
   /** ISO 8601 */

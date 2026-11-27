@@ -46,6 +46,7 @@ import {
 } from '@/app/api/billing/subscription/route';
 import { GET as invoicesGet } from '@/app/api/billing/invoices/route';
 import { POST as payInvoicePost } from '@/app/api/billing/invoices/[number]/pay/route';
+import { POST as voidInvoicePost } from '@/app/api/billing/invoices/[number]/void/route';
 import {
   GET as paymentMethodsGet,
   POST as createPaymentMethodPost,
@@ -630,6 +631,98 @@ describe('计费中转：未登录不碰后端', () => {
     const response = await setDefaultPaymentMethod(
       postRequest('http://localhost/api/billing/payment-methods/pm-1/default', {}),
       { params: methodParams },
+    );
+
+    expect(response.status).toBe(401);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('计费中转：作废账单的请求体白名单', () => {
+  it('打到 /billing/invoices/:number/void，且用 POST', async () => {
+    await voidInvoicePost(
+      postRequest('http://localhost/api/billing/invoices/INV-2026-001/void', {}),
+      { params: invoiceParams },
+    );
+
+    const [path, options] = apiFetchMock.mock.calls[0];
+    expect(path).toBe('/billing/invoices/INV-2026-001/void');
+    expect(options?.method).toBe('POST');
+    expect(options?.token).toBe(TEST_SESSION.accessToken);
+  });
+
+  it('只发 reason，未知字段一律丢弃', async () => {
+    const response = await voidInvoicePost(
+      postRequest('http://localhost/api/billing/invoices/INV-2026-001/void', {
+        // ⚠️ **作废人只能来自登录态**：客户端传的 voidedBy 被丢弃
+        voidedBy: 'someone-else',
+        voidedAt: '2020-01-01T00:00:00.000Z',
+        status: 'PAID',
+        tenantId: 'other-tenant',
+        number: 'OTHER-INVOICE',
+        reason: '  换套餐  ',
+      }),
+      { params: invoiceParams },
+    );
+
+    expect(response.status).toBe(200);
+    const [, options] = apiFetchMock.mock.calls[0];
+    const body = options?.body as Record<string, unknown>;
+    expect(body).toEqual({ reason: '换套餐' });
+  });
+
+  it('不传 reason 时 body 是空对象（作废原因可选）', async () => {
+    await voidInvoicePost(
+      postRequest('http://localhost/api/billing/invoices/INV-2026-001/void', {}),
+      { params: invoiceParams },
+    );
+
+    const [, options] = apiFetchMock.mock.calls[0];
+    expect(options?.body).toEqual({});
+  });
+
+  it('reason 只传空白时也发空对象', async () => {
+    await voidInvoicePost(
+      postRequest('http://localhost/api/billing/invoices/INV-2026-001/void', {
+        reason: '   ',
+      }),
+      { params: invoiceParams },
+    );
+
+    const [, options] = apiFetchMock.mock.calls[0];
+    expect(options?.body).toEqual({});
+  });
+
+  it('reason 超过 200 字 → 400，且不调后端', async () => {
+    const response = await voidInvoicePost(
+      postRequest('http://localhost/api/billing/invoices/INV-2026-001/void', {
+        reason: '长'.repeat(201),
+      }),
+      { params: invoiceParams },
+    );
+
+    expect(response.status).toBe(400);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('reason 不是字符串 → 400，且不调后端', async () => {
+    const response = await voidInvoicePost(
+      postRequest('http://localhost/api/billing/invoices/INV-2026-001/void', {
+        reason: 123,
+      }),
+      { params: invoiceParams },
+    );
+
+    expect(response.status).toBe(400);
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('未登录 → 401 且不调后端', async () => {
+    authMock.mockResolvedValue(null as never);
+
+    const response = await voidInvoicePost(
+      postRequest('http://localhost/api/billing/invoices/INV-2026-001/void', {}),
+      { params: invoiceParams },
     );
 
     expect(response.status).toBe(401);
