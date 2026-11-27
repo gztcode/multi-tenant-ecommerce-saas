@@ -1452,6 +1452,154 @@ describe('账单、续费与订阅付款 (e2e)', () => {
     }
   });
 
+  // ============================================================
+  // 付清旧周期账单：账单照收，但不许把订阅周期回滚
+  //
+  // 业主裁定（2026-11-27）：「换套餐即刻重开新周期，剩余天数作废」——
+  // 钱照收，但新周期不该被一张旧账单抢走。
+  // ============================================================
+
+  it('付清旧周期账单：账单转 PAID，但订阅周期不回滚、订阅仍是 ACTIVE', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const oldPlanId = await createPlan({ price: 9900, periodDays: 30 });
+    const newPlanId = await createPlan({ price: 29900, periodDays: 365 });
+
+    const original = await subscribe(merchant.token, oldPlanId);
+    expect(original.status).toBe('ACTIVE');
+
+    // ⚠️ **造一张「旧周期」的未付账单**：模拟历史遗留的扣款重试 /
+    //    后台补偿 —— 它的区间整段在过去，早已被后续周期覆盖。
+    const oldPeriodStart = new Date(Date.now() - 60 * DAY_MS);
+    const oldPeriodEnd = new Date(Date.now() - 30 * DAY_MS);
+    const oldInvoice = await asTenant(merchant.tenantId, () =>
+      invoices.generateInvoice({
+        subscriptionId: original.id,
+        tenantId: merchant.tenantId,
+        planId: oldPlanId,
+        periodStart: oldPeriodStart,
+        periodEnd: oldPeriodEnd,
+        dueAt: oldPeriodStart,
+      }),
+    );
+    expect(oldInvoice).not.toBeNull();
+
+    // ⚠️ **周期中途换套餐**：立即切到新套餐并重开一个完整周期
+    await http(app)
+      .patch('/api/v1/billing/subscription')
+      .set('authorization', `Bearer ${merchant.token}`)
+      .send({ planId: newPlanId })
+      .expect(200);
+
+    const afterChange = await readSubscription(merchant.tenantId);
+    expect(afterChange!.planId).toBe(newPlanId);
+    const changedStart = afterChange!.currentPeriodStart.getTime();
+    const changedEnd = afterChange!.currentPeriodEnd.getTime();
+
+    // ⚠️ **支付那张旧周期账单**
+    const paid = await asTenant(merchant.tenantId, () =>
+      invoices.markInvoicePaid(oldInvoice!.id),
+    );
+    expect(paid).toBe(true);
+
+    // 账单照收：PAID + paidAt
+    const invoiceRow = await readInvoice(merchant.tenantId, oldInvoice!.number);
+    expect(invoiceRow!.status).toBe('PAID');
+    expect(invoiceRow!.paidAt).not.toBeNull();
+
+    // ⚠️ **关键断言**：订阅周期**没有**被旧账单的区间覆盖
+    const after = await readSubscription(merchant.tenantId);
+    expect(after).not.toBeNull();
+    expect(after!.planId).toBe(newPlanId);
+    expect(after!.pendingPlanId).toBeNull();
+    expect(after!.currentPeriodStart.getTime()).toBe(changedStart);
+    expect(after!.currentPeriodEnd.getTime()).toBe(changedEnd);
+    expect(after!.status).toBe('ACTIVE');
+
+    // ⚠️ **再触发一次到期判定**：旧实现下周期被打回过去 →
+    //    这里会被 `expireIfNeeded` 打成 EXPIRED，商家刚付的钱白花。
+    await renewal.scan();
+    const afterScan = await readSubscription(merchant.tenantId);
+    expect(afterScan!.status).toBe('ACTIVE');
+    expect(afterScan!.currentPeriodEnd.getTime()).toBe(changedEnd);
+  });
+
+  it('正常续费付清：周期按账单区间延长（回归保护）', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const planId = await createPlan({ price: 9900, periodDays: 30 });
+
+    const subscription = await subscribe(merchant.token, planId);
+
+    // 下一期账单：从当前周期结束日开始，长度 30 天
+    const periodStart = new Date(subscription.currentPeriodEnd);
+    const periodEnd = new Date(periodStart.getTime() + 30 * DAY_MS);
+    const invoice = await asTenant(merchant.tenantId, () =>
+      invoices.generateInvoice({
+        subscriptionId: subscription.id,
+        tenantId: merchant.tenantId,
+        planId,
+        periodStart,
+        periodEnd,
+        dueAt: periodStart,
+      }),
+    );
+    expect(invoice).not.toBeNull();
+
+    const paid = await asTenant(merchant.tenantId, () =>
+      invoices.markInvoicePaid(invoice!.id),
+    );
+    expect(paid).toBe(true);
+
+    // ⚠️ 正常续费的账单区间恒超出当前周期 → 必须照旧延长
+    const after = await readSubscription(merchant.tenantId);
+    expect(after!.status).toBe('ACTIVE');
+    expect(after!.planId).toBe(planId);
+    expect(after!.currentPeriodStart.getTime()).toBe(periodStart.getTime());
+    expect(after!.currentPeriodEnd.getTime()).toBe(periodEnd.getTime());
+    expect(after!.trialEndsAt).toBeNull();
+  });
+
+  it('同一账单重复付清：第二次返回 false，周期不重复延长', async () => {
+    const merchant = await createMerchant(app, prisma);
+    const planId = await createPlan({ price: 9900, periodDays: 30 });
+
+    const subscription = await subscribe(merchant.token, planId);
+    const periodStart = new Date(subscription.currentPeriodEnd);
+    const periodEnd = new Date(periodStart.getTime() + 30 * DAY_MS);
+    const invoice = await asTenant(merchant.tenantId, () =>
+      invoices.generateInvoice({
+        subscriptionId: subscription.id,
+        tenantId: merchant.tenantId,
+        planId,
+        periodStart,
+        periodEnd,
+        dueAt: periodStart,
+      }),
+    );
+    expect(invoice).not.toBeNull();
+
+    const first = await asTenant(merchant.tenantId, () =>
+      invoices.markInvoicePaid(invoice!.id),
+    );
+    expect(first).toBe(true);
+
+    const afterFirst = await readSubscription(merchant.tenantId);
+    expect(afterFirst!.currentPeriodEnd.getTime()).toBe(periodEnd.getTime());
+
+    // ⚠️ **幂等**：账单已是 PAID，条件更新不命中 → 返回 false、周期不动
+    const second = await asTenant(merchant.tenantId, () =>
+      invoices.markInvoicePaid(invoice!.id),
+    );
+    expect(second).toBe(false);
+
+    const afterSecond = await readSubscription(merchant.tenantId);
+    expect(afterSecond!.currentPeriodStart.getTime()).toBe(
+      afterFirst!.currentPeriodStart.getTime(),
+    );
+    expect(afterSecond!.currentPeriodEnd.getTime()).toBe(
+      afterFirst!.currentPeriodEnd.getTime(),
+    );
+  });
+
   it('单个租户续费抛异常：其余租户照常处理（不中断整批）', async () => {
     const failing = await createMerchant(app, prisma);
     const healthy = await createMerchant(app, prisma);
