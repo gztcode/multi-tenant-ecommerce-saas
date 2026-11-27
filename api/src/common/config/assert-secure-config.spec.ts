@@ -72,6 +72,7 @@ describe('assertSecureConfig', () => {
   const KEYS = [
     'NODE_ENV',
     'JWT_SECRET',
+    'AUTH_SECRET',
     'DATABASE_URL',
     'REDIS_URL',
     'MINIO_ROOT_PASSWORD',
@@ -98,6 +99,9 @@ describe('assertSecureConfig', () => {
     }
     process.env.NODE_ENV = 'production';
     process.env.JWT_SECRET = REAL_SECRET;
+    // AUTH_SECRET 是 NextAuth 的会话签名密钥（api 进程不读它），
+    // 但生产部署共用同一份 infra/.env，启动守卫在这里提前拦下漏配/过短。
+    process.env.AUTH_SECRET = REAL_SECRET;
     // 生产基线的合法凭据：每个用例只覆盖自己关心的那一项。
     process.env.DATABASE_URL =
       'postgresql://ecommerce:real-db-password@postgres:5432/ecommerce?schema=public';
@@ -114,6 +118,7 @@ describe('assertSecureConfig', () => {
   });
 
   afterEach(() => {
+    jest.restoreAllMocks();
     for (const key of KEYS) {
       const value = saved[key];
       if (value === undefined) {
@@ -239,6 +244,34 @@ describe('assertSecureConfig', () => {
     delete process.env.MINIO_SECRET_KEY;
 
     expect(() => assertSecureConfig()).toThrow(/MinIO/);
+  });
+
+  it('生产环境 AUTH_SECRET 为空 → 拒绝启动', () => {
+    delete process.env.AUTH_SECRET;
+
+    expect(() => assertSecureConfig()).toThrow(/AUTH_SECRET/);
+  });
+
+  it('生产环境 AUTH_SECRET 只有 31 字符 → 拒绝启动（边界）', () => {
+    process.env.AUTH_SECRET = 'a'.repeat(31);
+
+    expect(() => assertSecureConfig()).toThrow(/AUTH_SECRET.*32/);
+  });
+
+  it('生产环境 AUTH_SECRET 恰好 32 字符 → 放行（边界）', () => {
+    process.env.AUTH_SECRET = 'a'.repeat(32);
+
+    expect(() => assertSecureConfig()).not.toThrow();
+  });
+
+  it('非生产环境短 AUTH_SECRET → 不抛错，只告警一次（本地开发）', () => {
+    process.env.NODE_ENV = 'development';
+    process.env.AUTH_SECRET = 'short';
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(() => assertSecureConfig()).not.toThrow();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/AUTH_SECRET/);
   });
 
   it('非生产环境使用全部默认凭据 → 放行（本地开发）', () => {

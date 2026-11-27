@@ -1510,11 +1510,15 @@ describe('支付与 webhook (e2e)', () => {
     const previousNodeEnv = process.env.NODE_ENV;
     const previousEnabled = process.env.FAKE_PAYMENT_ENABLED;
     const previousSecret = process.env.JWT_SECRET;
+    const previousAuthSecret = process.env.AUTH_SECRET;
     process.env.NODE_ENV = 'production';
     process.env.FAKE_PAYMENT_ENABLED = 'true';
     // ⚠️ 换成**非占位符**的密钥：否则会先撞上「JWT_SECRET 是占位符」那条断言，
     // 测不到假网关这一条。
     process.env.JWT_SECRET = 'a-real-secret-for-this-assertion-only-32ch';
+    // ⚠️ AUTH_SECRET 同理：生产启动守卫要求它存在且 ≥ 32 字符，
+    // 不补的话会先撞上 AUTH_SECRET 那条，测不到假网关断言。
+    process.env.AUTH_SECRET = 'a-real-secret-for-this-assertion-only-32ch';
 
     try {
       expect(() => assertSecureConfig()).toThrow(/FAKE_PAYMENT_ENABLED/);
@@ -1529,6 +1533,11 @@ describe('支付与 webhook (e2e)', () => {
         delete process.env.JWT_SECRET;
       } else {
         process.env.JWT_SECRET = previousSecret;
+      }
+      if (previousAuthSecret === undefined) {
+        delete process.env.AUTH_SECRET;
+      } else {
+        process.env.AUTH_SECRET = previousAuthSecret;
       }
     }
   });

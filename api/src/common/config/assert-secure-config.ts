@@ -56,13 +56,14 @@ const ENABLED_ENV_KEY: Record<ChannelKind, string> = {
  * 不会留下半启动的进程。
  */
 export function assertSecureConfig(): void {
-  // ⚠️ **顺序有意义**：沿用「JWT → 假网关开关 → 渠道配置」的既有顺序。
+  // ⚠️ **顺序有意义**：沿用「JWT → AUTH_SECRET → 假网关开关 → 渠道配置」的既有顺序。
   //
-  //    两个既有断言在前，是因为它们的报错文案已经被验收用例与运维手册引用
+  //    既有断言在前，是因为它们的报错文案已经被验收用例与运维手册引用
   //    （例如「生产配置下假支付网关不可用」断言文案必须含 `FAKE_PAYMENT_ENABLED`）。
   //    渠道配置是阶段 6a 新增的最后一道，放在最后不会改变任何一个既有报错的
   //    优先级 —— 三种都是**启动期硬失败**，先后顺序只影响「先看到哪一条」。
   assertJwtSecret();
+  assertAuthSecretConfig();
   assertFakeToggles();
   assertProductionCredentials();
   assertChannelConfig();
@@ -89,7 +90,8 @@ const COMPOSE_DEFAULT_REDIS_PASSWORD = 'ecommerceRedis163';
  * 生产环境的凭据守卫（阶段 9）。
  *
  * ⚠️ 只检查**本进程能看到的环境变量**：
- *    `AUTH_SECRET` 由 Next 进程读取，不在这里检查（见共享包的 `assertAuthSecret`）。
+ *    `AUTH_SECRET` 由 Next 进程读取（三端共用同一份 `infra/.env`），
+ *    这里只做长度与空值守卫，占位值判定仍由共享包的 `assertAuthSecret` 负责。
  * ⚠️ 非生产环境一律放行：本机 compose 与开发脚本本来就复用默认值。
  * ⚠️ URL 解析失败按「没有密码」处理（fail-closed），不吞异常后放行。
  */
@@ -156,6 +158,47 @@ function assertJwtSecret(): void {
   if (process.env.NODE_ENV === 'production' && isPlaceholderSecret(secret)) {
     throw new Error(
       '生产环境禁止使用示例/默认的 JWT_SECRET 占位符（含 docker-compose 内置默认值），请换成真实密钥。',
+    );
+  }
+}
+
+/** 生产环境 `AUTH_SECRET`（NextAuth 会话签名密钥）的最小长度 */
+const AUTH_SECRET_MIN_LENGTH = 32;
+
+/**
+ * `AUTH_SECRET` 的启动守卫（生产环境最小长度 32 字符）。
+ *
+ * `AUTH_SECRET` 由三端 Next 进程读取、用于签发会话 cookie；api 进程本身不读它，
+ * 但生产部署共用同一份 `infra/.env` —— 在这里提前拦下「漏配 / 过短」，
+ * 比等到某个前端容器起不来更早、更容易定位。
+ *
+ * ⚠️ 占位值判定**不在这里**：三端由共享包 `assertAuthSecret` 负责，
+ *    那边同时认 compose 默认值与 `.env.example` 占位值。
+ */
+function assertAuthSecretConfig(): void {
+  const secret = process.env.AUTH_SECRET ?? '';
+
+  if (process.env.NODE_ENV !== 'production') {
+    // 非生产允许短 secret 方便本地开发；同一份 infra/.env 会给三端复用，
+    // 短值只提醒一次，不阻断启动。
+    if (secret.length > 0 && secret.length < AUTH_SECRET_MIN_LENGTH) {
+      console.warn(
+        `AUTH_SECRET 只有 ${secret.length} 个字符，生产环境要求至少 ${AUTH_SECRET_MIN_LENGTH} 个（本机开发可忽略）。`,
+      );
+    }
+    return;
+  }
+
+  if (secret.length === 0) {
+    throw new Error(
+      '生产环境必须设置 AUTH_SECRET（NextAuth 会话签名密钥，可用 `openssl rand -base64 48` 生成）。',
+    );
+  }
+
+  if (secret.length < AUTH_SECRET_MIN_LENGTH) {
+    throw new Error(
+      `AUTH_SECRET 至少需要 ${AUTH_SECRET_MIN_LENGTH} 个字符，当前只有 ${secret.length} 个。` +
+        '请设置一个足够随机的密钥（可用 `openssl rand -base64 48` 生成）。',
     );
   }
 }

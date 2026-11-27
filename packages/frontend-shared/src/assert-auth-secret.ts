@@ -19,7 +19,10 @@ export const KNOWN_AUTH_SECRET_PLACEHOLDERS: ReadonlySet<string> = new Set([
   'change-me-auth-secret-at-least-32-chars',
 ]);
 
-/** 生产环境禁止空值或已知默认值；非生产环境放行。 */
+/** 生产环境 `AUTH_SECRET` 的最小长度（字符数）。 */
+export const MIN_AUTH_SECRET_LENGTH = 32;
+
+/** 生产环境禁止空值、过短值或已知默认值；非生产环境放行。 */
 export function assertAuthSecret(secret: string | undefined): void {
   // ⚠️ `next build` 会设置 NEXT_PHASE=phase-production-build。
   //    构建期没有运行时密钥是正常的（密钥由容器运行时注入），
@@ -35,6 +38,13 @@ export function assertAuthSecret(secret: string | undefined): void {
   if (!secret) {
     throw new Error(
       '生产环境必须设置 AUTH_SECRET（可用 `openssl rand -base64 48` 生成）。',
+    );
+  }
+
+  if (secret.length < MIN_AUTH_SECRET_LENGTH) {
+    throw new Error(
+      `生产环境 AUTH_SECRET 至少需要 ${MIN_AUTH_SECRET_LENGTH} 个字符，当前只有 ${secret.length} 个。` +
+        '请设置一个足够随机的密钥（可用 `openssl rand -base64 48` 生成）。',
     );
   }
 

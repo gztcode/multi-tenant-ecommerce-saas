@@ -98,12 +98,22 @@ describe('占位值名单与部署文件保持一致', () => {
   });
 });
 
-describe('已知缺口', () => {
-  it.todo(
-    '生产环境是否应拒绝「过短」的 AUTH_SECRET？目前只拦空值与两个已知占位值，' +
-      "`AUTH_SECRET=x` 能通过。阶段 9 设计文档（docs/requirements/archive/specs/" +
-      '2026-11-04-plan-09-tech-debt-cleanup-design.md）只要求拦默认值/占位值，' +
-      'deployment.md 的「至少 32 字符」只针对 JWT_SECRET 与 PAYOUT_ACCOUNT_ENCRYPTION_KEY。' +
-      '是否给 AUTH_SECRET 也加长度下限，需要单独决定后再补测试。',
-  );
+describe('生产环境密钥长度下限（32 字符）', () => {
+  it('31 字符 → 抛错（边界）', () => {
+    vi.stubEnv('NODE_ENV', 'production');
+
+    expect(() => assertAuthSecret('a'.repeat(31))).toThrow(/至少需要 32 个字符/);
+  });
+
+  it('32 字符 → 放行（边界）', () => {
+    vi.stubEnv('NODE_ENV', 'production');
+
+    expect(() => assertAuthSecret('a'.repeat(32))).not.toThrow();
+  });
+
+  it('非生产环境短 secret 放行（本地开发）', () => {
+    vi.stubEnv('NODE_ENV', 'development');
+
+    expect(() => assertAuthSecret('short')).not.toThrow();
+  });
 });
