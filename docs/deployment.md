@@ -434,7 +434,8 @@ cd infra && docker compose up -d
 > 所以上面这条命令**原样跑不起来**。启动校验会拒绝 compose 内置的默认凭据：默认/空的 PostgreSQL、Redis、MinIO 密码，
 > 以及示例/默认的 `JWT_SECRET` / `AUTH_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY` 都会让进程启动即失败。
 > 要真跑通，必须通过环境变量提供真实的 `POSTGRES_PASSWORD` / `REDIS_PASSWORD` / `MINIO_ROOT_PASSWORD` 凭据，
-> 以及真实的 `JWT_SECRET` / `AUTH_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY`（其中 `JWT_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY` 至少 32 字符，可用 `openssl rand -base64 48` 生成）。
+> 以及真实的 `JWT_SECRET` / `AUTH_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY`（三者都至少 32 字符，可用 `openssl rand -base64 48` 生成）。
+> `AUTH_SECRET` 短于 32 字符时，api 与三端前端都会在启动阶段直接失败（拒绝带着弱密钥跑起来）。
 >
 > 本机联调请走[开发指南](development.md)的「本地开发」路径（`cd api && npm run start:dev`，读 `api/.env`，`NODE_ENV` 不是 production，不触发这些拒绝）。
 > 也**不要**把 compose 的 `NODE_ENV` 改成 development 绕过：那会让非生产默认的假支付（`fake`）/ 假出款（`fake-payout`）渠道生效，
