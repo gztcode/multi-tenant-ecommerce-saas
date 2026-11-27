@@ -124,6 +124,20 @@ export class RenewalService implements OnModuleInit {
     const now = await this.prisma.databaseNow();
     const dayMs = 24 * 3600 * 1000;
 
+    // ⚠️ **非法周期（0 / 负数）不出账**：接口层（`CreatePlanDto` /
+    // `UpdatePlanDto`）有 `@Min(1)`，但库是共享的（直连改库、历史脏数据、
+    // 种子脚本都能写进这种套餐）。不拦的话会算出一个
+    // `periodEnd <= periodStart` 的周期：商家付了钱、订阅期原地不动甚至倒流，
+    // 下一轮扫描再把订阅判成 EXPIRED —— 钱收了、服务没开。
+    // 这里**不出账也不动周期**，只把订阅交给正常的过期判定。
+    if (plan.periodDays <= 0) {
+      this.logger.error(
+        `订阅 ${subscription.id} 的套餐 ${plan.id} periodDays 非法（${plan.periodDays}），跳过本期出账`,
+      );
+      await this.expireIfNeeded(subscriptionId, now);
+      return;
+    }
+
     // ⚠️ **下一个周期的边界**：从当前周期结束日开始
     const periodStart = subscription.currentPeriodEnd;
     const periodEnd = new Date(periodStart.getTime() + plan.periodDays * dayMs);
