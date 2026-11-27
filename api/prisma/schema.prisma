@@ -1046,7 +1046,12 @@ model Invoice {
   /** 应付截止（一般是周期结束日） */
   dueAt          DateTime
   paidAt         DateTime?
+  /** 作废时刻（作废是**保留记录**的状态流转，行不删） */
   voidedAt       DateTime?
+  /** 作废人（存 userId，展示名由账单列表按 id 解析；查不到就回落到 id） */
+  voidedBy       String?
+  /** 作废原因（可选，商家自己填） */
+  voidReason     String?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 

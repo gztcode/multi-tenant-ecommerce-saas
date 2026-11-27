@@ -1,12 +1,27 @@
-import { Body, Controller, Get, Patch, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { UserRole } from '@prisma/client';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
+import {
+  CurrentUser,
+  type CurrentUserPayload,
+} from '../../common/decorators/current-user.decorator';
 import { PlanService } from './plan.service';
 import { SubscriptionService } from './subscription.service';
 import { InvoiceService } from './invoice.service';
 import { SubscribeDto } from './dto/subscribe.dto';
+import { InvoiceListQueryDto } from './dto/invoice-list-query.dto';
+import { VoidInvoiceDto } from './dto/void-invoice.dto';
 
 /**
  * 商家侧的计费接口。
@@ -37,9 +52,36 @@ export class BillingController {
   }
 
   @Get('invoices')
-  @ApiOperation({ summary: '本店的账单列表' })
-  async listInvoices() {
-    return this.invoices.list(this.subscriptions.currentTenantId());
+  @ApiOperation({ summary: '本店的账单列表（可按状态筛选）' })
+  async listInvoices(@Query() query: InvoiceListQueryDto) {
+    return this.invoices.list(
+      this.subscriptions.currentTenantId(),
+      query.status,
+    );
+  }
+
+  /**
+   * 作废账单（**保留记录**：状态置 `VOID`，不删行）。
+   *
+   * ⚠️ **路径用账单号而不是 id**：与同资源下的支付路由
+   * （`POST billing/invoices/:number/pay`，在 payment 模块）保持同一标识；
+   * 账单号本来就是对外凭证，商家页面上看到的就是它。
+   *
+   * ⚠️ **作废人取自登录态**，客户端只能传原因。
+   */
+  @Post('invoices/:number/void')
+  @ApiOperation({ summary: '作废账单（保留记录）' })
+  voidInvoice(
+    @Param('number') number: string,
+    @Body() dto: VoidInvoiceDto,
+    @CurrentUser() user: CurrentUserPayload,
+  ) {
+    return this.invoices.voidInvoice({
+      tenantId: this.subscriptions.currentTenantId(),
+      number,
+      voidedBy: user.userId,
+      reason: dto.reason,
+    });
   }
 
   @Post('subscription')

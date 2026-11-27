@@ -213,6 +213,36 @@ export function SubscriptionPanel({
     }
   }
 
+  /**
+   * 作废账单（**保留记录**：后端把状态置 `VOID`，不删行）。
+   *
+   * ⚠️ **必须二次确认**：作废不可撤销，而且本计费周期就不会再自动续费了。
+   * ⚠️ **作废人由后端从登录态取**，这里只发空对象。
+   */
+  async function voidInvoice(invoice: Invoice) {
+    const confirmed = confirm(
+      `确定作废账单 ${invoice.number}（${formatPriceLabel(invoice.amount)}）？\n\n` +
+        '作废后账单会保留在列表里，但不能再支付，本计费周期也不会自动续费。此操作不可撤销。',
+    );
+    if (!confirmed) {
+      return;
+    }
+    await run(
+      `void:${invoice.number}`,
+      () =>
+        fetch(
+          `/api/billing/invoices/${encodeURIComponent(invoice.number)}/void`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          },
+        ),
+      '作废失败',
+      '账单已作废，本期不会再自动续费。',
+    );
+  }
+
   async function setDefaultMethod(id: string) {
     await run(
       `default:${id}`,
@@ -428,6 +458,9 @@ export function SubscriptionPanel({
           // ⚠️ **只有未结清的账单才给「去支付」**：
           // 已支付的再点一次会拿到一句没头没尾的失败。
           const payable = invoice.status === 'OPEN' || invoice.status === 'FAILED';
+          // ⚠️ **作废的准入与后端一致**：OPEN / FAILED 才显示作废按钮；
+          // 已支付的已经产生会计影响，前端不给入口（给了也只会拿到 409）。
+          const voidable = payable;
 
           return (
             <li
@@ -452,6 +485,20 @@ export function SubscriptionPanel({
                       ? ` · 已于 ${formatDate(invoice.paidAt)} 支付`
                       : ''}
                   </span>
+                  {/* ⚠️ **作废也要留痕**：谁、什么时候、为什么 ——
+                      只显示「已作废」等于让商家自己去猜。 */}
+                  {invoice.status === 'VOID' && (
+                    <span className="text-xs text-muted-foreground">
+                      已于 {formatDate(invoice.voidedAt)} 由{' '}
+                      {invoice.voidedByName ??
+                        invoice.voidedBy ??
+                        '未知操作人'}{' '}
+                      作废
+                      {invoice.voidReason
+                        ? ` · 原因：${invoice.voidReason}`
+                        : ''}
+                    </span>
+                  )}
                 </div>
                 <div className="flex flex-col items-end gap-2">
                   <span className="rounded-md border px-2 py-1 text-xs">
@@ -465,6 +512,16 @@ export function SubscriptionPanel({
                       className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-40"
                     >
                       去支付
+                    </button>
+                  )}
+                  {voidable && (
+                    <button
+                      type="button"
+                      disabled={busy === `void:${invoice.number}`}
+                      onClick={() => voidInvoice(invoice)}
+                      className="text-xs text-destructive underline disabled:opacity-40"
+                    >
+                      作废
                     </button>
                   )}
                 </div>

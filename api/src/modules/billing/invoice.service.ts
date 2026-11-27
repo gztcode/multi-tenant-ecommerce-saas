@@ -1,6 +1,11 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import {
   InvoiceStatus,
+  PaymentStatus,
   SubscriptionStatus,
   type Invoice,
 } from '@prisma/client';
@@ -8,6 +13,16 @@ import { TenantPrismaService } from '../../common/tenant/tenant-prisma.service';
 import { isUniqueViolation } from '../../common/errors/unique-constraint';
 import type { PrismaTransaction } from '../../common/prisma/prisma-transaction';
 import { transactionOptions } from '../../common/db/transaction-options';
+
+/**
+ * 对外的账单视图：账单行 + 作废人显示名。
+ *
+ * ⚠️ 库里只存 `voidedBy`（userId）；`voidedByName` 是**查询时解析**出来的，
+ * 不落库（账号改名后展示要跟着变）。没作废的账单该字段恒为 null。
+ */
+export interface InvoiceView extends Invoice {
+  voidedByName: string | null;
+}
 
 /**
  * 账单与订阅周期。
@@ -118,14 +133,144 @@ export class InvoiceService {
    *
    * ⚠️ **租户作用域的 `findMany`** —— 扩展自动附加 tenantId 条件，
    * 不需要自己写 `where: { tenantId }`（写了也一样，但容易漏）。
+   *
+   * ⚠️ **`status` 是可选的筛选条件**（沿用对账列表的做法）：
+   * 不传就维持原来的「全量最近 50 张」，传了才加条件 ——
+   * 前端不传时行为一个字节都不变。
    */
-  async list(tenantId: string): Promise<{ items: Invoice[]; total: number }> {
+  async list(
+    tenantId: string,
+    status?: InvoiceStatus,
+  ): Promise<{ items: InvoiceView[]; total: number }> {
     const items = await this.prisma.invoice.findMany({
-      where: { tenantId },
+      where: status ? { tenantId, status } : { tenantId },
       orderBy: { createdAt: 'desc' },
       take: 50,
     });
-    return { items, total: items.length };
+    return { items: await this.withOperatorNames(items), total: items.length };
+  }
+
+  /**
+   * 作废一张账单（**保留记录，不删行**）。
+   *
+   * 语义：`OPEN` / `FAILED` → `VOID`，写 `voidedAt` / `voidedBy` / `voidReason`。
+   *
+   * ⚠️ **允许作废的状态只有「还没产生会计影响」的两种**：
+   * - `OPEN`：还没付过钱；
+   * - `FAILED`：上一次支付尝试失败了，钱没到账。这也是商家最常想作废的一种
+   *   （换套餐 / 不再续费 / 测试数据），不允许就没法收拾。
+   *
+   * ⚠️ **`PAID` 一律禁止**：钱已经收了、订阅期已经延长，作废会让账实不符；
+   * 真实场景要退钱，那是退款流程，不是作废。
+   * 另外**再查一遍有没有 SUCCESS 支付单**：账单状态与支付单理论上同步，
+   * 但状态是第二层防御 —— 支付成功而账单没转 `PAID` 的异常数据不能被作废掉。
+   *
+   * ⚠️ **重复作废报 409，不静默成功**：商家连点两次要能看出第一次已经生效。
+   *
+   * ⚠️ **作废后本期不再续费**：自动续费的 `chargeAndSettle` 只放行
+   * `OPEN` / `FAILED`，`VOID` 账单会被跳过，到期后订阅自然 `EXPIRED`。
+   *
+   * 已知边界（PR 正文也写了）：作废时如果商家手上还开着支付页
+   * （已建 `PENDING` 支付单、尚未回调），渠道侧仍可能把这笔钱收走；
+   * 回调里 `markInvoicePaidInTx` 只认 `OPEN` / `FAILED`，所以**订阅不会延长**，
+   * 钱需要线下退款。不在作废里封死这条路径：`FAILED` 账单的支付单就是
+   * 长期 `PENDING` 的（复用重试），封死等于 `FAILED` 账单永远作废不了。
+   */
+  async voidInvoice(input: {
+    tenantId: string;
+    number: string;
+    voidedBy: string;
+    reason?: string;
+  }): Promise<InvoiceView> {
+    const invoice = await this.prisma.invoice.findFirst({
+      where: { tenantId: input.tenantId, number: input.number },
+    });
+    if (!invoice) {
+      throw new NotFoundException('账单不存在');
+    }
+    if (invoice.status === InvoiceStatus.VOID) {
+      throw new ConflictException('账单已作废，不能重复作废');
+    }
+    if (invoice.status === InvoiceStatus.PAID) {
+      throw new ConflictException('账单已支付，不能作废');
+    }
+    if (
+      invoice.status !== InvoiceStatus.OPEN &&
+      invoice.status !== InvoiceStatus.FAILED
+    ) {
+      throw new ConflictException('账单当前状态不允许作废');
+    }
+
+    const settled = await this.prisma.payment.findFirst({
+      where: { invoiceId: invoice.id, status: PaymentStatus.SUCCESS },
+      select: { id: true },
+    });
+    if (settled) {
+      throw new ConflictException('账单存在成功的支付记录，不能作废');
+    }
+
+    const now = await this.prisma.databaseNow();
+    const reason = input.reason?.trim() ? input.reason.trim() : null;
+    // ⚠️ **条件更新**（把可作废状态放进 where）：并发作废时只有一方命中，
+    // 另一方拿到 count = 0 —— 报冲突而不是覆盖前一次的作废人与时间。
+    const affected = await this.prisma.invoice.updateMany({
+      where: {
+        id: invoice.id,
+        status: { in: [InvoiceStatus.OPEN, InvoiceStatus.FAILED] },
+      },
+      data: {
+        status: InvoiceStatus.VOID,
+        voidedAt: now,
+        voidedBy: input.voidedBy,
+        voidReason: reason,
+      },
+    });
+    if (affected.count === 0) {
+      throw new ConflictException('账单状态已变化，请刷新后重试');
+    }
+
+    const updated = await this.prisma.invoice.findFirst({
+      where: { id: invoice.id },
+    });
+    if (!updated) {
+      // 刚更新过的行不该消失（作废不删行）；走到这里说明有别的进程在删数据。
+      throw new ConflictException('账单状态已变化，请刷新后重试');
+    }
+    const [view] = await this.withOperatorNames([updated]);
+    return view;
+  }
+
+  /**
+   * 给账单补上「作废人显示名」。
+   *
+   * ⚠️ **存的是 userId、解析成显示名是展示层的事**：与出款单的操作人
+   * （`payouts.approvedBy` → `operatorName`）同一套口径。
+   * 账号查不到（被删 / 跨租户）就回落到 id —— 宁可显示一串 id，
+   * 也不能把「谁作废的」显示成空白。
+   */
+  private async withOperatorNames(invoices: Invoice[]): Promise<InvoiceView[]> {
+    const voidedByIds = [
+      ...new Set(
+        invoices
+          .map((invoice) => invoice.voidedBy)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ];
+    if (voidedByIds.length === 0) {
+      return invoices.map((invoice) => ({ ...invoice, voidedByName: null }));
+    }
+
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: voidedByIds } },
+      select: { id: true, displayName: true },
+    });
+    const nameById = new Map(users.map((user) => [user.id, user.displayName]));
+    return invoices.map((invoice) => ({
+      ...invoice,
+      voidedByName: invoice.voidedBy
+        ? (nameById.get(invoice.voidedBy) ?? invoice.voidedBy)
+        : null,
+    }));
   }
 
   /**
