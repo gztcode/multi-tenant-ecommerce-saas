@@ -6,7 +6,8 @@
 
 > **范围声明**：这是单机部署（一台服务器 + compose）。多副本、HA、
 > secret manager、CDN 属于规模化改造，见
-> [待办与技术债](requirements/backlog.md)。
+> [待办与技术债](requirements/backlog.md)。其中 **secret manager / 托管数据库
+> 已于 2026-11-27 经业主裁决不是近期目标**（见 backlog 2.3 已裁决 #6）。
 
 ---
 
