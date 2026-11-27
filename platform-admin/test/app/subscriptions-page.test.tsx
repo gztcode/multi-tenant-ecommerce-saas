@@ -87,7 +87,7 @@ describe('订阅页：订阅列表', () => {
     expect(hasText(texts, '生效中')).toBe(true);
   });
 
-  it('有 pendingPlanName 时显示「下个周期：xxx」', async () => {
+  it('有 pendingPlanName（历史数据）时标注成「历史预约」，不再说「下个周期」', async () => {
     apiFetchAuthedMock.mockResolvedValue({
       items: [
         { ...SUBSCRIPTION, pendingPlanId: 'plan-2', pendingPlanName: '旗舰版' },
@@ -97,14 +97,18 @@ describe('订阅页：订阅列表', () => {
 
     const texts = await renderPage();
 
-    // ⚠️ **「即将涨价」这件事必须看得见**：不显示的话这张表读不出来。
-    expect(hasText(texts, '下个周期：旗舰版')).toBe(true);
+    // ⚠️ **历史数据仍会在续费时生效**（续费扫描按 `pendingPlanId ?? planId`），
+    // 所以不能直接隐藏；但也不能再用「下个周期」这种新规则下的错误措辞。
+    expect(
+      hasText(texts, '历史预约（旧规则，下次续费时生效）：旗舰版'),
+    ).toBe(true);
+    expect(hasText(texts, '下个周期')).toBe(false);
   });
 
-  it('没有 pendingPlanName 时不显示「下个周期」', async () => {
+  it('没有 pendingPlanName 时不显示历史预约', async () => {
     const texts = await renderPage();
 
-    expect(hasText(texts, '下个周期')).toBe(false);
+    expect(hasText(texts, '历史预约')).toBe(false);
   });
 
   it('抽佣费率显示成百分比', async () => {

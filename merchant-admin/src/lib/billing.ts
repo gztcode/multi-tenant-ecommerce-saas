@@ -74,7 +74,10 @@ export interface Subscription {
   id: string;
   tenantId: string;
   planId: string;
-  /** 待生效的套餐（下个周期生效）。null = 不换 */
+  /**
+   * 历史字段：后端自 2026-11-27 起换套餐立即生效（同一事务切 `planId`
+   * 并重置周期），不再写入此字段；保留只为兼容旧数据 / 老响应。
+   */
   pendingPlanId: string | null;
   status: SubscriptionStatus;
   /** ISO 8601 */

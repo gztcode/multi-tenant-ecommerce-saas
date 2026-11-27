@@ -148,21 +148,37 @@ export function SubscriptionPanel({
    * ⚠️ **有订阅时必须走 PATCH**：`POST` 在已有订阅时是幂等的
    * （护栏 M4），会原样返回旧订阅——套餐根本没换，界面却提示「已提交」。
    * 那比报错更糟。
+   *
+   * ⚠️ **换套餐立即生效**（后端 `changePlan()` 同一事务切 `planId`、
+   * 把周期起点重置为现在、周期终点 = 现在 + 新套餐 `periodDays`）。
+   * 当前周期的剩余天数作废、不折算、不退款——这是不可撤销的动作，
+   * 所以必须先二次确认，并且把这几件事逐条写清楚。
    */
-  async function subscribe(planId: string) {
+  async function subscribe(plan: Plan) {
     const changing = Boolean(subscription);
+    if (changing) {
+      const confirmed = confirm(
+        `确定切换到「${plan.name}」？\n\n` +
+          `切换立即生效：当前周期的剩余天数作废，不折算、不退款；` +
+          `新计费周期从今天起算，共 ${plan.periodDays} 天。`,
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+
     await run(
-      changing ? `plan:${planId}` : 'subscribe',
+      changing ? `plan:${plan.id}` : 'subscribe',
       () =>
         fetch('/api/billing/subscription', {
           method: changing ? 'PATCH' : 'POST',
           headers: { 'content-type': 'application/json' },
           // ⚠️ **只发 planId**：价格、额度、抽佣率都由后端从库里读。
-          body: JSON.stringify({ planId }),
+          body: JSON.stringify({ planId: plan.id }),
         }),
       changing ? '切换套餐失败' : '开通失败',
       changing
-        ? '已提交切换申请，新套餐将在本周期结束后生效；本期仍按原套餐计费。'
+        ? `已切换到「${plan.name}」，立即生效：新计费周期从今天起算，共 ${plan.periodDays} 天。`
         : '已提交开通申请，稍后刷新即可看到新的订阅状态。',
     );
   }
@@ -301,9 +317,6 @@ export function SubscriptionPanel({
     }
 
     const currentPlan = plans.find((plan) => plan.id === subscription.planId);
-    const pendingPlan = plans.find(
-      (plan) => plan.id === subscription.pendingPlanId,
-    );
 
     return (
       <div className="flex flex-col gap-3">
@@ -334,16 +347,6 @@ export function SubscriptionPanel({
             </span>
           )}
         </div>
-
-        {subscription.pendingPlanId && (
-          <div className="rounded-lg border border-primary/40 p-4 text-sm">
-            {pendingPlan
-              ? `已预约切换到「${pendingPlan.name}」，${formatDate(subscription.currentPeriodEnd)} 起生效。`
-              : /* ⚠️ **不要把裸 id 打给商家看**（形如「已预约切换套餐
-                   （plan_xxx）」）——那是内部标识，商家看不懂。 */
-                `已预约切换套餐（新套餐已下架，暂无法显示名称），${formatDate(subscription.currentPeriodEnd)} 起生效。`}
-          </div>
-        )}
       </div>
     );
   }
@@ -367,9 +370,10 @@ export function SubscriptionPanel({
             ([, enabled]) => Boolean(enabled),
           );
           const isCurrent = subscription?.planId === plan.id;
-          const isPending = subscription?.pendingPlanId === plan.id;
           // ⚠️ **按钮文案要区分**：没订阅是「开通」，有订阅是「切换到这个套餐」。
           // 两者走的是不同的端点（POST / PATCH），语义也不同。
+          // ⚠️ **换套餐立即生效**，没有「预约」这种中间态——后端不再写
+          // `pendingPlanId`，历史残留值也不影响界面。
           const actionLabel = subscription ? '切换到这个套餐' : '开通';
 
           return (
@@ -402,15 +406,11 @@ export function SubscriptionPanel({
                 </div>
                 <button
                   type="button"
-                  disabled={busy === `plan:${plan.id}` || isCurrent || isPending}
-                  onClick={() => subscribe(plan.id)}
+                  disabled={busy === `plan:${plan.id}` || isCurrent}
+                  onClick={() => subscribe(plan)}
                   className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-40"
                 >
-                  {isCurrent
-                    ? '使用中'
-                    : isPending
-                      ? '已预约切换'
-                      : actionLabel}
+                  {isCurrent ? '使用中' : actionLabel}
                 </button>
               </div>
 

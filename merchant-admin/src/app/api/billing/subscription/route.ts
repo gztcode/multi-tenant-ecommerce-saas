@@ -73,8 +73,9 @@ export async function POST(request: Request) {
  * ⚠️ **与 POST 用同一套白名单**（只收 `planId`）：换套餐同样是「客户端
  * 只能指定要哪个套餐」，价格与额度仍然从库里读。
  *
- * ⚠️ **语义是「下个周期生效」**：后端写的是 `pendingPlanId`，
- * 当前套餐不变。
+ * ⚠️ **语义是「立即生效」**：后端 `changePlan()` 在同一个事务里切
+ * `planId`、把周期起点重置为现在、周期终点 = 现在 + 新套餐 `periodDays`，
+ * 并清空 `pendingPlanId` —— 当前周期的剩余天数作废，不折算、不退款。
  */
 export async function PATCH(request: Request) {
   const session = await auth();
