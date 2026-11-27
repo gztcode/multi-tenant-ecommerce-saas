@@ -43,7 +43,7 @@
 | 11b | npm workspaces 化（根唯一 lockfile，5 个子包共用 `@ecom/frontend-shared`） | ✅ 已完成（PR #30，merge `6b1eddf`，[CI run](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593)）；有实现、无设计/计划/验收归档 |
 | 11c | 浏览器级 e2e（Playwright golden path） | ✅ 已完成（PR #31，merge `88583bb`，[CI run](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42452795536)）；有实现、无设计/计划/验收归档 |
 | 11d | 退货入库流程 | ✅ 已完成（PR #32，merge `9e287b3`，[CI run](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42488083335)）；有实现、无设计/计划/验收归档 |
-| 下一阶段 | **阶段 11 之后的剩余技术债**：2 项待办、6 项已放弃（留档）、7 项等业主裁决 —— 见 [`backlog.md`](backlog.md) 第二节 | ⏳ 未排期 |
+| 下一阶段 | **阶段 11 之后的剩余技术债**：0 项待办、6 项已放弃（留档）、6 项已裁决（留档）、1 项等业主裁决 —— 见 [`backlog.md`](backlog.md) 第二节 | ⏳ 未排期 |
 
 阶段 11 与 11b/11c/11d 交付内容的详细叙述见[阶段进度记录](archive/stage-history.md)；
 11b/11c/11d 没有各自的归档文档，实现证据见 [`archive/README.md`](archive/README.md) 的阶段索引。

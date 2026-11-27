@@ -15,7 +15,8 @@
 |------|------|
 | 待办 | 已确认要做、无外部阻塞 |
 | 已完成 | 有代码与合并记录（PR 号 + 合并 commit；有 CI run 的附链接） |
-| 已放弃 | 有明确理由不做，保留决策依据 |
+| 已放弃 | 工程侧判定不做（技术上不划算），保留决策依据 |
+| 已裁决 | 业主已拍板（做或不做），保留裁决日期与理由 |
 | 等业主裁决 | 产品 / 资源决策未定，工程侧不替业主拍板 |
 
 各阶段的整体完成情况以 [`README.md` 第三节状态表](README.md#三当前状态) 为准；
@@ -83,19 +84,27 @@
 | `Order.itemCount` 补快照回写 | 已放弃 | `api/src/modules/order/order.service.ts:1048` 注释明确「下单时写入的件数总和」 | 无需做 | 当前没有改单路径；只有将来支持改单才需要回写 |
 | 购物车金额改为实时精确值 | 已放弃 | `storefront/src/components/cart/cart-list.tsx:294` 已提示「金额为估算值，实际以提交订单时为准」 | 无需做 | 设计取舍：真实金额由后端在下单时按当时 SKU 价格计算 |
 
-### 2.3 等业主裁决
+### 2.3 已裁决（保留理由）
+
+> 以下六条由**业主于 2026-11-27 拍板**。保留裁决与理由，是为了避免以后有人重新提、
+> 或照着「待裁决」的旧写法再讨论一遍。**「不做」的项除非业主重新立项，否则不再进待办。**
+
+| # | 裁决问题 | 裁决（2026-11-27） | 现状 / 代码位置 | 说明 |
+|---|---------|------------------|----------------|------|
+| 1 | 换套餐的周期长度：按新套餐 `periodDays`，还是按剩余周期折算？ | **按新套餐 `periodDays` 重新起算**；**不折算剩余天数、不退款、不补差价** | `api/src/modules/payment/renewal.service.ts:129` 已如此（`periodEnd = periodStart + plan.periodDays`）；换套餐本身在下个周期生效（`api/src/modules/billing/subscription.service.ts:142-160` 的 `changePlan` 只写 `pendingPlanId`） | **现状即符合裁决口径，无需代码改动**，不存在「PR 在途」；当前周期不退款是既有设计 |
+| 2 | 对账人工闸边界：A 类之外是否允许批量确认？ | **维持现状，只允许 A 类** | `api/src/modules/payment/payout-reconciliation-resolver.service.ts` 顶部注释、`AGENTS.md` 的「CSV 来源的 A 类差异不自动改成 `PAID`」 | 动钱路径放宽风险大于收益；与 [2.2](#22-已放弃保留理由)「CSV 批量确认按严重级 / 状态扩展 `FILTER`」的放弃理由一致 |
+| 3 | CSV 来源 A 类的人工闸是否维持「机器不替人改钱」的现状？ | **维持现状** | CSV 来源的 A 类差异落 `PENDING` 人工项，批量确认按 `IDS` / `FILTER` 逐条复核 | 决策即完成，无代码改动 |
+| 4 | 是否做多店：`maxStores` 补实现还是从 backlog 删除？ | **不做，从 backlog 删除** | `api/src/modules/billing/quota.service.ts:141` 只读取不约束；`platform-admin/src/app/(dashboard)/plans/plan-form.tsx:380` 标注「当前架构每租户固定 1 家，此字段暂不生效」 | 真做多店要先做架构改造（`subdomain` 从 `Tenant` 迁到 `Store`、商品 / 订单按店归属），近期无收益；`maxStores` 字段保留但不再作为待办 |
+| 5 | 跨店会员是否有产品计划？ | **不做，从 backlog 删除** | 当前无会员模块 | 需求未成型；将来真要做会员体系时重新立项，不从本条复活 |
+| 6 | secret manager / 托管数据库是否近期目标？ | **不是近期目标**；阶段 8-1 据此**收口为已完成**（secret manager 除外） | 仍靠 `api/.env.example` 注入环境变量；TLS / pino / `statement_timeout` 已完成（见[三、已完成](#三已完成保留索引)） | 单机 compose 形态够用；等真做多副本 / 规模化时再评估 |
+
+### 2.4 等业主裁决
 
 以下问题属于产品或资源决策，**工程侧不替业主拍板**，原样列出：
 
 | # | 待裁决问题 | 现状 / 代码位置 | 决策后工作量 |
 |---|-----------|----------------|-------------|
-| 1 | **换套餐的周期长度**：按新套餐 `periodDays`，还是按剩余周期折算？ | `api/src/modules/payment/renewal.service.ts:129` 目前按新套餐 `periodDays` 计算 `periodEnd` | 0.5 天 |
-| 2 | **是否做多店**：决定 `maxStores` 是补实现还是从 backlog 删除。 | `api/src/modules/billing/quota.service.ts:141` 已读取；`platform-admin/src/app/(dashboard)/plans/plan-form.tsx:380` 标注「当前架构每租户固定 1 家，此字段暂不生效」 | 1 周+ |
-| 3 | **跨店会员**是否有产品计划；没有则从 backlog 移除。 | 当前无会员模块 | 1 周+ |
-| 4 | **对账人工闸边界**：A 类之外是否允许批量确认？当前设计明确不允许。 | `api/src/modules/payment/payout-reconciliation-resolver.service.ts` 顶部注释、`AGENTS.md` | 1–2 天 |
-| 5 | **真实渠道优先级**：等资质期间是否要接第二家 sandbox？ | 当前只有 `fake` / `fake-payout`（`api/src/common/channel/channel-config.ts:25-28`），`sandbox` 仅开发环境可见 | 数周 |
-| 6 | **secret manager / 托管数据库**是否近期目标；否则阶段 8-1 应改成「已完成（secret manager 除外）」并关闭。 | 仍靠 `api/.env.example` 注入环境变量；TLS / pino / `statement_timeout` 已完成（见「三、已完成」） | 0.5 天 |
-| 7 | **CSV 来源 A 类的人工闸**是否维持「机器不替人改钱」的现状（建议维持）。 | 设计就是人工闸：CSV 来源的 A 类差异落 `PENDING` 人工项，批量确认按 `IDS` / `FILTER` 逐条复核 | 决策即可 |
+| 1 | **真实渠道优先级**：等资质期间是否要接第二家 sandbox？ | 当前只有 `fake` / `fake-payout`（`api/src/common/channel/channel-config.ts:25-28`），`sandbox` 仅开发环境可见 | 数周 |
 
 ---
 
@@ -116,7 +125,7 @@
 | 对账差异详情支持筛选 | PR #68；`api/src/modules/payment/payout-reconciliation.service.ts` 的 `detail(id, filter)` + `dto/payout-reconciliation.dto.ts` 的 `DetailReconciliationDto`；`platform-admin/src/app/(dashboard)/reconciliations/[id]/page.tsx` 的筛选表单；单测 `payout-reconciliation.service.spec.ts` 的 `describe('筛选')`、e2e `payout-reconciliation-service.e2e-spec.ts` 的两条「详情筛选」用例 | 完全做完：`GET /platform/payout-reconciliations/:id` 支持可选 `severity` / `resolution` / `type`，只作用于差异列表与 `itemsTotal`；无参数时与改造前逐字一致（200 条上限与排序不变）；批量确认的 FILTER 固定条件（`PENDING + A 类 + payoutId`）与相关测试一行未改；`actionableCount` 不受筛选影响。**超过 200 条的差异现在靠筛选收窄范围看全**，文案不再承诺「去列表页按批次查看」 |
 | 告警系统落地（webhook） | PR #30（merge `6b1eddf`），CI [run 42450549593](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593) | 完全做完：`ALERT_WEBHOOK_URL` + `api/src/common/channel/webhook-alert-sink.ts`（去重与限频） |
 | 跨副本分布式锁 | PR #30（merge `6b1eddf`），CI [run 42450549593](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593) | 完全做完：`api/src/common/lock/redis-lock.service.ts` + spec；套在 media 清理、出款救援、渠道对账上 |
-| pino 结构化日志 / 生产 TLS / 慢查询阈值 | PR #30（merge `6b1eddf`），CI [run 42450549593](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593) | **主体做完**：`api/src/common/logging/pino-logger.service.ts`；`infra/nginx/templates/prod.conf.template:174-196`；`infra/postgres/init-tuning.sh:34`。**secret manager 未做**，见 [2.3 等业主裁决 #6](#23-等业主裁决) |
+| pino 结构化日志 / 生产 TLS / 慢查询阈值（阶段 8-1 收口） | PR #30（merge `6b1eddf`），CI [run 42450549593](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593) | **完全做完**：`api/src/common/logging/pino-logger.service.ts`；`infra/nginx/templates/prod.conf.template:174-196`；`infra/postgres/init-tuning.sh:34`。**secret manager / 托管数据库经业主裁决（2026-11-27）不是近期目标**，阶段 8-1 据此收口为已完成，见 [2.3 已裁决](#23-已裁决保留理由) #6 |
 | 游客订单查询 | PR #30（merge `6b1eddf`），CI [run 42450549593](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593)；后续 `ca6f116` 修防爆破可信代理 | 完全做完：订单号 + 收货手机号双因子、最小投影、Redis 失败计数；`api/src/modules/order/guest-order.controller.ts` + e2e `api/test/guest-order-lookup.e2e-spec.ts` |
 | 阶段 11b：npm workspaces 化 | PR #30（merge `6b1eddf`），CI [run 42450549593](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42450549593) | 有实现、**无设计 / 计划 / 验收归档**。证据：根 `package.json` 的 `workspaces` 含 5 个子包；`@ecom/frontend-shared` 以 workspace 符号链接被三端引用；用法见[开发与测试](../development.md) |
 | 阶段 11c：浏览器级 e2e（Playwright golden path） | PR #31（merge `88583bb`），CI [run 42452795536](https://github.com/gztcode/multi-tenant-ecommerce-saas/actions/runs/42452795536) | 有实现、**无设计 / 计划 / 验收归档**。证据：`e2e-browser/playwright.config.ts` 与 `e2e-browser/specs/`；命令见[开发与测试](../development.md) 的「浏览器级 e2e」 |
@@ -144,7 +153,7 @@
 | 5 | 给商家后台做主题实时预览 | 已完成 | [backlog.md 三、已完成](backlog.md#三已完成保留索引) |
 | 6 | 给 e2e 的队列做隔离 + 每轮清库 | 已完成 | [三、已完成](#三已完成保留索引) |
 | 7 | 退货入库流程 | 已完成 | [backlog.md 三、已完成](backlog.md#三已完成保留索引) |
-| 8 | 跨店会员 | 等业主裁决 | [backlog.md 2.3 等业主裁决](backlog.md#23-等业主裁决) |
+| 8 | 跨店会员 | 已裁决不做（2026-11-27） | [backlog.md 2.3 已裁决](backlog.md#23-已裁决保留理由) |
 
 ## 五、阶段 3 遗留的处置对照
 
@@ -153,7 +162,7 @@
 
 | 遗留项 | 处置 | 证据 / 说明 |
 |--------|------|------------|
-| 跨店会员不支持 | 等业主裁决 | 见 [backlog.md 2.3 等业主裁决](backlog.md#23-等业主裁决) |
+| 跨店会员不支持 | 已裁决不做（2026-11-27） | 见 [backlog.md 2.3 已裁决](backlog.md#23-已裁决保留理由) |
 | 游客订单查询 | 已完成 | 阶段 11（PR #30，merge `6b1eddf`）补了订单号 + 收货手机号双因子查询，见「三、已完成」 |
 | 退款不回补库存 | 设计取舍 + 已补手动入口 | 退款仍不自动回补库存；配套退货入库已由阶段 11d 补上（PR #32），见「三、已完成」 |
 | 购物车金额是估算值 | 已放弃（设计取舍） | 见 [2.2 已放弃](#22-已放弃保留理由) |
