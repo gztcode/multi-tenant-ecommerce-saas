@@ -27,7 +27,7 @@ import {
 import { RegisterMerchantDto } from './dto/register-merchant.dto';
 import { RegisterCustomerDto } from './dto/register-customer.dto';
 import { LoginDto, LoginScope } from './dto/login.dto';
-import { LoginThrottleService } from './login-throttle.service';
+import { AuthThrottleService } from './auth-throttle.service';
 
 /**
  * 用于在「用户不存在」时也执行一次 argon2 校验，消除登录接口的时序侧信道。
@@ -63,7 +63,7 @@ export class AuthService {
   constructor(
     private readonly prisma: TenantPrismaService,
     private readonly jwt: JwtService,
-    private readonly loginThrottle: LoginThrottleService,
+    private readonly authThrottle: AuthThrottleService,
   ) {
     this.graceKey = deriveGraceKey(
       process.env.JWT_SECRET ??
@@ -71,8 +71,19 @@ export class AuthService {
     );
   }
 
-  /** 商家注册：一次创建租户 + 店主用户 + 首个店铺 */
-  async registerMerchant(dto: RegisterMerchantDto): Promise<AuthResult> {
+  /**
+   * 商家注册：一次创建租户 + 店主用户 + 首个店铺
+   *
+   * `ip` 用于注册限流（安全审计 M2）：进来先判超限、再计数，
+   * 之后才做 `argon2.hash`——哈希是最贵的一步，不能让它被白嫖。
+   */
+  async registerMerchant(
+    dto: RegisterMerchantDto,
+    ip?: string,
+  ): Promise<AuthResult> {
+    this.authThrottle.assertRegistrationAllowed('merchant', ip);
+    this.authThrottle.recordRegistrationAttempt('merchant', ip);
+
     const passwordHash = await argon2.hash(dto.password);
     const subdomain = dto.subdomain.toLowerCase();
     const email = dto.email.toLowerCase();
@@ -161,12 +172,18 @@ export class AuthService {
     }
   }
 
-  /** 消费者注册：注册到当前子域名对应的租户 */
-  async registerCustomer(dto: RegisterCustomerDto): Promise<AuthResult> {
+  /** 消费者注册：注册到当前子域名对应的租户（`ip` 用于注册限流，同上） */
+  async registerCustomer(
+    dto: RegisterCustomerDto,
+    ip?: string,
+  ): Promise<AuthResult> {
     const context = getTenantContext();
     if (!context.tenantId) {
       throw new UnauthorizedException('无法确定店铺，缺少子域名');
     }
+
+    this.authThrottle.assertRegistrationAllowed('customer', ip);
+    this.authThrottle.recordRegistrationAttempt('customer', ip);
 
     const passwordHash = await argon2.hash(dto.password);
     const email = dto.email.toLowerCase();
@@ -235,14 +252,20 @@ export class AuthService {
    *   商家与平台超管的账号归属不靠子域名确定（店主的租户由邮箱唯一约束决定，
    *   超管则没有租户），因此传了 tenantId 也只对 CUSTOMER 生效。
    */
-  async login(dto: LoginDto, tenantId?: string | null): Promise<AuthResult> {
+  async login(
+    dto: LoginDto,
+    tenantId?: string | null,
+    ip?: string,
+  ): Promise<AuthResult> {
     const email = dto.email.toLowerCase();
 
-    // ⚠️ **失败限流按账号**（审计 P2-3）：key 里带 `scope` ——
-    //    同一个邮箱在「商家后台」与「店铺前台」是两个账号，不能互相锁。
-    //    不带租户：换店铺重试也该被算到同一个账号头上。
+    // ⚠️ **失败限流按账号 + 按 IP**（审计 P2-3 / M2）：
+    //    账号 key 里带 `scope` —— 同一个邮箱在「商家后台」与「店铺前台」
+    //    是两个账号，不能互相锁；不带租户：换店铺重试也该被算到同一个
+    //    账号头上。IP 维度另算一份，防「换大量账号、每个只试几个密码」
+    //    的密码喷洒（那种打法账号维度永远到不了阈值）。
     const throttleKey = `${dto.scope}:${email}`;
-    this.loginThrottle.assertNotLocked(throttleKey);
+    this.authThrottle.assertNotLocked(throttleKey, ip);
 
     const roleFilter = this.roleFilterFor(dto.scope);
 
@@ -276,7 +299,7 @@ export class AuthService {
       // ⚠️ **账号不存在也要计数**（审计 P2-3）：撞库主要就是在试
       //    大量**没注册过**的邮箱 —— 那条路径没有行可以落库，
       //    只能靠这里的失败计数兜住。
-      this.loginThrottle.recordFailure(throttleKey);
+      this.authThrottle.recordFailure(throttleKey, ip);
       throw new UnauthorizedException('邮箱或密码不正确');
     }
 
@@ -289,15 +312,16 @@ export class AuthService {
         if (candidate.role !== UserRole.PLATFORM_ADMIN && !candidate.tenantId) {
           continue;
         }
-        // 登录成功 → 清掉失败计数（用户改对了密码就不该继续被限）
-        this.loginThrottle.reset(throttleKey);
+        // 登录成功 → 清掉**账号**失败计数（用户改对了密码就不该继续被限）。
+        // 故意不清 IP 计数：否则拿一个自己的有效账号就能重置喷洒配额。
+        this.authThrottle.reset(throttleKey);
         return this.issueTokens(candidate);
       }
     }
 
     // 邮箱存在与不存在、以及密码错误，都返回同一句提示，
     // 避免攻击者据此枚举出已注册的邮箱。
-    this.loginThrottle.recordFailure(throttleKey);
+    this.authThrottle.recordFailure(throttleKey, ip);
     throw new UnauthorizedException('邮箱或密码不正确');
   }
 

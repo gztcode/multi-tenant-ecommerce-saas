@@ -9,7 +9,7 @@ import { UserRole } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { tenantContext } from '../../common/tenant/tenant-context';
 import { AuthService } from './auth.service';
-import { LoginThrottleService } from './login-throttle.service';
+import { AuthThrottleService } from './auth-throttle.service';
 import { LoginScope } from './dto/login.dto';
 
 const DB_NOW = new Date('2026-11-04T00:00:00.000Z');
@@ -32,7 +32,7 @@ function makeService(stored: Record<string, unknown>, dbNow: Date) {
     service: new AuthService(
       prisma as never,
       jwt as never,
-      new LoginThrottleService(),
+      new AuthThrottleService({ production: false }),
     ),
   };
 }
@@ -184,7 +184,7 @@ function makeRegisterService() {
     service: new AuthService(
       prisma as never,
       jwt as never,
-      new LoginThrottleService(),
+      new AuthThrottleService({ production: false }),
     ),
   };
 }

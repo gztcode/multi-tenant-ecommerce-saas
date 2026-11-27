@@ -7,7 +7,7 @@ import { JwtStrategy } from './jwt.strategy';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { TokenGraceService } from './token-grace.service';
 import { TokenGraceWorker } from './token-grace.worker';
-import { LoginThrottleService } from './login-throttle.service';
+import { AuthThrottleService } from './auth-throttle.service';
 
 /**
  * 认证模块。
@@ -39,7 +39,7 @@ import { LoginThrottleService } from './login-throttle.service';
     JwtAuthGuard,
     TokenGraceService,
     TokenGraceWorker,
-    LoginThrottleService,
+    AuthThrottleService,
   ],
   exports: [AuthService, JwtAuthGuard, JwtModule],
 })
