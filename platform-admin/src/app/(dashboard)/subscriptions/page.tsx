@@ -96,12 +96,15 @@ export default async function SubscriptionsPage() {
                       <TableCell>
                         <div className="flex flex-col">
                           <span>{subscription.planName}</span>
-                          {/* ⚠️ **有预约换套餐时要说清楚**：超管要知道
-                              下个周期会换成什么，否则这张表读不出
-                              「这家即将涨价」这种事。 */}
+                          {/* ⚠️ **这是历史数据，不是「下个周期生效」**：后端自
+                              2026-11-27 起换套餐立即生效，不再写 `pendingPlanId`；
+                              但旧数据在续费扫描里仍按 `pendingPlanId ?? planId`
+                              生效，直接隐藏会让超管看不到「下次续费要换套餐」，
+                              所以有值时标注成「历史预约」而不是删掉。 */}
                           {subscription.pendingPlanName && (
                             <span className="text-xs text-muted-foreground">
-                              下个周期：{subscription.pendingPlanName}
+                              历史预约（旧规则，下次续费时生效）：
+                              {subscription.pendingPlanName}
                             </span>
                           )}
                         </div>

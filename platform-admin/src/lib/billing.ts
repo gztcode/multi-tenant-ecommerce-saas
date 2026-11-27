@@ -75,8 +75,15 @@ export interface PlatformSubscription {
   tenantSubdomain: string;
   planId: string;
   planName: string;
-  /** 待生效的套餐（下个周期生效）。null = 不换 */
+  /**
+   * 历史字段：后端自 2026-11-27 起换套餐立即生效（同一事务切 `planId`
+   * 并重置周期），不再写入此字段；保留只为兼容旧数据 / 老响应。
+   *
+   * ⚠️ 旧数据里的值仍会被续费扫描（`pendingPlanId ?? planId`）采纳，
+   * 所以列表页在它有值时会标注「历史预约」。
+   */
   pendingPlanId: string | null;
+  /** 历史字段，含义同上（后端查好的套餐名） */
   pendingPlanName: string | null;
   status: SubscriptionStatus;
   /** 抽佣比例（基点）。查不到套餐时后端给 0 */
