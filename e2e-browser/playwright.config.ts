@@ -3,6 +3,7 @@ import { defineConfig } from '@playwright/test';
 import {
   API_BASE_URL,
   API_PORT,
+  AUTH_SECRET,
   DATABASE_URL,
   MERCHANT_ADMIN_URL,
   STOREFRONT_PORT,
@@ -76,7 +77,7 @@ export default defineConfig({
       timeout: 180_000,
       env: {
         API_BASE_URL,
-        AUTH_SECRET: 'browser-e2e-auth-secret-0123456789',
+        AUTH_SECRET,
         AUTH_TRUST_HOST: 'true',
         NEXT_PUBLIC_TENANT_SUBDOMAIN: 'demo',
       },
@@ -89,7 +90,7 @@ export default defineConfig({
       timeout: 180_000,
       env: {
         API_BASE_URL,
-        AUTH_SECRET: 'browser-e2e-auth-secret-0123456789',
+        AUTH_SECRET,
         AUTH_URL: MERCHANT_ADMIN_URL,
         AUTH_TRUST_HOST: 'true',
       },
