@@ -7,6 +7,11 @@
  *    脚本里只调用，不复制判定。
  */
 
+import {
+  classifyProductionValue,
+  describeProductionValueProblem,
+} from './production-value';
+
 /** 种子护栏错误：脚本入口据此只打印一行说明，而不是整段堆栈 */
 export class SeedGuardError extends Error {
   constructor(message: string) {
@@ -65,8 +70,9 @@ type EnvLike = Record<string, string | undefined>;
 /**
  * 解析某个种子账号的口令。
  *
- * - 生产环境：**必须**显式提供对应环境变量，未提供/为空即抛错
- *   （否则生产库会多出一个口令写在仓库里的账号）。
+ * - 生产环境：**必须**显式提供对应环境变量，且值不能等于内置默认口令 /
+ *   已知占位符（未提供、为空、等于默认值都按缺失处理并抛错，
+ *   否则生产库会多出一个口令写在仓库里的账号）。
  * - 非生产环境：未提供则沿用内置默认值，本地与 CI 行为不变。
  */
 export function resolveSeedPassword(
@@ -76,15 +82,25 @@ export function resolveSeedPassword(
   const spec = SEED_CREDENTIALS[kind];
   const raw = env[spec.envKey] ?? '';
 
-  if (raw.trim().length > 0) {
+  if (env.NODE_ENV === 'production') {
+    // ⚠️ 只判非空不够：compose / 运维脚本可能把内置默认口令原样注入，
+    //    那与「没配」是同一个后果 —— 仓库里公开的口令能登录生产超管。
+    const problem = classifyProductionValue(raw, {
+      defaultValue: spec.defaultPassword,
+    });
+    if (problem !== null) {
+      throw new SeedGuardError(
+        `生产环境必须显式提供 ${spec.envKey}（${spec.accountLabel}的登录口令）：` +
+          `当前值${describeProductionValueProblem(problem)}。` +
+          '值等于开发默认值/占位符，等同于未配置；' +
+          '生产环境禁止使用种子脚本内置的默认口令（它们在版本库里，等于公开）。',
+      );
+    }
     return { password: raw, source: 'env' };
   }
 
-  if (env.NODE_ENV === 'production') {
-    throw new SeedGuardError(
-      `生产环境必须显式提供 ${spec.envKey}（${spec.accountLabel}的登录口令）：` +
-        '生产环境禁止使用种子脚本内置的默认口令（它们在版本库里，等于公开）。',
-    );
+  if (raw.trim().length > 0) {
+    return { password: raw, source: 'env' };
   }
 
   return { password: spec.defaultPassword, source: 'default' };

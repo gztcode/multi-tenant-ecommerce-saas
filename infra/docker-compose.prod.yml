@@ -64,6 +64,11 @@ services:
   # 摊给公网扫描器。需要临时开放时在 infra/.env 里设 SWAGGER_ENABLED=true。
   api:
     environment:
+      # ⚠️ **必须显式**：基础 compose 默认 development（本机开发形态），
+      #    生产叠加本文件后才是 production。少了这一行，启动守卫
+      #    （默认值/占位符视为未配置）在生产**不会生效** —— 这正是审计
+      #    发现的「护栏永不触发」根因。
+      NODE_ENV: production
       SWAGGER_ENABLED: ${SWAGGER_ENABLED:-}
 
   # 生产上不需要把数据服务暴露到宿主机（哪怕回环）：
