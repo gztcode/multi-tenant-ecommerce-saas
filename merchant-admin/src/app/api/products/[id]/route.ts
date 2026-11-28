@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { readJson, toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 单个商品的中转：详情（GET）、更新（PATCH）、软删除（DELETE）。
@@ -29,7 +30,7 @@ export async function GET(
   const { id } = await params;
 
   try {
-    const result = await apiFetch(`/catalog/products/${id}`, {
+    const result = await apiFetch(`/catalog/products/${encodePathSegment(id)}`, {
       token: session.accessToken,
     });
     return NextResponse.json(result);
@@ -151,7 +152,7 @@ export async function PATCH(
   }
 
   try {
-    const result = await apiFetch(`/catalog/products/${id}`, {
+    const result = await apiFetch(`/catalog/products/${encodePathSegment(id)}`, {
       method: 'PATCH',
       body: sanitized,
       token: session.accessToken,
@@ -176,7 +177,7 @@ export async function DELETE(
   const { id } = await params;
 
   try {
-    await apiFetch(`/catalog/products/${id}`, {
+    await apiFetch(`/catalog/products/${encodePathSegment(id)}`, {
       method: 'DELETE',
       token: session.accessToken,
     });

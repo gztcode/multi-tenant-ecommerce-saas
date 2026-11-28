@@ -58,9 +58,10 @@ export default async function SettlementsPage({
       // ⚠️ **显式请求 `pageSize=100`**（后端 `pageSize` 的上限就是 100）：
       // 结算单的数量天然比套餐 / 订阅大一到两个数量级（商家数 × 月数），
       // 用后端缺省的 50 条会有一大半看不到，而超管连翻页都无从下手。
-      const query = periodParam
-        ? `?period=${encodeURIComponent(periodParam)}&pageSize=100`
-        : '?pageSize=100';
+      const query = `?${new URLSearchParams({
+        ...(periodParam ? { period: periodParam } : {}),
+        pageSize: '100',
+      })}`;
       list = await apiFetchAuthed<SettlementListResult>(
         `/platform/settlements${query}`,
       );

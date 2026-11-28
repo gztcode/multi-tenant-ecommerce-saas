@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 确认上传完成的中转。
@@ -31,7 +32,7 @@ export async function POST(
   }
 
   try {
-    const result = await apiFetch(`/media/${id}/confirm`, {
+    const result = await apiFetch(`/media/${encodePathSegment(id)}/confirm`, {
       method: 'POST',
       token: session.accessToken,
     });

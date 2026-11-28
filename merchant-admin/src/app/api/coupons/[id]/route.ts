@@ -6,6 +6,7 @@ import {
   toErrorResponse,
   unauthorizedResponse,
 } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 单张券的中转：PATCH 改券（编辑 / 暂停 / 启用）、DELETE 删券（软删）。
@@ -144,7 +145,7 @@ export async function PATCH(
   }
 
   try {
-    const result = await apiFetch(`/merchant/coupons/${id}`, {
+    const result = await apiFetch(`/merchant/coupons/${encodePathSegment(id)}`, {
       method: 'PATCH',
       body,
       token: session.accessToken,
@@ -168,7 +169,7 @@ export async function DELETE(
   try {
     // ⚠️ **删除走软删**（后端做的）：券要保留历史核销记录的可追溯性，
     // 所以不物理删除，只打上删除标记。
-    await apiFetch(`/merchant/coupons/${id}`, {
+    await apiFetch(`/merchant/coupons/${encodePathSegment(id)}`, {
       method: 'DELETE',
       token: session.accessToken,
     });

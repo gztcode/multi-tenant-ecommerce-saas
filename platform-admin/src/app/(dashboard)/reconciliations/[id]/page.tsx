@@ -17,6 +17,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ReconciliationItemsTable } from '../reconciliation-items-table';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /** 详情页的筛选参数（全部来自 URL，服务端读） */
 interface ReconciliationDetailSearchParams {
@@ -104,7 +105,7 @@ export default async function ReconciliationDetailPage({
   const hasFilter = queryString !== '';
 
   const data = await apiFetchAuthed<Reconciliation>(
-    `/platform/payout-reconciliations/${id}${queryString ? `?${queryString}` : ''}`,
+    `/platform/payout-reconciliations/${encodePathSegment(id)}${queryString ? `?${queryString}` : ''}`,
   );
 
   const items = sortItemsBySeverity(data.items ?? []);

@@ -6,6 +6,7 @@ import {
   toErrorResponse,
   unauthorizedResponse,
 } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 单个满减活动的中转：PATCH 改活动（编辑 / 暂停 / 启用）、DELETE 删活动。
@@ -104,7 +105,7 @@ export async function PATCH(
   }
 
   try {
-    const result = await apiFetch(`/merchant/promotions/${id}`, {
+    const result = await apiFetch(`/merchant/promotions/${encodePathSegment(id)}`, {
       method: 'PATCH',
       body,
       token: session.accessToken,
@@ -127,7 +128,7 @@ export async function DELETE(
 
   try {
     // ⚠️ **删除走软删**（后端做的）：活动要保留历史订单里引用的可追溯性。
-    await apiFetch(`/merchant/promotions/${id}`, {
+    await apiFetch(`/merchant/promotions/${encodePathSegment(id)}`, {
       method: 'DELETE',
       token: session.accessToken,
     });

@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 商家侧订单详情的中转。
@@ -21,7 +22,7 @@ export async function GET(
 
   try {
     const result = await apiFetch(
-      `/merchant/orders/${encodeURIComponent(orderNo)}`,
+      `/merchant/orders/${encodePathSegment(orderNo)}`,
       { token: session.accessToken },
     );
     return NextResponse.json(result);

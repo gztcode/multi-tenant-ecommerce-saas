@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { readJson, toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 商家发货的中转（填快递单号）。
@@ -44,7 +45,7 @@ export async function POST(
 
   try {
     const result = await apiFetch(
-      `/merchant/orders/${encodeURIComponent(orderNo)}/ship`,
+      `/merchant/orders/${encodePathSegment(orderNo)}/ship`,
       { method: 'POST', body, token: session.accessToken },
     );
     return NextResponse.json(result, { status: 201 });

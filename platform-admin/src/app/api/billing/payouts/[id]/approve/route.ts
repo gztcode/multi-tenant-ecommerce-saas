@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 审批通过出款的中转：POST /api/billing/payouts/:id/approve。
@@ -20,7 +21,7 @@ export async function POST(
   }
 
   try {
-    const result = await apiFetch(`/platform/payouts/${id}/approve`, {
+    const result = await apiFetch(`/platform/payouts/${encodePathSegment(id)}/approve`, {
       method: 'POST',
       token: session.accessToken,
     });

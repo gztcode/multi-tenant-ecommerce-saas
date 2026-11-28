@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 人工确认「渠道已打款」的中转：POST /api/billing/payouts/:id/confirm-paid。
@@ -57,7 +58,7 @@ export async function POST(
 
   try {
     const result = await apiFetch(
-      `/platform/payout-reconciliations/payouts/${id}/confirm-paid`,
+      `/platform/payout-reconciliations/payouts/${encodePathSegment(id)}/confirm-paid`,
       {
         method: 'POST',
         body: payload,

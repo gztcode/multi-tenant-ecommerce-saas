@@ -28,7 +28,7 @@ export default async function InventoryPage({
   if (productId) {
     try {
       skus = await apiFetchAuthed<SkuRow[]>(
-        `/inventory/summary?productId=${encodeURIComponent(productId)}`,
+        `/inventory/summary?${new URLSearchParams({ productId })}`,
       );
     } catch (cause) {
       error =

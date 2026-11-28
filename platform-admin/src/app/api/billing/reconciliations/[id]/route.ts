@@ -7,6 +7,7 @@ import {
   RECONCILIATION_RESOLUTION_VALUES,
   RECONCILIATION_SEVERITY_VALUES,
 } from '@/lib/reconciliation';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 详情筛选参数的白名单：**只有这三个键会被转发**，其余 query 一律丢弃。
@@ -59,7 +60,7 @@ export async function GET(
   const suffix = query.toString() ? `?${query.toString()}` : '';
   try {
     const result = await apiFetch(
-      `/platform/payout-reconciliations/${id}${suffix}`,
+      `/platform/payout-reconciliations/${encodePathSegment(id)}${suffix}`,
       { token: session.accessToken },
     );
     return NextResponse.json(result);

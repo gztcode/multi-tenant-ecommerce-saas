@@ -6,6 +6,7 @@ import {
   toErrorResponse,
   unauthorizedResponse,
 } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 账单作废的中转：POST 把账单置为 `VOID`（**保留记录，不删行**）。
@@ -59,7 +60,7 @@ export async function POST(
 
   try {
     const result = await apiFetch(
-      `/billing/invoices/${encodeURIComponent(number)}/void`,
+      `/billing/invoices/${encodePathSegment(number)}/void`,
       {
         method: 'POST',
         body,

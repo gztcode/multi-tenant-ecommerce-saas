@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { readJson, toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 商品规格矩阵的整体替换（PUT）。
@@ -163,7 +164,7 @@ export async function PUT(
   }
 
   try {
-    const result = await apiFetch(`/catalog/products/${id}/specs`, {
+    const result = await apiFetch(`/catalog/products/${encodePathSegment(id)}/specs`, {
       method: 'PUT',
       body: { version, specs: sanitizedSpecs },
       token: session.accessToken,

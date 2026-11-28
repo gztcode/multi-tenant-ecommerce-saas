@@ -6,6 +6,7 @@ import {
   toErrorResponse,
   unauthorizedResponse,
 } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 批量确认 CSV 来源 A 类差异的中转：
@@ -85,7 +86,7 @@ export async function POST(
 
     try {
       const result = await apiFetch(
-        `/platform/payout-reconciliations/${id}/items/batch-confirm`,
+        `/platform/payout-reconciliations/${encodePathSegment(id)}/items/batch-confirm`,
         {
           method: 'POST',
           body: { mode: 'IDS', itemIds: unique, note },
@@ -124,7 +125,7 @@ export async function POST(
 
   try {
     const result = await apiFetch(
-      `/platform/payout-reconciliations/${id}/items/batch-confirm`,
+      `/platform/payout-reconciliations/${encodePathSegment(id)}/items/batch-confirm`,
       {
         method: 'POST',
         body: {

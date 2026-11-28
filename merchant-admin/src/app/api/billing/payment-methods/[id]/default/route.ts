@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 设为默认支付方式的中转。
@@ -21,7 +22,7 @@ export async function POST(
   const { id } = await params;
 
   try {
-    const result = await apiFetch(`/billing/payment-methods/${id}/default`, {
+    const result = await apiFetch(`/billing/payment-methods/${encodePathSegment(id)}/default`, {
       method: 'POST',
       token: session.accessToken,
     });

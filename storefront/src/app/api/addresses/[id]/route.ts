@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { readJson, toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
 import { currentSubdomain, currentToken, fetchBackend } from '@/lib/server-cart';
 import { sanitizeAddressBody } from '@/lib/addresses';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 单个地址的中转：PATCH 改地址、DELETE 删地址（软删）。
@@ -34,7 +35,7 @@ export async function PATCH(
 
   try {
     const result = await fetchBackend(
-      `/addresses/${encodeURIComponent(id)}`,
+      `/addresses/${encodePathSegment(id)}`,
       { method: 'PATCH', body: sanitized.value, subdomain, token },
     );
     return NextResponse.json(result);
@@ -55,7 +56,7 @@ export async function DELETE(
   const subdomain = await currentSubdomain();
 
   try {
-    await fetchBackend(`/addresses/${encodeURIComponent(id)}`, {
+    await fetchBackend(`/addresses/${encodePathSegment(id)}`, {
       method: 'DELETE',
       subdomain,
       token,

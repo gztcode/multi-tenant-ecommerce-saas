@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 确认结算单的中转：POST /api/billing/settlements/:id/confirm。
@@ -19,7 +20,7 @@ export async function POST(
   }
 
   try {
-    const result = await apiFetch(`/platform/settlements/${id}/confirm`, {
+    const result = await apiFetch(`/platform/settlements/${encodePathSegment(id)}/confirm`, {
       method: 'POST',
       token: session.accessToken,
     });
