@@ -1,4 +1,5 @@
 import { assertSeedAllowed, resolveSeedPassword } from './seed-guard';
+import { KNOWN_PLACEHOLDER_SECRETS } from './placeholder-secrets';
 
 /**
  * 种子脚本的生产护栏（2026-11）。
@@ -29,6 +30,52 @@ describe('resolveSeedPassword', () => {
         'platform-admin',
       ),
     ).toEqual({ password: 'prod-口令-1', source: 'env' });
+  });
+
+  it('生产环境口令等于内置默认口令 → 按缺失处理并抛错', () => {
+    // 先拿到非生产环境的默认口令，再原样喂回生产分支。
+    const { password: builtinDefault } = resolveSeedPassword(
+      {},
+      'platform-admin',
+    );
+
+    expect(() =>
+      resolveSeedPassword(
+        {
+          NODE_ENV: 'production',
+          SEED_PLATFORM_ADMIN_PASSWORD: builtinDefault,
+        },
+        'platform-admin',
+      ),
+    ).toThrow(/SEED_PLATFORM_ADMIN_PASSWORD.*(默认|等同)/);
+  });
+
+  it('生产环境口令是已知占位符 → 按缺失处理并抛错', () => {
+    const placeholder = [...KNOWN_PLACEHOLDER_SECRETS][0];
+
+    expect(() =>
+      resolveSeedPassword(
+        { NODE_ENV: 'production', SEED_PLATFORM_ADMIN_PASSWORD: placeholder },
+        'platform-admin',
+      ),
+    ).toThrow(/SEED_PLATFORM_ADMIN_PASSWORD.*占位符/);
+  });
+
+  it('非生产环境口令正好等于内置默认值 → 仍视为显式配置（行为不变）', () => {
+    const { password: builtinDefault } = resolveSeedPassword(
+      {},
+      'platform-admin',
+    );
+
+    expect(
+      resolveSeedPassword(
+        {
+          NODE_ENV: 'development',
+          SEED_PLATFORM_ADMIN_PASSWORD: builtinDefault,
+        },
+        'platform-admin',
+      ),
+    ).toEqual({ password: builtinDefault, source: 'env' });
   });
 
   it('开发环境未设置口令 → 沿用内置默认值', () => {

@@ -107,8 +107,13 @@ PAYOUT_ACCOUNT_ENCRYPTION_KEY=$(openssl rand -base64 48)
 # 数据服务凭据
 POSTGRES_PASSWORD=...       # openssl rand -hex 16
 REDIS_PASSWORD=...          # 仅字母数字（拼进 redis:// URL）
-MINIO_ROOT_USER=...         # ≥8 字符
-MINIO_ROOT_PASSWORD=...     # ≥40 字符
+MINIO_ROOT_USER=...         # ≥8 字符（同时作为 api 的 MINIO_ACCESS_KEY）
+MINIO_ROOT_PASSWORD=...     # ≥40 字符（同时作为 api 的 MINIO_SECRET_KEY）
+
+# api 的 MinIO 连接（⚠️ 生产不允许留默认值，等于默认值/占位符/回环地址都会启动失败）
+MINIO_ENDPOINT=https://minio.example.com     # 浏览器可达地址，不能是 localhost/127.0.0.1/0.0.0.0
+MINIO_INTERNAL_ENDPOINT=http://minio:9000    # 容器内地址（保持服务名 + 容器端口）
+MINIO_BUCKET=ecommerce-media-prod            # 必须显式设置，不能沿用开发默认 ecommerce-media
 
 # 生产标识
 BASE_DOMAIN=example.com
@@ -278,6 +283,10 @@ VALUES (gen_random_uuid()::text, NULL, 'ops@example.com', 'Platform Ops', '<argo
 然后立即用该账号登录 `admin.example.com` 改密，并**禁用/删除**
 seed 产生的演示账号（若曾误跑 seed）。
 
+> **种子口令护栏**：生产环境（`NODE_ENV=production`）下，`SEED_*_PASSWORD`
+> 未设置、为空、等于脚本内置默认口令、或等于已知占位符，都会**直接抛错**，
+> seed 不会创建任何账号。这是故意的：内置口令在版本库里，等于公开。
+
 ## 9. 可观测性接入
 
 - **抓取**：Prometheus 抓 `https://api.example.com/api/v1/metrics`。
@@ -430,15 +439,21 @@ cd infra && docker compose up -d
 
 子域名本地调试：把 `127.0.0.1 *.platform.test` 写进 `/etc/hosts`。
 
-> **注意**：compose 默认是 **production 姿态**（`api/Dockerfile` 自带 `ENV NODE_ENV=production`，compose 也显式设 `NODE_ENV: production`），
-> 所以上面这条命令**原样跑不起来**。启动校验会拒绝 compose 内置的默认凭据：默认/空的 PostgreSQL、Redis、MinIO 密码，
-> 以及示例/默认的 `JWT_SECRET` / `AUTH_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY` 都会让进程启动即失败。
-> 要真跑通，必须通过环境变量提供真实的 `POSTGRES_PASSWORD` / `REDIS_PASSWORD` / `MINIO_ROOT_PASSWORD` 凭据，
-> 以及真实的 `JWT_SECRET` / `AUTH_SECRET` / `PAYOUT_ACCOUNT_ENCRYPTION_KEY`（三者都至少 32 字符，可用 `openssl rand -base64 48` 生成）。
-> `AUTH_SECRET` 短于 32 字符时，api 与三端前端都会在启动阶段直接失败（拒绝带着弱密钥跑起来）。
+> **注意**：基础 compose 是**本机开发形态**——api 的 `NODE_ENV` 默认是
+> `${NODE_ENV:-development}`（`api/Dockerfile` 里的 `ENV NODE_ENV=production`
+> 会被 compose 的 environment 覆盖）。所以 `docker compose up -d` 原样就能以
+> 开发语义起步，不会被「生产不允许默认值/占位符」这类只在生产生效的规则拦住。
 >
-> 本机联调请走[开发指南](development.md)的「本地开发」路径（`cd api && npm run start:dev`，读 `api/.env`，`NODE_ENV` 不是 production，不触发这些拒绝）。
-> 也**不要**把 compose 的 `NODE_ENV` 改成 development 绕过：那会让非生产默认的假支付（`fake`）/ 假出款（`fake-payout`）渠道生效，
-> 属于安全姿态变更。
+> **生产必须叠加 `-f docker-compose.prod.yml`**：那里把 api 固定为
+> `NODE_ENV: production`，启动守卫才真正生效——这时 compose 内置的默认凭据
+> （默认/空的 PostgreSQL、Redis、MinIO 密码，开发默认的 MinIO endpoint /
+> bucket / access key，以及示例/默认的 `JWT_SECRET` / `AUTH_SECRET` /
+> `PAYOUT_ACCOUNT_ENCRYPTION_KEY`）都会让进程**启动即失败**，包括
+> 「变量有值但等于开发默认值」这种 compose 部署里最常见的形态。
+> 要跑通，必须按上面 §「`.env` 生产必改项」提供真实值。
+>
+> 也**不要**只改基础 compose 的 `NODE_ENV` 来绕过守卫：那会让开发默认值
+> （尤其是假支付 `fake` / 假出款 `fake-payout` 渠道）进入生产流量。
+> 生产只认「叠加 prod override」这一条路径。
 >
 > compose 里的 `JWT_SECRET` / `AUTH_SECRET` 是明文固定值，**仅供本机开发**；真实部署必须换成外部注入的随机密钥。
