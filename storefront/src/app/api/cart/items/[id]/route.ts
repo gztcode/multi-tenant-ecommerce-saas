@@ -7,6 +7,7 @@ import {
   forwardableCookie,
 } from '@/lib/server-cart';
 import type { Cart } from '@/lib/cart';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 改购物车条目数量的中转（PATCH）与删除条目（DELETE）。
@@ -38,7 +39,7 @@ export async function PATCH(
 
   try {
     const { data, setCookie } = await fetchWithCookie<Cart>(
-      `/cart/items/${encodeURIComponent(id)}`,
+      `/cart/items/${encodePathSegment(id)}`,
       {
         method: 'PATCH',
         body: { quantity },
@@ -69,7 +70,7 @@ export async function DELETE(
 
   try {
     await fetchWithCookie<Cart>(
-      `/cart/items/${encodeURIComponent(id)}`,
+      `/cart/items/${encodePathSegment(id)}`,
       { method: 'DELETE', subdomain, token, cookie },
     );
     return new NextResponse(null, { status: 204 });

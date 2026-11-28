@@ -7,6 +7,7 @@ import { SkuPriceTable } from '@/components/product/sku-price-table';
 import { MediaUploader } from '@/components/product/media-uploader';
 import type { CategoryOption, ProductDetail, ResolvedMediaItem } from '@/components/product/types';
 import { PRODUCT_STATUS_LABEL } from '@/components/product/types';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 商品编辑页（Server Component）。
@@ -41,7 +42,7 @@ export default async function ProductEditPage({
 
   let product: ProductDetail;
   try {
-    product = await apiFetchAuthed<ProductDetail>(`/catalog/products/${id}`);
+    product = await apiFetchAuthed<ProductDetail>(`/catalog/products/${encodePathSegment(id)}`);
   } catch (cause) {
     // 404（商品不存在 / 已软删 / 不属于本租户）交给 notFound()：
     // 渲染一个 404 页面比显示「加载失败」诚实，也不该把 id 探测的结果泄出去。

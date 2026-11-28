@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 撤回出款申请的中转（DELETE）。
@@ -22,7 +23,7 @@ export async function DELETE(
   const { id } = await context.params;
 
   try {
-    const result = await apiFetch(`/merchant/payouts/${id}`, {
+    const result = await apiFetch(`/merchant/payouts/${encodePathSegment(id)}`, {
       method: 'DELETE',
       token: session.accessToken,
     });

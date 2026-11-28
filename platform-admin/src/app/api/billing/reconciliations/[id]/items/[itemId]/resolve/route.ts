@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 处置一条对账差异的中转：POST /api/billing/reconciliations/:id/items/:itemId/resolve。
@@ -49,7 +50,7 @@ export async function POST(
 
   try {
     const result = await apiFetch(
-      `/platform/payout-reconciliations/${id}/items/${itemId}/resolve`,
+      `/platform/payout-reconciliations/${encodePathSegment(id)}/items/${encodePathSegment(itemId)}/resolve`,
       {
         method: 'POST',
         body: { resolution: body.resolution, note: body.note.trim() },

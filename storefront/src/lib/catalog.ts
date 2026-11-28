@@ -1,4 +1,5 @@
 import { apiFetch } from './api-client';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /** 公开商品列表的响应形状 */
 export interface PublicProductList {
@@ -83,7 +84,7 @@ export async function fetchPublicProduct(
   subdomain: string,
   slug: string,
 ): Promise<PublicProductDetail> {
-  return apiFetch<PublicProductDetail>(`/public/products/${slug}`, {
+  return apiFetch<PublicProductDetail>(`/public/products/${encodePathSegment(slug)}`, {
     subdomain,
   });
 }

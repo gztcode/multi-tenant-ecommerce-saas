@@ -27,6 +27,7 @@ import {
 } from '@/components/ui/card';
 
 import { SettlementRowActions } from '../settlement-actions';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 结算单明细分页的响应（阶段 5l）。
@@ -96,7 +97,7 @@ export default async function SettlementDetailPage({
 
   try {
     statement = await apiFetchAuthed<SettlementDetail>(
-      `/platform/settlements/${id}`,
+      `/platform/settlements/${encodePathSegment(id)}`,
     );
   } catch (cause) {
     if (cause instanceof ApiError && cause.status === 404) {
@@ -116,7 +117,9 @@ export default async function SettlementDetailPage({
   if (statement) {
     try {
       entriesPage = await apiFetchAuthed<SettlementEntriesPage>(
-        `/platform/settlements/${id}/entries?page=${page}&pageSize=${pageSize}`,
+        `/platform/settlements/${encodePathSegment(id)}/entries?${new URLSearchParams(
+          { page: String(page), pageSize: String(pageSize) },
+        )}`,
       );
     } catch (cause) {
       entriesError =

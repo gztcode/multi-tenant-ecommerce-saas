@@ -7,6 +7,7 @@ import {
   unauthorizedResponse,
 } from '@/lib/route-helpers';
 import { buildPlanBody } from '../plan-body';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 单个套餐的中转：PATCH 改套餐、DELETE 下架套餐。
@@ -45,7 +46,7 @@ export async function PATCH(
   }
 
   try {
-    const updated = await apiFetch(`/platform/plans/${id}`, {
+    const updated = await apiFetch(`/platform/plans/${encodePathSegment(id)}`, {
       method: 'PATCH',
       body: result.body,
       token: session.accessToken,
@@ -67,7 +68,7 @@ export async function DELETE(
   const { id } = await params;
 
   try {
-    await apiFetch(`/platform/plans/${id}`, {
+    await apiFetch(`/platform/plans/${encodePathSegment(id)}`, {
       method: 'DELETE',
       token: session.accessToken,
     });

@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 解绑支付方式的中转。
@@ -23,7 +24,7 @@ export async function DELETE(
   const { id } = await params;
 
   try {
-    const result = await apiFetch(`/billing/payment-methods/${id}`, {
+    const result = await apiFetch(`/billing/payment-methods/${encodePathSegment(id)}`, {
       method: 'DELETE',
       token: session.accessToken,
     });

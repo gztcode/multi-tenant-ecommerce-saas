@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
 import { currentSubdomain, currentToken, fetchBackend } from '@/lib/server-cart';
 import type { Order } from '@/lib/cart';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 订单详情的中转。
@@ -22,7 +23,7 @@ export async function GET(
 
   try {
     const result = await fetchBackend<Order>(
-      `/orders/${encodeURIComponent(orderNo)}`,
+      `/orders/${encodePathSegment(orderNo)}`,
       { subdomain, token },
     );
     return NextResponse.json(result);

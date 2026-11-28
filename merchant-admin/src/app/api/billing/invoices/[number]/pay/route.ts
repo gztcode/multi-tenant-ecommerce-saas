@@ -6,6 +6,7 @@ import {
   toErrorResponse,
   unauthorizedResponse,
 } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 手动续费的中转：POST 建订阅账单的支付单（返回渠道的支付页面 URL）。
@@ -51,7 +52,7 @@ export async function POST(
 
   try {
     const result = await apiFetch<{ payUrl?: string }>(
-      `/billing/invoices/${number}/pay`,
+      `/billing/invoices/${encodePathSegment(number)}/pay`,
       {
         method: 'POST',
         body,

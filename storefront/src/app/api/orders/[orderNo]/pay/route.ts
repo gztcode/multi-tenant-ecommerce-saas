@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
 import { currentSubdomain, currentToken, fetchBackend } from '@/lib/server-cart';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /** 后端发起支付的响应 */
 interface CreatedPayment {
@@ -47,7 +48,7 @@ export async function POST(
 
   try {
     const payment = await fetchBackend<CreatedPayment>(
-      `/orders/${encodeURIComponent(orderNo)}/pay`,
+      `/orders/${encodePathSegment(orderNo)}/pay`,
       { method: 'POST', body: {}, subdomain, token },
     );
 

@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 人工重试出款的中转：POST /api/billing/payouts/:id/retry。
@@ -42,7 +43,7 @@ export async function POST(
   }
 
   try {
-    const result = await apiFetch(`/platform/payouts/${id}/retry`, {
+    const result = await apiFetch(`/platform/payouts/${encodePathSegment(id)}/retry`, {
       method: 'POST',
       body: { reason: body.reason.trim() },
       token: session.accessToken,

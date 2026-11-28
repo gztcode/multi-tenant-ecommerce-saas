@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { ApiError, apiFetch } from '@/lib/api-client';
 import { TENANT_STATUSES } from '@/lib/tenant';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 商家状态变更的同源中转接口。
@@ -51,7 +52,7 @@ export async function PATCH(
   }
 
   try {
-    const tenant = await apiFetch(`/tenants/${id}/status`, {
+    const tenant = await apiFetch(`/tenants/${encodePathSegment(id)}/status`, {
       method: 'PATCH',
       body: { status },
       token: session.accessToken,

@@ -13,6 +13,7 @@ import type {
   OrderStatus,
 } from './cart';
 import type { AvailableCoupon, CouponPreview, MyCoupon } from './coupon';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 消费者侧的接口封装（地址簿 / 订单），供 Server Component 在**服务端**取数。
@@ -133,7 +134,7 @@ export async function fetchOrder(orderNo: string): Promise<{
   const subdomain = await currentSubdomain();
 
   try {
-    const order = await apiFetch<Order>(`/orders/${orderNo}`, {
+    const order = await apiFetch<Order>(`/orders/${encodePathSegment(orderNo)}`, {
       subdomain,
       token,
     });

@@ -14,6 +14,7 @@ import {
   formatRateBps,
 } from '@/lib/statement';
 import type { StatementPeriodDetail } from '@/lib/statement';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 商家侧的对账单详情页（Server Component）。
@@ -33,7 +34,7 @@ export default async function StatementDetailPage({
 
   try {
     data = await apiFetchAuthed<StatementPeriodDetail>(
-      `/merchant/statements/${period}`,
+      `/merchant/statements/${encodePathSegment(period)}`,
     );
   } catch (cause) {
     // ⚠️ **404 要交给 `notFound()`**：这一期压根不存在时，

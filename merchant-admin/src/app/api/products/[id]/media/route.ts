@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { readJson, toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 设置商品媒体列表（整体替换）的中转。
@@ -69,7 +70,7 @@ export async function PUT(
   const mediaIdsClean: string[] = [...new Set(mediaIds as string[])];
 
   try {
-    const result = await apiFetch(`/catalog/products/${id}/media`, {
+    const result = await apiFetch(`/catalog/products/${encodePathSegment(id)}/media`, {
       method: 'PUT',
       // 白名单重建：只发 mediaIds。sort / status / key / url 一律由服务端维护。
       body: { mediaIds: mediaIdsClean },

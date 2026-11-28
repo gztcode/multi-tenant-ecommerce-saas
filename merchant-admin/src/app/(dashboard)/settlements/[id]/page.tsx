@@ -13,6 +13,7 @@ import type { PayoutDetail } from '@/lib/payout';
 //    `new Date(...).toLocaleString()`** —— 两份实现迟早漂。
 import { formatDateTime } from '@/lib/billing';
 import { PayoutCancelButton } from '../payout-cancel-button';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 商家侧的出款单详情页（Server Component）。
@@ -29,7 +30,7 @@ export default async function PayoutDetailPage({
   let error: string | null = null;
 
   try {
-    payout = await apiFetchAuthed<PayoutDetail>(`/merchant/payouts/${id}`);
+    payout = await apiFetchAuthed<PayoutDetail>(`/merchant/payouts/${encodePathSegment(id)}`);
   } catch (cause) {
     if (cause instanceof ApiError && cause.status === 404) {
       notFound();

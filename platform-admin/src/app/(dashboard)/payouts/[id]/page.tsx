@@ -31,6 +31,7 @@ import {
 } from '@/components/ui/card';
 
 import { PayoutActions } from '../payout-actions';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 平台侧出款单详情页（Server Component）。
@@ -51,7 +52,7 @@ export default async function PayoutDetailPage({
 
   try {
     payout = await apiFetchAuthed<PlatformPayoutDetail>(
-      `/platform/payouts/${id}`,
+      `/platform/payouts/${encodePathSegment(id)}`,
     );
   } catch (cause) {
     if (cause instanceof ApiError && cause.status === 404) {

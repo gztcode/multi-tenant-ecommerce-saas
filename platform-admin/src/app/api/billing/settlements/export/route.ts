@@ -24,7 +24,7 @@ export async function GET(request: Request) {
     );
   }
 
-  const query = period ? `?period=${encodeURIComponent(period)}` : '';
+  const query = period ? `?${new URLSearchParams({ period })}` : '';
   const response = await fetch(
     `${API_BASE_URL}/platform/settlements/export${query}`,
     { headers: { authorization: `Bearer ${session.accessToken}` } },

@@ -3,6 +3,7 @@ import { notFound } from 'next/navigation';
 import { ApiError, apiFetchAuthed } from '@/lib/api-client';
 import { OrderDetail } from '@/components/order/order-detail';
 import type { MerchantOrder } from '@/components/order/types';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 商家侧订单详情页（Server Component）。
@@ -23,7 +24,7 @@ export default async function OrderDetailPage({
   let order: MerchantOrder;
   try {
     order = await apiFetchAuthed<MerchantOrder>(
-      `/merchant/orders/${encodeURIComponent(orderNo)}`,
+      `/merchant/orders/${encodePathSegment(orderNo)}`,
     );
   } catch (cause) {
     // 404（订单不存在 / 不属于本租户）交给 notFound()：

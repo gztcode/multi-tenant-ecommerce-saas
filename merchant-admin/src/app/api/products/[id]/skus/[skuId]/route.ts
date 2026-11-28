@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { readJson, toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 单个 SKU 的更新（PATCH）。
@@ -87,7 +88,7 @@ export async function PATCH(
   }
 
   try {
-    const result = await apiFetch(`/catalog/products/${id}/skus/${skuId}`, {
+    const result = await apiFetch(`/catalog/products/${encodePathSegment(id)}/skus/${encodePathSegment(skuId)}`, {
       method: 'PATCH',
       body: sanitized,
       token: session.accessToken,

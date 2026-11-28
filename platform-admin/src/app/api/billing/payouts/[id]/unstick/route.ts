@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 解除卡单的中转：POST /api/billing/payouts/:id/unstick。
@@ -48,7 +49,7 @@ export async function POST(
   }
 
   try {
-    const result = await apiFetch(`/platform/payouts/${id}/unstick`, {
+    const result = await apiFetch(`/platform/payouts/${encodePathSegment(id)}/unstick`, {
       method: 'POST',
       body: { to: body.to, reason: body.reason.trim() },
       token: session.accessToken,

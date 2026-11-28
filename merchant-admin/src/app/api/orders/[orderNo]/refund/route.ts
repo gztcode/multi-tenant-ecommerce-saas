@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { readJson, toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 商家整单退款的中转。
@@ -44,7 +45,7 @@ export async function POST(
 
   try {
     const result = await apiFetch(
-      `/merchant/orders/${encodeURIComponent(orderNo)}/refund`,
+      `/merchant/orders/${encodePathSegment(orderNo)}/refund`,
       { method: 'POST', body, token: session.accessToken },
     );
     return NextResponse.json(result);

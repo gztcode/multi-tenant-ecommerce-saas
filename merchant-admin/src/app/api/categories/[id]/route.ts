@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
 import { apiFetch } from '@/lib/api-client';
 import { readJson, toErrorResponse, unauthorizedResponse } from '@/lib/route-helpers';
+import { encodePathSegment } from '@ecom/frontend-shared/url';
 
 /**
  * 品类改名与删除的中转。
@@ -45,7 +46,7 @@ export async function PATCH(
   }
 
   try {
-    const result = await apiFetch(`/catalog/categories/${id}`, {
+    const result = await apiFetch(`/catalog/categories/${encodePathSegment(id)}`, {
       method: 'PATCH',
       body: sanitized,
       token: session.accessToken,
@@ -67,7 +68,7 @@ export async function DELETE(
   const { id } = await params;
 
   try {
-    await apiFetch(`/catalog/categories/${id}`, {
+    await apiFetch(`/catalog/categories/${encodePathSegment(id)}`, {
       method: 'DELETE',
       token: session.accessToken,
     });
