@@ -129,12 +129,30 @@ export class MinioService implements OnModuleInit {
     }
   }
 
-  /** 签发上传用的 presigned PUT URL */
-  async createUploadUrl(key: string, contentType: string): Promise<string> {
+  /**
+   * 签发上传用的 presigned PUT URL。
+   *
+   * ⚠️ **`contentLength` 必须原样放进签名**（审计 L1）：只把它当业务校验写在
+   *    `confirm()` 里，等于允许客户端用 1KB 的申请签出凭证、再直传 5GB ——
+   *    数据先落盘、出口带宽先消耗，超限对象只是事后被删掉。
+   *    SigV4 会把 `content-length` 写进 `X-Amz-SignedHeaders`，MinIO 收到
+   *    实际字节数与签名不符的 PUT 会直接 403（实测：签 1024 字节、发 2048 → 403，
+   *    发 1024 → 200），超限数据根本进不了存储层。
+   *
+   * 代价是**客户端必须发与申报值完全一致的字节数**：浏览器 XHR / fetch
+   * 上传 `File` 时 Content-Length 由运行时按 `File.size` 自动填，两者本来就相同；
+   * 任何「申报一个值、发另一个值」的行为都会被存储层拒绝，这正是要的语义。
+   */
+  async createUploadUrl(
+    key: string,
+    contentType: string,
+    contentLength: number,
+  ): Promise<string> {
     const command = new PutObjectCommand({
       Bucket: this.bucket,
       Key: key,
       ContentType: contentType,
+      ContentLength: contentLength,
     });
     return getSignedUrl(this.publicClient, command, {
       expiresIn: MAX_PRESIGN_TTL_SECONDS,
